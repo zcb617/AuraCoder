@@ -1,14 +1,67 @@
 use std::{
     collections::BTreeMap,
+    /*
     fs,
     path::PathBuf,
+    */
     sync::{Mutex, MutexGuard, OnceLock},
+    time::Duration,
 };
 
 use anyhow::Context;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use crate::runtime_env;
+
+/// 配置字典中允许由 AppConfig 读写的固定键集合，未知键由数据库保留。
+#[cfg(test)]
+const CONFIG_KEYS: [&str; 34] = [
+    "general.theme",
+    "general.default_engine",
+    "general.default_model",
+    "general.locale",
+    "general.terminal_accelerated_rendering",
+    "general.terminal_font_size",
+    "general.chat_notifications",
+    "general.terminal_notifications",
+    "general.notification_sound",
+    "general.default_autonomy_preset",
+    "general.default_file_open_target",
+    "ui.sidebar_width",
+    "ui.git_panel_width",
+    "ui.font_size",
+    "ui.display_scale",
+    "debug.persist_engine_event_logs",
+    "debug.max_action_output_chars",
+    "power.keep_awake_enabled",
+    "power.prevent_display_sleep",
+    "power.prevent_screen_saver",
+    "power.ac_only_mode",
+    "power.battery_threshold",
+    "power.session_duration_secs",
+    "power.prevent_closed_display_sleep",
+    "computer_control.enabled",
+    "computer_control.persistent_authorizations",
+    "claude_code.session_mode",
+    "remote_access.enabled",
+    "remote_access.endpoint",
+    "remote_access.tunnel_id",
+    "remote_access.credential",
+    "remote_access.devices",
+    "remote_access.device_credential",
+    "harnesses.launch_args",
+];
+
+/// 将配置字典中的单个 JSON 文本应用到目标字段，损坏值只影响当前字段。
+macro_rules! apply_config_json {
+    ($key:expr, $raw:expr, $target:expr) => {
+        match serde_json::from_str(&$raw) {
+            Ok(value) => $target = value,
+            Err(error) => log::warn!("invalid JSON for app config key {}: {}", $key, error),
+        }
+    };
+}
 
 pub const DEFAULT_TERMINAL_FONT_SIZE: u32 = 12;
 pub const MIN_TERMINAL_FONT_SIZE: u32 = 8;
@@ -515,44 +568,46 @@ impl AppConfig {
     fn load_or_create_unlocked() -> anyhow::Result<Self> {
         runtime_env::migrate_legacy_app_data_dir()
             .context("failed to migrate legacy app data dir")?;
-        let path = Self::path();
+        let mut connection = open_config_database()?;
+        let dictionary_rows: i64 =
+            connection.query_row("SELECT COUNT(*) FROM config", [], |row| row.get(0))?;
 
-        if !path.exists() {
-            let config = Self::default();
-            config.save_unlocked()?;
+        if dictionary_rows > 0 {
+            let mut config = load_config_dictionary(&connection)?;
+            if normalize_remote_endpoint(&mut config) {
+                save_config_dictionary(&mut connection, &config)?;
+            }
             return Ok(config);
         }
 
-        let raw = fs::read_to_string(&path)?;
-        let config = toml::from_str::<Self>(&raw).unwrap_or_default();
+        /* 配置文件已取消，不再执行以下旧 TOML 导入、备份和重命名逻辑。
+        let path = Self::path();
+        let legacy_file_exists = path.exists();
+        let mut config = if legacy_file_exists {
+            let raw = fs::read_to_string(&path)?;
+            toml::from_str::<Self>(&raw).unwrap_or_default()
+        } else {
+            Self::default()
+        };
+        normalize_remote_endpoint(&mut config);
+        save_config_dictionary(&mut connection, &config)?;
 
-        /*
-        let mut config = toml::from_str::<Self>(&raw).unwrap_or_default();
-
-        // Existing installations can have a config file created before
-        // `display_scale` existed. Reading a missing field falls back to 100, but
-        // the config must also be migrated so the field is explicitly persisted.
-        let persisted_display_scale = toml::from_str::<toml::Value>(&raw)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("ui")
-                    .and_then(toml::Value::as_table)
-                    .and_then(|ui| ui.get("display_scale"))
-                    .and_then(toml::Value::as_integer)
-            })
-            .and_then(|value| u32::try_from(value).ok());
-        let normalized_display_scale = config.display_scale();
-        if persisted_display_scale != Some(normalized_display_scale) {
-            config.ui.display_scale = normalized_display_scale;
-            config.save_unlocked()?;
+        if legacy_file_exists {
+            let backup_path = path.with_file_name("config.toml.migrated.bak");
+            if let Err(error) = fs::rename(&path, &backup_path) {
+                log::warn!("failed to back up migrated config.toml: {}", error);
+            }
         }
         */
 
+        let mut config = Self::default();
+        normalize_remote_endpoint(&mut config);
+        save_config_dictionary(&mut connection, &config)?;
         Ok(config)
     }
 
     fn save_unlocked(&self) -> anyhow::Result<()> {
+        /* SQLite 字典持久化已替代以下旧 TOML 写入逻辑，保留原代码以便追溯。
         let path = Self::path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -563,11 +618,17 @@ impl AppConfig {
         fs::write(&temp_path, raw)?;
         replace_file(&temp_path, &path)?;
         Ok(())
+        */
+
+        let mut connection = open_config_database()?;
+        save_config_dictionary(&mut connection, self)
     }
 
+    /* 配置文件已取消，停用原用于定位 config.toml 的公开接口。
     pub fn path() -> PathBuf {
         runtime_env::config_path()
     }
+    */
 }
 
 /// 返回当前操作系统的默认通知声音，未支持的平台不附加声音。
@@ -593,6 +654,230 @@ fn default_notification_sound() -> Option<&'static str> {
     }
 }
 
+/// 打开运行期工作区数据库，并设置配置读写使用的五秒锁等待时间。
+fn open_config_database() -> anyhow::Result<Connection> {
+    let database_path = runtime_env::app_data_dir().join("workspaces.db");
+    let connection = Connection::open(database_path)
+        .context("failed to open workspaces database for app config")?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    Ok(connection)
+}
+
+/// 从 SQLite 配置字典加载已知配置字段，缺失字段保留默认值，未知字段继续保留在数据库中。
+fn load_config_dictionary(connection: &Connection) -> anyhow::Result<AppConfig> {
+    let mut config = AppConfig::default();
+    let mut statement = connection.prepare("SELECT config_key, config_value FROM config")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    for row in rows {
+        let (key, raw) = row?;
+        match key.as_str() {
+            "general.theme" => apply_config_json!(&key, raw, config.general.theme),
+            "general.default_engine" => {
+                apply_config_json!(&key, raw, config.general.default_engine)
+            }
+            "general.default_model" => {
+                apply_config_json!(&key, raw, config.general.default_model)
+            }
+            "general.locale" => apply_config_json!(&key, raw, config.general.locale),
+            "general.terminal_accelerated_rendering" => {
+                apply_config_json!(&key, raw, config.general.terminal_accelerated_rendering)
+            }
+            "general.terminal_font_size" => {
+                apply_config_json!(&key, raw, config.general.terminal_font_size)
+            }
+            "general.chat_notifications" => {
+                apply_config_json!(&key, raw, config.general.chat_notifications)
+            }
+            "general.terminal_notifications" => {
+                apply_config_json!(&key, raw, config.general.terminal_notifications)
+            }
+            "general.notification_sound" => {
+                apply_config_json!(&key, raw, config.general.notification_sound)
+            }
+            "general.default_autonomy_preset" => {
+                apply_config_json!(&key, raw, config.general.default_autonomy_preset)
+            }
+            "general.default_file_open_target" => {
+                apply_config_json!(&key, raw, config.general.default_file_open_target)
+            }
+            "ui.sidebar_width" => apply_config_json!(&key, raw, config.ui.sidebar_width),
+            "ui.git_panel_width" => apply_config_json!(&key, raw, config.ui.git_panel_width),
+            "ui.font_size" => apply_config_json!(&key, raw, config.ui.font_size),
+            "ui.display_scale" => apply_config_json!(&key, raw, config.ui.display_scale),
+            "debug.persist_engine_event_logs" => {
+                apply_config_json!(&key, raw, config.debug.persist_engine_event_logs)
+            }
+            "debug.max_action_output_chars" => {
+                apply_config_json!(&key, raw, config.debug.max_action_output_chars)
+            }
+            "power.keep_awake_enabled" => {
+                apply_config_json!(&key, raw, config.power.keep_awake_enabled)
+            }
+            "power.prevent_display_sleep" => {
+                apply_config_json!(&key, raw, config.power.prevent_display_sleep)
+            }
+            "power.prevent_screen_saver" => {
+                apply_config_json!(&key, raw, config.power.prevent_screen_saver)
+            }
+            "power.ac_only_mode" => apply_config_json!(&key, raw, config.power.ac_only_mode),
+            "power.battery_threshold" => {
+                apply_config_json!(&key, raw, config.power.battery_threshold)
+            }
+            "power.session_duration_secs" => {
+                apply_config_json!(&key, raw, config.power.session_duration_secs)
+            }
+            "power.prevent_closed_display_sleep" => {
+                apply_config_json!(&key, raw, config.power.prevent_closed_display_sleep)
+            }
+            "computer_control.enabled" => {
+                apply_config_json!(&key, raw, config.computer_control.enabled)
+            }
+            "computer_control.persistent_authorizations" => {
+                apply_config_json!(&key, raw, config.computer_control.persistent_authorizations)
+            }
+            "claude_code.session_mode" => {
+                apply_config_json!(&key, raw, config.claude_code.session_mode)
+            }
+            "remote_access.enabled" => {
+                apply_config_json!(&key, raw, config.remote_access.enabled)
+            }
+            "remote_access.endpoint" => {
+                apply_config_json!(&key, raw, config.remote_access.endpoint)
+            }
+            "remote_access.tunnel_id" => {
+                apply_config_json!(&key, raw, config.remote_access.tunnel_id)
+            }
+            "remote_access.credential" => {
+                apply_config_json!(&key, raw, config.remote_access.credential)
+            }
+            "remote_access.devices" => apply_config_json!(&key, raw, config.remote_access.devices),
+            "remote_access.device_credential" => {
+                apply_config_json!(&key, raw, config.remote_access.device_credential)
+            }
+            "harnesses.launch_args" => {
+                apply_config_json!(&key, raw, config.harnesses.launch_args)
+            }
+            _ => {}
+        }
+    }
+
+    Ok(config)
+}
+
+/// 在一个 SQLite 事务中写入 AppConfig 的全部固定字典字段，并保留未知键。
+fn save_config_dictionary(connection: &mut Connection, config: &AppConfig) -> anyhow::Result<()> {
+    let transaction = connection.transaction()?;
+    let mut statement = transaction.prepare(
+        "INSERT INTO config(config_key, config_value) VALUES (?1, ?2)\
+         ON CONFLICT(config_key) DO UPDATE SET config_value = excluded.config_value",
+    )?;
+    // 34 个固定字段统一使用 JSON 文本写入字典表，未知键不会被触碰。
+    macro_rules! upsert {
+        ($key:expr, $value:expr $(,)?) => {{
+            let serialized = serde_json::to_string($value)?;
+            statement.execute(params![$key, serialized])?;
+            Ok::<(), anyhow::Error>(())
+        }};
+    }
+
+    upsert!("general.theme", &config.general.theme)?;
+    upsert!("general.default_engine", &config.general.default_engine)?;
+    upsert!("general.default_model", &config.general.default_model)?;
+    upsert!("general.locale", &config.general.locale)?;
+    upsert!(
+        "general.terminal_accelerated_rendering",
+        &config.general.terminal_accelerated_rendering,
+    )?;
+    upsert!(
+        "general.terminal_font_size",
+        &config.general.terminal_font_size,
+    )?;
+    upsert!(
+        "general.chat_notifications",
+        &config.general.chat_notifications,
+    )?;
+    upsert!(
+        "general.terminal_notifications",
+        &config.general.terminal_notifications,
+    )?;
+    upsert!(
+        "general.notification_sound",
+        &config.general.notification_sound,
+    )?;
+    upsert!(
+        "general.default_autonomy_preset",
+        &config.general.default_autonomy_preset,
+    )?;
+    upsert!(
+        "general.default_file_open_target",
+        &config.general.default_file_open_target,
+    )?;
+    upsert!("ui.sidebar_width", &config.ui.sidebar_width)?;
+    upsert!("ui.git_panel_width", &config.ui.git_panel_width)?;
+    upsert!("ui.font_size", &config.ui.font_size)?;
+    upsert!("ui.display_scale", &config.ui.display_scale)?;
+    upsert!(
+        "debug.persist_engine_event_logs",
+        &config.debug.persist_engine_event_logs,
+    )?;
+    upsert!(
+        "debug.max_action_output_chars",
+        &config.debug.max_action_output_chars,
+    )?;
+    upsert!("power.keep_awake_enabled", &config.power.keep_awake_enabled)?;
+    upsert!(
+        "power.prevent_display_sleep",
+        &config.power.prevent_display_sleep,
+    )?;
+    upsert!(
+        "power.prevent_screen_saver",
+        &config.power.prevent_screen_saver,
+    )?;
+    upsert!("power.ac_only_mode", &config.power.ac_only_mode)?;
+    upsert!("power.battery_threshold", &config.power.battery_threshold)?;
+    upsert!(
+        "power.session_duration_secs",
+        &config.power.session_duration_secs,
+    )?;
+    upsert!(
+        "power.prevent_closed_display_sleep",
+        &config.power.prevent_closed_display_sleep,
+    )?;
+    upsert!("computer_control.enabled", &config.computer_control.enabled)?;
+    upsert!(
+        "computer_control.persistent_authorizations",
+        &config.computer_control.persistent_authorizations,
+    )?;
+    upsert!("claude_code.session_mode", &config.claude_code.session_mode)?;
+    upsert!("remote_access.enabled", &config.remote_access.enabled)?;
+    upsert!("remote_access.endpoint", &config.remote_access.endpoint)?;
+    upsert!("remote_access.tunnel_id", &config.remote_access.tunnel_id)?;
+    upsert!("remote_access.credential", &config.remote_access.credential)?;
+    upsert!("remote_access.devices", &config.remote_access.devices)?;
+    upsert!(
+        "remote_access.device_credential",
+        &config.remote_access.device_credential,
+    )?;
+    upsert!("harnesses.launch_args", &config.harnesses.launch_args)?;
+
+    drop(statement);
+    transaction.commit()?;
+    Ok(())
+}
+
+/// 将旧版 panes 远程地址修正为 AuraCoder 当前远程地址。
+fn normalize_remote_endpoint(config: &mut AppConfig) -> bool {
+    if config.remote_access.endpoint == "wss://panes.jxrjkf.cn/ws/tunnel" {
+        config.remote_access.endpoint = "wss://auracoder.jxrjkf.cn/ws/tunnel".to_string();
+        true
+    } else {
+        false
+    }
+}
+
 fn config_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -604,6 +889,7 @@ fn lock_config() -> anyhow::Result<MutexGuard<'static, ()>> {
         .map_err(|_| anyhow::anyhow!("config lock poisoned"))
 }
 
+/* SQLite 字典持久化已替代旧 TOML 原子替换逻辑，保留原函数体以便追溯。
 fn replace_file(temp_path: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -635,10 +921,45 @@ fn replace_file(temp_path: &std::path::Path, path: &std::path::Path) -> std::io:
 
     fs::rename(temp_path, path)
 }
+*/
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, ClaudeCodeSessionMode};
+    /*
+    use std::{fs, path::Path};
+    */
+
+    use rusqlite::Connection;
+
+    use super::{
+        load_config_dictionary, normalize_remote_endpoint, save_config_dictionary, AppConfig,
+        ClaudeCodeSessionMode, ComputerControlAuthorizationConfig, RemoteDeviceConfig, CONFIG_KEYS,
+    };
+
+    /// 创建与 107.sql 相同结构的内存配置字典，避免测试修改运行时全局路径。
+    fn memory_config_database() -> Connection {
+        let connection = Connection::open_in_memory().expect("memory database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE config (
+                    config_key TEXT PRIMARY KEY NOT NULL,
+                    config_value TEXT NOT NULL
+                )",
+            )
+            .expect("config table should be created");
+        connection
+    }
+
+    /* 配置文件已取消，不再执行旧 TOML 导入测试辅助。
+    /// 将显式路径上的旧 TOML 配置导入测试字典，并执行旧 endpoint 规范化。
+    fn import_legacy_config(connection: &mut Connection, legacy_path: &Path) -> AppConfig {
+        let raw = fs::read_to_string(legacy_path).expect("legacy config should be readable");
+        let mut config = toml::from_str::<AppConfig>(&raw).unwrap_or_default();
+        normalize_remote_endpoint(&mut config);
+        save_config_dictionary(connection, &config).expect("legacy config should be persisted");
+        config
+    }
+    */
 
     #[test]
     fn missing_locale_field_uses_none() {
@@ -1058,5 +1379,196 @@ notification_sound = "Glass"
         assert_eq!(config.notification_sound(), None);
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         assert_eq!(config.notification_sound(), None);
+    }
+
+    #[test]
+    fn dictionary_roundtrip_preserves_all_config_groups() {
+        let mut config = AppConfig::default();
+        config.general.theme = "light".to_string();
+        config.general.locale = Some("zh-CN".to_string());
+        config.general.terminal_font_size = Some(18);
+        config.ui.sidebar_width = 333;
+        config.debug.max_action_output_chars = 3210;
+        config.power.ac_only_mode = true;
+        config.power.battery_threshold = Some(22);
+        config.computer_control.enabled = true;
+        config.computer_control.persistent_authorizations.push(
+            ComputerControlAuthorizationConfig {
+                request_id: "request-1".to_string(),
+                target_key: "application:editor".to_string(),
+                agent: "codex".to_string(),
+                tool: "launch_app".to_string(),
+                call_id: "call-1".to_string(),
+                application: "editor".to_string(),
+                operation: "input".to_string(),
+                scope: "application".to_string(),
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+            },
+        );
+        config.remote_access.enabled = true;
+        config.remote_access.endpoint = "wss://example.invalid/ws/tunnel".to_string();
+        config.remote_access.devices.push(RemoteDeviceConfig {
+            id: "device-1".to_string(),
+            name: "phone".to_string(),
+            credential: "device-secret".to_string(),
+            paired_at: "2026-01-01T00:00:00Z".to_string(),
+            last_connected_at: "2026-01-02T00:00:00Z".to_string(),
+        });
+        config
+            .harnesses
+            .launch_args
+            .insert("codex".to_string(), "--yolo".to_string());
+
+        let mut connection = memory_config_database();
+        save_config_dictionary(&mut connection, &config).expect("config should save");
+        let restored = load_config_dictionary(&connection).expect("config should load");
+
+        assert_eq!(CONFIG_KEYS.len(), 34);
+        assert_eq!(config.general.theme, restored.general.theme);
+        assert_eq!(config.general.locale, restored.general.locale);
+        assert_eq!(config.ui.sidebar_width, restored.ui.sidebar_width);
+        assert_eq!(
+            config.debug.max_action_output_chars,
+            restored.debug.max_action_output_chars
+        );
+        assert_eq!(
+            config.power.battery_threshold,
+            restored.power.battery_threshold
+        );
+        assert_eq!(
+            config.computer_control.enabled,
+            restored.computer_control.enabled
+        );
+        assert_eq!(
+            config.computer_control.persistent_authorizations,
+            restored.computer_control.persistent_authorizations
+        );
+        assert_eq!(config.remote_access, restored.remote_access);
+        assert_eq!(config.harnesses.launch_args, restored.harnesses.launch_args);
+        let row_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM config", [], |row| row.get(0))
+            .expect("config row count should be readable");
+        assert_eq!(row_count, 34);
+    }
+
+    #[test]
+    fn invalid_dictionary_value_falls_back_only_for_that_key() {
+        let connection = memory_config_database();
+        connection
+            .execute(
+                "INSERT INTO config(config_key, config_value) VALUES (?1, ?2)",
+                rusqlite::params!["general.theme", "not-json"],
+            )
+            .expect("invalid value should be inserted");
+        connection
+            .execute(
+                "INSERT INTO config(config_key, config_value) VALUES (?1, ?2)",
+                rusqlite::params!["general.default_model", "\"custom-model\""],
+            )
+            .expect("valid value should be inserted");
+
+        let loaded = load_config_dictionary(&connection).expect("config should load");
+        assert_eq!(loaded.general.theme, AppConfig::default().general.theme);
+        assert_eq!(loaded.general.default_model, "custom-model");
+    }
+
+    #[test]
+    fn missing_and_unknown_dictionary_keys_are_safe() {
+        let mut connection = memory_config_database();
+        connection
+            .execute(
+                "INSERT INTO config(config_key, config_value) VALUES (?1, ?2)",
+                rusqlite::params!["future.key", "true"],
+            )
+            .expect("unknown value should be inserted");
+
+        let loaded = load_config_dictionary(&connection).expect("config should load");
+        assert_eq!(loaded.general.theme, AppConfig::default().general.theme);
+        save_config_dictionary(&mut connection, &loaded).expect("config should save");
+        let unknown_value: String = connection
+            .query_row(
+                "SELECT config_value FROM config WHERE config_key = 'future.key'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("unknown key should remain");
+        assert_eq!(unknown_value, "true");
+    }
+
+    /* 配置文件已取消，不再执行旧 TOML 导入测试。
+    #[test]
+    fn legacy_toml_import_preserves_values_and_normalizes_endpoint() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "auracoder-app-config-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&test_dir).expect("test directory should be created");
+        let legacy_path = test_dir.join("config.toml");
+        let mut legacy = AppConfig::default();
+        legacy.general.theme = "light".to_string();
+        legacy.remote_access.endpoint = "wss://panes.jxrjkf.cn/ws/tunnel".to_string();
+        legacy.remote_access.device_credential = "test-device-credential".to_string();
+        legacy.remote_access.devices.push(RemoteDeviceConfig {
+            id: "legacy-device".to_string(),
+            name: "legacy phone".to_string(),
+            credential: "test-credential".to_string(),
+            paired_at: "2026-01-01T00:00:00Z".to_string(),
+            last_connected_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+        fs::write(
+            &legacy_path,
+            toml::to_string_pretty(&legacy).expect("legacy config should serialize"),
+        )
+        .expect("legacy config should be written");
+
+        let mut connection = memory_config_database();
+        let imported = import_legacy_config(&mut connection, &legacy_path);
+        assert_eq!(imported.general.theme, "light");
+        assert_eq!(
+            imported.remote_access.endpoint,
+            "wss://auracoder.jxrjkf.cn/ws/tunnel"
+        );
+        assert_eq!(imported.remote_access.devices.len(), 1);
+        assert_eq!(
+            imported.remote_access.device_credential,
+            "test-device-credential"
+        );
+        let row_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM config", [], |row| row.get(0))
+            .expect("config row count should be readable");
+        assert_eq!(row_count, 34);
+        fs::remove_dir_all(&test_dir).expect("test directory should be removed");
+    }
+    */
+
+    #[test]
+    fn persisted_legacy_endpoint_is_normalized() {
+        let mut connection = memory_config_database();
+        connection
+            .execute(
+                "INSERT INTO config(config_key, config_value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    "remote_access.endpoint",
+                    "\"wss://panes.jxrjkf.cn/ws/tunnel\""
+                ],
+            )
+            .expect("legacy endpoint should be inserted");
+
+        let mut loaded = load_config_dictionary(&connection).expect("config should load");
+        assert!(normalize_remote_endpoint(&mut loaded));
+        save_config_dictionary(&mut connection, &loaded).expect("normalized config should save");
+        assert_eq!(
+            loaded.remote_access.endpoint,
+            "wss://auracoder.jxrjkf.cn/ws/tunnel"
+        );
+        let persisted: String = connection
+            .query_row(
+                "SELECT config_value FROM config WHERE config_key = 'remote_access.endpoint'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("normalized endpoint should be readable");
+        assert_eq!(persisted, "\"wss://auracoder.jxrjkf.cn/ws/tunnel\"");
     }
 }

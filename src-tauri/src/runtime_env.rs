@@ -14,10 +14,13 @@ use tokio::{
 
 const LOGIN_ENV_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const LOGIN_ENV_PROBE_MARKER: &str = "__PANES_LOGIN_ENV_START__";
+const PANES_BUILD_TYPE: &str = env!("PANES_BUILD_TYPE");
 
 static LOGIN_SHELL_ENV: OnceCell<HashMap<OsString, OsString>> = OnceCell::const_new();
 static APP_DATA_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/* 配置文件概念已取消，停用旧 config.toml 路径覆盖状态。
 static CONFIG_PATH_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+*/
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellFlavor {
@@ -54,7 +57,7 @@ pub fn is_flatpak() -> bool {
 }
 
 /// Initializes the per-instance data directory from the main application's
-/// `--config <path>` argument before any configuration, database, or runtime
+/// `--config <data-dir>` argument before any configuration, database, or runtime
 /// state is loaded.
 pub fn initialize_from_cli() -> anyhow::Result<()> {
     let mut args = env::args_os().skip(1);
@@ -72,26 +75,33 @@ pub fn initialize_from_cli() -> anyhow::Result<()> {
         return Ok(());
     };
     if raw_path.is_empty() {
-        anyhow::bail!("--config path must not be empty");
+        anyhow::bail!("--config data directory must not be empty");
     }
 
-    let config_path = if Path::new(&raw_path).is_absolute() {
+    let data_dir = if Path::new(&raw_path).is_absolute() {
         PathBuf::from(raw_path)
     } else {
         env::current_dir()?.join(raw_path)
     };
+
+    /*
+    旧版 --config 参数表示 config.toml 文件时，曾把文件父目录作为实例数据目录；
+    现已改为目录参数语义，保留旧代码以便追溯：
     let data_dir = config_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .ok_or_else(|| anyhow::anyhow!("--config path must have a parent directory"))?
         .to_path_buf();
+    */
 
     APP_DATA_DIR_OVERRIDE
-        .set(data_dir)
+        .set(data_dir.clone())
         .map_err(|_| anyhow::anyhow!("AuraCoder startup options were already initialized"))?;
+    /* 配置文件概念已取消，不再设置 config.toml 路径覆盖。
     CONFIG_PATH_OVERRIDE
-        .set(config_path)
+        .set(data_dir.join("config.toml"))
         .map_err(|_| anyhow::anyhow!("AuraCoder startup options were already initialized"))?;
+    */
     Ok(())
 }
 
@@ -102,6 +112,7 @@ pub fn app_data_dir() -> PathBuf {
 
     app_data_dir_for(
         cfg!(target_os = "windows"),
+        PANES_BUILD_TYPE == "development",
         local_app_data_dir().as_deref(),
         roaming_app_data_dir().as_deref(),
         home_dir().as_deref(),
@@ -124,17 +135,22 @@ pub fn migrate_legacy_app_data_dir() -> std::io::Result<()> {
     if APP_DATA_DIR_OVERRIDE.get().is_some() {
         return Ok(());
     }
+    if PANES_BUILD_TYPE == "development" {
+        return Ok(());
+    }
 
     let current = app_data_dir();
     migrate_legacy_app_data_dir_for(&current, legacy_app_data_dir().as_deref())
 }
 
+/* 配置文件概念已取消，停用原 config.toml 路径接口。
 pub fn config_path() -> PathBuf {
     CONFIG_PATH_OVERRIDE
         .get()
         .cloned()
         .unwrap_or_else(|| app_data_dir().join("config.toml"))
 }
+*/
 
 pub fn augmented_path() -> Option<OsString> {
     join_paths(augmented_path_entries())
@@ -948,25 +964,40 @@ pub fn roaming_app_data_dir() -> Option<PathBuf> {
 
 fn app_data_dir_for(
     is_windows: bool,
+    is_development: bool,
     local_app_data: Option<&Path>,
     roaming_app_data: Option<&Path>,
     home: Option<&Path>,
 ) -> PathBuf {
+    let windows_directory_name = if is_development {
+        "AuraCoder-Development"
+    } else {
+        "AuraCoder"
+    };
+    let unix_directory_name = if is_development {
+        ".agent-workspace-development"
+    } else {
+        ".agent-workspace"
+    };
+
     if is_windows {
         if let Some(path) = local_app_data {
-            return path.join("AuraCoder");
+            return path.join(windows_directory_name);
         }
         if let Some(path) = roaming_app_data {
-            return path.join("AuraCoder");
+            return path.join(windows_directory_name);
         }
         if let Some(home) = home {
-            return home.join("AppData").join("Local").join("AuraCoder");
+            return home
+                .join("AppData")
+                .join("Local")
+                .join(windows_directory_name);
         }
-        return env::temp_dir().join("AuraCoder");
+        return env::temp_dir().join(windows_directory_name);
     }
 
-    home.map(legacy_app_data_dir_for)
-        .unwrap_or_else(|| Path::new(".").join(".agent-workspace"))
+    home.map(|path| path.join(unix_directory_name))
+        .unwrap_or_else(|| Path::new(".").join(unix_directory_name))
 }
 
 fn non_empty_os_str(value: Option<&OsStr>) -> Option<&OsStr> {
@@ -1721,6 +1752,7 @@ mod tests {
     fn app_data_dir_for_windows_prefers_local_app_data() {
         let path = app_data_dir_for(
             true,
+            false,
             Some(Path::new(r"C:\Users\auracoder\AppData\Local")),
             Some(Path::new(r"C:\Users\auracoder\AppData\Roaming")),
             Some(Path::new(r"C:\Users\auracoder")),
@@ -1730,15 +1762,49 @@ mod tests {
 
     #[test]
     fn app_data_dir_for_unix_uses_dot_agent_workspace() {
-        let path = app_data_dir_for(false, None, None, Some(Path::new("/home/auracoder")));
+        let path = app_data_dir_for(false, false, None, None, Some(Path::new("/home/auracoder")));
         assert_eq!(path, PathBuf::from("/home/auracoder/.agent-workspace"));
     }
 
     #[test]
     fn app_data_dir_for_windows_falls_back_to_absolute_temp_dir() {
-        let path = app_data_dir_for(true, None, None, None);
+        let path = app_data_dir_for(true, false, None, None, None);
         assert_eq!(path, std::env::temp_dir().join("AuraCoder"));
         assert!(path.is_absolute());
+    }
+
+    #[test]
+    fn app_data_dir_for_windows_development_uses_independent_directory() {
+        let path = app_data_dir_for(
+            true,
+            true,
+            Some(Path::new(r"C:\Users\auracoder\AppData\Local")),
+            None,
+            None,
+        );
+        assert_eq!(
+            normalize_path(&path),
+            "C:/Users/auracoder/AppData/Local/AuraCoder-Development"
+        );
+    }
+
+    #[test]
+    fn app_data_dir_for_unix_development_uses_independent_directory() {
+        let path = app_data_dir_for(false, true, None, None, Some(Path::new("/home/auracoder")));
+        assert_eq!(
+            path,
+            PathBuf::from("/home/auracoder/.agent-workspace-development")
+        );
+    }
+
+    #[test]
+    fn app_data_dir_for_development_fallbacks_are_isolated() {
+        let unix_path = app_data_dir_for(false, true, None, None, None);
+        assert_eq!(unix_path, PathBuf::from("./.agent-workspace-development"));
+
+        let windows_path = app_data_dir_for(true, true, None, None, None);
+        assert!(windows_path.is_absolute());
+        assert!(windows_path.ends_with("AuraCoder-Development"));
     }
 
     #[cfg(target_os = "linux")]
@@ -1885,15 +1951,15 @@ mod tests {
         let legacy = root.join(".agent-workspace");
 
         fs::create_dir_all(legacy.join("logs")).expect("legacy app data dir should exist");
-        fs::write(legacy.join("config.toml"), "theme = \"dark\"\n")
-            .expect("legacy config should be written");
+        fs::write(legacy.join("workspaces.db"), "legacy database\n")
+            .expect("legacy database should be written");
         fs::write(legacy.join("logs").join("events.log"), "hello\n")
             .expect("legacy log should be written");
 
         migrate_legacy_app_data_dir_for(&current, Some(&legacy))
             .expect("legacy app data should migrate");
 
-        assert!(current.join("config.toml").exists());
+        assert!(current.join("workspaces.db").exists());
         assert!(current.join("logs").join("events.log").exists());
         assert!(!legacy.exists());
 
@@ -1908,19 +1974,20 @@ mod tests {
 
         fs::create_dir_all(&current).expect("current app data dir should exist");
         fs::create_dir_all(&legacy).expect("legacy app data dir should exist");
-        fs::write(current.join("config.toml"), "theme = \"light\"\n")
-            .expect("current config should be written");
-        fs::write(legacy.join("config.toml"), "theme = \"dark\"\n")
-            .expect("legacy config should be written");
+        fs::write(current.join("workspaces.db"), "current database\n")
+            .expect("current database should be written");
+        fs::write(legacy.join("workspaces.db"), "legacy database\n")
+            .expect("legacy database should be written");
 
         migrate_legacy_app_data_dir_for(&current, Some(&legacy))
             .expect("migration should skip populated targets");
 
         assert_eq!(
-            fs::read_to_string(current.join("config.toml")).expect("current config should exist"),
-            "theme = \"light\"\n"
+            fs::read_to_string(current.join("workspaces.db"))
+                .expect("current database should exist"),
+            "current database\n"
         );
-        assert!(legacy.join("config.toml").exists());
+        assert!(legacy.join("workspaces.db").exists());
 
         let _ = fs::remove_dir_all(&root);
     }

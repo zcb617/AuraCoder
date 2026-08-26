@@ -20,9 +20,10 @@ mod macos;
 pub(crate) mod macos_helper;
 pub mod monitor;
 
-use crate::config::app_config::{AppConfig, PowerConfig};
+use crate::config::app_config::PowerConfig;
 #[cfg(not(target_os = "macos"))]
 use crate::process_utils;
+use crate::runtime_env;
 #[cfg(not(target_os = "macos"))]
 use std::process::Stdio;
 
@@ -1023,16 +1024,22 @@ impl KeepAwakeProcessOps for SystemKeepAwakeProcessOps {
 }
 
 fn default_state_dir() -> PathBuf {
+    runtime_env::app_data_dir().join("keep-awake-helpers")
+}
+
+/* 配置文件路径依赖已取消，保留旧实现以便追溯。
+fn default_state_dir_from_config_file() -> PathBuf {
     AppConfig::path()
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("keep-awake-helpers")
 }
+*/
 
 async fn save_keep_awake_enabled_preference(enabled: bool) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        AppConfig::mutate(|config| {
+        crate::config::app_config::AppConfig::mutate(|config| {
             config.power.keep_awake_enabled = enabled;
             Ok(())
         })
