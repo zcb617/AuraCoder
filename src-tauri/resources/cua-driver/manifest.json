@@ -1,0 +1,46 @@
+{
+  "source": "trycua/cua",
+  "releaseTag": "cua-driver-rs-v0.19.3",
+  "archive": "cua-driver-rs-0.19.3-windows-x86_64.zip",
+  "releaseUrl": "https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.19.3",
+  "archiveSha256": "e48b0117e343cec2577fc12693c741e094f389f8d4aef91e06284960bb03bce1",
+  "librarySha256": "d7e67baef87fac1a315d86113eeb485fbf8e03e5906797f0bf79d24a990fa38b",
+  "archives": {
+    "windows-x86_64": {
+      "name": "cua-driver-rs-0.19.3-windows-x86_64.zip",
+      "sha256": "e48b0117e343cec2577fc12693c741e094f389f8d4aef91e06284960bb03bce1",
+      "librarySha256": "d7e67baef87fac1a315d86113eeb485fbf8e03e5906797f0bf79d24a990fa38b"
+    },
+    "linux-x86_64": {
+      "name": "cua-driver-rs-0.19.3-linux-x86_64.tar.gz",
+      "sha256": "e3b4777975a76f1dfd1460bc48e8181b12954e6f783b87d54af793e425a3644f",
+      "librarySha256": "31c142f5c67443a1fa933160bfa20d93b9914220fb9a47f2884d38df20ab0671"
+    },
+    "darwin-x64": {
+      "name": "trycua-cua-driver-darwin-x64-0.19.3.tgz",
+      "sha256": "697b32da4db28f3672ddd866640ec647a7918dc8ba0b495babc6a7b72255c6d6",
+      "librarySha256": "17480cd85943e0f1a4c911dd97e108d6f1b0b5ff484f642513e46dc56be2ce84"
+    },
+    "darwin-arm64": {
+      "name": "trycua-cua-driver-darwin-arm64-0.19.3.tgz",
+      "sha256": "8105b629f14c4bac45b6bc96bea90623eb64369079473d31f7bd6a5a08203427",
+      "librarySha256": "17480cd85943e0f1a4c911dd97e108d6f1b0b5ff484f642513e46dc56be2ce84"
+    }
+  },
+  "requiredFiles": [
+    "windows-x86_64/cua_driver_sdk.dll",
+    "windows-x86_64/cua_driver_abi.h",
+    "linux-x86_64/libcua_driver_sdk.so",
+    "linux-x86_64/cua_driver_abi.h",
+    "linux-x86_64/cua-driver",
+    "linux-x86_64/cua-cursor-theme",
+    "linux-x86_64/cua_driver_node_runtime.node",
+    "linux-x86_64/wayland-helper/install.sh",
+    "linux-x86_64/wayland-helper/README.md",
+    "linux-x86_64/wayland-helper/winrects@cua/extension.js",
+    "linux-x86_64/wayland-helper/winrects@cua/metadata.json",
+    "macos-universal/libcua_driver_sdk.dylib",
+    "macos-universal/cua_driver_node_runtime.node",
+    "macos-universal/node-runtime-NOTICE.md"
+  ]
+}

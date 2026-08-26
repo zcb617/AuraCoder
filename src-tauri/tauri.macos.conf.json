@@ -1,0 +1,14 @@
+{
+  "productName": "AuraCoder",
+  "identifier": "com.0573zzz.auracoder.prd",
+  "bundle": {
+    "macOS": {
+      "signingIdentity": "Yunxiang AuraCoder Signing"
+    },
+    "resources": {
+      "sidecar-dist": "sidecar-dist",
+      "resources/cua-driver/manifest.json": "resources/cua-driver/manifest.json",
+      "resources/cua-driver/macos-universal": "resources/cua-driver/macos-universal"
+    }
+  }
+}

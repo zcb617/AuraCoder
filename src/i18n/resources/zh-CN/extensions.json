@@ -1,0 +1,130 @@
+{
+  "title": "扩展管理",
+  "subtitle": "统一管理当前智能体的技能、插件与 MCP",
+  "provider": { "label": "智能体" },
+  "workspace": {
+    "none": "未选择工作区",
+    "hint": "选择工作区后可查看项目级扩展；全局项目仍会显示。"
+  },
+  "search": { "placeholder": "搜索技能、插件或 MCP……" },
+  "tabs": { "label": "扩展类型", "skill": "技能", "plugin": "插件", "mcp": "MCP" },
+  "filters": {
+    "all": "全部",
+    "installed": "已安装 / 已配置",
+    "available": "可用",
+    "disabled": "已禁用",
+    "issues": "异常",
+    "allSources": "全部来源",
+    "allScopes": "全部作用域"
+  },
+  "categories": {
+    "label": "分类",
+    "all": "全部分类",
+    "uncategorized": "未分类",
+    "mcp": { "plugin": "插件提供", "standalone": "独立 MCP" },
+    "official": {
+      "businessOperations": "商业与运营",
+      "communication": "沟通协作",
+      "creativity": "创意",
+      "dataAnalytics": "数据与分析",
+      "database": "数据库",
+      "deployment": "部署",
+      "design": "设计",
+      "development": "开发",
+      "developerTools": "开发工具",
+      "educationResearch": "教育与研究",
+      "engineering": "工程",
+      "finance": "金融",
+      "learning": "学习",
+      "location": "位置服务",
+      "math": "数学",
+      "monitoring": "监控",
+      "other": "其他",
+      "productivity": "生产力",
+      "security": "安全",
+      "testing": "测试",
+      "travel": "旅行"
+    }
+  },
+  "sections": { "installed": "已安装 / 已配置", "available": "可用" },
+  "loading": "正在加载扩展……",
+  "status": {
+    "available": "可用",
+    "installed": "已安装",
+    "configured": "已配置",
+    "enabled": "已启用",
+    "disabled": "已禁用",
+    "connected": "已连接",
+    "disconnected": "未连接",
+    "authRequired": "需要认证",
+    "error": "异常"
+  },
+  "scope": {
+    "builtin": "内置",
+    "user": "用户",
+    "project": "项目",
+    "plugin": "插件",
+    "managed": "托管",
+    "local": "本地"
+  },
+  "item": { "noDescription": "暂无说明" },
+  "cache": {
+    "notFetched": "尚未获取扩展目录；后台正在异步刷新，也可立即请求刷新。",
+    "requestNow": "请求后台刷新",
+    "refreshing": "正在后台刷新，当前列表会保留到新数据写入。",
+    "refreshFinished": "本次后台刷新已结束。",
+    "refreshedAt": "当前数据{{age}}刷新。"
+  },
+  "refreshErrors": {
+    "refreshFailed": "{{kind}} 目录刷新失败，已保留上次成功的数据。"
+  },
+  "empty": {
+    "installed": "没有符合当前筛选条件的已安装或已配置项目。",
+    "available": "没有符合当前筛选条件的可用项目。",
+    "noOfficialCatalog": "当前智能体没有为此扩展类型提供可验证的官方目录。"
+  },
+  "details": {
+    "title": "扩展详情",
+    "status": "状态",
+    "scope": "作用域",
+    "category": "分类",
+    "version": "版本",
+    "source": "来源",
+    "path": "路径",
+    "parentPlugin": "所属插件",
+    "included": "包含的扩展",
+    "newSession": "此变更可能需要新建会话后生效。"
+  },
+  "actions": {
+    "install": "安装",
+    "uninstall": "卸载",
+    "enable": "启用",
+    "disable": "禁用",
+    "remove": "移除",
+    "configure": "配置",
+    "authenticate": "认证",
+    "logout": "退出认证",
+    "open_location": "打开位置",
+    "refresh": "刷新",
+    "retry": "重试",
+    "none": "当前项目没有可执行的管理操作。",
+    "completed": "扩展已更新。",
+    "completedNewSession": "扩展已更新，请新建会话以使用变更。"
+  },
+  "confirm": {
+    "title": "确认移除",
+    "message": "确定移除 {{name}} 吗？它提供的技能或 MCP 工具可能不再可用。",
+    "messageWithDependencies": "确定移除 {{name}} 吗？以下扩展将不再可用：{{dependencies}}。",
+    "confirm": "移除"
+  },
+  "readOnly": {
+    "codex_skill_toggle": "Codex 当前没有稳定的非交互式技能启停命令。",
+    "codex_remote_plugin_managed": "此 Codex 远程插件由 Codex 桌面端管理，当前不提供可验证的命令行卸载操作。",
+    "claude_skill_toggle": "Claude Code 当前没有稳定的非交互式技能启停命令。",
+    "plugin_managed_mcp": "此 MCP 服务由所属插件管理。",
+    "mcp_details_unavailable": "当前运行时无法提供此 MCP 的配置详情。",
+    "managed_policy": "此项目由托管策略控制，当前为只读。",
+    "opencode_skill": "当前版本中的 OpenCode 技能为只读。",
+    "opencode_plugin_jsonc": "为保留配置注释和未知字段，OpenCode 插件配置当前为只读。"
+  }
+}

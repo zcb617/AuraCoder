@@ -1,0 +1,33 @@
+{
+  "actions": {
+    "allow": "允许",
+    "cancel": "取消",
+    "close": "关闭",
+    "copy": "复制",
+    "discard": "丢弃",
+    "dismiss": "关闭",
+    "notNow": "暂不",
+    "remove": "移除",
+    "refresh": "刷新",
+    "retry": "重试",
+    "save": "保存"
+  },
+  "fileReferences": {
+    "resolveFailed": "在此工作区中找不到 {{reference}}。",
+    "shiftClickHint": "按住 Shift 并单击可在编辑器中打开",
+    "clickHint": "单击可在编辑器中打开"
+  },
+  "language": {
+    "label": "语言",
+    "changed": "语言已更新。原生菜单标签会在重启后更新。",
+    "english": "English",
+    "portugueseBrazil": "Português (Brasil)"
+  },
+  "labels": {
+    "settings": "设置"
+  },
+  "diff": {
+    "unchangedLines_one": "{{count}} 行未更改",
+    "unchangedLines_other": "{{count}} 行未更改"
+  }
+}

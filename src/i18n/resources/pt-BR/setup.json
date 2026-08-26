@@ -1,0 +1,104 @@
+{
+  "greeting": {
+    "title": "Bem-vindo ao AuraCoder",
+    "subtitle": "Seu cockpit local para programação assistida por IA.",
+    "cta": "Começar"
+  },
+  "workflow": {
+    "title": "Qual é sua forma preferida de trabalhar?",
+    "subtitle": "Escolha o fluxo que o AuraCoder deve otimizar primeiro. Você pode reabrir o onboarding depois e mudar isso.",
+    "options": {
+      "cli": {
+        "title": "CLI Agents",
+        "description": "Veja quais CLIs de agent o AuraCoder já suporta, instale as que fizerem sentido e depois escolha o workspace onde quer começar."
+      },
+      "chat": {
+        "title": "Chat com Codex / Claude / OpenCode",
+        "description": "Escolha Codex, Claude, OpenCode ou qualquer combinação. O AuraCoder verifica o que está pronto, ajuda a instalar o que faltar e depois leva você para um workspace."
+      }
+    }
+  },
+  "cliProviders": {
+    "title": "Escolha seus CLI agents",
+    "subtitle": "Veja quais providers já estão disponíveis nesta máquina e instale os que faltarem antes de abrir seu primeiro workspace.",
+    "helper": "O launch fica de fora aqui de propósito. O onboarding termina quando você confirma um workspace e o AuraCoder te leva para o painel de harnesses.",
+    "scanning": "Escaneando providers disponíveis..."
+  },
+  "chatEngines": {
+    "title": "Escolha seus harnesses de chat",
+    "subtitle": "Selecione quais harnesses você quer deixar prontos dentro do chat do AuraCoder.",
+    "helper": "Você pode selecionar Codex, Claude, OpenCode ou qualquer combinação. O próximo passo verifica cada runtime selecionado antes de continuar.",
+    "options": {
+      "codex": {
+        "description": "Chat via Codex App Server. Pode instalar Node.js e Codex CLI se estiverem ausentes."
+      },
+      "claude": {
+        "description": "Chat via Claude Agent SDK. Não exige instalar a Claude CLI separadamente."
+      },
+      "opencode": {
+        "description": "Chat via servidor headless do OpenCode. Exige a CLI opencode no PATH."
+      }
+    }
+  },
+  "chatReadiness": {
+    "title": "Verifique a prontidão do chat",
+    "subtitle": "O AuraCoder está checando os engines selecionados e as dependências realmente necessárias para chat.",
+    "helper": "Avisos sobre configuração futura de auth são apenas informativos nesta versão. O objetivo aqui é deixar o runtime instalado e um workspace confirmado.",
+    "loading": "Verificando os engines selecionados...",
+    "readyHint": "Tudo o que foi selecionado para chat está pronto. Continue para escolher o workspace que você quer usar primeiro.",
+    "authDeferred": "O Codex ainda precisa de login na conta, mas isso não bloqueia o onboarding nesta versão. Conclua o onboarding agora e finalize o auth do Codex depois.",
+    "nodeInstallAvailable": "Node.js está ausente. O AuraCoder pode instalar automaticamente para que os engines de chat selecionados funcionem.",
+    "nodeInstallManual": "Node.js está ausente. Instale manualmente o Node.js 20+ e depois atualize a verificação.",
+    "codexInstallAvailable": "Codex CLI está ausente. O AuraCoder pode instalar automaticamente para o engine de chat do Codex.",
+    "codexInstallManual": "Codex CLI está ausente. Instale manualmente e depois atualize a verificação.",
+    "openCodeInstallAvailable": "OpenCode CLI está ausente. O AuraCoder pode instalar com npm para o engine de chat do OpenCode.",
+    "openCodeInstallManual": "OpenCode CLI está ausente. Instale Node.js/npm e OpenCode manualmente, depois atualize a verificação.",
+    "deps": {
+      "node": "Node.js"
+    },
+    "status": {
+      "ready": "Pronto",
+      "attention": "Precisa de atenção",
+      "pending": "Os dados de health ainda não foram carregados."
+    },
+    "sections": {
+      "warnings": "Avisos",
+      "checks": "Checks",
+      "fixes": "Próximos passos sugeridos",
+      "showNotes": "Mostrar avisos",
+      "hideNotes": "Ocultar avisos"
+    }
+  },
+  "workspace": {
+    "title": "Confirme seu primeiro workspace",
+    "subtitle": "Escolha o workspace que o AuraCoder deve abrir após o onboarding. Mesmo que já exista um ativo, confirme aqui de forma explícita.",
+    "helper": "Selecione um workspace existente ou abra uma nova pasta. O onboarding só termina depois dessa confirmação.",
+    "empty": "Ainda não há workspaces disponíveis. Abra uma pasta para continuar.",
+    "current": "Workspace atual"
+  },
+  "steps": {
+    "workflow": "Fluxo",
+    "cliProviders": "Providers",
+    "chatEngines": "Engines",
+    "chatReadiness": "Prontidão",
+    "workspace": "Workspace"
+  },
+  "actions": {
+    "back": "Voltar",
+    "continue": "Continuar",
+    "finish": "Concluir onboarding",
+    "openFolder": "Abrir pasta",
+    "refreshProviders": "Atualizar providers",
+    "refreshStatus": "Atualizar status",
+    "install": "Instalar",
+    "openWebsite": "Abrir site",
+    "copied": "Copiado"
+  },
+  "install": {
+    "waiting": "Aguardando...",
+    "installing": "Instalando {{name}}..."
+  },
+  "footer": {
+    "stepCounter": "Passo {{current}} de {{total}}"
+  }
+}

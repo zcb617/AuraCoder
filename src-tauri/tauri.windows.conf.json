@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "resources": {
+      "sidecar-dist": "sidecar-dist",
+      "resources/cua-driver/manifest.json": "resources/cua-driver/manifest.json",
+      "resources/cua-driver/windows-x86_64": "resources/cua-driver/windows-x86_64"
+    }
+  }
+}

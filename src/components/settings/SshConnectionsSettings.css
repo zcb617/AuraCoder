@@ -1,0 +1,444 @@
+.ssh-settings-section {
+  min-width: 0;
+}
+
+.ssh-settings-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.ssh-settings-header h2 {
+  margin: 0;
+  color: var(--text-1);
+  font-size: 18px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.ssh-settings-header p {
+  max-width: 660px;
+  margin: 7px 0 0;
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.ssh-add-button {
+  flex: 0 0 auto;
+}
+
+.ssh-inline-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  color: var(--danger, #ef7676);
+  font-size: 11px;
+}
+
+.ssh-connections-card {
+  overflow: hidden;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+}
+
+.ssh-connection-row {
+  min-height: 58px;
+  padding: 11px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--text-1);
+}
+
+.ssh-connection-row + .ssh-connection-row {
+  border-top: 1px solid var(--divider);
+}
+
+.ssh-connection-icon,
+.ssh-scan-icon {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  color: var(--accent, #69b7ff);
+  background: color-mix(in srgb, var(--accent, #69b7ff) 12%, transparent);
+  border-radius: 9px;
+}
+
+.ssh-connection-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ssh-connection-main strong,
+.ssh-connection-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ssh-connection-main strong {
+  color: var(--text-1);
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.ssh-connection-main small {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+}
+
+.ssh-status-ok {
+  color: var(--success, #48d486);
+}
+
+.ssh-status-ok i,
+.ssh-status-error i,
+.ssh-status-muted i {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  display: inline-block;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.ssh-status-error {
+  color: var(--danger, #ef7676);
+}
+
+.ssh-status-muted {
+  color: var(--text-3);
+}
+
+.ssh-connection-actions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+}
+
+.ssh-connection-actions .usp-icon-button {
+  width: 28px;
+  min-height: 28px;
+  color: var(--text-3);
+}
+
+.ssh-connection-actions .usp-icon-button:hover {
+  color: var(--text-1);
+}
+
+.ssh-delete-button:hover {
+  color: var(--danger, #ef7676) !important;
+}
+
+.ssh-toggle {
+  width: 28px;
+  height: 17px;
+  padding: 2px;
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 999px;
+  background: var(--bg-4, #4b4b4b);
+  cursor: pointer;
+}
+
+.ssh-toggle span {
+  width: 13px;
+  height: 13px;
+  display: block;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 140ms ease;
+}
+
+.ssh-toggle.is-on {
+  background: var(--accent, #3c9fff);
+}
+
+.ssh-toggle.is-on span {
+  transform: translateX(11px);
+}
+
+.ssh-empty-state {
+  min-height: 100px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.ssh-deleted-section {
+  margin-top: 15px;
+}
+
+.ssh-deleted-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 0;
+  color: var(--text-3);
+  background: transparent;
+  border: 0;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.ssh-deleted-card {
+  margin-top: 7px;
+}
+
+.ssh-deleted-icon {
+  color: var(--text-3);
+  background: var(--bg-3);
+}
+
+.ssh-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(0 0 0 / 58%);
+}
+
+.ssh-modal {
+  width: min(520px, calc(100vw - 48px));
+  max-height: min(700px, calc(100vh - 48px));
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  padding: 22px;
+  overflow: hidden;
+  background: var(--bg-2);
+  border: 1px solid color-mix(in srgb, var(--border) 80%, white 4%);
+  border-radius: 18px;
+  box-shadow: 0 24px 70px rgb(0 0 0 / 45%);
+}
+
+.ssh-modal-header,
+.ssh-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+}
+
+.ssh-modal-header > div {
+  min-width: 0;
+}
+
+.ssh-modal-header h3 {
+  margin: 0;
+  color: var(--text-1);
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+.ssh-modal-header p {
+  margin: 6px 0 0;
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.ssh-modal-close {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  color: var(--text-3);
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.ssh-modal-close:hover {
+  color: var(--text-1);
+  background: var(--bg-4);
+}
+
+.ssh-scan-list {
+  min-height: 180px;
+  max-height: 404px;
+  overflow: auto;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 13px;
+}
+
+.ssh-modal .ssh-scan-item {
+  min-height: 62px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 13px;
+  color: var(--text-1);
+  border-bottom: 1px solid var(--divider);
+  cursor: pointer;
+}
+
+.ssh-modal .ssh-scan-item:last-child {
+  border-bottom: 0;
+}
+
+.ssh-scan-icon {
+  width: 28px;
+  height: 28px;
+  color: var(--text-2);
+  background: transparent;
+}
+
+.ssh-scan-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ssh-scan-copy strong,
+.ssh-scan-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ssh-scan-copy strong {
+  color: var(--text-1);
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.ssh-scan-copy small {
+  color: var(--text-3);
+  font-size: 10.5px;
+}
+
+.ssh-modal .ssh-scan-item > input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  margin: 0 2px 0 8px;
+  padding: 0;
+  accent-color: var(--accent, #4da8ff);
+}
+
+.ssh-modal .ssh-scan-item:has(input:disabled) {
+  cursor: default;
+  opacity: 0.58;
+}
+
+.ssh-modal-footer {
+  padding-top: 2px;
+}
+
+.ssh-modal-footer > span {
+  max-width: 250px;
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.ssh-modal-footer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.ssh-manual-button {
+  color: var(--text-2);
+}
+
+.ssh-form-fields {
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding-right: 2px;
+}
+
+.ssh-modal .ssh-form-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--text-3);
+  font-size: 10.5px;
+}
+
+.ssh-form-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 130px;
+  gap: 10px;
+}
+
+.ssh-modal input:not([type="checkbox"]),
+.ssh-modal textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 10px;
+  color: var(--text-1);
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+  font: inherit;
+}
+
+.ssh-modal input:not([type="checkbox"]):focus,
+.ssh-modal textarea:focus {
+  border-color: var(--focus-ring, var(--accent));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.ssh-modal textarea {
+  resize: vertical;
+}
+
+.ssh-spin {
+  animation: ssh-spin 0.8s linear infinite;
+}
+
+@keyframes ssh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 620px) {
+  .ssh-settings-header,
+  .ssh-modal-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .ssh-add-button,
+  .ssh-modal-footer-actions {
+    align-self: flex-end;
+  }
+
+  .ssh-connection-actions .usp-icon-button {
+    width: 25px;
+  }
+}

@@ -1,0 +1,174 @@
+use std::{
+    borrow::Cow,
+    io,
+    path::{Path, PathBuf},
+};
+
+pub fn canonicalize_path(path: &Path) -> io::Result<PathBuf> {
+    if is_flatpak_document_portal_path(path) {
+        // Paths under /run/flatpak/doc/ are bind mounts set up per-grant by
+        // xdg-desktop-portal for sandboxed apps. Canonicalizing them can
+        // resolve straight through the bind mount to a target the sandbox
+        // has no access to (or one that stops existing once the portal
+        // session ends), so we store them as-is instead.
+        return Ok(path.to_path_buf());
+    }
+    std::fs::canonicalize(path).map(normalize_windows_path)
+}
+
+fn is_flatpak_document_portal_path(path: &Path) -> bool {
+    path.starts_with("/run/flatpak/doc")
+}
+
+pub fn normalize_windows_path_string(path: &str) -> String {
+    normalize_windows_path(PathBuf::from(path))
+        .to_string_lossy()
+        .to_string()
+}
+
+pub fn normalize_windows_path(path: PathBuf) -> PathBuf {
+    PathBuf::from(strip_windows_verbatim_prefix(path.to_string_lossy().as_ref()).into_owned())
+}
+
+pub fn is_path_within_root(path: &str, root: &str) -> bool {
+    let normalized_path = normalize_for_comparison(path);
+    let normalized_root = normalize_for_comparison(root);
+    if normalized_path == normalized_root {
+        return true;
+    }
+
+    normalized_path.starts_with(&format!("{normalized_root}/"))
+}
+
+pub fn paths_equal(left: &str, right: &str) -> bool {
+    normalize_for_comparison(left) == normalize_for_comparison(right)
+}
+
+pub fn legacy_windows_verbatim_path(path: &Path) -> Option<String> {
+    add_windows_verbatim_prefix(path.to_string_lossy().as_ref())
+}
+
+pub fn legacy_windows_verbatim_path_string(path: &str) -> Option<String> {
+    legacy_windows_verbatim_path(Path::new(path))
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn strip_windows_verbatim_prefix(rendered: &str) -> Cow<'_, str> {
+    if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
+        Cow::Owned(format!(r"\\{}", rest))
+    } else if let Some(rest) = rendered.strip_prefix(r"\\?\") {
+        Cow::Borrowed(rest)
+    } else {
+        Cow::Borrowed(rendered)
+    }
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn add_windows_verbatim_prefix(rendered: &str) -> Option<String> {
+    if rendered.is_empty() {
+        return None;
+    }
+
+    if rendered.starts_with(r"\\?\") {
+        return Some(rendered.to_string());
+    }
+
+    if let Some(rest) = rendered.strip_prefix(r"\\") {
+        return Some(format!(r"\\?\UNC\{}", rest));
+    }
+
+    let bytes = rendered.as_bytes();
+    if bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+        return Some(format!(r"\\?\{}", rendered.replace('/', "\\")));
+    }
+
+    None
+}
+
+fn normalize_for_comparison(path: &str) -> String {
+    let normalized = normalize_windows_path_string(path).replace('\\', "/");
+    if cfg!(target_os = "windows")
+        || normalized.starts_with("//")
+        || normalized
+            .as_bytes()
+            .get(1)
+            .is_some_and(|byte| *byte == b':')
+    {
+        normalized.to_lowercase()
+    } else {
+        normalized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        add_windows_verbatim_prefix, canonicalize_path, is_path_within_root, paths_equal,
+        strip_windows_verbatim_prefix,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn strips_drive_letter_windows_verbatim_prefix() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\Users\auracoder\repo").as_ref(),
+            r"C:\Users\auracoder\repo"
+        );
+    }
+
+    #[test]
+    fn strips_unc_windows_verbatim_prefix() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\repo").as_ref(),
+            r"\\server\share\repo"
+        );
+    }
+
+    #[test]
+    fn leaves_regular_paths_unchanged() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"C:\Users\auracoder\repo").as_ref(),
+            r"C:\Users\auracoder\repo"
+        );
+    }
+
+    #[test]
+    fn adds_drive_letter_windows_verbatim_prefix() {
+        assert_eq!(
+            add_windows_verbatim_prefix(r"C:\Users\auracoder\repo").as_deref(),
+            Some(r"\\?\C:\Users\auracoder\repo")
+        );
+    }
+
+    #[test]
+    fn adds_unc_windows_verbatim_prefix() {
+        assert_eq!(
+            add_windows_verbatim_prefix(r"\\server\share\repo").as_deref(),
+            Some(r"\\?\UNC\server\share\repo")
+        );
+    }
+
+    #[test]
+    fn detects_paths_within_root() {
+        assert!(is_path_within_root(
+            "/workspace/apps/app/src/main.ts",
+            "/workspace/apps/app"
+        ));
+        assert!(!is_path_within_root(
+            "/workspace/apps/api/src/main.ts",
+            "/workspace/apps/app"
+        ));
+    }
+
+    #[test]
+    fn treats_windows_paths_as_equal_across_case_and_separator_variants() {
+        assert!(paths_equal(r"D:\zhangcb\my_wiki", r"d:/zhangcb/my_wiki"));
+    }
+
+    #[test]
+    fn leaves_flatpak_document_portal_paths_uncanonicalized() {
+        let portal_path = Path::new("/run/flatpak/doc/12345/my-repo");
+        let result = canonicalize_path(portal_path).expect("portal path is returned as-is");
+        assert_eq!(result, portal_path);
+    }
+}

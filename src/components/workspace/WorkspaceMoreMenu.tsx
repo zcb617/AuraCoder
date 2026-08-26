@@ -1,0 +1,121 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { useTranslation } from "react-i18next";
+import {
+  MoreHorizontal,
+  Settings2,
+  Trash2,
+} from "lucide-react";
+import type { Workspace } from "../../types";
+
+interface WorkspaceMoreMenuProps {
+  workspace: Workspace;
+  onOpenSettings: () => void;
+  onArchive: () => void;
+}
+
+export function WorkspaceMoreMenu({
+  workspace,
+  onOpenSettings,
+  onArchive,
+}: WorkspaceMoreMenuProps) {
+  const { t } = useTranslation("workspace");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuPos, setMenuPos] = useState({ top: 0, left: 0 });
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  const closeMenu = useCallback(() => setMenuOpen(false), []);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    function onPointerDown(e: PointerEvent) {
+      const target = e.target as Node;
+      if (
+        triggerRef.current?.contains(target) ||
+        menuRef.current?.contains(target)
+      )
+        return;
+      closeMenu();
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") closeMenu();
+    }
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, [menuOpen, closeMenu]);
+
+  function handleTriggerClick(e: React.MouseEvent) {
+    e.stopPropagation();
+    if (menuOpen) {
+      closeMenu();
+      return;
+    }
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (rect) {
+      setMenuPos({
+        top: rect.bottom + 4,
+        left: Math.max(8, rect.right - 180),
+      });
+    }
+    setMenuOpen(true);
+  }
+
+  function handleItem(action: () => void) {
+    closeMenu();
+    action();
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        ref={triggerRef}
+        title={t("more.options")}
+        aria-label={t("more.options")}
+        className="sb-project-action sb-project-more"
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={handleTriggerClick}
+      >
+        <MoreHorizontal size={12} />
+      </button>
+
+      {menuOpen &&
+        createPortal(
+          <div
+            ref={menuRef}
+            className="git-action-menu"
+            style={{
+              position: "fixed",
+              top: menuPos.top,
+              left: menuPos.left,
+              minWidth: 180,
+            }}
+          >
+            <button
+              type="button"
+              className="git-action-menu-item"
+              onClick={() => handleItem(onOpenSettings)}
+            >
+              <Settings2 size={13} />
+              {t("more.settings")}
+            </button>
+            <div style={{ height: 1, margin: "4px 0", background: "var(--border)" }} />
+            <button
+              type="button"
+              className="git-action-menu-item git-action-menu-item-danger"
+              onClick={() => handleItem(onArchive)}
+            >
+              <Trash2 size={13} />
+              {t("more.removeProject")}
+            </button>
+          </div>,
+          document.body,
+        )}
+    </>
+  );
+}

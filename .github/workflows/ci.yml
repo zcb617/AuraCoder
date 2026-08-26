@@ -1,0 +1,629 @@
+name: Tag Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    # Local validation is completed before tagging.
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Unit tests
+        run: pnpm test -- --passWithNoTests
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex@0.125.0
+      - name: Codex app-server schema parity
+        run: pnpm check:codex-schema
+      - name: Build frontend
+        run: pnpm build
+
+  rust:
+    # Local validation is completed before tagging.
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Ensure frontendDist placeholder
+        run: |
+          mkdir -p dist
+          if [ ! -f dist/index.html ]; then
+            echo "<!doctype html><html><body>CI placeholder</body></html>" > dist/index.html
+          fi
+      - name: Rust fmt check
+        working-directory: src-tauri
+        run: cargo fmt -- --check
+      - name: Rust check
+        working-directory: src-tauri
+        run: cargo check
+
+  macos_compat:
+    # Local validation is completed before tagging.
+    if: ${{ false }}
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust targets for macOS compatibility checks
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Ensure frontendDist placeholder
+        run: |
+          mkdir -p dist
+          if [ ! -f dist/index.html ]; then
+            echo "<!doctype html><html><body>CI placeholder</body></html>" > dist/index.html
+          fi
+      - name: Rust check for Intel macOS target
+        working-directory: src-tauri
+        run: cargo check --target x86_64-apple-darwin
+
+  windows_compat:
+    # Local validation is completed before tagging.
+    if: ${{ false }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Ensure frontendDist placeholder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          if (-not (Test-Path dist/index.html)) {
+            Set-Content -Path dist/index.html -Value '<!doctype html><html><body>CI placeholder</body></html>'
+          }
+      - name: Rust check on Windows
+        working-directory: src-tauri
+        run: cargo check
+      - name: Windows runtime env tests
+        working-directory: src-tauri
+        run: cargo test runtime_env --lib
+      - name: Windows app config tests
+        working-directory: src-tauri
+        run: cargo test app_config --lib
+      - name: Windows file command tests
+        working-directory: src-tauri
+        run: cargo test commands::files::tests --lib
+      - name: Windows keep awake tests
+        working-directory: src-tauri
+        run: cargo test commands::power::tests --lib
+      - name: Windows keep awake backend tests
+        working-directory: src-tauri
+        run: cargo test power::tests --lib
+      - name: Windows terminal tests
+        working-directory: src-tauri
+        run: cargo test terminal::tests --lib
+      - name: Windows Codex engine tests
+        working-directory: src-tauri
+        run: cargo test codex::tests --lib
+      - name: Windows Claude sidecar tests
+        working-directory: src-tauri
+        run: cargo test claude_sidecar::tests --lib
+
+  updater_signing_check:
+    name: Updater Signing Preflight
+    # Local validation is completed before tagging.
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify updater public key format
+        run: pnpm check:tauri-updater-config
+      - name: Sign updater probe
+        shell: bash
+        env:
+          UPDATER_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          probe="$(mktemp)"
+          private_key_file="$(mktemp)"
+          trap 'rm -f "$probe" "$probe.sig" "$private_key_file"' EXIT
+          printf 'updater-signing-preflight\n' > "$probe"
+          printf '%s' "$UPDATER_SIGNING_PRIVATE_KEY" > "$private_key_file"
+          pnpm exec tauri signer sign --private-key-path "$private_key_file" --password "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "$probe"
+          test -s "$probe.sig"
+
+  windows_bundle_check:
+    # Local validation is completed before tagging.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    needs: [frontend, windows_compat, updater_signing_check]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build desktop assets
+        run: pnpm run build:desktop
+      - name: Build unsigned Windows NSIS bundle
+        run: pnpm exec tauri build --ci --bundles nsis --config src-tauri/tauri.windows.bundle-check.conf.json --no-sign
+        env:
+          PANES_SKIP_DESKTOP_PREBUILD: "1"
+      - name: Validate local Windows NSIS install and bundled sidecar
+        shell: pwsh
+        run: |
+          $setupExe = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *-setup.exe | Select-Object -First 1
+          if (-not $setupExe) {
+            throw "Windows NSIS installer was not built."
+          }
+
+          $installRoot = Join-Path $env:RUNNER_TEMP "auracoder-bundle-check"
+          if (Test-Path $installRoot) {
+            Remove-Item -Recurse -Force $installRoot
+          }
+
+          $installer = Start-Process -FilePath $setupExe.FullName -ArgumentList @('/S', "/D=$installRoot") -Wait -PassThru
+          if ($installer.ExitCode -ne 0) {
+            throw "Windows installer exited with code $($installer.ExitCode)."
+          }
+
+          $appBinary = Get-ChildItem $installRoot -Recurse -Filter AuraCoder.exe | Select-Object -First 1
+          if (-not $appBinary) {
+            throw "Unable to locate installed AuraCoder.exe."
+          }
+
+          $sidecar = Get-ChildItem $installRoot -Recurse -Filter claude-agent-sdk-server.mjs | Select-Object -First 1
+          if (-not $sidecar) {
+            throw "Unable to locate bundled Claude sidecar in installed app."
+          }
+
+          Get-Command git | Out-Null
+          Get-Command node | Out-Null
+
+          $sidecarOut = Join-Path $env:RUNNER_TEMP "auracoder-bundle-check-sidecar.out"
+          $sidecarErr = Join-Path $env:RUNNER_TEMP "auracoder-bundle-check-sidecar.err"
+          if (Test-Path $sidecarOut) { Remove-Item -Force $sidecarOut }
+          if (Test-Path $sidecarErr) { Remove-Item -Force $sidecarErr }
+
+          $sidecarProc = Start-Process -FilePath node -ArgumentList $sidecar.FullName -PassThru -RedirectStandardOutput $sidecarOut -RedirectStandardError $sidecarErr
+          $ready = $false
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            if ((Test-Path $sidecarOut) -and ((Get-Content $sidecarOut -Raw) -match '"type":"ready"')) {
+              $ready = $true
+              break
+            }
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $ready) {
+            if (Test-Path $sidecarOut) { Get-Content $sidecarOut }
+            if (Test-Path $sidecarErr) { Get-Content $sidecarErr }
+            throw "Bundled Claude sidecar did not reach ready state."
+          }
+
+          if (-not $sidecarProc.HasExited) {
+            Stop-Process -Id $sidecarProc.Id -Force
+          }
+
+          $appProc = Start-Process -FilePath $appBinary.FullName -WorkingDirectory $appBinary.Directory.FullName -PassThru
+          Start-Sleep -Seconds 5
+          if ($appProc.HasExited) {
+            throw "AuraCoder.exe exited immediately on the Windows runner."
+          }
+          Stop-Process -Id $appProc.Id -Force
+
+  prepare_release_assets:
+    name: Prepare Release Desktop Assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout released tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend assets
+        # This job only shares dist with platform release jobs.
+        # run: pnpm run build:desktop
+        run: pnpm run build
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-desktop-assets
+          compression-level: 0
+          if-no-files-found: error
+          path: |
+            dist
+
+  release_bundles:
+    name: Build Release Bundles (${{ matrix.platform }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare_release_assets]
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS 正式版本改由本机 auracode-macos-release SKILL 发布。
+          # - platform: macos-15
+          #   sidecar_target_dir: src-tauri/target/universal-apple-darwin/release/sidecar-dist
+          - platform: ubuntu-22.04
+            sidecar_target_dir: src-tauri/target/release/sidecar-dist
+          - platform: windows-latest
+            sidecar_target_dir: src-tauri/target/release/sidecar-dist
+
+    steps:
+      - name: Checkout released tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+
+      - name: Download prebuilt desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-desktop-assets
+          path: dist
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      # - name: Install Rust for universal macOS build
+        # if: matrix.platform == 'macos-15'
+        # uses: dtolnay/rust-toolchain@stable
+        # with:
+          # targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install Rust
+        if: matrix.platform != 'macos-15'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Check Claude sidecar content version
+        id: claude_sidecar_version
+        shell: bash
+        run: |
+          current_version="$(node scripts/build-claude-sidecar.mjs --print-version)"
+          version_file="${{ matrix.sidecar_target_dir }}/claude-remote-runtime-version.txt"
+          existing_version=""
+          if [ -f "$version_file" ]; then
+            existing_version="$(tr -d '\r\n' < "$version_file")"
+          fi
+          if [ -n "$existing_version" ] && [ "$current_version" = "$existing_version" ]; then
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Current Claude sidecar version: $current_version"
+          echo "Existing Claude sidecar version: ${existing_version:-missing}"
+
+      - name: Install dependencies
+        if: matrix.platform != 'macos-15'
+        run: pnpm install --frozen-lockfile
+
+      # - name: Install dependencies for universal macOS
+        # if: matrix.platform == 'macos-15'
+        # pnpm 9 does not honor repeated --config.supportedArchitectures.* CLI
+        # flags, so the x64 Claude SDK native package never gets installed on
+        # the arm64 runner. The package.json pnpm field is the documented way
+        # to install optional dependencies for both macOS architectures.
+        # run: |
+          # npm pkg set 'pnpm.supportedArchitectures.os[0]=darwin' 'pnpm.supportedArchitectures.cpu[0]=x64' 'pnpm.supportedArchitectures.cpu[1]=arm64'
+          # pnpm install --frozen-lockfile
+          # git checkout -- package.json
+
+      - name: Reuse existing Claude sidecar assets
+        if: steps.claude_sidecar_version.outputs.needs_build == 'false'
+        shell: bash
+        run: |
+          mkdir -p src-tauri/sidecar-dist
+          cp -R "${{ matrix.sidecar_target_dir }}/." src-tauri/sidecar-dist/
+
+      - name: Build platform Claude sidecar assets
+        if: steps.claude_sidecar_version.outputs.needs_build == 'true'
+        run: pnpm run build:claude-sidecar
+
+      # - name: Prepare macOS code signing
+        # if: matrix.platform == 'macos-15'
+        # run: ./packaging/macos/prepare-codesign.sh
+        # env:
+          # MACOS_CODESIGN_P12_BASE64: ${{ secrets.MACOS_CODESIGN_P12_BASE64 }}
+          # MACOS_CODESIGN_P12_PASSWORD: ${{ secrets.MACOS_CODESIGN_P12_PASSWORD }}
+
+      # - name: Build universal macOS bundles
+        # if: matrix.platform == 'macos-15'
+        # run: pnpm exec tauri build --target universal-apple-darwin --config src-tauri/tauri.macos.conf.json
+        # env:
+          # PANES_SKIP_DESKTOP_PREBUILD: "1"
+          # TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      # 签名准备已前移到 macOS 构建前；保留原位置记录，避免构建后重复导入证书。
+      # - name: Prepare macOS code signing
+      #   if: matrix.platform == 'macos-15'
+      #   run: ./packaging/macos/prepare-codesign.sh
+
+      # - name: Verify signed macOS app
+        # if: matrix.platform == 'macos-15'
+        # shell: bash
+        # run: |
+          # set -euo pipefail
+
+          # APP_BUNDLE="src-tauri/target/universal-apple-darwin/release/bundle/macos/AuraCoder.app"
+          # if [ ! -d "$APP_BUNDLE" ]; then
+            # echo "Unable to locate bundled AuraCoder.app."
+            # exit 1
+          # fi
+
+          # /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+          # CODESIGN_DETAILS="$(/usr/bin/codesign -dv --verbose=4 "$APP_BUNDLE" 2>&1)"
+          # if [[ "$CODESIGN_DETAILS" != *"Authority=Yunxiang AuraCoder Signing"* ]]; then
+            # echo "AuraCoder.app does not use the fixed Yunxiang AuraCoder Signing identity."
+            # exit 1
+          # fi
+          # if [[ "$CODESIGN_DETAILS" != *"Identifier=com.0573zzz.auracoder.prd"* ]]; then
+            # echo "AuraCoder.app has an unexpected bundle identifier."
+            # exit 1
+          # fi
+
+          # INFO_PLIST="$APP_BUNDLE/Contents/Info.plist"
+          # DISPLAY_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$INFO_PLIST")"
+          # BUNDLE_IDENTIFIER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST")"
+          # test "$DISPLAY_NAME" = "AuraCoder"
+          # test "$BUNDLE_IDENTIFIER" = "com.0573zzz.auracoder.prd"
+
+      - name: Verify universal macOS app binary
+        # Local validation is completed before tagging.
+        if: ${{ false }}
+        run: |
+          APP_BINARY="$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -path '*/AuraCoder.app/Contents/MacOS/*' -type f -print -quit)"
+          if [ -z "$APP_BINARY" ]; then
+            echo "Unable to locate bundled AuraCoder.app binary."
+            exit 1
+          fi
+
+          file "$APP_BINARY"
+          lipo -info "$APP_BINARY"
+          file "$APP_BINARY" | grep -Eq 'arm64|aarch64'
+          file "$APP_BINARY" | grep -q 'x86_64'
+
+      - name: Verify macOS bundles contain CUA runtime
+        # Disabled by default; enable explicitly when release artifact validation is needed.
+        if: ${{ false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUNDLE_ROOT="src-tauri/target/universal-apple-darwin/release/bundle"
+          APP_BUNDLE="$(find "$BUNDLE_ROOT/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          DMG_FILE="$(find "$BUNDLE_ROOT/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          UPDATER_ARCHIVE="$(find "$BUNDLE_ROOT/macos" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit)"
+
+          if [ -z "$APP_BUNDLE" ] || [ -z "$DMG_FILE" ] || [ -z "$UPDATER_ARCHIVE" ]; then
+            echo "Unable to locate all macOS release bundles."
+            exit 1
+          fi
+
+          verify_cua_app() {
+            local app_bundle="$1"
+            local cua_root="$app_bundle/Contents/Resources/resources/cua-driver"
+            local cua_library="$cua_root/macos-universal/libcua_driver_sdk.dylib"
+            local cua_node_runtime="$cua_root/macos-universal/cua_driver_node_runtime.node"
+
+            test -f "$cua_root/manifest.json"
+            test -f "$cua_library"
+            test -f "$cua_node_runtime"
+            test -f "$cua_root/macos-universal/node-runtime-NOTICE.md"
+            cmp src-tauri/resources/cua-driver/macos-universal/libcua_driver_sdk.dylib "$cua_library"
+            cmp src-tauri/resources/cua-driver/macos-universal/cua_driver_node_runtime.node "$cua_node_runtime"
+
+            for native_runtime in "$cua_library" "$cua_node_runtime"; do
+              native_architectures="$(lipo -archs "$native_runtime")"
+              echo "$native_runtime: $native_architectures"
+              grep -qw 'x86_64' <<<"$native_architectures"
+              grep -qw 'arm64' <<<"$native_architectures"
+            done
+          }
+
+          verify_cua_app "$APP_BUNDLE"
+
+          UPDATER_FILE_LIST="$RUNNER_TEMP/auracoder-cua-updater-files.txt"
+          tar -tzf "$UPDATER_ARCHIVE" > "$UPDATER_FILE_LIST"
+          grep -q '/Contents/Resources/resources/cua-driver/manifest.json$' "$UPDATER_FILE_LIST"
+          grep -q '/Contents/Resources/resources/cua-driver/macos-universal/libcua_driver_sdk.dylib$' "$UPDATER_FILE_LIST"
+          grep -q '/Contents/Resources/resources/cua-driver/macos-universal/cua_driver_node_runtime.node$' "$UPDATER_FILE_LIST"
+
+          MOUNT_POINT="$(mktemp -d "$RUNNER_TEMP/auracoder-cua-dmg.XXXXXX")"
+          hdiutil attach "$DMG_FILE" -nobrowse -readonly -mountpoint "$MOUNT_POINT"
+          trap 'hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true' EXIT
+          INSTALLED_APP="$(find "$MOUNT_POINT" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [ -z "$INSTALLED_APP" ]; then
+            echo "Unable to locate AuraCoder.app inside the macOS DMG."
+            exit 1
+          fi
+          verify_cua_app "$INSTALLED_APP"
+
+      - name: Build Linux Tauri bundles
+        if: matrix.platform == 'ubuntu-22.04'
+        run: pnpm tauri:build
+        env:
+          NO_STRIP: "true"
+          PANES_SKIP_DESKTOP_PREBUILD: "1"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Build Windows Tauri bundles
+        if: matrix.platform == 'windows-latest'
+        run: pnpm tauri:build
+        env:
+          PANES_SKIP_DESKTOP_PREBUILD: "1"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Upload Linux assets to GitHub Release
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/deb/*.deb.sig
+            src-tauri/target/release/bundle/appimage/*.AppImage.sig
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      # - name: Upload macOS assets to GitHub Release
+        # if: matrix.platform == 'macos-15'
+        # uses: softprops/action-gh-release@v2
+        # with:
+          # tag_name: ${{ github.ref_name }}
+          # files: |
+            # src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            # src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+            # src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg.sig
+            # src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+          # fail_on_unmatched_files: false
+        # env:
+          # GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Upload Windows assets to GitHub Release
+        if: matrix.platform == 'windows-latest'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/nsis/*-setup.exe.sig
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+  update_manifest:
+    name: Publish Update Manifest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release_bundles]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Generate latest.json
+        run: node scripts/generate-update-manifest.mjs "${{ github.ref_name }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy to gh-pages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mv latest.json /tmp/latest.json
+          git checkout --orphan gh-pages-tmp
+          git rm -rf .
+          mv /tmp/latest.json latest.json
+          git add latest.json
+          git commit -m "Update manifest for ${{ github.ref_name }}"
+          git push origin gh-pages-tmp:gh-pages --force

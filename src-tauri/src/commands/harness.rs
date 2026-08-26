@@ -1,0 +1,842 @@
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use tauri::{AppHandle, Emitter, State};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tokio::time::{timeout, Duration};
+
+use crate::config::app_config::AppConfig;
+use crate::models::{HarnessInfo, HarnessReport, InstallProgressEvent, InstallResult};
+use crate::process_utils;
+use crate::runtime_env;
+use crate::state::AppState;
+
+fn err_to_string(error: impl std::fmt::Display) -> String {
+    error.to_string()
+}
+
+const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+// ---------------------------------------------------------------------------
+// Harness definitions
+// ---------------------------------------------------------------------------
+
+pub(crate) struct HarnessDef {
+    id: &'static str,
+    name: &'static str,
+    description: &'static str,
+    command: &'static str,
+    version_flag: &'static str,
+    install_command: Option<&'static str>,
+    install_args: &'static [&'static str],
+    /// Raw shell script for install (used for curl-pipe installers).
+    /// Takes precedence over `install_command` when set.
+    install_script: Option<&'static str>,
+    website: &'static str,
+    native: bool,
+}
+
+pub(crate) const HARNESSES: &[HarnessDef] = &[
+    HarnessDef {
+        id: "codex",
+        name: "Codex CLI",
+        description: "Natively integrated — powers the AuraCoder chat engine",
+        command: "codex",
+        version_flag: "--version",
+        install_command: Some("npm"),
+        install_args: &["install", "-g", "@openai/codex"],
+        install_script: None,
+        website: "https://github.com/openai/codex",
+        native: true,
+    },
+    HarnessDef {
+        id: "claude-code",
+        name: "Claude Code",
+        description: "Anthropic's agentic coding tool",
+        command: "claude",
+        version_flag: "--version",
+        install_command: Some("npm"),
+        install_args: &["install", "-g", "@anthropic-ai/claude-code"],
+        install_script: Some("curl -fsSL https://claude.ai/install.sh | bash"),
+        website: "https://docs.anthropic.com/en/docs/claude-code",
+        native: false,
+    },
+    /*
+    当前系统只支持 opencode | codex | claude code 三个工具，其余工具定义保留备查，
+    不再参与探测和展示：
+    HarnessDef {
+        id: "gemini-cli",
+        name: "Gemini CLI",
+        description: "Google's AI-powered command-line coding agent (Enterprise/Cloud licenses only, discontinued for free tier)",
+        command: "gemini",
+        version_flag: "--version",
+        install_command: Some("npm"),
+        install_args: &["install", "-g", "@google/gemini-cli"],
+        install_script: None,
+        website: "https://github.com/google-gemini/gemini-cli",
+        native: false,
+    },
+    HarnessDef {
+        id: "antigravity",
+        name: "Antigravity CLI",
+        description: "Google's terminal agent CLI, the successor to Gemini CLI for free and individual accounts",
+        command: "agy",
+        version_flag: "--version",
+        install_command: None,
+        install_args: &[],
+        install_script: Some("curl -fsSL https://antigravity.google/cli/install.sh | bash"),
+        website: "https://antigravity.google",
+        native: false,
+    },
+    HarnessDef {
+        id: "kiro",
+        name: "Kiro",
+        description: "AI-powered CLI coding agent by AWS",
+        command: "kiro-cli",
+        version_flag: "--version",
+        install_command: None,
+        install_args: &[],
+        install_script: Some("curl -fsSL https://cli.kiro.dev/install | bash"),
+        website: "https://kiro.dev",
+        native: false,
+    },
+    */
+    HarnessDef {
+        id: "opencode",
+        name: "OpenCode",
+        description: "Open-source AI coding assistant",
+        command: "opencode",
+        version_flag: "--version",
+        install_command: Some("npm"),
+        install_args: &["install", "-g", "opencode-ai"],
+        install_script: None,
+        website: "https://opencode.ai",
+        native: false,
+    },
+    /*
+    与上面相同的下线处理：
+    HarnessDef {
+        id: "kilo-code",
+        name: "Kilo Code",
+        description: "AI-powered code assistant",
+        command: "kilo",
+        version_flag: "--version",
+        install_command: Some("npm"),
+        install_args: &["install", "-g", "@kilocode/cli"],
+        install_script: None,
+        website: "https://kilocode.ai",
+        native: false,
+    },
+    HarnessDef {
+        id: "factory-droid",
+        name: "Factory Droid",
+        description: "Autonomous coding agent by Factory",
+        command: "droid",
+        version_flag: "--version",
+        install_command: None,
+        install_args: &[],
+        install_script: Some("curl -fsSL https://app.factory.ai/cli | sh"),
+        website: "https://factory.ai",
+        native: false,
+    },
+    */
+];
+
+// ---------------------------------------------------------------------------
+// check_harnesses
+// ---------------------------------------------------------------------------
+
+/// 本机 CLI 服务统一查询入口。
+///
+/// 管理页和本机聊天工具列表都通过这里读取同一份安装检测结果。
+async fn detect_harnesses() -> Result<HarnessReport, String> {
+    let mut harnesses = Vec::new();
+
+    for def in HARNESSES {
+        let status = detect_harness(def).await;
+        harnesses.push(status);
+    }
+
+    let npm_available = runtime_env::resolve_executable("npm").is_some()
+        || detect_via_login_shell("npm", "--version").await.is_some();
+
+    let mise_preferred =
+        runtime_env::is_flatpak() && runtime_env::resolve_executable("mise").is_some();
+    let preferred_install_method = if mise_preferred {
+        Some("mise".to_string())
+    } else if npm_available {
+        Some("npm".to_string())
+    } else {
+        None
+    };
+
+    Ok(HarnessReport {
+        harnesses,
+        npm_available,
+        preferred_install_method,
+    })
+}
+
+#[tauri::command]
+pub async fn check_harnesses() -> Result<HarnessReport, String> {
+    let mut report = detect_harnesses().await?;
+    let local_services =
+        crate::local_cli_service_lifecycle::LocalCliServiceLifecycle::list_ready().await;
+
+    for harness in &mut report.harnesses {
+        let lifecycle_cli_id = match harness.id.as_str() {
+            "codex" => Some("codex"),
+            "opencode" => Some("opencode"),
+            "claude-code" => Some("claude"),
+            _ => None,
+        };
+        if let Some(cli_id) = lifecycle_cli_id {
+            harness.found = local_services
+                .iter()
+                .any(|service| service.cli_id() == cli_id);
+        }
+    }
+
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// install_harness
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn install_harness(app: AppHandle, harness_id: String) -> Result<InstallResult, String> {
+    let def = HARNESSES
+        .iter()
+        .find(|h| h.id == harness_id)
+        .ok_or_else(|| format!("unknown harness: {harness_id}"))?;
+
+    // Prefer install_script (curl-pipe installers) over install_command (npm).
+    // On Windows, curl-pipe installers are not supported — fall through to
+    // install_command when available instead of hard-erroring.
+    if let Some(script) = def.install_script {
+        #[cfg(not(target_os = "windows"))]
+        {
+            return run_harness_install_script(&app, &harness_id, script).await;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = script;
+            if def.install_command.is_none() {
+                return Err(format!(
+                    "{} must be installed manually from {} on Windows \
+                     (the automated installer requires a Unix shell)",
+                    def.name, def.website
+                ));
+            }
+            // Fall through to install_command below
+        }
+    }
+
+    let install_cmd = def.install_command.ok_or_else(|| {
+        format!(
+            "{} must be installed manually from {}",
+            def.name, def.website
+        )
+    })?;
+
+    // Inside a Flatpak sandbox, /app is read-only at runtime, so `npm
+    // install -g` has nowhere to write to. Prefer the bundled `mise`
+    // instead, which installs into the user's writable data dir.
+    if install_cmd == "npm" && runtime_env::is_flatpak() {
+        if let Some(package) = npm_package_from_install_args(def.install_args) {
+            if runtime_env::resolve_executable("mise").is_some() {
+                let mise = resolve_mise_path().await;
+                let args = vec![
+                    "use".to_string(),
+                    "-g".to_string(),
+                    format!("npm:{package}"),
+                ];
+                return run_harness_install(&app, &harness_id, &mise, &args).await;
+            }
+        }
+    }
+
+    let npm = if install_cmd == "npm" {
+        resolve_npm_path().await
+    } else {
+        install_cmd.to_string()
+    };
+
+    let args: Vec<String> = def.install_args.iter().map(|s| s.to_string()).collect();
+
+    run_harness_install(&app, &harness_id, &npm, &args).await
+}
+
+/// Extracts the npm package name from an `["install", "-g", "<package>"]`
+/// style install-args slice, which is the shape every npm-installed
+/// harness in `HARNESSES` uses.
+fn npm_package_from_install_args<'a>(install_args: &[&'a str]) -> Option<&'a str> {
+    match install_args {
+        ["install", "-g", package] => Some(package),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// launch_harness
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn launch_harness(harness_id: String) -> Result<String, String> {
+    let def = HARNESSES
+        .iter()
+        .find(|h| h.id == harness_id)
+        .ok_or_else(|| format!("unknown harness: {harness_id}"))?;
+    let base_command = def.command;
+
+    // Return the command line so the frontend can write it into a terminal session
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        compose_launch_command(base_command, config.harness_launch_args(&harness_id))
+    })
+    .await
+    .map_err(err_to_string)?
+}
+
+/// Launch args are submitted to the user's shell. Limit them to a portable
+/// argument grammar so the settings field cannot introduce shell operators.
+fn normalize_launch_args(args: &str) -> Result<String, String> {
+    if let Some(character) = args.chars().find(|character| {
+        !(character.is_alphanumeric()
+            || matches!(character, ' ' | '\t')
+            || matches!(character, '-' | '_' | '.' | '/' | ':' | '=' | ',' | '+'))
+    }) {
+        return Err(format!(
+            "launch arguments contain unsupported shell character: {character:?}"
+        ));
+    }
+
+    Ok(args.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn compose_launch_command(base: &str, extra_args: Option<&str>) -> Result<String, String> {
+    let args = extra_args
+        .map(normalize_launch_args)
+        .transpose()?
+        .unwrap_or_default();
+    if args.is_empty() {
+        Ok(base.to_string())
+    } else {
+        Ok(format!("{base} {args}"))
+    }
+}
+
+#[tauri::command]
+pub async fn get_harness_launch_args() -> Result<BTreeMap<String, String>, String> {
+    tokio::task::spawn_blocking(|| -> Result<BTreeMap<String, String>, String> {
+        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        Ok(config.harnesses.launch_args)
+    })
+    .await
+    .map_err(err_to_string)?
+}
+
+#[tauri::command]
+pub async fn set_harness_launch_args(
+    state: State<'_, AppState>,
+    harness_id: String,
+    args: String,
+) -> Result<String, String> {
+    if !HARNESSES.iter().any(|h| h.id == harness_id) {
+        return Err(format!("unknown harness: {harness_id}"));
+    }
+
+    let config_write_lock = state.config_write_lock.clone();
+    let _guard = config_write_lock.lock_owned().await;
+
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let sanitized = normalize_launch_args(&args)?;
+        AppConfig::mutate(|config| {
+            if sanitized.is_empty() {
+                config.harnesses.launch_args.remove(&harness_id);
+            } else {
+                config
+                    .harnesses
+                    .launch_args
+                    .insert(harness_id.clone(), sanitized.clone());
+            }
+            Ok(sanitized)
+        })
+        .map_err(err_to_string)
+    })
+    .await
+    .map_err(err_to_string)?
+}
+
+// ---------------------------------------------------------------------------
+// Detection
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn detect_harness(def: &HarnessDef) -> HarnessInfo {
+    if let Some(path) = runtime_env::resolve_executable(def.command) {
+        if let Some(version) = get_command_version(&path, &[def.version_flag]).await {
+            return HarnessInfo {
+                id: def.id.to_string(),
+                name: def.name.to_string(),
+                description: def.description.to_string(),
+                command: def.command.to_string(),
+                found: true,
+                version: Some(version),
+                path: Some(path.display().to_string()),
+                can_auto_install: harness_can_auto_install(def),
+                website: def.website.to_string(),
+                native: def.native,
+            };
+        }
+    }
+
+    if let Some((path, version)) = detect_via_login_shell(def.command, def.version_flag).await {
+        return HarnessInfo {
+            id: def.id.to_string(),
+            name: def.name.to_string(),
+            description: def.description.to_string(),
+            command: def.command.to_string(),
+            found: true,
+            version: Some(version),
+            path: Some(path),
+            can_auto_install: harness_can_auto_install(def),
+            website: def.website.to_string(),
+            native: def.native,
+        };
+    }
+
+    HarnessInfo {
+        id: def.id.to_string(),
+        name: def.name.to_string(),
+        description: def.description.to_string(),
+        command: def.command.to_string(),
+        found: false,
+        version: None,
+        path: None,
+        can_auto_install: harness_can_auto_install(def),
+        website: def.website.to_string(),
+        native: def.native,
+    }
+}
+
+fn harness_can_auto_install(def: &HarnessDef) -> bool {
+    #[cfg(target_os = "windows")]
+    if def.install_script.is_some() {
+        return def.install_command.is_some();
+    }
+
+    def.install_command.is_some() || def.install_script.is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Install runner
+// ---------------------------------------------------------------------------
+
+async fn run_harness_install(
+    app: &AppHandle,
+    harness_id: &str,
+    program: &str,
+    args: &[String],
+) -> Result<InstallResult, String> {
+    let emit = |line: String, stream: String, finished: bool| {
+        let event = InstallProgressEvent {
+            dependency: harness_id.to_string(),
+            line,
+            stream,
+            finished,
+        };
+        let _ = app.emit("setup-install-progress", &event);
+    };
+
+    emit(
+        format!("$ {} {}", program, args.join(" ")),
+        "status".to_string(),
+        false,
+    );
+
+    let mut command = Command::new(program);
+    process_utils::configure_tokio_command(&mut command);
+    command.args(args);
+    // 旧手工 PATH 处理由 runtime_env::get 接替：
+    // if let Some(augmented_path) = runtime_env::augmented_path_with_prepend(
+    //     Path::new(program)
+    //         .parent()
+    //         .into_iter()
+    //         .map(|value| value.to_path_buf()),
+    // ) {
+    //     command.env("PATH", augmented_path);
+    // }
+    command.envs(runtime_env::get(Path::new(program)).await);
+
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn {program}: {e}"))?;
+
+    let dep = harness_id.to_string();
+    let app_clone = app.clone();
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let dep_stdout = dep.clone();
+    let app_stdout = app_clone.clone();
+    let stdout_task = tokio::spawn(async move {
+        if let Some(stdout) = stdout {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = app_stdout.emit(
+                    "setup-install-progress",
+                    &InstallProgressEvent {
+                        dependency: dep_stdout.clone(),
+                        line,
+                        stream: "stdout".to_string(),
+                        finished: false,
+                    },
+                );
+            }
+        }
+    });
+
+    let dep_stderr = dep.clone();
+    let app_stderr = app_clone.clone();
+    let stderr_task = tokio::spawn(async move {
+        if let Some(stderr) = stderr {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = app_stderr.emit(
+                    "setup-install-progress",
+                    &InstallProgressEvent {
+                        dependency: dep_stderr.clone(),
+                        line,
+                        stream: "stderr".to_string(),
+                        finished: false,
+                    },
+                );
+            }
+        }
+    });
+
+    let _ = tokio::join!(stdout_task, stderr_task);
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("failed to wait for {program}: {e}"))?;
+
+    let success = status.success();
+    let message = if success {
+        format!("{harness_id} installed successfully")
+    } else {
+        format!(
+            "{harness_id} installation failed (exit code {})",
+            status.code().unwrap_or(-1)
+        )
+    };
+
+    emit(message.clone(), "status".to_string(), true);
+
+    Ok(InstallResult { success, message })
+}
+
+// ---------------------------------------------------------------------------
+// Script-based install runner (curl-pipe installers)
+// ---------------------------------------------------------------------------
+
+async fn run_harness_install_script(
+    app: &AppHandle,
+    harness_id: &str,
+    script: &str,
+) -> Result<InstallResult, String> {
+    let emit = |line: String, stream: String, finished: bool| {
+        let event = InstallProgressEvent {
+            dependency: harness_id.to_string(),
+            line,
+            stream,
+            finished,
+        };
+        let _ = app.emit("setup-install-progress", &event);
+    };
+
+    emit(format!("$ {script}"), "status".to_string(), false);
+
+    let spec = runtime_env::command_shell_for_string(script);
+    let mut command = Command::new(&spec.program);
+    process_utils::configure_tokio_command(&mut command);
+    command.args(&spec.args);
+    // 旧手工 PATH 处理由 runtime_env::get 接替：
+    // if let Some(augmented_path) = runtime_env::augmented_path_with_prepend(
+    //     spec.program
+    //         .parent()
+    //         .into_iter()
+    //         .map(|value| value.to_path_buf()),
+    // ) {
+    //     command.env("PATH", augmented_path);
+    // }
+    command.envs(runtime_env::get(&spec.program).await);
+
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn install script: {e}"))?;
+
+    let dep = harness_id.to_string();
+    let app_clone = app.clone();
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let dep_stdout = dep.clone();
+    let app_stdout = app_clone.clone();
+    let stdout_task = tokio::spawn(async move {
+        if let Some(stdout) = stdout {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = app_stdout.emit(
+                    "setup-install-progress",
+                    &InstallProgressEvent {
+                        dependency: dep_stdout.clone(),
+                        line,
+                        stream: "stdout".to_string(),
+                        finished: false,
+                    },
+                );
+            }
+        }
+    });
+
+    let dep_stderr = dep.clone();
+    let app_stderr = app_clone.clone();
+    let stderr_task = tokio::spawn(async move {
+        if let Some(stderr) = stderr {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = app_stderr.emit(
+                    "setup-install-progress",
+                    &InstallProgressEvent {
+                        dependency: dep_stderr.clone(),
+                        line,
+                        stream: "stderr".to_string(),
+                        finished: false,
+                    },
+                );
+            }
+        }
+    });
+
+    let _ = tokio::join!(stdout_task, stderr_task);
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("failed to wait for install script: {e}"))?;
+
+    let success = status.success();
+    let message = if success {
+        format!("{harness_id} installed successfully")
+    } else {
+        format!(
+            "{harness_id} installation failed (exit code {})",
+            status.code().unwrap_or(-1)
+        )
+    };
+
+    emit(message.clone(), "status".to_string(), true);
+
+    Ok(InstallResult { success, message })
+}
+
+// ---------------------------------------------------------------------------
+// Utility helpers (same patterns as setup.rs)
+// ---------------------------------------------------------------------------
+
+async fn get_command_version(path: &Path, args: &[&str]) -> Option<String> {
+    let mut command = Command::new(path);
+    process_utils::configure_tokio_command(&mut command);
+    let output = command.args(args).output().await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) async fn detect_via_login_shell(
+    command: &str,
+    version_flag: &str,
+) -> Option<(String, String)> {
+    for shell in runtime_env::login_probe_shells() {
+        let probe_cmd = format!("command -v {command} && {command} {version_flag}");
+        let output = match timeout(
+            LOGIN_SHELL_PROBE_TIMEOUT,
+            Command::new(&shell)
+                .args(runtime_env::login_probe_shell_args(&shell, &probe_cmd))
+                .output(),
+        )
+        .await
+        {
+            Err(_) => {
+                log::warn!(
+                    "timed out probing `{command}` via login shell `{}`",
+                    shell.display()
+                );
+                continue;
+            }
+            Ok(Ok(output)) if output.status.success() => output,
+            _ => continue,
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let Some((path, version)) = runtime_env::parse_login_probe_output(&stdout) else {
+            continue;
+        };
+
+        return Some((path, version));
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) async fn detect_via_login_shell(
+    command: &str,
+    version_flag: &str,
+) -> Option<(String, String)> {
+    let probe_script = format!(
+        "$p = (Get-Command {cmd} -ErrorAction SilentlyContinue | Select-Object -First 1).Source; \
+         if ($p) {{ Write-Output $p; & $p {flag} }}",
+        cmd = command,
+        flag = version_flag,
+    );
+
+    for powershell in runtime_env::windows_login_probe_shells() {
+        let mut cmd = Command::new(&powershell);
+        cmd.args(["-NoLogo", "-Command", &probe_script]);
+        process_utils::configure_tokio_command(&mut cmd);
+
+        let Ok(Ok(output)) = timeout(Duration::from_secs(10), cmd.output()).await else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let Some((path, version)) = runtime_env::parse_windows_login_probe_output(&stdout) else {
+            continue;
+        };
+
+        if !path.is_empty() && Path::new(&path).is_file() {
+            return Some((path, version));
+        }
+    }
+
+    None
+}
+
+async fn resolve_npm_path() -> String {
+    if let Some(path) = runtime_env::resolve_executable("npm") {
+        return path.display().to_string();
+    }
+    if let Some((path, _version)) = detect_via_login_shell("npm", "--version").await {
+        return path;
+    }
+    "npm".to_string()
+}
+
+async fn resolve_mise_path() -> String {
+    if let Some(path) = runtime_env::resolve_executable("mise") {
+        return path.display().to_string();
+    }
+    if let Some((path, _version)) = detect_via_login_shell("mise", "--version").await {
+        return path;
+    }
+    "mise".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn npm_package_from_install_args_matches_every_harness_definition() {
+        for def in HARNESSES {
+            if def.install_command == Some("npm") {
+                assert!(
+                    npm_package_from_install_args(def.install_args).is_some(),
+                    "expected {} to have an install_args shape of [\"install\", \"-g\", <package>]",
+                    def.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn npm_package_from_install_args_rejects_unexpected_shapes() {
+        assert_eq!(
+            npm_package_from_install_args(&["install", "opencode-ai"]),
+            None
+        );
+        assert_eq!(npm_package_from_install_args(&[]), None);
+        assert_eq!(
+            npm_package_from_install_args(&["install", "-g", "opencode-ai"]),
+            Some("opencode-ai")
+        );
+    }
+
+    #[test]
+    fn compose_launch_command_appends_configured_args() {
+        assert_eq!(compose_launch_command("codex", None).unwrap(), "codex");
+        assert_eq!(
+            compose_launch_command("codex", Some("--yolo")).unwrap(),
+            "codex --yolo"
+        );
+        assert_eq!(
+            compose_launch_command("claude", Some("  --dangerously-skip-permissions  ")).unwrap(),
+            "claude --dangerously-skip-permissions"
+        );
+        assert_eq!(
+            compose_launch_command("codex", Some("   ")).unwrap(),
+            "codex"
+        );
+    }
+
+    #[test]
+    fn normalize_launch_args_accepts_portable_argument_characters() {
+        assert_eq!(
+            normalize_launch_args("--model=gpt-5 --config /Users/me/file.toml").unwrap(),
+            "--model=gpt-5 --config /Users/me/file.toml"
+        );
+        assert_eq!(normalize_launch_args("--a\t--b").unwrap(), "--a --b");
+    }
+
+    #[test]
+    fn normalize_launch_args_rejects_shell_syntax() {
+        for args in [
+            "--yolo; whoami",
+            "--flag | whoami",
+            "--flag $(whoami)",
+            "--flag `whoami`",
+            "--flag > output.txt",
+            "--flag\nwhoami",
+            "--name \"two words\"",
+        ] {
+            assert!(
+                normalize_launch_args(args).is_err(),
+                "accepted unsafe args: {args}"
+            );
+        }
+    }
+}

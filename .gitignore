@@ -1,0 +1,37 @@
+node_modules/
+dist/
+.vite/
+.DS_Store
+src-tauri/target/
+src-tauri/gen/
+src-tauri/sidecar-dist/claude-remote-runtime-linux-*.tar.gz
+src-tauri/sidecar-dist/claude-remote-runtime-version.txt
+src-tauri/helper/build/
+src-tauri/sidecar-dist/claude-sdk-node_modules.tar.gz
+*.log
+.agent-workspace/
+*.tsbuildinfo
+
+
+# Local recovery copy for the Tauri updater signing key.
+#.tauri-signing/
+# This directory is allowed in private Gogs; public export filters it separately.
+
+# Local flatpak-builder build output
+.flatpak-builder/
+build-flatpak/
+
+# Local uni-app Android build output
+mobile/src/uni_modules
+mobile/unpackage/resources
+uniapp_build/simpleDemo/src/main/assets/apps
+uniapp_build/simpleDemo/build
+uniapp_build/.gradle
+uniapp_build/.idea
+uniapp_build/build
+uniapp_build/simpleDemo/src/main/AndroidManifest.xml
+uniapp_build/simpleDemo/build.gradle
+
+.tmp
+.pnpm-store
+.worktree

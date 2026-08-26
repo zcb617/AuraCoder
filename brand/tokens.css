@@ -1,0 +1,101 @@
+:root {
+  /* Raw neutral palette, subtly tinted toward the AuraCoder violet-black base. */
+  --auracoder-neutral-0: #ffffff;
+  --auracoder-neutral-50: #fafafb;
+  --auracoder-neutral-100: #ececef;
+  --auracoder-neutral-200: #d4d4d7;
+  --auracoder-neutral-300: #b1b1b4;
+  --auracoder-neutral-400: #89898d;
+  --auracoder-neutral-500: #636367;
+  --auracoder-neutral-600: #47474c;
+  --auracoder-neutral-700: #2d2d32;
+  --auracoder-neutral-800: #18181c;
+  --auracoder-neutral-850: #0d0d11;
+  --auracoder-neutral-900: #040406;
+  --auracoder-neutral-950: #010102;
+  --auracoder-neutral-1000: #000000;
+
+  /* Brand accent. */
+  --auracoder-mint-50: #e8fbee;
+  --auracoder-mint-100: #cef3db;
+  --auracoder-mint-200: #ace8c3;
+  --auracoder-mint-300: #88ddab;
+  --auracoder-mint-400: #61d596;
+  --auracoder-mint-500: #33b978;
+  --auracoder-mint-600: #02955a;
+  --auracoder-mint-700: #006d40;
+  --auracoder-mint-800: #014a2a;
+  --auracoder-mint-900: #042917;
+  --auracoder-mint-950: #021409;
+
+  /* Supporting semantic colors. */
+  --auracoder-blue: #57b6ff;
+  --auracoder-blue-on-light: #006eb8;
+  --auracoder-blue-surface-dark: #020e1b;
+  --auracoder-blue-surface-light: #e7f4ff;
+  --auracoder-violet: #a88dff;
+  --auracoder-violet-on-light: #6e4fc1;
+  --auracoder-violet-surface-dark: #0e0a1b;
+  --auracoder-violet-surface-light: #f2f0ff;
+  --auracoder-amber: #f1b047;
+  --auracoder-amber-on-light: #935c00;
+  --auracoder-amber-surface-dark: #160b00;
+  --auracoder-amber-surface-light: #faf0e3;
+  --auracoder-coral: #f9776e;
+  --auracoder-coral-on-light: #bd413d;
+  --auracoder-coral-surface-dark: #1a0706;
+  --auracoder-coral-surface-light: #ffedeb;
+
+  /* Default dark application theme. */
+  --auracoder-canvas: var(--auracoder-neutral-950);
+  --auracoder-sidebar: var(--auracoder-neutral-850);
+  --auracoder-pane: var(--auracoder-neutral-900);
+  --auracoder-surface: var(--auracoder-neutral-850);
+  --auracoder-surface-hover: var(--auracoder-neutral-800);
+  --auracoder-surface-active: var(--auracoder-mint-950);
+  --auracoder-border: var(--auracoder-neutral-700);
+  --auracoder-border-strong: var(--auracoder-neutral-600);
+  --auracoder-divider: var(--auracoder-neutral-800);
+  --auracoder-text-primary: var(--auracoder-neutral-50);
+  --auracoder-text-secondary: var(--auracoder-neutral-300);
+  --auracoder-text-tertiary: var(--auracoder-neutral-400);
+  --auracoder-text-disabled: var(--auracoder-neutral-500);
+  --auracoder-icon-primary: var(--auracoder-neutral-100);
+  --auracoder-icon-secondary: var(--auracoder-neutral-400);
+  --auracoder-accent: var(--auracoder-mint-400);
+  --auracoder-accent-hover: var(--auracoder-mint-300);
+  --auracoder-accent-pressed: var(--auracoder-mint-500);
+  --auracoder-accent-on: var(--auracoder-mint-950);
+  --auracoder-focus-ring: var(--auracoder-mint-400);
+  --auracoder-status-info: var(--auracoder-blue);
+  --auracoder-status-agent: var(--auracoder-violet);
+  --auracoder-status-warning: var(--auracoder-amber);
+  --auracoder-status-danger: var(--auracoder-coral);
+}
+
+[data-auracoder-theme="light"] {
+  --auracoder-canvas: var(--auracoder-neutral-50);
+  --auracoder-sidebar: var(--auracoder-neutral-100);
+  --auracoder-pane: var(--auracoder-neutral-0);
+  --auracoder-surface: var(--auracoder-neutral-50);
+  --auracoder-surface-hover: var(--auracoder-neutral-100);
+  --auracoder-surface-active: var(--auracoder-mint-50);
+  --auracoder-border: var(--auracoder-neutral-200);
+  --auracoder-border-strong: var(--auracoder-neutral-300);
+  --auracoder-divider: var(--auracoder-neutral-200);
+  --auracoder-text-primary: var(--auracoder-neutral-800);
+  --auracoder-text-secondary: var(--auracoder-neutral-600);
+  --auracoder-text-tertiary: var(--auracoder-neutral-500);
+  --auracoder-text-disabled: var(--auracoder-neutral-300);
+  --auracoder-icon-primary: var(--auracoder-neutral-800);
+  --auracoder-icon-secondary: var(--auracoder-neutral-500);
+  --auracoder-accent: var(--auracoder-mint-700);
+  --auracoder-accent-hover: var(--auracoder-mint-800);
+  --auracoder-accent-pressed: var(--auracoder-mint-900);
+  --auracoder-accent-on: var(--auracoder-neutral-0);
+  --auracoder-focus-ring: var(--auracoder-mint-600);
+  --auracoder-status-info: var(--auracoder-blue-on-light);
+  --auracoder-status-agent: var(--auracoder-violet-on-light);
+  --auracoder-status-warning: var(--auracoder-amber-on-light);
+  --auracoder-status-danger: var(--auracoder-coral-on-light);
+}

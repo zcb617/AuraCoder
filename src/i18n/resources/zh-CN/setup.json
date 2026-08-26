@@ -1,0 +1,104 @@
+{
+  "greeting": {
+    "title": "欢迎使用 AuraCoder",
+    "subtitle": "你的本地 AI 辅助编程工作台。",
+    "cta": "开始使用"
+  },
+  "workflow": {
+    "title": "你希望如何工作？",
+    "subtitle": "选择 AuraCoder 首先要优化的工作流。你之后可以重新打开引导并切换。",
+    "options": {
+      "cli": {
+        "title": "CLI 智能体",
+        "description": "浏览 AuraCoder 已支持的智能体 CLI，安装你需要的工具，然后选择要开始使用的工作区。"
+      },
+      "chat": {
+        "title": "与 Codex / Claude / OpenCode 对话",
+        "description": "选择 Codex、Claude、OpenCode，或任意组合。AuraCoder 会检查哪些已就绪，帮助安装缺失项，然后带你进入工作区。"
+      }
+    }
+  },
+  "cliProviders": {
+    "title": "选择你的 CLI 智能体",
+    "subtitle": "查看此计算机上已可用的提供方，并在打开第一个工作区前安装缺失的工具。",
+    "helper": "此处会刻意跳过启动。你确认工作区后引导即结束，随后 AuraCoder 会带你进入工具面板。",
+    "scanning": "正在扫描可用提供方…"
+  },
+  "chatEngines": {
+    "title": "选择你的对话引擎",
+    "subtitle": "选择希望在 AuraCoder 对话中准备好的引擎。",
+    "helper": "你可以选择 Codex、Claude、OpenCode，或任意组合。继续前，下一步会检查每个选中的运行时。",
+    "options": {
+      "codex": {
+        "description": "由 Codex App Server 提供对话能力。如果缺失，可能会安装 Node.js 和 Codex CLI。"
+      },
+      "claude": {
+        "description": "由 Claude Agent SDK 提供对话能力，无需单独安装 Claude CLI。"
+      },
+      "opencode": {
+        "description": "由 OpenCode 无头服务器提供对话能力，需要 PATH 中存在 opencode CLI。"
+      }
+    }
+  },
+  "chatReadiness": {
+    "title": "检查对话就绪状态",
+    "subtitle": "AuraCoder 正在检查所选引擎及其对话实际需要的依赖项。",
+    "helper": "此版本中，未来身份验证设置的提示仅供参考。这里的目标是安装运行时并选定一个工作区。",
+    "loading": "正在检查所选引擎…",
+    "readyHint": "已为对话选择的所有项目均已就绪。继续选择你想首先使用的工作区。",
+    "authDeferred": "Codex 仍需登录账号，但在此版本中不会阻止完成引导。现在完成引导，之后再完成 Codex 身份验证。",
+    "nodeInstallAvailable": "缺少 Node.js。AuraCoder 可以自动安装它，以便所选对话引擎运行。",
+    "nodeInstallManual": "缺少 Node.js。请手动安装 Node.js 20+，然后刷新就绪状态检查。",
+    "codexInstallAvailable": "缺少 Codex CLI。AuraCoder 可以为 Codex 对话引擎自动安装它。",
+    "codexInstallManual": "缺少 Codex CLI。请手动安装，然后刷新就绪状态检查。",
+    "openCodeInstallAvailable": "缺少 OpenCode CLI。AuraCoder 可以使用 npm 为 OpenCode 对话引擎安装它。",
+    "openCodeInstallManual": "缺少 OpenCode CLI。请手动安装 Node.js/npm 和 OpenCode，然后刷新就绪状态检查。",
+    "deps": {
+      "node": "Node.js"
+    },
+    "status": {
+      "ready": "已就绪",
+      "attention": "需要处理",
+      "pending": "健康状态数据尚未加载。"
+    },
+    "sections": {
+      "warnings": "警告",
+      "checks": "检查项",
+      "fixes": "建议的下一步",
+      "showNotes": "显示警告",
+      "hideNotes": "隐藏警告"
+    }
+  },
+  "workspace": {
+    "title": "确认你的第一个工作区",
+    "subtitle": "选择 AuraCoder 在完成引导后要打开的工作区。即使已有活动工作区，也请在此明确确认。",
+    "helper": "选择已有工作区或打开新文件夹。只有确认后才会完成引导。",
+    "empty": "尚无可用工作区。请打开一个文件夹以继续。",
+    "current": "当前工作区"
+  },
+  "steps": {
+    "workflow": "工作流",
+    "cliProviders": "提供方",
+    "chatEngines": "引擎",
+    "chatReadiness": "就绪状态",
+    "workspace": "工作区"
+  },
+  "actions": {
+    "back": "返回",
+    "continue": "继续",
+    "finish": "完成引导",
+    "openFolder": "打开文件夹",
+    "refreshProviders": "刷新提供方",
+    "refreshStatus": "刷新状态",
+    "install": "安装",
+    "openWebsite": "打开网站",
+    "copied": "已复制"
+  },
+  "install": {
+    "waiting": "正在等待…",
+    "installing": "正在安装 {{name}}…"
+  },
+  "footer": {
+    "stepCounter": "第 {{current}} 步，共 {{total}} 步"
+  }
+}

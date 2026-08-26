@@ -1,0 +1,1093 @@
+import { useEffect, useState } from "react";
+import {
+  ArrowRightCircle,
+  FlaskConical,
+  GitBranch,
+  Minimize2,
+  Puzzle,
+  RefreshCw,
+  RotateCcw,
+  Scissors,
+  Search,
+  Server,
+  SquareCode,
+  UserCircle,
+  X,
+  Zap,
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
+import type { CliSlashCommandPanel } from "../../cli-tools/contracts/slash-command";
+import { ipc } from "../../lib/ipc";
+import type {
+  CodexExperimentalFeature,
+  CodexMcpServer,
+  CodexPluginMarketplace,
+  CodexReviewDelivery,
+  CodexReviewTarget,
+  CodexSkill,
+  ExtensionItem,
+  OpenCodeAgent,
+  OpenCodeCommand,
+  OpenCodeMcpServer,
+  OpenCodeRemoteSession,
+} from "../../types";
+
+type ReviewTargetMode =
+  | "uncommittedChanges"
+  | "baseBranch"
+  | "commit"
+  | "custom";
+
+// 旧的输入框面板联合类型保留在此处作为迁移记录；现在由 CLI 菜单契约统一定义。
+// export type ActiveSlashCommand =
+//   | { type: "review" }
+//   | { type: "fork" }
+//   | { type: "rollback" }
+//   | { type: "compact" }
+//   | { type: "fast" }
+//   | { type: "personality" }
+//   | { type: "skills" }
+//   | { type: "plugins" }
+//   | { type: "agents" }
+//   | { type: "commands" }
+//   | { type: "sessions" }
+//   | { type: "mcp" }
+//   | { type: "experimental" };
+export type ActiveSlashCommand = CliSlashCommandPanel | { type: "fast" };
+
+export interface SlashCommandPayload {
+  target?: CodexReviewTarget;
+  delivery?: CodexReviewDelivery;
+  numTurns?: number;
+  serviceTier?: string;
+  personality?: string;
+}
+
+interface ChatCommandPanelProps {
+  command: ActiveSlashCommand;
+  busy: boolean;
+  error: string | null;
+  defaultBaseBranch: string | null;
+  /** Current values for config commands */
+  currentServiceTier?: string;
+  currentPersonality?: string;
+  personalitySupported?: boolean;
+  /** Data for info panels */
+  skills?: CodexSkill[];
+  extensionSkills?: ExtensionItem[];
+  pluginMarketplaces?: CodexPluginMarketplace[];
+  extensionPlugins?: ExtensionItem[];
+  openCodeAgents?: OpenCodeAgent[];
+  openCodeCommands?: OpenCodeCommand[];
+  openCodeMcpServers?: OpenCodeMcpServer[];
+  workspaceId?: string | null;
+  selectedModelId?: string | null;
+  onAttachOpenCodeSession?: (session: OpenCodeRemoteSession) => Promise<void>;
+  mcpServers?: CodexMcpServer[];
+  extensionMcpServers?: ExtensionItem[];
+  experimentalFeatures?: CodexExperimentalFeature[];
+  onConfirm: (
+    command: ActiveSlashCommand,
+    payload?: SlashCommandPayload,
+  ) => void;
+  onDismiss: () => void;
+}
+
+export function ChatCommandPanel({
+  command,
+  busy,
+  error,
+  defaultBaseBranch,
+  currentServiceTier,
+  currentPersonality,
+  personalitySupported,
+  skills,
+  extensionSkills,
+  pluginMarketplaces,
+  extensionPlugins,
+  openCodeAgents,
+  openCodeCommands,
+  openCodeMcpServers,
+  workspaceId,
+  selectedModelId,
+  onAttachOpenCodeSession,
+  mcpServers,
+  extensionMcpServers,
+  experimentalFeatures,
+  onConfirm,
+  onDismiss,
+}: ChatCommandPanelProps) {
+  const { t } = useTranslation("chat");
+
+  switch (command.type) {
+    case "review":
+      return (
+        <ReviewPanel
+          busy={busy}
+          error={error}
+          defaultBaseBranch={defaultBaseBranch}
+          onConfirm={(target, delivery) =>
+            onConfirm(command, { target, delivery })
+          }
+          onDismiss={onDismiss}
+          t={t}
+        />
+      );
+    case "fork":
+      return (
+        <ConfirmPanel
+          icon={GitBranch}
+          title={t("threadPicker.forkTitle")}
+          description={t("threadPicker.forkDescription")}
+          confirmLabel={t("threadPicker.forkAction")}
+          busy={busy}
+          error={error}
+          onConfirm={() => onConfirm(command)}
+          onDismiss={onDismiss}
+        />
+      );
+    case "rollback":
+      return (
+        <RollbackPanel
+          busy={busy}
+          error={error}
+          onConfirm={(numTurns) => onConfirm(command, { numTurns })}
+          onDismiss={onDismiss}
+          t={t}
+        />
+      );
+    case "fast":
+      // /fast is handled as a direct toggle in ChatPanel — no panel needed
+      return null;
+    case "personality":
+      return (
+        <OptionPickerPanel
+          busy={busy}
+          error={error}
+          icon={UserCircle}
+          title={t("configPicker.personality")}
+          description={
+            personalitySupported
+              ? t("configPicker.personalityDescription")
+              : t("configPicker.personalityUnsupported")
+          }
+          options={[
+            { value: "inherit", label: t("configPicker.inherit") },
+            { value: "none", label: t("configPicker.personalities.none") },
+            { value: "friendly", label: t("configPicker.personalities.friendly") },
+            { value: "pragmatic", label: t("configPicker.personalities.pragmatic") },
+          ]}
+          currentValue={currentPersonality ?? "inherit"}
+          onSelect={(value) => onConfirm(command, { personality: value })}
+          onDismiss={onDismiss}
+        />
+      );
+    case "compact":
+      return (
+        <ConfirmPanel
+          icon={Minimize2}
+          title={t("threadPicker.compactTitle")}
+          description={t("threadPicker.compactDescription")}
+          confirmLabel={t("threadPicker.compactAction")}
+          busy={busy}
+          error={error}
+          onConfirm={() => onConfirm(command)}
+          onDismiss={onDismiss}
+        />
+      );
+    case "skills":
+      return (
+        <InfoListPanel
+          icon={Scissors}
+          title={t("slashCommands.panels.skills.title")}
+          emptyLabel={t("slashCommands.panels.skills.empty")}
+          items={extensionSkills
+            ? extensionSkills.map((skill) => ({
+                name: skill.name,
+                detail: skill.description || skill.scope,
+                enabled: skill.enabled !== false,
+              }))
+            : (skills ?? []).map((s) => ({
+                name: s.name,
+                detail: s.description || s.scope,
+                enabled: s.enabled,
+              }))}
+          onDismiss={onDismiss}
+        />
+      );
+    case "plugins":
+      return (
+        <InfoListPanel
+          icon={Puzzle}
+          title={t("slashCommands.panels.plugins.title")}
+          emptyLabel={t("slashCommands.panels.plugins.empty")}
+          items={extensionPlugins
+            ? extensionPlugins.map((plugin) => ({
+                name: plugin.name,
+                detail: plugin.description || plugin.marketplace || plugin.scope,
+                enabled: plugin.enabled !== false,
+              }))
+            : (pluginMarketplaces ?? []).flatMap((marketplace) =>
+                marketplace.plugins.map((plugin) => ({
+                  name: plugin.name,
+                  detail: [
+                    plugin.description,
+                    plugin.capabilities.length > 0 ? plugin.capabilities.join(", ") : null,
+                    marketplace.name,
+                  ]
+                    .filter(Boolean)
+                    .join(" · "),
+                  enabled: plugin.enabled && plugin.installed,
+                })),
+              )}
+          onDismiss={onDismiss}
+        />
+      );
+    case "agents":
+      return (
+        <InfoListPanel
+          icon={UserCircle}
+          title={t("slashCommands.panels.openCodeAgents.title")}
+          emptyLabel={t("slashCommands.panels.openCodeAgents.empty")}
+          items={(openCodeAgents ?? []).map((agent) => ({
+            name: agent.name,
+            detail: agent.description || agent.mode,
+            badge: agent.mode,
+          }))}
+          onDismiss={onDismiss}
+        />
+      );
+    case "commands":
+      return (
+        <InfoListPanel
+          icon={SquareCode}
+          title={t("slashCommands.panels.openCodeCommands.title")}
+          emptyLabel={t("slashCommands.panels.openCodeCommands.empty")}
+          items={(openCodeCommands ?? []).map((command) => ({
+            name: `/${command.name}`,
+            detail: command.description || command.hints.join(" "),
+            badge: command.source ?? (command.subtask ? "subtask" : undefined),
+          }))}
+          onDismiss={onDismiss}
+        />
+      );
+    case "sessions":
+      return (
+        <OpenCodeSessionsPanel
+          busy={busy}
+          error={error}
+          workspaceId={workspaceId}
+          selectedModelId={selectedModelId}
+          onAttach={onAttachOpenCodeSession}
+          onDismiss={onDismiss}
+          t={t}
+        />
+      );
+    case "mcp":
+      return (
+        <InfoListPanel
+          icon={Server}
+          title={t("slashCommands.panels.mcp.title")}
+          emptyLabel={t("slashCommands.panels.mcp.empty")}
+          items={
+            extensionMcpServers
+              ? extensionMcpServers.map((server) => ({
+                  name: server.name,
+                  detail: server.description || server.health,
+                  badge: server.authState || server.health,
+                }))
+              : openCodeMcpServers
+              ? openCodeMcpServers.map((server) => ({
+                  name: server.name,
+                  detail: server.detail ?? server.status,
+                  badge: server.status,
+                }))
+              : (mcpServers ?? []).map((s) => ({
+                  name: s.name,
+                  detail: `${s.toolCount} tools, ${s.resourceCount} resources`,
+                  badge: s.authStatus,
+                }))
+          }
+          onDismiss={onDismiss}
+        />
+      );
+    case "experimental":
+      return (
+        <InfoListPanel
+          icon={FlaskConical}
+          title={t("slashCommands.panels.experimental.title")}
+          emptyLabel={t("slashCommands.panels.experimental.empty")}
+          items={(experimentalFeatures ?? []).map((f) => ({
+            name: f.displayName || f.name,
+            detail: f.stage,
+            enabled: f.enabled,
+          }))}
+          onDismiss={onDismiss}
+        />
+      );
+  }
+}
+
+type OpenCodeSessionFilter = "active" | "archived";
+
+function formatRemoteSessionTimestamp(value: string): string {
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(timestamp);
+}
+
+function describeOpenCodeSession(session: OpenCodeRemoteSession): string {
+  const title = session.title?.trim();
+  return title || session.engineThreadId;
+}
+
+function OpenCodeSessionsPanel({
+  busy,
+  error,
+  workspaceId,
+  selectedModelId,
+  onAttach,
+  onDismiss,
+  t,
+}: {
+  busy: boolean;
+  error: string | null;
+  workspaceId?: string | null;
+  selectedModelId?: string | null;
+  onAttach?: (session: OpenCodeRemoteSession) => Promise<void>;
+  onDismiss: () => void;
+  t: ReturnType<typeof useTranslation<"chat">>["t"];
+}) {
+  const [sessions, setSessions] = useState<OpenCodeRemoteSession[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [searchDraft, setSearchDraft] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [filter, setFilter] = useState<OpenCodeSessionFilter>("active");
+  const [localBusy, setLocalBusy] = useState<string | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const browsingDisabled = !workspaceId || !selectedModelId || !onAttach;
+  const blocked = busy || localBusy !== null;
+  const displayError = error || localError;
+
+  async function loadSessions(reset: boolean) {
+    if (!workspaceId) {
+      setSessions([]);
+      setNextCursor(null);
+      setLoaded(true);
+      return;
+    }
+
+    const cursor = reset ? null : nextCursor;
+    setLocalBusy(reset ? "refresh" : "more");
+    if (reset) {
+      setLocalError(null);
+      setLoaded(false);
+      setNextCursor(null);
+    }
+
+    try {
+      const page = await ipc.listOpenCodeRemoteSessions(workspaceId, {
+        cursor,
+        limit: 20,
+        searchTerm: searchQuery || null,
+        archived: filter === "archived",
+      });
+      setSessions((current) => {
+        if (reset) {
+          return page.sessions;
+        }
+        const seen = new Set(current.map((session) => session.engineThreadId));
+        return [
+          ...current,
+          ...page.sessions.filter((session) => !seen.has(session.engineThreadId)),
+        ];
+      });
+      setNextCursor(page.nextCursor ?? null);
+      setLoaded(true);
+    } catch (nextError) {
+      setLocalError(nextError instanceof Error ? nextError.message : String(nextError));
+      if (reset) {
+        setSessions([]);
+        setNextCursor(null);
+        setLoaded(true);
+      }
+    } finally {
+      setLocalBusy(null);
+    }
+  }
+
+  useEffect(() => {
+    void loadSessions(true);
+  }, [filter, searchQuery, workspaceId]);
+
+  async function handleAttach(session: OpenCodeRemoteSession) {
+    if (!onAttach) {
+      return;
+    }
+    setLocalBusy(`attach:${session.engineThreadId}`);
+    setLocalError(null);
+    try {
+      await onAttach(session);
+      onDismiss();
+    } catch (nextError) {
+      setLocalError(nextError instanceof Error ? nextError.message : String(nextError));
+    } finally {
+      setLocalBusy(null);
+    }
+  }
+
+  return (
+    <div className="chat-command-panel">
+      <div className="chat-command-panel-header">
+        <div className="chat-command-panel-title">
+          <GitBranch size={12} />
+          <span>{t("slashCommands.panels.openCodeSessions.title")}</span>
+        </div>
+        <button
+          type="button"
+          className="chat-command-panel-close"
+          onClick={onDismiss}
+          disabled={blocked}
+        >
+          <X size={12} />
+        </button>
+      </div>
+      <div className="chat-command-panel-desc">
+        {t("slashCommands.panels.openCodeSessions.description")}
+      </div>
+
+      <div className="chat-command-panel-fields">
+        <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 8 }}>
+          <input
+            className="chat-command-panel-input"
+            value={searchDraft}
+            onChange={(event) => setSearchDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                setSearchQuery(searchDraft.trim());
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                onDismiss();
+              }
+            }}
+            placeholder={t("slashCommands.panels.openCodeSessions.searchPlaceholder")}
+            disabled={blocked || browsingDisabled}
+            autoFocus
+          />
+          <select
+            className="chat-command-panel-input"
+            value={filter}
+            onChange={(event) => setFilter(event.target.value as OpenCodeSessionFilter)}
+            disabled={blocked || browsingDisabled}
+          >
+            <option value="active">
+              {t("slashCommands.panels.openCodeSessions.filters.active")}
+            </option>
+            <option value="archived">
+              {t("slashCommands.panels.openCodeSessions.filters.archived")}
+            </option>
+          </select>
+          <button
+            type="button"
+            className="chat-command-panel-btn-secondary"
+            onClick={() => setSearchQuery(searchDraft.trim())}
+            disabled={blocked || browsingDisabled}
+          >
+            <Search size={11} />
+            {t("threadPicker.searchAction")}
+          </button>
+        </div>
+
+        <div className="chat-command-panel-desc">
+          {browsingDisabled
+            ? t("slashCommands.panels.openCodeSessions.unavailable")
+            : t("slashCommands.panels.openCodeSessions.historyNote")}
+        </div>
+      </div>
+
+      {displayError && <div className="chat-command-panel-error">{displayError}</div>}
+
+      <div style={{ display: "grid", gap: 8, maxHeight: 280, overflowY: "auto" }}>
+        {!loaded && localBusy === "refresh" ? (
+          <div className="chat-command-panel-desc">
+            {t("slashCommands.panels.openCodeSessions.loading")}
+          </div>
+        ) : null}
+        {loaded && sessions.length === 0 && !browsingDisabled ? (
+          <div className="chat-command-panel-desc">
+            {t("slashCommands.panels.openCodeSessions.empty")}
+          </div>
+        ) : null}
+        {sessions.map((session) => {
+          const label = describeOpenCodeSession(session);
+          const attachBusy = localBusy === `attach:${session.engineThreadId}`;
+          return (
+            <div key={session.engineThreadId} className="chat-command-panel-list-item">
+              <div style={{ minWidth: 0 }}>
+                <div className="chat-command-panel-list-name" title={label}>
+                  {label}
+                </div>
+                <div className="chat-command-panel-list-detail" title={session.cwd}>
+                  {session.cwd}
+                </div>
+                <div className="chat-command-panel-list-detail">
+                  {t("slashCommands.panels.openCodeSessions.meta", {
+                    updatedAt: formatRemoteSessionTimestamp(session.updatedAt),
+                  })}
+                </div>
+              </div>
+              <button
+                type="button"
+                className="chat-command-panel-btn-primary"
+                onClick={() => void handleAttach(session)}
+                disabled={blocked || browsingDisabled}
+              >
+                <ArrowRightCircle size={11} />
+                {attachBusy
+                  ? t("threadPicker.working")
+                  : session.localThreadId
+                    ? t("threadPicker.openAttachedAction")
+                    : t("threadPicker.attachAction")}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="chat-command-panel-actions">
+        <button
+          type="button"
+          className="chat-command-panel-btn-secondary"
+          onClick={() => void loadSessions(true)}
+          disabled={blocked || browsingDisabled}
+        >
+          <RefreshCw size={11} />
+          {localBusy === "refresh" ? t("threadPicker.working") : t("threadPicker.refreshAction")}
+        </button>
+        <button
+          type="button"
+          className="chat-command-panel-btn-secondary"
+          onClick={() => void loadSessions(false)}
+          disabled={blocked || browsingDisabled || !nextCursor}
+        >
+          <RefreshCw size={11} />
+          {localBusy === "more" ? t("threadPicker.working") : t("threadPicker.loadMoreAction")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ── Generic confirm panel (fork / compact) ── */
+
+function ConfirmPanel({
+  icon: Icon,
+  title,
+  description,
+  confirmLabel,
+  busy,
+  error,
+  onConfirm,
+  onDismiss,
+}: {
+  icon: typeof GitBranch;
+  title: string;
+  description: string;
+  confirmLabel: string;
+  busy: boolean;
+  error: string | null;
+  onConfirm: () => void;
+  onDismiss: () => void;
+}) {
+  const { t } = useTranslation("chat");
+  return (
+    <div className="chat-command-panel">
+      <div className="chat-command-panel-header">
+        <div className="chat-command-panel-title">
+          <Icon size={12} />
+          <span>{title}</span>
+        </div>
+        <button
+          type="button"
+          className="chat-command-panel-close"
+          onClick={onDismiss}
+        >
+          <X size={12} />
+        </button>
+      </div>
+      <div className="chat-command-panel-desc">{description}</div>
+      {error && <div className="chat-command-panel-error">{error}</div>}
+      <div className="chat-command-panel-actions">
+        <button
+          type="button"
+          className="chat-command-panel-btn-secondary"
+          onClick={onDismiss}
+          disabled={busy}
+        >
+          {t("panel.approvalActions.cancel")}
+        </button>
+        <button
+          type="button"
+          className="chat-command-panel-btn-primary"
+          onClick={onConfirm}
+          disabled={busy}
+        >
+          <Icon size={11} />
+          {busy ? t("threadPicker.working") : confirmLabel}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ── Option picker panel (fast / personality / effort) ── */
+
+function OptionPickerPanel({
+  busy,
+  error,
+  icon: Icon,
+  title,
+  description,
+  options,
+  currentValue,
+  onSelect,
+  onDismiss,
+}: {
+  busy: boolean;
+  error: string | null;
+  icon: typeof Zap;
+  title: string;
+  description: string;
+  options: { value: string; label: string }[];
+  currentValue: string;
+  onSelect: (value: string) => void;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="chat-command-panel">
+      <div className="chat-command-panel-header">
+        <div className="chat-command-panel-title">
+          <Icon size={12} />
+          <span>{title}</span>
+        </div>
+        <button
+          type="button"
+          className="chat-command-panel-close"
+          onClick={onDismiss}
+          disabled={busy}
+        >
+          <X size={12} />
+        </button>
+      </div>
+      {description && (
+        <div className="chat-command-panel-desc">{description}</div>
+      )}
+      {error && <div className="chat-command-panel-error">{error}</div>}
+      <div className="chat-command-panel-toggle-group">
+        {options.map((opt) => (
+          <button
+            key={opt.value}
+            type="button"
+            className={`chat-command-panel-toggle${opt.value === currentValue ? " chat-command-panel-toggle-active" : ""}`}
+            onClick={() => onSelect(opt.value)}
+            disabled={busy}
+          >
+            {opt.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ── Rollback panel ── */
+
+function RollbackPanel({
+  busy,
+  error,
+  onConfirm,
+  onDismiss,
+  t,
+}: {
+  busy: boolean;
+  error: string | null;
+  onConfirm: (numTurns: number) => void;
+  onDismiss: () => void;
+  t: ReturnType<typeof useTranslation<"chat">>["t"];
+}) {
+  const [turnsText, setTurnsText] = useState("1");
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  function handleConfirm() {
+    const parsed = Number.parseInt(turnsText.trim(), 10);
+    if (!Number.isFinite(parsed) || parsed < 1) {
+      setLocalError(t("threadPicker.invalidTurns"));
+      return;
+    }
+    setLocalError(null);
+    onConfirm(parsed);
+  }
+
+  const displayError = error || localError;
+
+  return (
+    <div className="chat-command-panel">
+      <div className="chat-command-panel-header">
+        <div className="chat-command-panel-title">
+          <RotateCcw size={12} />
+          <span>{t("threadPicker.rollbackTitle")}</span>
+        </div>
+        <button
+          type="button"
+          className="chat-command-panel-close"
+          onClick={onDismiss}
+        >
+          <X size={12} />
+        </button>
+      </div>
+      <div className="chat-command-panel-desc">
+        {t("threadPicker.rollbackDescription")}
+      </div>
+      <div className="chat-command-panel-fields">
+        <label className="chat-command-panel-field">
+          <span className="chat-command-panel-field-label">
+            {t("threadPicker.rollbackTurns")}
+          </span>
+          <input
+            className="chat-command-panel-input"
+            type="number"
+            min={1}
+            value={turnsText}
+            onChange={(e) => setTurnsText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                handleConfirm();
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                onDismiss();
+              }
+            }}
+            disabled={busy}
+            autoFocus
+          />
+        </label>
+        <div className="chat-command-panel-warning">
+          {t("threadPicker.rollbackWarning")}
+        </div>
+      </div>
+      {displayError && (
+        <div className="chat-command-panel-error">{displayError}</div>
+      )}
+      <div className="chat-command-panel-actions">
+        <button
+          type="button"
+          className="chat-command-panel-btn-secondary"
+          onClick={onDismiss}
+          disabled={busy}
+        >
+          {t("panel.approvalActions.cancel")}
+        </button>
+        <button
+          type="button"
+          className="chat-command-panel-btn-primary"
+          onClick={handleConfirm}
+          disabled={busy}
+        >
+          <RotateCcw size={11} />
+          {busy ? t("threadPicker.working") : t("threadPicker.rollbackAction")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ── Review panel ── */
+
+function ReviewPanel({
+  busy,
+  error,
+  defaultBaseBranch,
+  onConfirm,
+  onDismiss,
+  t,
+}: {
+  busy: boolean;
+  error: string | null;
+  defaultBaseBranch: string | null;
+  onConfirm: (target: CodexReviewTarget, delivery: CodexReviewDelivery) => void;
+  onDismiss: () => void;
+  t: ReturnType<typeof useTranslation<"chat">>["t"];
+}) {
+  const [targetMode, setTargetMode] =
+    useState<ReviewTargetMode>("uncommittedChanges");
+  const [delivery, setDelivery] = useState<CodexReviewDelivery>("inline");
+  const [baseBranch, setBaseBranch] = useState(defaultBaseBranch ?? "");
+  const [commitSha, setCommitSha] = useState("");
+  const [customInstructions, setCustomInstructions] = useState("");
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setBaseBranch(defaultBaseBranch ?? "");
+  }, [defaultBaseBranch]);
+
+  function handleConfirm() {
+    let target: CodexReviewTarget;
+
+    if (targetMode === "uncommittedChanges") {
+      target = { type: "uncommittedChanges" };
+    } else if (targetMode === "baseBranch") {
+      const branch = baseBranch.trim();
+      if (!branch) {
+        setLocalError(t("reviewPicker.errors.branchRequired"));
+        return;
+      }
+      target = { type: "baseBranch", branch };
+    } else if (targetMode === "commit") {
+      const sha = commitSha.trim();
+      if (!sha) {
+        setLocalError(t("reviewPicker.errors.commitRequired"));
+        return;
+      }
+      target = { type: "commit", sha };
+    } else {
+      const instructions = customInstructions.trim();
+      if (!instructions) {
+        setLocalError(t("reviewPicker.errors.instructionsRequired"));
+        return;
+      }
+      target = { type: "custom", instructions };
+    }
+
+    setLocalError(null);
+    onConfirm(target, delivery);
+  }
+
+  const displayError = error || localError;
+
+  return (
+    <div className="chat-command-panel">
+      <div className="chat-command-panel-header">
+        <div className="chat-command-panel-title">
+          <Search size={12} />
+          <span>{t("reviewPicker.title")}</span>
+        </div>
+        <button
+          type="button"
+          className="chat-command-panel-close"
+          onClick={onDismiss}
+        >
+          <X size={12} />
+        </button>
+      </div>
+      <div className="chat-command-panel-desc">
+        {t("reviewPicker.subtitle")}
+      </div>
+
+      <div className="chat-command-panel-fields">
+        <label className="chat-command-panel-field">
+          <span className="chat-command-panel-field-label">
+            {t("reviewPicker.targetLabel")}
+          </span>
+          <div className="chat-command-panel-toggle-group">
+            {([
+              { value: "uncommittedChanges", label: t("reviewPicker.targets.uncommittedChanges") },
+              { value: "baseBranch", label: t("reviewPicker.targets.baseBranch") },
+              { value: "commit", label: t("reviewPicker.targets.commit") },
+              { value: "custom", label: t("reviewPicker.targets.custom") },
+            ] as const).map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                className={`chat-command-panel-toggle${targetMode === opt.value ? " chat-command-panel-toggle-active" : ""}`}
+                onClick={() => setTargetMode(opt.value)}
+                disabled={busy}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </label>
+
+        {targetMode === "baseBranch" && (
+          <label className="chat-command-panel-field">
+            <span className="chat-command-panel-field-label">
+              {t("reviewPicker.branchLabel")}
+            </span>
+            <input
+              className="chat-command-panel-input"
+              value={baseBranch}
+              onChange={(e) => setBaseBranch(e.target.value)}
+              placeholder={t("reviewPicker.branchPlaceholder")}
+              disabled={busy}
+              autoFocus
+            />
+          </label>
+        )}
+
+        {targetMode === "commit" && (
+          <label className="chat-command-panel-field">
+            <span className="chat-command-panel-field-label">
+              {t("reviewPicker.commitLabel")}
+            </span>
+            <input
+              className="chat-command-panel-input"
+              value={commitSha}
+              onChange={(e) => setCommitSha(e.target.value)}
+              placeholder={t("reviewPicker.commitPlaceholder")}
+              disabled={busy}
+              autoFocus
+            />
+          </label>
+        )}
+
+        {targetMode === "custom" && (
+          <label className="chat-command-panel-field">
+            <span className="chat-command-panel-field-label">
+              {t("reviewPicker.instructionsLabel")}
+            </span>
+            <textarea
+              className="chat-command-panel-input"
+              value={customInstructions}
+              onChange={(e) => setCustomInstructions(e.target.value)}
+              placeholder={t("reviewPicker.instructionsPlaceholder")}
+              rows={3}
+              disabled={busy}
+              spellCheck={false}
+              style={{ resize: "vertical" }}
+              autoFocus
+            />
+          </label>
+        )}
+
+        <label className="chat-command-panel-field">
+          <span className="chat-command-panel-field-label">
+            {t("reviewPicker.deliveryLabel")}
+          </span>
+          <div className="chat-command-panel-toggle-group">
+            <button
+              type="button"
+              className={`chat-command-panel-toggle${delivery === "inline" ? " chat-command-panel-toggle-active" : ""}`}
+              onClick={() => setDelivery("inline")}
+              disabled={busy}
+            >
+              {t("reviewPicker.delivery.inline")}
+            </button>
+            <button
+              type="button"
+              className={`chat-command-panel-toggle${delivery === "detached" ? " chat-command-panel-toggle-active" : ""}`}
+              onClick={() => setDelivery("detached")}
+              disabled={busy}
+            >
+              {t("reviewPicker.delivery.detached")}
+            </button>
+          </div>
+        </label>
+
+        <div className="chat-command-panel-hint">
+          {delivery === "detached"
+            ? t("reviewPicker.deliveryDescriptions.detached")
+            : t("reviewPicker.deliveryDescriptions.inline")}
+        </div>
+      </div>
+
+      {displayError && (
+        <div className="chat-command-panel-error">{displayError}</div>
+      )}
+      <div className="chat-command-panel-actions">
+        <button
+          type="button"
+          className="chat-command-panel-btn-secondary"
+          onClick={onDismiss}
+          disabled={busy}
+        >
+          {t("panel.approvalActions.cancel")}
+        </button>
+        <button
+          type="button"
+          className="chat-command-panel-btn-primary"
+          onClick={handleConfirm}
+          disabled={busy}
+        >
+          <Search size={11} />
+          {busy ? t("reviewPicker.working") : t("reviewPicker.startAction")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ── Info list panel (skills / mcp / experimental) ── */
+
+function InfoListPanel({
+  icon: Icon,
+  title,
+  emptyLabel,
+  items,
+  onDismiss,
+}: {
+  icon: typeof Scissors;
+  title: string;
+  emptyLabel: string;
+  items: { name: string; detail?: string; enabled?: boolean; badge?: string }[];
+  onDismiss: () => void;
+}) {
+  const { t } = useTranslation("chat");
+  return (
+    <div className="chat-command-panel">
+      <div className="chat-command-panel-header">
+        <div className="chat-command-panel-title">
+          <Icon size={12} />
+          <span>{title}</span>
+        </div>
+        <button
+          type="button"
+          className="chat-command-panel-close"
+          onClick={onDismiss}
+        >
+          <X size={12} />
+        </button>
+      </div>
+      {items.length === 0 ? (
+        <div className="chat-command-panel-desc">{emptyLabel}</div>
+      ) : (
+        <div className="chat-command-panel-info-list">
+          {items.map((item) => (
+            <div key={item.name} className="chat-command-panel-info-item">
+              <span className="chat-command-panel-info-name">
+                {item.name}
+              </span>
+              {item.detail && (
+                <span className="chat-command-panel-info-detail">
+                  {item.detail}
+                </span>
+              )}
+              {item.enabled !== undefined && (
+                <span
+                  className={`chat-command-panel-info-badge ${item.enabled ? "chat-command-panel-info-badge-on" : "chat-command-panel-info-badge-off"}`}
+                >
+                  {item.enabled ? t("slashCommands.panels.info.badgeOn") : t("slashCommands.panels.info.badgeOff")}
+                </span>
+              )}
+              {item.badge && (
+                <span className="chat-command-panel-info-badge">
+                  {item.badge}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

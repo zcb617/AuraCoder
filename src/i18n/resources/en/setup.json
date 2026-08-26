@@ -1,0 +1,104 @@
+{
+  "greeting": {
+    "title": "Welcome to AuraCoder",
+    "subtitle": "Your local cockpit for AI-assisted coding.",
+    "cta": "Get started"
+  },
+  "workflow": {
+    "title": "How do you prefer to work?",
+    "subtitle": "Pick the workflow AuraCoder should optimize first. You can reopen onboarding later and switch.",
+    "options": {
+      "cli": {
+        "title": "CLI Agents",
+        "description": "Browse the agent CLIs AuraCoder already supports, install the ones you want, and then choose the workspace where you want to start."
+      },
+      "chat": {
+        "title": "Chat with Codex / Claude / OpenCode",
+        "description": "Choose Codex, Claude, OpenCode, or any combination. AuraCoder will verify what is ready, help install what is missing, and then send you to a workspace."
+      }
+    }
+  },
+  "cliProviders": {
+    "title": "Pick your CLI agents",
+    "subtitle": "See which providers are already available on this machine and install any missing ones before opening your first workspace.",
+    "helper": "Launch is intentionally skipped here. The onboarding ends after you confirm a workspace, then AuraCoder takes you to the harness panel.",
+    "scanning": "Scanning available providers..."
+  },
+  "chatEngines": {
+    "title": "Pick your chat harnesses",
+    "subtitle": "Choose which harnesses you want ready inside AuraCoder chat.",
+    "helper": "You can select Codex, Claude, OpenCode, or any combination. The next step checks each selected runtime before you continue.",
+    "options": {
+      "codex": {
+        "description": "Chat powered by the Codex App Server. May install Node.js and the Codex CLI if they are missing."
+      },
+      "claude": {
+        "description": "Chat powered by the Claude Agent SDK. Does not require installing the Claude CLI separately."
+      },
+      "opencode": {
+        "description": "Chat powered by the OpenCode headless server. Requires the opencode CLI on PATH."
+      }
+    }
+  },
+  "chatReadiness": {
+    "title": "Verify chat readiness",
+    "subtitle": "AuraCoder is checking the selected engines, plus the dependencies they actually need for chat.",
+    "helper": "Warnings about future auth setup are informational in this version. The goal here is to get the runtime installed and a workspace selected.",
+    "loading": "Checking selected engines...",
+    "readyHint": "Everything selected for chat is ready. Continue to choose the workspace you want to use first.",
+    "authDeferred": "Codex still needs account sign-in, but that does not block onboarding in this version. Finish onboarding now and complete Codex auth afterward.",
+    "nodeInstallAvailable": "Node.js is missing. AuraCoder can install it automatically so the selected chat engines can run.",
+    "nodeInstallManual": "Node.js is missing. Install Node.js 20+ manually, then refresh the readiness check.",
+    "codexInstallAvailable": "Codex CLI is missing. AuraCoder can install it automatically for the Codex chat engine.",
+    "codexInstallManual": "Codex CLI is missing. Install it manually, then refresh the readiness check.",
+    "openCodeInstallAvailable": "OpenCode CLI is missing. AuraCoder can install it with npm for the OpenCode chat engine.",
+    "openCodeInstallManual": "OpenCode CLI is missing. Install Node.js/npm and OpenCode manually, then refresh the readiness check.",
+    "deps": {
+      "node": "Node.js"
+    },
+    "status": {
+      "ready": "Ready",
+      "attention": "Needs attention",
+      "pending": "Health data has not loaded yet."
+    },
+    "sections": {
+      "warnings": "Warnings",
+      "checks": "Checks",
+      "fixes": "Suggested next steps",
+      "showNotes": "Show warnings",
+      "hideNotes": "Hide warnings"
+    }
+  },
+  "workspace": {
+    "title": "Confirm your first workspace",
+    "subtitle": "Choose the workspace AuraCoder should open after onboarding. Even if one is already active, confirm it here explicitly.",
+    "helper": "Select an existing workspace or open a new folder. Onboarding completes only after this confirmation.",
+    "empty": "No workspaces are available yet. Open a folder to continue.",
+    "current": "Current workspace"
+  },
+  "steps": {
+    "workflow": "Workflow",
+    "cliProviders": "Providers",
+    "chatEngines": "Engines",
+    "chatReadiness": "Readiness",
+    "workspace": "Workspace"
+  },
+  "actions": {
+    "back": "Back",
+    "continue": "Continue",
+    "finish": "Finish onboarding",
+    "openFolder": "Open folder",
+    "refreshProviders": "Refresh providers",
+    "refreshStatus": "Refresh status",
+    "install": "Install",
+    "openWebsite": "Open website",
+    "copied": "Copied"
+  },
+  "install": {
+    "waiting": "Waiting...",
+    "installing": "Installing {{name}}..."
+  },
+  "footer": {
+    "stepCounter": "Step {{current}} of {{total}}"
+  }
+}

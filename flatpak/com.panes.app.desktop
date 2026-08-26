@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=AuraCoder
+Comment=Local-first cockpit for AI-assisted coding
+Exec=auracoder-wrapper %U
+Icon=com.auracoder.app
+Terminal=false
+Categories=Development;IDE;

@@ -1,0 +1,25 @@
+{
+  "app": {
+    "submenu": "AuraCoder",
+    "aboutComment": "O cockpit open-source para programação assistida por IA",
+    "websiteLabel": "GitHub"
+  },
+  "menu": {
+    "edit": "Editar",
+    "undo": "Desfazer",
+    "redo": "Refazer",
+    "cut": "Recortar",
+    "copy": "Copiar",
+    "paste": "Colar",
+    "selectAll": "Selecionar tudo",
+    "view": "Visualizar",
+    "window": "Janela",
+    "toggleSidebar": "Alternar sidebar",
+    "toggleGitPanel": "Alternar painel Git",
+    "toggleFocusMode": "Alternar modo foco",
+    "toggleFullscreen": "Alternar tela cheia",
+    "search": "Buscar",
+    "toggleTerminal": "Alternar terminal",
+    "close": "Fechar"
+  }
+}

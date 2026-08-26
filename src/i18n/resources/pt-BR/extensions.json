@@ -1,0 +1,130 @@
+{
+  "title": "Gerenciamento de extensões",
+  "subtitle": "Gerencie skills, plugins e MCP do agente atual",
+  "provider": { "label": "Agente" },
+  "workspace": {
+    "none": "Nenhum workspace",
+    "hint": "Selecione um workspace para incluir extensões do projeto. Os itens globais continuam visíveis."
+  },
+  "search": { "placeholder": "Buscar skills, plugins ou MCP..." },
+  "tabs": { "label": "Tipo de extensão", "skill": "Skills", "plugin": "Plugins", "mcp": "MCP" },
+  "filters": {
+    "all": "Tudo",
+    "installed": "Instalado / configurado",
+    "available": "Disponível",
+    "disabled": "Desativado",
+    "issues": "Problemas",
+    "allSources": "Todas as fontes",
+    "allScopes": "Todos os escopos"
+  },
+  "categories": {
+    "label": "Categorias",
+    "all": "Todas as categorias",
+    "uncategorized": "Sem categoria",
+    "mcp": { "plugin": "Fornecido por plugin", "standalone": "MCP independente" },
+    "official": {
+      "businessOperations": "Negócios e operações",
+      "communication": "Comunicação",
+      "creativity": "Criatividade",
+      "dataAnalytics": "Dados e análises",
+      "database": "Bancos de dados",
+      "deployment": "Implantação",
+      "design": "Design",
+      "development": "Desenvolvimento",
+      "developerTools": "Ferramentas de desenvolvimento",
+      "educationResearch": "Educação e pesquisa",
+      "engineering": "Engenharia",
+      "finance": "Finanças",
+      "learning": "Aprendizado",
+      "location": "Localização",
+      "math": "Matemática",
+      "monitoring": "Monitoramento",
+      "other": "Outros",
+      "productivity": "Produtividade",
+      "security": "Segurança",
+      "testing": "Testes",
+      "travel": "Viagens"
+    }
+  },
+  "sections": { "installed": "Instalado / configurado", "available": "Disponível" },
+  "loading": "Carregando extensões...",
+  "status": {
+    "available": "Disponível",
+    "installed": "Instalado",
+    "configured": "Configurado",
+    "enabled": "Ativado",
+    "disabled": "Desativado",
+    "connected": "Conectado",
+    "disconnected": "Desconectado",
+    "authRequired": "Autenticação necessária",
+    "error": "Erro"
+  },
+  "scope": {
+    "builtin": "Integrado",
+    "user": "Usuário",
+    "project": "Projeto",
+    "plugin": "Plugin",
+    "managed": "Gerenciado",
+    "local": "Local"
+  },
+  "item": { "noDescription": "Nenhuma descrição fornecida" },
+  "cache": {
+    "notFetched": "O catálogo de extensões ainda não foi obtido. O serviço em segundo plano está atualizando-o de forma assíncrona; você também pode solicitar uma atualização agora.",
+    "requestNow": "Solicitar atualização em segundo plano",
+    "refreshing": "Atualizando em segundo plano. A lista atual permanece visível até que novos dados sejam salvos.",
+    "refreshFinished": "A atualização atual em segundo plano foi concluída.",
+    "refreshedAt": "Os dados atuais foram atualizados {{age}}."
+  },
+  "refreshErrors": {
+    "refreshFailed": "A atualização do catálogo de {{kind}} falhou. Os últimos dados bem-sucedidos continuam visíveis."
+  },
+  "empty": {
+    "installed": "Nenhum item instalado ou configurado corresponde aos filtros.",
+    "available": "Nenhum item disponível corresponde aos filtros.",
+    "noOfficialCatalog": "Este agente não fornece um catálogo oficial verificável para este tipo de extensão."
+  },
+  "details": {
+    "title": "Detalhes da extensão",
+    "status": "Status",
+    "scope": "Escopo",
+    "category": "Categoria",
+    "version": "Versão",
+    "source": "Fonte",
+    "path": "Caminho",
+    "parentPlugin": "Plugin pai",
+    "included": "Extensões incluídas",
+    "newSession": "Uma nova sessão pode ser necessária para aplicar esta alteração."
+  },
+  "actions": {
+    "install": "Instalar",
+    "uninstall": "Desinstalar",
+    "enable": "Ativar",
+    "disable": "Desativar",
+    "remove": "Remover",
+    "configure": "Configurar",
+    "authenticate": "Autenticar",
+    "logout": "Sair",
+    "open_location": "Abrir local",
+    "refresh": "Atualizar",
+    "retry": "Tentar novamente",
+    "none": "Nenhuma ação de gerenciamento está disponível para este item.",
+    "completed": "Extensão atualizada.",
+    "completedNewSession": "Extensão atualizada. Inicie uma nova sessão para usar a alteração."
+  },
+  "confirm": {
+    "title": "Confirmar remoção",
+    "message": "Remover {{name}}? Suas skills ou ferramentas MCP podem deixar de estar disponíveis.",
+    "messageWithDependencies": "Remover {{name}}? Estas extensões incluídas deixarão de estar disponíveis: {{dependencies}}.",
+    "confirm": "Remover"
+  },
+  "readOnly": {
+    "codex_skill_toggle": "O Codex não fornece um comando estável e não interativo para alternar skills.",
+    "codex_remote_plugin_managed": "Este plugin remoto do Codex é gerenciado pelo app de desktop do Codex; não há uma ação de desinstalação por CLI verificada aqui.",
+    "claude_skill_toggle": "O Claude Code não fornece um comando estável e não interativo para alternar skills.",
+    "plugin_managed_mcp": "Este servidor MCP é gerenciado pelo plugin pai.",
+    "mcp_details_unavailable": "Os detalhes de configuração do MCP não estão disponíveis no runtime atual.",
+    "managed_policy": "Este item é controlado por uma política gerenciada e é somente leitura aqui.",
+    "opencode_skill": "As skills do OpenCode são somente leitura nesta versão.",
+    "opencode_plugin_jsonc": "As alterações de plugins do OpenCode são somente leitura para preservar comentários e campos desconhecidos da configuração."
+  }
+}

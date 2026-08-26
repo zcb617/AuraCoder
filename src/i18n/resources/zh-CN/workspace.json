@@ -1,0 +1,234 @@
+{
+  "errors": {
+    "notFound": "找不到工作区。"
+  },
+  "actions": {
+    "back": "返回",
+    "reveal": "在文件管理器中显示",
+    "rescan": "重新扫描"
+  },
+  "nav": {
+    "general": "常规",
+    "repositories": "仓库",
+    "startup": "启动"
+  },
+  "sections": {
+    "workspace": "工作区",
+    "scanning": "扫描",
+    "info": "信息"
+  },
+  "general": {
+    "workspaceFallback": "工作区",
+    "name": "名称",
+    "path": "路径"
+  },
+  "scanning": {
+    "depth": "深度",
+    "scanning": "正在扫描…"
+  },
+  "info": {
+    "opened": "打开时间",
+    "created": "创建时间"
+  },
+  "trust": {
+    "trusted": "可信",
+    "standard": "标准",
+    "restricted": "受限"
+  },
+  "repos": {
+    "count_one": "{{count}} 个仓库",
+    "count_other": "{{count}} 个仓库",
+    "allTrusted": "全部可信",
+    "allStandard": "全部标准",
+    "loading": "正在加载…",
+    "emptyTitle": "未找到仓库。",
+    "emptyHint": "请尝试在“常规”中增大扫描深度。",
+    "manageRemotes": "管理远程仓库",
+    "visible": "在 Git 面板中显示",
+    "hidden": "在 Git 面板中隐藏",
+    "remotes": "远程仓库"
+  },
+  "startup": {
+    "loading": "正在加载启动预设…",
+    "fallbackTerminal": "终端 {{index}}",
+    "whenOpening": "打开时",
+    "startIn": "启动位置",
+    "splitPanelSize": "拆分面板大小",
+    "terminalTabs": "终端标签页",
+    "terminalTabsHint": "当没有终端在运行时会自动创建。",
+    "addTab": "添加标签页",
+    "noTerminalTabs": "尚未配置终端标签页。",
+    "addFirstTab": "添加第一个标签页",
+    "tabSettings": "标签页设置",
+    "removeTab": "移除标签页",
+    "broadcastInput": "向所有窗格广播输入",
+    "createWorktreePerPane": "为每个窗格创建 Git 工作树",
+    "in": "位于",
+    "moreOptions": "更多选项",
+    "removePane": "移除窗格",
+    "addPane": "添加窗格",
+    "editAs": "以 {{format}} 编辑",
+    "import": "导入",
+    "export": "导出",
+    "reset": "重置",
+    "applyNow": "立即应用",
+    "save": "保存",
+    "snapshot": {
+      "title": "快速设置",
+      "description": "将当前终端布局保存为此工作区的默认布局。",
+      "action": "保存布局快照"
+    },
+    "views": {
+      "chat": "对话",
+      "split": "拆分",
+      "terminal": "终端",
+      "editor": "编辑器"
+    },
+    "pathBase": {
+      "workspace": "工作区",
+      "worktree": "工作树",
+      "absolute": "绝对路径"
+    },
+    "harness": {
+      "none": "无智能体"
+    },
+    "pane": {
+      "fallbackShell": "Shell {{index}}",
+      "title": "标题",
+      "pathRelativeTo": "路径相对于"
+    },
+    "worktree": {
+      "repo": "仓库",
+      "activeRepo": "活动仓库",
+      "fixedRepo": "固定仓库",
+      "path": "路径",
+      "branch": "分支",
+      "directory": "目录",
+      "prefix": "前缀"
+    },
+    "autoLaunchAgent": "启动时自动启动智能体",
+    "dialog": {
+      "importTitle": "导入启动预设",
+      "exportTitle": "导出启动预设",
+      "presetFiles": "预设文件"
+    },
+    "modal": {
+      "title": "工作区启动预设",
+      "builder": "构建器",
+      "advanced": "高级",
+      "validate": "验证",
+      "general": "常规",
+      "defaultView": "默认视图",
+      "startupLayout": "启动布局",
+      "appliedOnlyWhen": "仅在工作区没有活动终端会话时应用。",
+      "createStartupLayout": "创建启动布局",
+      "activeTabOnStart": "启动时的活动标签页",
+      "focusedPaneOnStart": "启动时聚焦的窗格",
+      "tabName": "标签页名称",
+      "groupId": "组 ID",
+      "panePlaceholder": "窗格 {{index}}",
+      "broadcastOnStart": "启动时广播",
+      "worktree": "工作树",
+      "enablePerPaneWorktrees": "启用每窗格工作树",
+      "auracoder": "窗格",
+      "paneId": "窗格 ID",
+      "cwd": "工作目录",
+      "pathBase": "路径基准",
+      "harness": "运行工具",
+      "plainTerminal": "普通终端",
+      "launchHarnessOnCreate": "创建时启动运行工具",
+      "splitTree": "拆分树",
+      "usePaneIdsFromTab": "使用此标签页中的窗格 ID",
+      "root": "根节点",
+      "leaf": "叶节点",
+      "split": "拆分",
+      "verticalSplit": "垂直拆分",
+      "horizontalSplit": "水平拆分",
+      "addAnotherPaneBeforeSplit": "请先添加另一个窗格，再将此节点转换为拆分。",
+      "noStartupTabsConfigured": "尚未配置启动标签页。",
+      "childLabel": "{{label}} {{suffix}}",
+      "footer": {
+        "presetSavedInDb": "预设已保存到工作区数据库",
+        "defaultBehavior": "工作区正在使用默认启动行为",
+        "liveSessions_one": "当前有 {{count}} 个活动终端会话",
+        "liveSessions_other": "当前有 {{count}} 个活动终端会话",
+        "switchWorkspaceToSaveLayout": "切换到此工作区以保存其当前布局。",
+        "saveCurrentLayout": "保存当前布局",
+        "resetBehavior": "重置行为",
+        "savePreset": "保存预设",
+        "saveCurrentLayoutTitleActive": "保存当前终端布局",
+        "saveCurrentLayoutTitleInactive": "切换到此工作区以保存其当前布局",
+        "applyNowTitleActive": "立即将预设应用到此工作区",
+        "applyNowTitleInactive": "切换到此工作区以应用其预设"
+      },
+      "confirm": {
+        "applyingPresetWillClose": "应用预设将关闭当前终端会话。"
+      },
+      "applyPreset": "应用预设"
+    },
+    "preview": {
+      "stagedHint_one": "（已暂存 {{count}} 项）",
+      "stagedHint_other": "（已暂存 {{count}} 项）"
+    },
+    "confirm": {
+      "replaceCurrentSessions": "替换当前终端会话？",
+      "runningTerminalsClosed": "所有正在运行的终端都将关闭。",
+      "keepOrRemoveWorktrees": "你可以选择保留或移除现有工作树。",
+      "cancel": "取消",
+      "keepWorktrees": "保留工作树",
+      "removeWorktrees": "移除工作树",
+      "replace": "替换"
+    },
+    "footer": {
+      "presetSaved": "预设已保存",
+      "usingDefaults": "正在使用默认值",
+      "running_one": "正在运行 {{count}} 项",
+      "running_other": "正在运行 {{count}} 项"
+    },
+    "titles": {
+      "switchWorkspaceFirst": "请先切换到此工作区",
+      "workingDirectoryFor": "{{name}} 的工作目录",
+      "applyPreset": "将预设应用到正在运行的工作区"
+    },
+    "errors": {
+      "switchWorkspaceFirst": "请先切换到此工作区",
+      "runtimeLayoutUnavailable": "运行时布局不可用",
+      "presetCouldNotBeApplied": "无法应用预设"
+    },
+    "toasts": {
+      "loadFailed": "加载预设失败：{{error}}",
+      "fixBeforeClosing": "请在关闭前修复预设：{{error}}",
+      "switchFormatFailed": "切换格式失败：{{error}}",
+      "validationPassed": "启动预设有效。",
+      "validationFailed": "预设验证失败：{{error}}",
+      "saved": "启动预设已保存。",
+      "saveFailed": "保存失败：{{error}}",
+      "cleared": "启动预设已清除。",
+      "clearFailed": "清除失败：{{error}}",
+      "currentLayoutSaved": "当前布局已保存为启动预设。",
+      "saveLayoutFailed": "保存布局失败：{{error}}",
+      "applied": "启动预设已应用。",
+      "applyFailed": "应用失败：{{error}}",
+      "imported": "预设已导入。",
+      "importFailed": "导入失败：{{error}}",
+      "exported": "预设已导出。",
+      "exportFailed": "导出失败：{{error}}"
+    }
+  },
+  "toasts": {
+    "rescanned": "已重新扫描。",
+    "updateScanDepthFailed": "更新扫描深度失败。",
+    "reposRescanned": "仓库已重新扫描。",
+    "rescanFailed": "重新扫描失败。",
+    "updateTrustFailed": "更新信任级别失败。",
+    "toggleVisibilityFailed": "切换可见性失败。",
+    "updateTrustLevelsFailed": "更新信任级别失败。",
+    "revealFailed": "无法在文件管理器中显示工作区。"
+  },
+  "more": {
+    "options": "工作区选项",
+    "settings": "工作区设置",
+    "archive": "归档工作区",
+    "removeProject": "移除本项目"
+  }
+}

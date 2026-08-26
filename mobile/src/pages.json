@@ -1,0 +1,89 @@
+{
+  "pages": [
+    {
+      "path": "pages/index/index",
+      "style": {
+        "navigationStyle": "custom",
+        "backgroundColor": "#0d1016",
+        "backgroundTextStyle": "light",
+        "app-plus": {
+          "bounce": "none"
+        }
+      }
+    },
+    {
+      "path": "pages/project/index",
+      "style": {
+        "navigationStyle": "default",
+        "navigationBarTitleText": "项目会话",
+        "navigationBarTextStyle": "white",
+        "navigationBarBackgroundColor": "#0d1016",
+        "backgroundColor": "#0d1016",
+        "backgroundTextStyle": "light"
+      }
+    },
+    {
+      "path": "pages/conversation/index",
+      "style": {
+        "navigationStyle": "default",
+        "navigationBarTitleText": "会话",
+        "navigationBarTextStyle": "white",
+        "navigationBarBackgroundColor": "#0d1016",
+        "backgroundColor": "#0d1016",
+        "backgroundTextStyle": "light"
+      }
+    },
+    {
+      "path": "pages/settings/index",
+      "style": {
+        "navigationStyle": "default",
+        "navigationBarTitleText": "设置",
+        "navigationBarTextStyle": "white",
+        "navigationBarBackgroundColor": "#0d1016",
+        "backgroundColor": "#0d1016",
+        "backgroundTextStyle": "light"
+      }
+    },
+    {
+      "path": "pages/settings/auracoder/index",
+      "style": {
+        "navigationStyle": "default",
+        "navigationBarTitleText": "我的 AuraCoder",
+        "navigationBarTextStyle": "white",
+        "navigationBarBackgroundColor": "#0d1016",
+        "backgroundColor": "#0d1016",
+        "backgroundTextStyle": "light"
+      }
+    },
+    {
+      "path": "pages/settings/auracoder/add",
+      "style": {
+        "navigationStyle": "default",
+        "navigationBarTitleText": "添加 AuraCoder",
+        "navigationBarTextStyle": "white",
+        "navigationBarBackgroundColor": "#0d1016",
+        "backgroundColor": "#0d1016",
+        "backgroundTextStyle": "light"
+      }
+    },
+    {
+      "path": "pages/settings/auracoder/detail",
+      "style": {
+        "navigationStyle": "default",
+        "navigationBarTitleText": "AuraCoder 设备",
+        "navigationBarTextStyle": "white",
+        "navigationBarBackgroundColor": "#0d1016",
+        "backgroundColor": "#0d1016",
+        "backgroundTextStyle": "light"
+      }
+    }
+  ],
+  "globalStyle": {
+    "navigationStyle": "custom",
+    "backgroundColor": "#0d1016",
+    "backgroundTextStyle": "light",
+    "app-plus": {
+      "background": "#0d1016"
+    }
+  }
+}

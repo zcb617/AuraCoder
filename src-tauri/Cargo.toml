@@ -1,0 +1,79 @@
+[package]
+name = "AuraCoder"
+version = "1.0.0"
+edition = "2021"
+authors = ["AuraCoder contributors"]
+license = "MIT"
+
+[lib]
+name = "agent_workspace_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "unstable"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+base64 = "0.22"
+toml = "0.8"
+libc = "0.2"
+
+rusqlite = { version = "0.31", features = ["bundled"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+anyhow = "1"
+thiserror = "1"
+log = "0.4"
+env_logger = "0.11"
+which = "6"
+flate2 = "1"
+tar = "0.4"
+
+git2 = { version = "0.19", features = ["vendored-openssl"] }
+notify = "6"
+portable-pty = "0.8"
+sys-locale = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+plist = "1.8"
+tempfile = "3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+webview2-com = "0.38"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Threading"] }
+winreg = "0.55"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5.13.2"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.dev]
+# Keep local debug builds inspectable without letting `target/` explode as quickly.
+debug = 1
+
+[profile.release]
+# Reuse compiler state across repeated local release acceptance builds.
+incremental = true

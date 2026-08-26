@@ -1,0 +1,9 @@
+{
+  "productName": "AuraCoderDev",
+  "identifier": "com.0573zzz.auracoder.dev",
+  "bundle": {
+    "macOS": {
+      "signingIdentity": "Yunxiang AuraCoder Signing"
+    }
+  }
+}

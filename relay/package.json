@@ -1,0 +1,17 @@
+{
+  "name": "auracoder-tunnel-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AuraCoder mobile WSS tunnel relay",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/relay.test.js"
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "app": {
+    "submenu": "AuraCoder",
+    "aboutComment": "面向 AI 辅助编程的开源工作台",
+    "websiteLabel": "GitHub"
+  },
+  "menu": {
+    "edit": "编辑",
+    "undo": "撤销",
+    "redo": "重做",
+    "cut": "剪切",
+    "copy": "复制",
+    "paste": "粘贴",
+    "selectAll": "全选",
+    "view": "视图",
+    "window": "窗口",
+    "toggleSidebar": "切换侧边栏",
+    "toggleGitPanel": "切换 Git 面板",
+    "toggleFocusMode": "切换专注模式",
+    "toggleFullscreen": "切换全屏",
+    "search": "搜索",
+    "toggleTerminal": "切换终端",
+    "close": "关闭"
+  }
+}

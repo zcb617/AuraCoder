@@ -1,0 +1,4473 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ClipboardCopy, ClipboardPaste, Columns2, Copy, Folder, GitBranch as GitBranchIcon, Minus, Pencil, Plus, Radio, Rows2, SquareTerminal, Trash2, X } from "lucide-react";
+import { createPortal } from "react-dom";
+import { useTranslation } from "react-i18next";
+import { useHarnessStore } from "../../stores/harnessStore";
+import { useWorkspaceStore } from "../../stores/workspaceStore";
+import { toast } from "../../stores/toastStore";
+import { handleDragDoubleClick, handleDragMouseDown } from "../../lib/windowDrag";
+import { isLinuxDesktop, isMacDesktop } from "../../lib/windowActions";
+import { ConfirmDialog } from "../shared/ConfirmDialog";
+import { getHarnessIcon } from "../shared/HarnessLogos";
+import { copyTextToClipboard, readTextFromClipboard } from "../../lib/clipboard";
+import {
+  isTerminalCopyShortcut,
+  isTerminalPasteShortcut,
+} from "../../lib/terminalClipboard";
+import { resolveTerminalBootstrapAction } from "../../lib/terminalBootstrap";
+import {
+  getTerminalAcceleratedRenderingPreferenceVersion,
+  listenTerminalAcceleratedRenderingChanged,
+} from "../../lib/terminalRenderingSettings";
+import { getCurrentThemeMode, getXtermThemeColors, listenThemeChanged } from "../../lib/theme";
+import {
+  DEFAULT_TERMINAL_FONT_SIZE,
+  getTerminalFontSizePreferenceVersion,
+  listenTerminalFontSizeChanged,
+} from "../../lib/terminalFontSizeSettings";
+import {
+  extractTextLinkMatches,
+  getWorkspacePaneLeafIdFromEventTarget,
+  navigateLinkTarget,
+} from "../../lib/fileLinkNavigation";
+import {
+  collectDetachedTerminalEvictionKeys,
+  markPaneTerminalDetached,
+  markWorkspaceTerminalDetached,
+} from "./terminalCacheLifecycle";
+import { Terminal, type ILink, type ILinkProvider } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebglAddon } from "@xterm/addon-webgl";
+import { ImageAddon } from "@xterm/addon-image";
+import {
+  ipc,
+  listenTerminalExit,
+  listenTerminalForegroundChanged,
+  listenTerminalNotification,
+  listenTerminalNotificationCleared,
+  listenTerminalOutput,
+  writeCommandToNewSession,
+} from "../../lib/ipc";
+import {
+  useTerminalStore,
+  collectSessionIds,
+  getGroupDisplayHarness,
+} from "../../stores/terminalStore";
+import { useUiStore } from "../../stores/uiStore";
+import type {
+  SplitNode,
+  SplitContainer as SplitContainerType,
+  TerminalNotification,
+  TerminalRendererDiagnostics,
+  WorkspaceStartupWorktreeConfig,
+} from "../../types";
+
+interface TerminalPanelProps {
+  workspaceId: string;
+  embedded?: boolean;
+}
+
+interface TerminalSize {
+  cols: number;
+  rows: number;
+}
+
+interface ImageAddonCapabilities {
+  enableSizeReports: boolean;
+  sixelSupport: boolean;
+  iipSupport: boolean;
+  storageLimit: number;
+}
+
+interface FrontendResizeSnapshot {
+  cols: number;
+  rows: number;
+  pixelWidth: number;
+  pixelHeight: number;
+  recordedAt: string;
+}
+
+interface FrontendRendererDiagnostics {
+  acceleratedRenderingEnabled: boolean;
+  stdinBatchingEnabled: boolean;
+  imageAddonInitAttempted: boolean;
+  imageAddonInitOk: boolean;
+  imageAddonInitError?: string;
+  imageAddonRuntimeErrorCount: number;
+  imageAddonRuntimeLastError?: string;
+  imageAddonCapabilities: ImageAddonCapabilities;
+  webglRequested: boolean;
+  webglActive: boolean;
+  webglUnsupported: boolean;
+  webglInitError?: string;
+  webglContextLossCount: number;
+  outputChunkCount: number;
+  outputCharCount: number;
+  outputDroppedChunkCount: number;
+  outputDroppedCharCount: number;
+  pendingOutputDroppedChunkCount: number;
+  pendingOutputDroppedCharCount: number;
+  lastOutputDropAt?: string;
+  lastResize: FrontendResizeSnapshot | null;
+}
+
+interface FrontendTerminalRuntimeSnapshot {
+  cols: number;
+  rows: number;
+  isAttached: boolean;
+  lastAppliedSeq: number;
+  resumeInFlight: boolean;
+  rendererMode: "webgl" | "canvas";
+  rendererDegradedReason: string | null;
+  flushInProgress: boolean;
+  flushWatchdogActive: boolean;
+  flushStallCount: number;
+  flushInFlightMs: number | null;
+  outputQueueChunks: number;
+  outputQueueChars: number;
+  outputDrainInFlight: boolean;
+  outputDrainTimerActive: boolean;
+  outputDrainRequestedSeq: number;
+  outputDrainRetryAttempts: number;
+  flushTimerActive: boolean;
+  fitTimerActive: boolean;
+  lastResizeSent: TerminalSize | null;
+  pendingOutput: {
+    chunks: number;
+    chars: number;
+    droppedChars: number;
+    droppedChunks: number;
+    lastDropWarnAt: string | null;
+  } | null;
+  stdinQueueChunks: number;
+  stdinQueueChars: number;
+  stdinFlushTimerActive: boolean;
+  stdinFlushInFlight: boolean;
+  lastInputSentAt: string | null;
+}
+
+interface RendererDiagnosticsExport {
+  capturedAt: string;
+  workspaceId: string;
+  sessionId: string;
+  backend: TerminalRendererDiagnostics | null;
+  backendFetchedAt: string | null;
+  frontend: FrontendRendererDiagnostics | null;
+  frontendRuntime: FrontendTerminalRuntimeSnapshot | null;
+  userAgent: string;
+}
+
+interface BackendRendererDiagnosticsEntry {
+  diagnostics: TerminalRendererDiagnostics;
+  fetchedAt: string;
+}
+
+interface SequencedOutputChunk {
+  seq: number;
+  ts: string;
+  data: string;
+}
+
+type TerminalInputChunk =
+  | { kind: "text"; data: string }
+  | { kind: "protocol"; data: string }
+  | { kind: "bytes"; data: number[] };
+
+interface SessionTerminal {
+  terminal: Terminal;
+  fitAddon: FitAddon;
+  stdinQueue: TerminalInputChunk[];
+  stdinQueueChars: number;
+  stdinFlushInFlight: boolean;
+  stdinFlushTimer?: number;
+  lastInputSentAt?: number;
+  lastInputDropWarnAt?: number;
+  outputQueue: string[];
+  outputQueueChars: number;
+  lastAppliedSeq: number;
+  outputDrainInFlight: boolean;
+  outputDrainTimer?: number;
+  outputDrainRequestedSeq: number;
+  outputDrainRetryAttempts: number;
+  resumeInFlight: boolean;
+  resumeRetryAttempts: number;
+  resumeRetryTimer?: number;
+  rendererMode: "webgl" | "canvas";
+  rendererDegradedReason?: string;
+  flushTimeoutWindowStartedAt?: number;
+  flushTimeoutWindowCount: number;
+  flushInProgress: boolean;
+  flushNonce: number;
+  flushStartedAt?: number;
+  flushWatchdogTimer?: number;
+  flushStallCount: number;
+  flushTimer?: number;
+  fitTimer?: number;
+  evictionTimer?: number;
+  isAttached: boolean;
+  lastAccessedAt: number;
+  detachedAt?: number;
+  lastOutputDropWarnAt?: number;
+  lastResizeSent?: TerminalSize;
+  needsResumeOnAttach: boolean;
+  requiresColdReattach: boolean;
+  debugSample: {
+    chunks: number;
+    chars: number;
+    lastLogAt: number;
+  };
+  rendererDiagnostics: FrontendRendererDiagnostics;
+  imageAddonCleanup?: () => void;
+  webglCleanup?: () => void;
+  dispose: () => void;
+}
+
+interface InternalCoreBrowserService {
+  _isFocused?: boolean;
+  _cachedIsFocused?: boolean;
+}
+
+interface InternalRenderService {
+  handleFocus(): void;
+  handleBlur(): void;
+}
+
+interface InternalTerminalCore {
+  _coreBrowserService?: InternalCoreBrowserService;
+  _renderService?: InternalRenderService;
+}
+
+interface InternalTerminal {
+  _core?: InternalTerminalCore;
+}
+
+const DEFAULT_COLS = 120;
+const DEFAULT_ROWS = 36;
+const FIT_DEBOUNCE_MS = 80;
+const INPUT_FLUSH_DELAY_MS = 4;
+const INPUT_BATCH_CHAR_LIMIT = 4096;
+const INPUT_QUEUE_MAX_CHARS = 256 * 1024;
+const INPUT_DROP_WARN_COOLDOWN_MS = 5000;
+const OUTPUT_FLUSH_DELAY_MS = 4;
+const OUTPUT_FLUSH_STALL_TIMEOUT_MS = 2500;
+const OUTPUT_BATCH_CHAR_LIMIT = 65536;
+const OUTPUT_PULL_MAX_BYTES = 256 * 1024;
+const OUTPUT_DRAIN_RETRY_BASE_MS = 250;
+const OUTPUT_DRAIN_RETRY_MAX_MS = 2000;
+const OUTPUT_DRAIN_RETRY_MAX_ATTEMPTS = 5;
+const OUTPUT_QUEUE_MAX_CHARS_ATTACHED = 4 * 1024 * 1024;
+const OUTPUT_QUEUE_MAX_CHARS_DETACHED = 256 * 1024;
+const PENDING_OUTPUT_MAX_CHARS = 256 * 1024;
+const OUTPUT_DROP_WARN_COOLDOWN_MS = 5000;
+const TERMINAL_SCROLLBACK_LINES = 2000;
+const DETACHED_TERMINAL_IDLE_EVICTION_MS = 2 * 60 * 1000;
+const TERMINAL_EDIT_EVENT = "auracoder:terminal-edit-action";
+const OUTPUT_FLUSH_STALL_FALLBACK_WINDOW_MS = 30000;
+const OUTPUT_FLUSH_STALL_FALLBACK_THRESHOLD = 3;
+const OUTPUT_RESUME_RETRY_BASE_MS = 125;
+const OUTPUT_RESUME_RETRY_MAX_MS = 2000;
+const TERMINAL_DEBUG =
+  import.meta.env.DEV && import.meta.env.VITE_TERMINAL_DEBUG === "1";
+const SHOW_TERMINAL_DIAGNOSTICS_UI = import.meta.env.DEV;
+const IMAGE_ADDON_OPTIONS: ImageAddonCapabilities = {
+  enableSizeReports: true,
+  sixelSupport: true,
+  iipSupport: true,
+  storageLimit: 64,
+};
+const IMAGE_ADDON_ERROR_PATTERNS = [
+  "imageaddon",
+  "sixel",
+  "iip",
+  "image storage",
+  "canvas",
+];
+
+let acceleratedTerminalRenderingEnabled = true;
+let acceleratedTerminalRenderingPreferenceLoaded = false;
+let terminalFontSizePreference = DEFAULT_TERMINAL_FONT_SIZE;
+let terminalFontSizePreferenceLoaded = false;
+
+// Module-level cache — xterm instances survive component mount/unmount cycles.
+// This is what preserves terminal scrollback when switching workspaces.
+const cachedTerminals = new Map<string, SessionTerminal>();
+const pendingOutput = new Map<
+  string,
+  {
+    chunks: SequencedOutputChunk[];
+    chars: number;
+    lastDropWarnAt?: number;
+    droppedChars: number;
+    droppedChunks: number;
+  }
+>();
+const cachedBackendRendererDiagnostics = new Map<string, BackendRendererDiagnosticsEntry>();
+const backendDiagnosticsRefreshTimers = new Map<string, number>();
+
+function terminalCacheKey(workspaceId: string, sessionId: string): string {
+  return `${workspaceId}::${sessionId}`;
+}
+
+function terminalWorkspacePrefix(workspaceId: string): string {
+  return `${workspaceId}::`;
+}
+
+function forEachWorkspaceCachedTerminal(
+  workspaceId: string,
+  callback: (sessionId: string, session: SessionTerminal) => void,
+) {
+  const workspacePrefix = terminalWorkspacePrefix(workspaceId);
+  for (const [cacheKey, session] of cachedTerminals.entries()) {
+    if (!cacheKey.startsWith(workspacePrefix)) {
+      continue;
+    }
+    const sessionId = cacheKey.slice(workspacePrefix.length);
+    callback(sessionId, session);
+  }
+}
+
+/** Theme is app-global (not workspace-scoped), so this updates every cached
+ * terminal across every workspace, including ones detached in the background. */
+function applyThemeToAllCachedTerminals(mode: ReturnType<typeof getCurrentThemeMode>) {
+  const theme = getXtermThemeColors(mode);
+  for (const session of cachedTerminals.values()) {
+    session.terminal.options.theme = theme;
+  }
+}
+
+function parseTerminalCacheKey(
+  cacheKey: string,
+): { workspaceId: string; sessionId: string } | null {
+  const delimiter = cacheKey.indexOf("::");
+  if (delimiter <= 0 || delimiter === cacheKey.length - 2) {
+    return null;
+  }
+  return {
+    workspaceId: cacheKey.slice(0, delimiter),
+    sessionId: cacheKey.slice(delimiter + 2),
+  };
+}
+
+function touchCachedTerminal(session: SessionTerminal) {
+  session.lastAccessedAt = Date.now();
+}
+
+function refreshTerminalCursor(session: SessionTerminal) {
+  if (!session.isAttached) {
+    return;
+  }
+  const lastRow = session.terminal.rows - 1;
+  if (lastRow < 0) {
+    return;
+  }
+  session.terminal.refresh(0, lastRow);
+}
+
+function setTerminalFocusState(session: SessionTerminal, focused: boolean) {
+  session.terminal.element?.classList.toggle("focus", focused);
+  if (focused) {
+    touchCachedTerminal(session);
+  }
+
+  const internal = session.terminal as unknown as InternalTerminal;
+  const coreBrowserService = internal._core?._coreBrowserService;
+  if (coreBrowserService) {
+    coreBrowserService._isFocused = focused;
+    coreBrowserService._cachedIsFocused = undefined;
+  }
+}
+
+// Lock/unlock a terminal so xterm.js renders an active blinking cursor
+// regardless of real DOM focus.  Two things fight us:
+//
+// 1. CoreBrowserService.isFocused — a getter that checks the DOM every frame.
+//    Fix: override the getter via Object.defineProperty to always return true.
+//
+// 2. RenderService.handleBlur() — called from the terminal's onBlur event,
+//    pauses the cursor blink timer.  Fix: replace handleBlur with a no-op and
+//    force handleFocus to keep the blink timer running.
+const broadcastFocusLocked = new WeakSet<object>();
+const savedHandleBlur = new WeakMap<object, () => void>();
+
+function lockTerminalFocus(session: SessionTerminal) {
+  const core = (session.terminal as unknown as InternalTerminal)._core;
+  const svc = core?._coreBrowserService;
+  const rs = core?._renderService;
+  if (!svc || broadcastFocusLocked.has(svc)) return;
+  broadcastFocusLocked.add(svc);
+
+  // 1. Override isFocused getter → always true
+  Object.defineProperty(svc, "isFocused", {
+    get: () => true,
+    configurable: true,
+  });
+
+  // 2. Neuter handleBlur on the render service so the blink timer never pauses
+  if (rs) {
+    savedHandleBlur.set(rs, rs.handleBlur.bind(rs));
+    rs.handleBlur = () => {};
+    // Force the blink timer to start/resume now
+    rs.handleFocus();
+  }
+
+  session.terminal.element?.classList.add("focus");
+  refreshTerminalCursor(session);
+}
+
+function unlockTerminalFocus(session: SessionTerminal) {
+  const core = (session.terminal as unknown as InternalTerminal)._core;
+  const svc = core?._coreBrowserService;
+  const rs = core?._renderService;
+  if (!svc || !broadcastFocusLocked.has(svc)) return;
+  broadcastFocusLocked.delete(svc);
+
+  // Restore the original isFocused getter from the prototype
+  delete (svc as Record<string, unknown>).isFocused;
+
+  // Restore handleBlur
+  if (rs) {
+    const original = savedHandleBlur.get(rs);
+    if (original) {
+      rs.handleBlur = original;
+      savedHandleBlur.delete(rs);
+    }
+    // Trigger a blur so the cursor stops blinking on this unfocused terminal
+    rs.handleBlur();
+  }
+
+  session.terminal.element?.classList.remove("focus");
+  refreshTerminalCursor(session);
+}
+
+function logTerminalDebug(
+  message: string,
+  details?: Record<string, string | number | boolean | undefined>
+) {
+  if (!TERMINAL_DEBUG) {
+    return;
+  }
+  if (details) {
+    console.debug(`[terminal] ${message}`, details);
+    return;
+  }
+  console.debug(`[terminal] ${message}`);
+}
+
+function logTerminalWarning(
+  message: string,
+  details?: Record<string, string | number | boolean | undefined>,
+) {
+  if (details) {
+    console.warn(`[terminal] ${message}`, details);
+    return;
+  }
+  console.warn(`[terminal] ${message}`);
+}
+
+function errorToMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.stack ? `${error.message}\n${error.stack}` : error.message;
+  }
+  return String(error);
+}
+
+function isLikelyImageAddonError(error: unknown): boolean {
+  const message = errorToMessage(error).toLowerCase();
+  return IMAGE_ADDON_ERROR_PATTERNS.some((pattern) => message.includes(pattern));
+}
+
+function createRendererDiagnostics(): FrontendRendererDiagnostics {
+  return {
+    acceleratedRenderingEnabled:
+      acceleratedTerminalRenderingPreferenceLoaded &&
+      acceleratedTerminalRenderingEnabled,
+    stdinBatchingEnabled: true,
+    imageAddonInitAttempted: false,
+    imageAddonInitOk: false,
+    imageAddonRuntimeErrorCount: 0,
+    imageAddonCapabilities: { ...IMAGE_ADDON_OPTIONS },
+    webglRequested: false,
+    webglActive: false,
+    webglUnsupported: false,
+    webglContextLossCount: 0,
+    outputChunkCount: 0,
+    outputCharCount: 0,
+    outputDroppedChunkCount: 0,
+    outputDroppedCharCount: 0,
+    pendingOutputDroppedChunkCount: 0,
+    pendingOutputDroppedCharCount: 0,
+    lastResize: null,
+  };
+}
+
+function cloneFrontendDiagnostics(
+  diagnostics: FrontendRendererDiagnostics | undefined,
+): FrontendRendererDiagnostics | null {
+  if (!diagnostics) {
+    return null;
+  }
+  return {
+    ...diagnostics,
+    imageAddonCapabilities: { ...diagnostics.imageAddonCapabilities },
+    lastResize: diagnostics.lastResize ? { ...diagnostics.lastResize } : null,
+  };
+}
+
+function snapshotFrontendRuntime(
+  cacheKey: string,
+  session: SessionTerminal | undefined,
+): FrontendTerminalRuntimeSnapshot | null {
+  if (!session) {
+    return null;
+  }
+  const pending = pendingOutput.get(cacheKey);
+  return {
+    cols: session.terminal.cols,
+    rows: session.terminal.rows,
+    isAttached: session.isAttached,
+    lastAppliedSeq: session.lastAppliedSeq,
+    resumeInFlight: session.resumeInFlight,
+    rendererMode: session.rendererMode,
+    rendererDegradedReason: session.rendererDegradedReason ?? null,
+    flushInProgress: session.flushInProgress,
+    flushWatchdogActive: session.flushWatchdogTimer !== undefined,
+    flushStallCount: session.flushStallCount,
+    flushInFlightMs: session.flushStartedAt
+      ? Math.max(0, Date.now() - session.flushStartedAt)
+      : null,
+    outputQueueChunks: session.outputQueue.length,
+    outputQueueChars: session.outputQueueChars,
+    outputDrainInFlight: session.outputDrainInFlight,
+    outputDrainTimerActive: session.outputDrainTimer !== undefined,
+    outputDrainRequestedSeq: session.outputDrainRequestedSeq,
+    outputDrainRetryAttempts: session.outputDrainRetryAttempts,
+    flushTimerActive: session.flushTimer !== undefined,
+    fitTimerActive: session.fitTimer !== undefined,
+    lastResizeSent: session.lastResizeSent ? { ...session.lastResizeSent } : null,
+    pendingOutput: pending
+      ? {
+          chunks: pending.chunks.length,
+          chars: pending.chars,
+          droppedChars: pending.droppedChars,
+          droppedChunks: pending.droppedChunks,
+          lastDropWarnAt: pending.lastDropWarnAt
+            ? new Date(pending.lastDropWarnAt).toISOString()
+            : null,
+        }
+      : null,
+    stdinQueueChunks: session.stdinQueue.length,
+    stdinQueueChars: session.stdinQueueChars,
+    stdinFlushTimerActive: session.stdinFlushTimer !== undefined,
+    stdinFlushInFlight: session.stdinFlushInFlight,
+    lastInputSentAt: session.lastInputSentAt
+      ? new Date(session.lastInputSentAt).toISOString()
+      : null,
+  };
+}
+
+function terminalInputChunkLength(chunk: TerminalInputChunk): number {
+  return chunk.data.length;
+}
+
+function isUtf16LowSurrogate(codeUnit: number): boolean {
+  return codeUnit >= 0xdc00 && codeUnit <= 0xdfff;
+}
+
+function isUtf16HighSurrogate(codeUnit: number): boolean {
+  return codeUnit >= 0xd800 && codeUnit <= 0xdbff;
+}
+
+function clampInputChunkBoundary(data: string, maxCodeUnits: number): number {
+  const boundary = Math.min(maxCodeUnits, data.length);
+  if (boundary <= 0 || boundary >= data.length) {
+    return boundary;
+  }
+
+  const previous = data.charCodeAt(boundary - 1);
+  const next = data.charCodeAt(boundary);
+  if (isUtf16HighSurrogate(previous) && isUtf16LowSurrogate(next)) {
+    return boundary - 1;
+  }
+  return boundary;
+}
+
+function shouldFlushInputImmediately(data: string): boolean {
+  if (!data) {
+    return false;
+  }
+  for (let index = 0; index < data.length; index += 1) {
+    const code = data.charCodeAt(index);
+    if (code === 0x1b || code < 0x20 || code === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function refreshBackendRendererDiagnostics(
+  workspaceId: string,
+  sessionId: string,
+): Promise<void> {
+  const cacheKey = terminalCacheKey(workspaceId, sessionId);
+  try {
+    const diagnostics = await ipc.terminalGetRendererDiagnostics(workspaceId, sessionId);
+    cachedBackendRendererDiagnostics.set(cacheKey, {
+      diagnostics,
+      fetchedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    logTerminalDebug("backend-diagnostics-refresh-failed", {
+      cacheKey,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function scheduleBackendRendererDiagnosticsRefresh(
+  workspaceId: string,
+  sessionId: string,
+  delayMs: number = 750,
+) {
+  if (!SHOW_TERMINAL_DIAGNOSTICS_UI) {
+    return;
+  }
+  const cacheKey = terminalCacheKey(workspaceId, sessionId);
+  if (backendDiagnosticsRefreshTimers.has(cacheKey)) {
+    return;
+  }
+  const timer = window.setTimeout(() => {
+    backendDiagnosticsRefreshTimers.delete(cacheKey);
+    void refreshBackendRendererDiagnostics(workspaceId, sessionId);
+  }, delayMs);
+  backendDiagnosticsRefreshTimers.set(cacheKey, timer);
+}
+
+function recordImageAddonRuntimeError(
+  cacheKey: string,
+  session: SessionTerminal,
+  stage: string,
+  error: unknown,
+) {
+  const message = errorToMessage(error);
+  session.rendererDiagnostics.imageAddonRuntimeErrorCount += 1;
+  session.rendererDiagnostics.imageAddonRuntimeLastError = message;
+  logTerminalWarning("image-addon:runtime:error", {
+    cacheKey,
+    stage,
+    count: session.rendererDiagnostics.imageAddonRuntimeErrorCount,
+    reason: message,
+  });
+}
+
+function setupImageAddon(
+  cacheKey: string,
+  terminal: Terminal,
+  diagnostics: FrontendRendererDiagnostics,
+): (() => void) | null {
+  diagnostics.imageAddonInitAttempted = true;
+  diagnostics.imageAddonInitError = undefined;
+  logTerminalDebug("image-addon:init:start", { cacheKey });
+  try {
+    const imageAddon = new ImageAddon(IMAGE_ADDON_OPTIONS);
+    terminal.loadAddon(imageAddon);
+    diagnostics.imageAddonInitOk = true;
+    logTerminalDebug("image-addon:init:ok", { cacheKey });
+    return () => {
+      imageAddon.dispose();
+    };
+  } catch (error) {
+    diagnostics.imageAddonInitOk = false;
+    diagnostics.imageAddonInitError = errorToMessage(error);
+    logTerminalWarning("image-addon:init:error", {
+      cacheKey,
+      reason: diagnostics.imageAddonInitError,
+    });
+    return null;
+  }
+}
+
+function setupWebglRenderer(
+  cacheKey: string,
+  terminal: Terminal,
+  diagnostics: FrontendRendererDiagnostics,
+  onContextLoss: () => void,
+): (() => void) | null {
+  diagnostics.webglRequested = true;
+  if (typeof WebGL2RenderingContext === "undefined") {
+    diagnostics.webglUnsupported = true;
+    diagnostics.webglActive = false;
+    logTerminalWarning("webgl-unsupported", { cacheKey });
+    logTerminalDebug("webgl-unsupported", { cacheKey });
+    return null;
+  }
+  try {
+    const webglAddon = new WebglAddon();
+    terminal.loadAddon(webglAddon);
+    const contextLossDisposable = webglAddon.onContextLoss(() => {
+      diagnostics.webglContextLossCount += 1;
+      diagnostics.webglActive = false;
+      logTerminalWarning("webgl-context-loss", {
+        cacheKey,
+        count: diagnostics.webglContextLossCount,
+      });
+      logTerminalDebug("webgl-context-loss", { cacheKey });
+      onContextLoss();
+    });
+    diagnostics.webglActive = true;
+    logTerminalDebug("webgl-enabled", { cacheKey });
+    return () => {
+      contextLossDisposable.dispose();
+      webglAddon.dispose();
+      diagnostics.webglActive = false;
+    };
+  } catch (error) {
+    diagnostics.webglInitError = errorToMessage(error);
+    diagnostics.webglActive = false;
+    logTerminalWarning("webgl-disabled", {
+      cacheKey,
+      reason: diagnostics.webglInitError,
+    });
+    logTerminalDebug("webgl-disabled", {
+      cacheKey,
+      reason: diagnostics.webglInitError,
+    });
+    return null;
+  }
+}
+
+function degradeRendererToCanvas(
+  cacheKey: string,
+  session: SessionTerminal,
+  reason: string,
+) {
+  if (session.rendererMode === "canvas") {
+    return;
+  }
+  session.webglCleanup?.();
+  session.webglCleanup = undefined;
+  session.rendererMode = "canvas";
+  session.rendererDegradedReason = reason;
+  session.rendererDiagnostics.webglActive = false;
+  logTerminalWarning("terminal-renderer-degraded", {
+    cacheKey,
+    reason,
+  });
+}
+
+function applyAcceleratedRenderingPreference(
+  cacheKey: string,
+  session: SessionTerminal,
+  enabled: boolean,
+) {
+  acceleratedTerminalRenderingPreferenceLoaded = true;
+  acceleratedTerminalRenderingEnabled = enabled;
+  session.rendererDiagnostics.acceleratedRenderingEnabled = enabled;
+
+  if (!session.imageAddonCleanup) {
+    session.imageAddonCleanup = setupImageAddon(
+      cacheKey,
+      session.terminal,
+      session.rendererDiagnostics,
+    ) ?? undefined;
+  }
+
+  if (!enabled) {
+    session.webglCleanup?.();
+    session.webglCleanup = undefined;
+    session.rendererMode = "canvas";
+    session.rendererDegradedReason = "settings-disabled";
+    session.rendererDiagnostics.webglActive = false;
+    if (session.terminal.rows > 0) {
+      session.terminal.refresh(0, session.terminal.rows - 1);
+    }
+    return;
+  }
+
+  if (!session.webglCleanup) {
+    const webglCleanup = setupWebglRenderer(
+      cacheKey,
+      session.terminal,
+      session.rendererDiagnostics,
+      () => {
+        const latest = cachedTerminals.get(cacheKey);
+        if (!latest) {
+          return;
+        }
+        degradeRendererToCanvas(cacheKey, latest, "webgl-context-loss");
+      },
+    );
+    if (webglCleanup) {
+      session.webglCleanup = webglCleanup;
+      session.rendererMode = "webgl";
+      session.rendererDegradedReason = undefined;
+    } else {
+      session.rendererMode = "canvas";
+    }
+  }
+
+  if (session.terminal.rows > 0) {
+    session.terminal.refresh(0, session.terminal.rows - 1);
+  }
+}
+
+function applyTerminalFontSizePreference(
+  workspaceId: string,
+  sessionId: string,
+  session: SessionTerminal,
+  fontSize: number,
+) {
+  session.terminal.options.fontSize = fontSize;
+  // Re-fit so cols/rows account for the new glyph metrics, then let the
+  // existing resize pipeline propagate the change to the PTY.
+  session.fitAddon.fit();
+  sendResizeIfNeeded(workspaceId, sessionId, session, session.terminal.cols, session.terminal.rows);
+  if (session.terminal.rows > 0) {
+    session.terminal.refresh(0, session.terminal.rows - 1);
+  }
+}
+
+function registerFlushStall(cacheKey: string, session: SessionTerminal) {
+  const now = Date.now();
+  if (
+    session.flushTimeoutWindowStartedAt === undefined ||
+    now - session.flushTimeoutWindowStartedAt > OUTPUT_FLUSH_STALL_FALLBACK_WINDOW_MS
+  ) {
+    session.flushTimeoutWindowStartedAt = now;
+    session.flushTimeoutWindowCount = 1;
+  } else {
+    session.flushTimeoutWindowCount += 1;
+  }
+  if (session.flushTimeoutWindowCount >= OUTPUT_FLUSH_STALL_FALLBACK_THRESHOLD) {
+    degradeRendererToCanvas(cacheKey, session, "write-callback-stall");
+  }
+}
+
+function resetResumeRetry(session: SessionTerminal) {
+  session.resumeRetryAttempts = 0;
+  if (session.resumeRetryTimer !== undefined) {
+    window.clearTimeout(session.resumeRetryTimer);
+    session.resumeRetryTimer = undefined;
+  }
+}
+
+function scheduleResumeRetry(
+  workspaceId: string,
+  sessionId: string,
+  session: SessionTerminal,
+  reason: "attach" | "live-gap",
+) {
+  if (session.resumeRetryTimer !== undefined) {
+    return;
+  }
+  const exponent = Math.min(session.resumeRetryAttempts, 4);
+  const delayMs = Math.min(
+    OUTPUT_RESUME_RETRY_BASE_MS * (2 ** exponent),
+    OUTPUT_RESUME_RETRY_MAX_MS,
+  );
+  session.resumeRetryAttempts += 1;
+  const cacheKey = terminalCacheKey(workspaceId, sessionId);
+  logTerminalWarning("terminal-replay-resume-retry-scheduled", {
+    cacheKey,
+    reason,
+    delayMs,
+    attempt: session.resumeRetryAttempts,
+  });
+  session.resumeRetryTimer = window.setTimeout(() => {
+    const latest = cachedTerminals.get(cacheKey);
+    if (!latest) {
+      return;
+    }
+    latest.resumeRetryTimer = undefined;
+    void resumeSessionOutput(workspaceId, sessionId, reason);
+  }, delayMs);
+}
+
+function normalizeSize(cols: number, rows: number): TerminalSize {
+  return {
+    cols: Math.max(1, cols),
+    rows: Math.max(1, rows),
+  };
+}
+
+function sameSize(a?: TerminalSize, b?: TerminalSize): boolean {
+  if (!a || !b) {
+    return false;
+  }
+  return a.cols === b.cols && a.rows === b.rows;
+}
+
+function hasRenderableSize(container: HTMLElement): boolean {
+  return container.offsetWidth > 0 && container.offsetHeight > 0;
+}
+
+function clearSessionTimers(session: SessionTerminal) {
+  if (session.stdinFlushTimer !== undefined) {
+    window.clearTimeout(session.stdinFlushTimer);
+    session.stdinFlushTimer = undefined;
+  }
+  if (session.fitTimer !== undefined) {
+    window.clearTimeout(session.fitTimer);
+    session.fitTimer = undefined;
+  }
+  if (session.resumeRetryTimer !== undefined) {
+    window.clearTimeout(session.resumeRetryTimer);
+    session.resumeRetryTimer = undefined;
+  }
+  if (session.outputDrainTimer !== undefined) {
+    window.clearTimeout(session.outputDrainTimer);
+    session.outputDrainTimer = undefined;
+  }
+  if (session.flushWatchdogTimer !== undefined) {
+    window.clearTimeout(session.flushWatchdogTimer);
+    session.flushWatchdogTimer = undefined;
+  }
+  if (session.flushTimer !== undefined) {
+    window.clearTimeout(session.flushTimer);
+    session.flushTimer = undefined;
+  }
+  if (session.evictionTimer !== undefined) {
+    window.clearTimeout(session.evictionTimer);
+    session.evictionTimer = undefined;
+  }
+}
+
+function warnDroppedTerminalInput(
+  cacheKey: string,
+  session: SessionTerminal,
+  droppedChars: number,
+) {
+  if (droppedChars <= 0) {
+    return;
+  }
+  const now = Date.now();
+  if (
+    session.lastInputDropWarnAt !== undefined &&
+    now - session.lastInputDropWarnAt < INPUT_DROP_WARN_COOLDOWN_MS
+  ) {
+    return;
+  }
+  session.lastInputDropWarnAt = now;
+  logTerminalWarning("terminal-input-trimmed", {
+    cacheKey,
+    droppedChars,
+    queueChars: session.stdinQueueChars,
+    maxChars: INPUT_QUEUE_MAX_CHARS,
+  });
+}
+
+function getCellPixelSize(terminal: Terminal): { cellWidth: number; cellHeight: number } {
+  const screenEl = terminal.element?.querySelector(".xterm-screen");
+  if (screenEl instanceof HTMLElement && terminal.cols > 0 && terminal.rows > 0) {
+    return {
+      cellWidth: Math.floor(screenEl.clientWidth / terminal.cols),
+      cellHeight: Math.floor(screenEl.clientHeight / terminal.rows),
+    };
+  }
+  return { cellWidth: 0, cellHeight: 0 };
+}
+
+function sendResizeIfNeeded(
+  workspaceId: string,
+  sessionId: string,
+  session: SessionTerminal,
+  cols: number,
+  rows: number
+) {
+  const next = normalizeSize(cols, rows);
+  if (sameSize(session.lastResizeSent, next)) {
+    return;
+  }
+  session.lastResizeSent = next;
+  const { cellWidth, cellHeight } = getCellPixelSize(session.terminal);
+  session.rendererDiagnostics.lastResize = {
+    cols: next.cols,
+    rows: next.rows,
+    pixelWidth: cellWidth * next.cols,
+    pixelHeight: cellHeight * next.rows,
+    recordedAt: new Date().toISOString(),
+  };
+  void ipc
+    .terminalResize(
+      workspaceId,
+      sessionId,
+      next.cols,
+      next.rows,
+      cellWidth * next.cols,
+      cellHeight * next.rows,
+    )
+    .catch(() => undefined);
+}
+
+function pullInputBatch(
+  inputQueue: TerminalInputChunk[],
+): { payload: string; charCount: number } | null {
+  if (inputQueue.length === 0) {
+    return null;
+  }
+
+  const firstChunk = inputQueue[0];
+  if (!firstChunk || firstChunk.kind !== "text") {
+    return null;
+  }
+
+  let totalChars = 0;
+  const chunks: string[] = [];
+  while (inputQueue.length > 0 && totalChars < INPUT_BATCH_CHAR_LIMIT) {
+    const chunk = inputQueue[0];
+    if (!chunk) {
+      inputQueue.shift();
+      continue;
+    }
+    if (chunk.kind !== "text") {
+      break;
+    }
+
+    const remainingChars = INPUT_BATCH_CHAR_LIMIT - totalChars;
+    if (chunk.data.length <= remainingChars) {
+      chunks.push(chunk.data);
+      totalChars += chunk.data.length;
+      inputQueue.shift();
+      continue;
+    }
+
+    const boundary = clampInputChunkBoundary(chunk.data, remainingChars);
+    if (boundary <= 0) {
+      break;
+    }
+    chunks.push(chunk.data.slice(0, boundary));
+    inputQueue[0] = {
+      kind: "text",
+      data: chunk.data.slice(boundary),
+    };
+    totalChars += boundary;
+  }
+
+  if (chunks.length === 0) {
+    return null;
+  }
+
+  return {
+    payload: chunks.join(""),
+    charCount: totalChars,
+  };
+}
+
+function pullInputChunk(inputQueue: TerminalInputChunk[]): TerminalInputChunk | null {
+  return inputQueue.shift() ?? null;
+}
+
+function pullProtocolInputChunk(
+  inputQueue: TerminalInputChunk[],
+): { payload: string; charCount: number } | null {
+  if (inputQueue.length === 0) {
+    return null;
+  }
+
+  const head = inputQueue[0];
+  if (!head || head.kind !== "protocol") {
+    return null;
+  }
+
+  inputQueue.shift();
+  return {
+    payload: head.data,
+    charCount: head.data.length,
+  };
+}
+
+function flushTerminalInputQueue(
+  cacheKey: string,
+  workspaceId: string,
+  sessionId: string,
+) {
+  const session = cachedTerminals.get(cacheKey);
+  if (!session || session.stdinFlushInFlight) {
+    return;
+  }
+
+  if (session.stdinQueue.length === 0) {
+    return;
+  }
+
+  const head = session.stdinQueue[0];
+  if (!head) {
+    session.stdinQueueChars = 0;
+    return;
+  }
+  session.stdinFlushInFlight = true;
+  const sentAt = Date.now();
+  session.lastInputSentAt = sentAt;
+
+  if (head.kind === "protocol") {
+    const protocolChunk = pullProtocolInputChunk(session.stdinQueue);
+    if (!protocolChunk) {
+      session.stdinFlushInFlight = false;
+      return;
+    }
+
+    session.stdinQueueChars = Math.max(0, session.stdinQueueChars - protocolChunk.charCount);
+    void ipc
+      .terminalWrite(workspaceId, sessionId, protocolChunk.payload)
+      .catch(() => undefined)
+      .finally(() => {
+        const latest = cachedTerminals.get(cacheKey);
+        if (!latest) {
+          return;
+        }
+        scheduleBackendRendererDiagnosticsRefresh(workspaceId, sessionId);
+        latest.stdinFlushInFlight = false;
+        if (latest.stdinQueue.length > 0) {
+          scheduleTerminalInputFlush(cacheKey, workspaceId, sessionId, 0);
+        }
+      });
+    return;
+  }
+
+  if (head.kind === "text") {
+    const batch = pullInputBatch(session.stdinQueue);
+    if (!batch) {
+      session.stdinFlushInFlight = false;
+      return;
+    }
+
+    session.stdinQueueChars = Math.max(0, session.stdinQueueChars - batch.charCount);
+    void ipc
+      .terminalWrite(workspaceId, sessionId, batch.payload)
+      .catch(() => undefined)
+      .finally(() => {
+        const latest = cachedTerminals.get(cacheKey);
+        if (!latest) {
+          return;
+        }
+        scheduleBackendRendererDiagnosticsRefresh(workspaceId, sessionId);
+        latest.stdinFlushInFlight = false;
+        if (latest.stdinQueue.length > 0) {
+          scheduleTerminalInputFlush(cacheKey, workspaceId, sessionId, 0);
+        }
+      });
+    return;
+  }
+
+  const chunk = pullInputChunk(session.stdinQueue);
+  if (!chunk || chunk.kind !== "bytes") {
+    session.stdinFlushInFlight = false;
+    return;
+  }
+
+  session.stdinQueueChars = Math.max(
+    0,
+    session.stdinQueueChars - terminalInputChunkLength(chunk),
+  );
+  void ipc
+    .terminalWriteBytes(workspaceId, sessionId, chunk.data)
+    .catch(() => undefined)
+    .finally(() => {
+      const latest = cachedTerminals.get(cacheKey);
+      if (!latest) {
+        return;
+      }
+      scheduleBackendRendererDiagnosticsRefresh(workspaceId, sessionId);
+      latest.stdinFlushInFlight = false;
+      if (latest.stdinQueue.length > 0) {
+        scheduleTerminalInputFlush(cacheKey, workspaceId, sessionId, 0);
+      }
+    });
+}
+
+function scheduleTerminalInputFlush(
+  cacheKey: string,
+  workspaceId: string,
+  sessionId: string,
+  delayMs: number,
+) {
+  const session = cachedTerminals.get(cacheKey);
+  if (!session) {
+    return;
+  }
+
+  if (delayMs <= 0) {
+    if (session.stdinFlushTimer !== undefined) {
+      window.clearTimeout(session.stdinFlushTimer);
+      session.stdinFlushTimer = undefined;
+    }
+    flushTerminalInputQueue(cacheKey, workspaceId, sessionId);
+    return;
+  }
+
+  if (session.stdinFlushTimer !== undefined) {
+    return;
+  }
+
+  session.stdinFlushTimer = window.setTimeout(() => {
+    const latest = cachedTerminals.get(cacheKey);
+    if (!latest) {
+      return;
+    }
+    latest.stdinFlushTimer = undefined;
+    flushTerminalInputQueue(cacheKey, workspaceId, sessionId);
+  }, delayMs);
+}
+
+function enqueueTerminalInput(
+  cacheKey: string,
+  workspaceId: string,
+  sessionId: string,
+  data: string,
+) {
+  const session = cachedTerminals.get(cacheKey);
+  if (!session) {
+    void ipc.terminalWrite(workspaceId, sessionId, data).catch(() => undefined);
+    return;
+  }
+
+  const remainingChars = Math.max(0, INPUT_QUEUE_MAX_CHARS - session.stdinQueueChars);
+  if (remainingChars <= 0) {
+    warnDroppedTerminalInput(cacheKey, session, data.length);
+    scheduleTerminalInputFlush(cacheKey, workspaceId, sessionId, 0);
+    return;
+  }
+
+  const boundary = clampInputChunkBoundary(data, remainingChars);
+  const accepted = data.slice(0, boundary);
+  const droppedChars = data.length - accepted.length;
+  if (!accepted) {
+    warnDroppedTerminalInput(cacheKey, session, droppedChars);
+    scheduleTerminalInputFlush(cacheKey, workspaceId, sessionId, 0);
+    return;
+  }
+
+  session.stdinQueue.push({ kind: "text", data: accepted });
+  session.stdinQueueChars += accepted.length;
+  warnDroppedTerminalInput(cacheKey, session, droppedChars);
+  const delayMs = shouldFlushInputImmediately(data) ? 0 : INPUT_FLUSH_DELAY_MS;
+  scheduleTerminalInputFlush(cacheKey, workspaceId, sessionId, delayMs);
+}
+
+function enqueueTerminalProtocolInput(
+  cacheKey: string,
+  workspaceId: string,
+  sessionId: string,
+  data: string,
+) {
+  const session = cachedTerminals.get(cacheKey);
+  if (!session) {
+    void ipc.terminalWrite(workspaceId, sessionId, data).catch(() => undefined);
+    return;
+  }
+
+  session.stdinQueue.push({ kind: "protocol", data });
+  session.stdinQueueChars += data.length;
+  scheduleTerminalInputFlush(cacheKey, workspaceId, sessionId, 0);
+}
+
+function enqueueTerminalInputBytes(
+  cacheKey: string,
+  workspaceId: string,
+  sessionId: string,
+  data: number[],
+) {
+  const session = cachedTerminals.get(cacheKey);
+  if (!session) {
+    void ipc.terminalWriteBytes(workspaceId, sessionId, data).catch(() => undefined);
+    return;
+  }
+
+  const remainingChars = Math.max(0, INPUT_QUEUE_MAX_CHARS - session.stdinQueueChars);
+  if (remainingChars <= 0) {
+    warnDroppedTerminalInput(cacheKey, session, data.length);
+    scheduleTerminalInputFlush(cacheKey, workspaceId, sessionId, 0);
+    return;
+  }
+
+  const accepted = data.slice(0, remainingChars);
+  const droppedChars = data.length - accepted.length;
+  if (accepted.length === 0) {
+    warnDroppedTerminalInput(cacheKey, session, droppedChars);
+    scheduleTerminalInputFlush(cacheKey, workspaceId, sessionId, 0);
+    return;
+  }
+
+  session.stdinQueue.push({ kind: "bytes", data: accepted });
+  session.stdinQueueChars += accepted.length;
+  warnDroppedTerminalInput(cacheKey, session, droppedChars);
+  scheduleTerminalInputFlush(cacheKey, workspaceId, sessionId, 0);
+}
+
+function trimOutputQueue(
+  outputQueue: string[],
+  currentChars: number,
+  maxChars: number,
+): { chars: number; droppedChars: number; droppedChunks: number } {
+  if (currentChars <= maxChars) {
+    return { chars: currentChars, droppedChars: 0, droppedChunks: 0 };
+  }
+
+  let droppedChars = 0;
+  let droppedChunks = 0;
+  while (outputQueue.length > 0 && currentChars - droppedChars > maxChars) {
+    const removed = outputQueue.shift();
+    if (!removed) {
+      break;
+    }
+    droppedChars += removed.length;
+    droppedChunks += 1;
+  }
+
+  return {
+    chars: Math.max(0, currentChars - droppedChars),
+    droppedChars,
+    droppedChunks,
+  };
+}
+
+function trimSequencedOutputQueue(
+  outputQueue: SequencedOutputChunk[],
+  currentChars: number,
+  maxChars: number,
+): { chars: number; droppedChars: number; droppedChunks: number } {
+  if (currentChars <= maxChars) {
+    return { chars: currentChars, droppedChars: 0, droppedChunks: 0 };
+  }
+
+  let droppedChars = 0;
+  let droppedChunks = 0;
+  while (outputQueue.length > 0 && currentChars - droppedChars > maxChars) {
+    const removed = outputQueue.shift();
+    if (!removed) {
+      break;
+    }
+    droppedChars += removed.data.length;
+    droppedChunks += 1;
+  }
+
+  return {
+    chars: Math.max(0, currentChars - droppedChars),
+    droppedChars,
+    droppedChunks,
+  };
+}
+
+function capSessionOutputQueue(cacheKey: string, session: SessionTerminal) {
+  const maxChars = session.isAttached
+    ? OUTPUT_QUEUE_MAX_CHARS_ATTACHED
+    : OUTPUT_QUEUE_MAX_CHARS_DETACHED;
+  const result = trimOutputQueue(session.outputQueue, session.outputQueueChars, maxChars);
+  session.outputQueueChars = result.chars;
+  if (result.droppedChars <= 0) {
+    return;
+  }
+  if (!session.isAttached) {
+    session.requiresColdReattach = true;
+  }
+  session.rendererDiagnostics.outputDroppedCharCount += result.droppedChars;
+  session.rendererDiagnostics.outputDroppedChunkCount += result.droppedChunks;
+  session.rendererDiagnostics.lastOutputDropAt = new Date().toISOString();
+  const now = Date.now();
+  if (
+    session.lastOutputDropWarnAt !== undefined &&
+    now - session.lastOutputDropWarnAt < OUTPUT_DROP_WARN_COOLDOWN_MS
+  ) {
+    return;
+  }
+  session.lastOutputDropWarnAt = now;
+  logTerminalWarning("terminal-output-trimmed", {
+    cacheKey,
+    droppedChars: result.droppedChars,
+    droppedChunks: result.droppedChunks,
+    attached: session.isAttached,
+    maxChars,
+  });
+  if (!session.isAttached) {
+    pruneDetachedTerminalCache();
+  }
+}
+
+function capPendingOutput(
+  cacheKey: string,
+  pending: {
+    chunks: SequencedOutputChunk[];
+    chars: number;
+    lastDropWarnAt?: number;
+    droppedChars: number;
+    droppedChunks: number;
+  },
+) {
+  const result = trimSequencedOutputQueue(
+    pending.chunks,
+    pending.chars,
+    PENDING_OUTPUT_MAX_CHARS,
+  );
+  pending.chars = result.chars;
+  if (result.droppedChars <= 0) {
+    return;
+  }
+  pending.droppedChars += result.droppedChars;
+  pending.droppedChunks += result.droppedChunks;
+  const now = Date.now();
+  if (
+    pending.lastDropWarnAt !== undefined &&
+    now - pending.lastDropWarnAt < OUTPUT_DROP_WARN_COOLDOWN_MS
+  ) {
+    return;
+  }
+  pending.lastDropWarnAt = now;
+  logTerminalWarning("terminal-pending-output-trimmed", {
+    cacheKey,
+    droppedChars: result.droppedChars,
+    droppedChunks: result.droppedChunks,
+    maxChars: PENDING_OUTPUT_MAX_CHARS,
+  });
+}
+
+function pullOutputBatch(outputQueue: string[]): { payload: string; charCount: number } | null {
+  if (outputQueue.length === 0) {
+    return null;
+  }
+
+  let totalChars = 0;
+  let take = 0;
+  for (const chunk of outputQueue) {
+    if (take > 0 && totalChars + chunk.length > OUTPUT_BATCH_CHAR_LIMIT) {
+      break;
+    }
+    totalChars += chunk.length;
+    take += 1;
+    if (totalChars >= OUTPUT_BATCH_CHAR_LIMIT) {
+      break;
+    }
+  }
+
+  if (take === 0) {
+    take = 1;
+  }
+
+  const chunks = outputQueue.splice(0, take);
+  let charCount = 0;
+  for (const chunk of chunks) {
+    charCount += chunk.length;
+  }
+  return {
+    payload: chunks.join(""),
+    charCount,
+  };
+}
+
+function flushOutputQueue(cacheKey: string) {
+  const session = cachedTerminals.get(cacheKey);
+  if (!session || session.flushInProgress) {
+    return;
+  }
+  if (!session.isAttached) {
+    return;
+  }
+
+  const batch = pullOutputBatch(session.outputQueue);
+  if (!batch) {
+    return;
+  }
+  session.outputQueueChars = Math.max(0, session.outputQueueChars - batch.charCount);
+
+  const flushNonce = session.flushNonce + 1;
+  session.flushNonce = flushNonce;
+  session.flushStartedAt = Date.now();
+  session.flushInProgress = true;
+  if (session.flushWatchdogTimer !== undefined) {
+    window.clearTimeout(session.flushWatchdogTimer);
+    session.flushWatchdogTimer = undefined;
+  }
+  session.flushWatchdogTimer = window.setTimeout(() => {
+    const latest = cachedTerminals.get(cacheKey);
+    if (!latest || !latest.flushInProgress || latest.flushNonce !== flushNonce) {
+      return;
+    }
+    latest.flushWatchdogTimer = undefined;
+    latest.flushInProgress = false;
+    latest.flushStartedAt = undefined;
+    latest.flushStallCount += 1;
+    registerFlushStall(cacheKey, latest);
+    logTerminalWarning("terminal-write-callback-timeout", {
+      cacheKey,
+      stallCount: latest.flushStallCount,
+      timeoutMs: OUTPUT_FLUSH_STALL_TIMEOUT_MS,
+      queueDepth: latest.outputQueue.length,
+      queueChars: latest.outputQueueChars,
+    });
+    if (latest.outputQueue.length > 0) {
+      scheduleOutputFlush(cacheKey, latest, 0);
+    } else {
+      scheduleOutputDrainIfNeeded(cacheKey, latest, 0);
+    }
+  }, OUTPUT_FLUSH_STALL_TIMEOUT_MS);
+  try {
+    session.terminal.write(batch.payload, () => {
+      const latest = cachedTerminals.get(cacheKey);
+      if (!latest || latest.flushNonce !== flushNonce) {
+        return;
+      }
+      if (latest.flushWatchdogTimer !== undefined) {
+        window.clearTimeout(latest.flushWatchdogTimer);
+        latest.flushWatchdogTimer = undefined;
+      }
+      latest.flushInProgress = false;
+      latest.flushStartedAt = undefined;
+      if (latest.outputQueue.length > 0) {
+        scheduleOutputFlush(cacheKey, latest, 0);
+      } else {
+        scheduleOutputDrainIfNeeded(cacheKey, latest, 0);
+      }
+    });
+  } catch (error) {
+    if (session.flushNonce === flushNonce) {
+      if (session.flushWatchdogTimer !== undefined) {
+        window.clearTimeout(session.flushWatchdogTimer);
+        session.flushWatchdogTimer = undefined;
+      }
+      session.flushInProgress = false;
+      session.flushStartedAt = undefined;
+    }
+    if (isLikelyImageAddonError(error)) {
+      recordImageAddonRuntimeError(cacheKey, session, "terminal.write", error);
+    } else {
+      logTerminalWarning("terminal-write-error", {
+        cacheKey,
+        reason: errorToMessage(error),
+      });
+    }
+  }
+}
+
+function scheduleOutputFlush(
+  cacheKey: string,
+  session: SessionTerminal,
+  delayMs: number = OUTPUT_FLUSH_DELAY_MS
+) {
+  if (session.flushTimer !== undefined) {
+    return;
+  }
+  session.flushTimer = window.setTimeout(() => {
+    const latest = cachedTerminals.get(cacheKey);
+    if (!latest) {
+      return;
+    }
+    latest.flushTimer = undefined;
+    flushOutputQueue(cacheKey);
+  }, delayMs);
+}
+
+function addPendingOutputChunk(cacheKey: string, chunk: SequencedOutputChunk) {
+  const pending =
+    pendingOutput.get(cacheKey) ?? {
+      chunks: [],
+      chars: 0,
+      droppedChars: 0,
+      droppedChunks: 0,
+    };
+  pending.chunks.push(chunk);
+  pending.chars += chunk.data.length;
+  capPendingOutput(cacheKey, pending);
+  pendingOutput.set(cacheKey, pending);
+}
+
+function enqueueOutputChunk(
+  cacheKey: string,
+  session: SessionTerminal,
+  chunk: SequencedOutputChunk,
+): "applied" | "duplicate" | "gap" {
+  if (chunk.seq <= session.lastAppliedSeq) {
+    return "duplicate";
+  }
+  if (session.lastAppliedSeq > 0 && chunk.seq > session.lastAppliedSeq + 1) {
+    return "gap";
+  }
+
+  session.lastAppliedSeq = chunk.seq;
+  session.outputQueue.push(chunk.data);
+  session.outputQueueChars += chunk.data.length;
+  session.rendererDiagnostics.outputChunkCount += 1;
+  session.rendererDiagnostics.outputCharCount += chunk.data.length;
+  capSessionOutputQueue(cacheKey, session);
+
+  session.debugSample.chunks += 1;
+  session.debugSample.chars += chunk.data.length;
+  const now = Date.now();
+  if (TERMINAL_DEBUG && now - session.debugSample.lastLogAt >= 1000) {
+    logTerminalDebug("output-sample", {
+      queueDepth: session.outputQueue.length,
+      chunks: session.debugSample.chunks,
+      chars: session.debugSample.chars,
+      attached: session.isAttached,
+    });
+    session.debugSample.lastLogAt = now;
+    session.debugSample.chunks = 0;
+    session.debugSample.chars = 0;
+  }
+
+  return "applied";
+}
+
+async function resumeSessionOutput(
+  workspaceId: string,
+  sessionId: string,
+  reason: "attach" | "live-gap",
+) {
+  const cacheKey = terminalCacheKey(workspaceId, sessionId);
+  const session = cachedTerminals.get(cacheKey);
+  if (!session || session.resumeInFlight) {
+    return;
+  }
+  const sessionRef = session;
+  session.resumeInFlight = true;
+
+  try {
+    const fromSeq = sessionRef.lastAppliedSeq > 0 ? sessionRef.lastAppliedSeq : null;
+    const resume = await ipc.terminalResumeSession(workspaceId, sessionId, fromSeq);
+    const latest = cachedTerminals.get(cacheKey);
+    if (!latest || latest !== sessionRef) {
+      return;
+    }
+    resetResumeRetry(latest);
+
+    if (resume.gap && latest.lastAppliedSeq > 0) {
+      logTerminalWarning("terminal-replay-gap", {
+        cacheKey,
+        reason,
+        fromSeq: fromSeq ?? undefined,
+        oldestAvailableSeq: resume.oldestAvailableSeq ?? undefined,
+      });
+      if (latest.isAttached) {
+        const container = latest.terminal.element?.parentElement;
+        if (container instanceof HTMLElement) {
+          destroyCachedTerminal(workspaceId, sessionId);
+          createCachedTerminal(workspaceId, sessionId, container);
+          return;
+        }
+      }
+      latest.requiresColdReattach = true;
+      latest.needsResumeOnAttach = true;
+      return;
+    }
+
+    for (const chunk of resume.chunks) {
+      const current = cachedTerminals.get(cacheKey);
+      if (!current || current !== sessionRef) {
+        return;
+      }
+      const result = enqueueOutputChunk(cacheKey, current, chunk);
+      if (result === "gap") {
+        addPendingOutputChunk(cacheKey, chunk);
+        logTerminalWarning("terminal-replay-gap-during-apply", {
+          cacheKey,
+          reason,
+          chunkSeq: chunk.seq,
+          lastAppliedSeq: current.lastAppliedSeq,
+        });
+        break;
+      }
+    }
+    if (reason === "attach") {
+      latest.needsResumeOnAttach = false;
+      latest.requiresColdReattach = false;
+    }
+  } catch (error) {
+    const latest = cachedTerminals.get(cacheKey);
+    const hasPendingReplayChunks =
+      (pendingOutput.get(cacheKey)?.chunks.length ?? 0) > 0;
+    if (latest && latest === sessionRef && (reason === "live-gap" || hasPendingReplayChunks)) {
+      scheduleResumeRetry(workspaceId, sessionId, latest, reason);
+    }
+    logTerminalWarning("terminal-replay-resume-failed", {
+      cacheKey,
+      reason,
+      details: errorToMessage(error),
+    });
+  } finally {
+    const latest = cachedTerminals.get(cacheKey);
+    if (!latest || latest !== sessionRef) {
+      return;
+    }
+    latest.resumeInFlight = false;
+    if (latest.requiresColdReattach) {
+      return;
+    }
+    drainPendingOutput(cacheKey, latest);
+    if (latest.isAttached && latest.outputQueue.length > 0) {
+      scheduleOutputFlush(cacheKey, latest, 0);
+    }
+    scheduleOutputDrainIfNeeded(cacheKey, latest, 0);
+  }
+}
+
+function scheduleOutputDrainIfNeeded(
+  cacheKey: string,
+  session: SessionTerminal,
+  delayMs: number = 0,
+) {
+  if (session.outputDrainRequestedSeq <= session.lastAppliedSeq) {
+    return;
+  }
+  const parsed = parseTerminalCacheKey(cacheKey);
+  if (!parsed) {
+    return;
+  }
+  scheduleTerminalOutputDrain(
+    parsed.workspaceId,
+    parsed.sessionId,
+    session.outputDrainRequestedSeq,
+    delayMs,
+  );
+}
+
+function scheduleTerminalOutputDrain(
+  workspaceId: string,
+  sessionId: string,
+  latestSeq: number,
+  delayMs: number = 0,
+) {
+  const cacheKey = terminalCacheKey(workspaceId, sessionId);
+  const session = cachedTerminals.get(cacheKey);
+  if (!session) {
+    return;
+  }
+
+  session.outputDrainRequestedSeq = Math.max(
+    session.outputDrainRequestedSeq,
+    latestSeq,
+  );
+  scheduleBackendRendererDiagnosticsRefresh(workspaceId, sessionId);
+
+  if (!session.isAttached) {
+    session.needsResumeOnAttach = true;
+    return;
+  }
+  if (session.resumeInFlight || session.outputDrainInFlight) {
+    return;
+  }
+  if (session.outputDrainTimer !== undefined) {
+    return;
+  }
+  if (
+    session.outputQueueChars >
+    OUTPUT_QUEUE_MAX_CHARS_ATTACHED - OUTPUT_PULL_MAX_BYTES
+  ) {
+    return;
+  }
+
+  session.outputDrainTimer = window.setTimeout(() => {
+    const latest = cachedTerminals.get(cacheKey);
+    if (!latest) {
+      return;
+    }
+    latest.outputDrainTimer = undefined;
+    void drainTerminalOutput(workspaceId, sessionId);
+  }, delayMs);
+}
+
+async function drainTerminalOutput(workspaceId: string, sessionId: string) {
+  const cacheKey = terminalCacheKey(workspaceId, sessionId);
+  const session = cachedTerminals.get(cacheKey);
+  if (!session || session.outputDrainInFlight) {
+    return;
+  }
+  if (!session.isAttached) {
+    session.needsResumeOnAttach = true;
+    return;
+  }
+  if (session.resumeInFlight) {
+    return;
+  }
+  if (
+    session.outputQueueChars >
+    OUTPUT_QUEUE_MAX_CHARS_ATTACHED - OUTPUT_PULL_MAX_BYTES
+  ) {
+    return;
+  }
+
+  const sessionRef = session;
+  sessionRef.outputDrainInFlight = true;
+  let drainSucceeded = false;
+  let retryDelayMs: number | null = null;
+  try {
+    const fromSeq = sessionRef.lastAppliedSeq > 0 ? sessionRef.lastAppliedSeq : null;
+    const resume = await ipc.terminalDrainOutput(
+      workspaceId,
+      sessionId,
+      fromSeq,
+      OUTPUT_PULL_MAX_BYTES,
+    );
+    const latest = cachedTerminals.get(cacheKey);
+    if (!latest || latest !== sessionRef) {
+      return;
+    }
+    drainSucceeded = true;
+    latest.outputDrainRetryAttempts = 0;
+
+    latest.outputDrainRequestedSeq = Math.max(
+      latest.outputDrainRequestedSeq,
+      resume.latestSeq,
+    );
+
+    if (resume.gap && latest.lastAppliedSeq > 0) {
+      logTerminalWarning("terminal-output-drain-gap", {
+        cacheKey,
+        fromSeq: fromSeq ?? undefined,
+        oldestAvailableSeq: resume.oldestAvailableSeq ?? undefined,
+      });
+      void resumeSessionOutput(workspaceId, sessionId, "live-gap");
+      return;
+    }
+
+    for (const chunk of resume.chunks) {
+      const current = cachedTerminals.get(cacheKey);
+      if (!current || current !== sessionRef) {
+        return;
+      }
+      const result = enqueueOutputChunk(cacheKey, current, chunk);
+      if (result === "duplicate") {
+        continue;
+      }
+      if (result === "gap") {
+        addPendingOutputChunk(cacheKey, chunk);
+        logTerminalWarning("terminal-output-drain-gap-during-apply", {
+          cacheKey,
+          chunkSeq: chunk.seq,
+          lastAppliedSeq: current.lastAppliedSeq,
+        });
+        void resumeSessionOutput(workspaceId, sessionId, "live-gap");
+        break;
+      }
+    }
+
+    if (latest.isAttached && latest.outputQueue.length > 0) {
+      scheduleOutputFlush(cacheKey, latest, 0);
+    }
+  } catch (error) {
+    if (sessionRef.outputDrainRetryAttempts < OUTPUT_DRAIN_RETRY_MAX_ATTEMPTS) {
+      const exponent = Math.min(sessionRef.outputDrainRetryAttempts, 3);
+      retryDelayMs = Math.min(
+        OUTPUT_DRAIN_RETRY_BASE_MS * (2 ** exponent),
+        OUTPUT_DRAIN_RETRY_MAX_MS,
+      );
+      sessionRef.outputDrainRetryAttempts += 1;
+    } else {
+      sessionRef.outputDrainRequestedSeq = sessionRef.lastAppliedSeq;
+      sessionRef.needsResumeOnAttach = true;
+    }
+    logTerminalWarning("terminal-output-drain-failed", {
+      cacheKey,
+      details: errorToMessage(error),
+      retryDelayMs: retryDelayMs ?? undefined,
+      attempt: sessionRef.outputDrainRetryAttempts,
+    });
+  } finally {
+    const latest = cachedTerminals.get(cacheKey);
+    if (!latest || latest !== sessionRef) {
+      return;
+    }
+    latest.outputDrainInFlight = false;
+    if (latest.isAttached && latest.outputQueue.length > 0) {
+      scheduleOutputFlush(cacheKey, latest, 0);
+    }
+    if (
+      drainSucceeded &&
+      latest.outputDrainRequestedSeq > latest.lastAppliedSeq &&
+      latest.outputQueueChars <= OUTPUT_QUEUE_MAX_CHARS_ATTACHED - OUTPUT_PULL_MAX_BYTES
+    ) {
+      scheduleTerminalOutputDrain(workspaceId, sessionId, latest.outputDrainRequestedSeq, 0);
+    }
+    if (!drainSucceeded && retryDelayMs !== null) {
+      scheduleTerminalOutputDrain(
+        workspaceId,
+        sessionId,
+        latest.outputDrainRequestedSeq,
+        retryDelayMs,
+      );
+    }
+  }
+}
+
+function drainPendingOutput(cacheKey: string, session: SessionTerminal) {
+  const buffered = pendingOutput.get(cacheKey);
+  if (!buffered?.chunks.length) {
+    if (buffered) {
+      session.rendererDiagnostics.pendingOutputDroppedCharCount += buffered.droppedChars;
+      session.rendererDiagnostics.pendingOutputDroppedChunkCount += buffered.droppedChunks;
+      if (buffered.droppedChars > 0) {
+        session.rendererDiagnostics.lastOutputDropAt = new Date().toISOString();
+      }
+      pendingOutput.delete(cacheKey);
+    }
+    return;
+  }
+
+  pendingOutput.delete(cacheKey);
+  session.rendererDiagnostics.pendingOutputDroppedCharCount += buffered.droppedChars;
+  session.rendererDiagnostics.pendingOutputDroppedChunkCount += buffered.droppedChunks;
+  if (buffered.droppedChars > 0) {
+    session.rendererDiagnostics.lastOutputDropAt = new Date().toISOString();
+  }
+
+  const ordered = [...buffered.chunks].sort((left, right) => left.seq - right.seq);
+  let gapIndex = -1;
+  for (let index = 0; index < ordered.length; index += 1) {
+    const result = enqueueOutputChunk(cacheKey, session, ordered[index]);
+    if (result === "duplicate") {
+      continue;
+    }
+    if (result === "gap") {
+      gapIndex = index;
+      break;
+    }
+  }
+
+  if (gapIndex >= 0) {
+    const remaining = ordered.slice(gapIndex);
+    const remainingChars = remaining.reduce((total, chunk) => total + chunk.data.length, 0);
+    pendingOutput.set(cacheKey, {
+      chunks: remaining,
+      chars: remainingChars,
+      droppedChars: 0,
+      droppedChunks: 0,
+    });
+    const parsed = parseTerminalCacheKey(cacheKey);
+    if (parsed && !session.resumeInFlight && session.resumeRetryTimer === undefined) {
+      void resumeSessionOutput(parsed.workspaceId, parsed.sessionId, "live-gap");
+    }
+    return;
+  }
+
+  if (session.isAttached) {
+    scheduleOutputFlush(cacheKey, session, 0);
+  }
+}
+
+function runTerminalFit(workspaceId: string, sessionId: string) {
+  const cacheKey = terminalCacheKey(workspaceId, sessionId);
+  const session = cachedTerminals.get(cacheKey);
+  if (!session || !session.isAttached) {
+    return;
+  }
+
+  const container = session.terminal.element?.parentElement;
+  if (!(container instanceof HTMLElement) || !hasRenderableSize(container)) {
+    return;
+  }
+
+  const before = normalizeSize(session.terminal.cols, session.terminal.rows);
+  session.fitAddon.fit();
+  const after = normalizeSize(session.terminal.cols, session.terminal.rows);
+  if (!sameSize(before, after) && after.rows > 0) {
+    session.terminal.refresh(0, after.rows - 1);
+  }
+
+  sendResizeIfNeeded(workspaceId, sessionId, session, after.cols, after.rows);
+
+  if (session.outputQueue.length > 0) {
+    scheduleOutputFlush(cacheKey, session, 0);
+  }
+}
+
+function scheduleTerminalFit(
+  workspaceId: string,
+  sessionId: string,
+  delayMs: number = FIT_DEBOUNCE_MS
+) {
+  const cacheKey = terminalCacheKey(workspaceId, sessionId);
+  const session = cachedTerminals.get(cacheKey);
+  if (!session) {
+    return;
+  }
+
+  if (session.fitTimer !== undefined) {
+    window.clearTimeout(session.fitTimer);
+  }
+  session.fitTimer = window.setTimeout(() => {
+    const latest = cachedTerminals.get(cacheKey);
+    if (!latest) {
+      return;
+    }
+    latest.fitTimer = undefined;
+    runTerminalFit(workspaceId, sessionId);
+  }, delayMs);
+}
+
+function scheduleDetachedTerminalEviction(
+  workspaceId: string,
+  sessionId: string,
+  session: SessionTerminal,
+) {
+  if (session.evictionTimer !== undefined) {
+    window.clearTimeout(session.evictionTimer);
+    session.evictionTimer = undefined;
+  }
+  if (session.isAttached || session.detachedAt === undefined) {
+    return;
+  }
+
+  const detachedAt = session.detachedAt;
+  const elapsed = Date.now() - detachedAt;
+  const delayMs = Math.max(0, DETACHED_TERMINAL_IDLE_EVICTION_MS - elapsed);
+  session.evictionTimer = window.setTimeout(() => {
+    const cacheKey = terminalCacheKey(workspaceId, sessionId);
+    const latest = cachedTerminals.get(cacheKey);
+    if (!latest) {
+      return;
+    }
+    latest.evictionTimer = undefined;
+    if (latest.isAttached || latest.detachedAt !== detachedAt) {
+      return;
+    }
+    destroyCachedTerminal(workspaceId, sessionId);
+  }, delayMs);
+}
+
+function markWorkspaceTerminalsDetached(workspaceId: string) {
+  const workspacePrefix = terminalWorkspacePrefix(workspaceId);
+  const detachedAt = Date.now();
+  for (const [cacheKey, session] of cachedTerminals) {
+    if (!cacheKey.startsWith(workspacePrefix)) {
+      continue;
+    }
+    markWorkspaceTerminalDetached(session, detachedAt);
+    if (session.fitTimer !== undefined) {
+      window.clearTimeout(session.fitTimer);
+      session.fitTimer = undefined;
+    }
+    if (session.flushTimer !== undefined) {
+      window.clearTimeout(session.flushTimer);
+      session.flushTimer = undefined;
+    }
+    if (session.outputDrainTimer !== undefined) {
+      window.clearTimeout(session.outputDrainTimer);
+      session.outputDrainTimer = undefined;
+    }
+    capSessionOutputQueue(cacheKey, session);
+    const sessionId = cacheKey.slice(workspacePrefix.length);
+    scheduleDetachedTerminalEviction(workspaceId, sessionId, session);
+  }
+  pruneDetachedTerminalCache();
+}
+
+function markCachedTerminalDetached(cacheKey: string, session: SessionTerminal) {
+  markPaneTerminalDetached(session, Date.now());
+  if (session.fitTimer !== undefined) {
+    window.clearTimeout(session.fitTimer);
+    session.fitTimer = undefined;
+  }
+  if (session.flushTimer !== undefined) {
+    window.clearTimeout(session.flushTimer);
+    session.flushTimer = undefined;
+  }
+  if (session.outputDrainTimer !== undefined) {
+    window.clearTimeout(session.outputDrainTimer);
+    session.outputDrainTimer = undefined;
+  }
+  capSessionOutputQueue(cacheKey, session);
+  const parsed = parseTerminalCacheKey(cacheKey);
+  if (!parsed) {
+    return;
+  }
+  scheduleDetachedTerminalEviction(parsed.workspaceId, parsed.sessionId, session);
+}
+
+/** Permanently destroy a cached terminal (used when session is explicitly closed). */
+function destroyCachedTerminal(workspaceId: string, sessionId: string) {
+  const key = terminalCacheKey(workspaceId, sessionId);
+  const refreshTimer = backendDiagnosticsRefreshTimers.get(key);
+  if (refreshTimer !== undefined) {
+    window.clearTimeout(refreshTimer);
+    backendDiagnosticsRefreshTimers.delete(key);
+  }
+  const cached = cachedTerminals.get(key);
+  if (cached) {
+    clearSessionTimers(cached);
+    cached.dispose();
+    cachedTerminals.delete(key);
+  }
+  pendingOutput.delete(key);
+  cachedBackendRendererDiagnostics.delete(key);
+}
+
+function pruneDetachedTerminalCache() {
+  const now = Date.now();
+  const staleKeys = collectDetachedTerminalEvictionKeys(
+    [...cachedTerminals.entries()].map(([cacheKey, session]) => ({
+      cacheKey,
+      isAttached: session.isAttached,
+      detachedAt: session.detachedAt,
+      lastAccessedAt: session.lastAccessedAt,
+    })),
+    now,
+    DETACHED_TERMINAL_IDLE_EVICTION_MS,
+  );
+  for (const cacheKey of staleKeys) {
+    const parsed = parseTerminalCacheKey(cacheKey);
+    if (!parsed) {
+      continue;
+    }
+    destroyCachedTerminal(parsed.workspaceId, parsed.sessionId);
+  }
+}
+
+function createCachedTerminal(
+  workspaceId: string,
+  sessionId: string,
+  container: HTMLElement,
+): SessionTerminal {
+  const cacheKey = terminalCacheKey(workspaceId, sessionId);
+  const terminalOptions: ConstructorParameters<typeof Terminal>[0] & {
+    allowNonHttpProtocols?: boolean;
+    linkHandler: {
+      activate(event: MouseEvent | undefined, text: string): void;
+    };
+  } = {
+    allowProposedApi: true,
+    convertEol: false,
+    cursorBlink: true,
+    cursorInactiveStyle: "none",
+    fontFamily: '"Geist Mono", ui-monospace, monospace',
+    fontSize: terminalFontSizePreferenceLoaded
+      ? terminalFontSizePreference
+      : DEFAULT_TERMINAL_FONT_SIZE,
+    linkHandler: {
+      activate(event, text) {
+        void navigateLinkTarget(text, {
+          shiftKey: Boolean(event?.shiftKey),
+          sourceLeafId: getWorkspacePaneLeafIdFromEventTarget(event?.target ?? null),
+        });
+      },
+    },
+    lineHeight: 1.3,
+    scrollback: TERMINAL_SCROLLBACK_LINES,
+    theme: getXtermThemeColors(getCurrentThemeMode()),
+  };
+  terminalOptions.allowNonHttpProtocols = true;
+  const terminal = new Terminal(terminalOptions);
+
+  const fitAddon = new FitAddon();
+  terminal.loadAddon(fitAddon);
+
+  const unicode11 = new Unicode11Addon();
+  terminal.loadAddon(unicode11);
+  terminal.unicode.activeVersion = "11";
+
+  const rendererDiagnostics = createRendererDiagnostics();
+
+  terminal.open(container);
+  const textLinkProviderDisposable = terminal.registerLinkProvider(
+    createTerminalTextLinkProvider(terminal),
+  );
+
+  // xterm.js fires onData for BOTH user keystrokes AND auto-generated
+  // terminal protocol responses (DA1/DA2 device attributes, cursor position
+  // reports, OSC color query responses, focus in/out events). These responses
+  // must NOT be broadcast to other terminals — they would appear as garbage.
+  const RE_TERMINAL_RESPONSE = /^\x1b(\[\?[\d;]*c|\[>[\d;]*c|\[\d+;\d+R|\]\d+;|\[I\b|\[O\b)/;
+  function isTerminalResponse(data: string): boolean {
+    return data.length >= 3 && data.charCodeAt(0) === 0x1b && RE_TERMINAL_RESPONSE.test(data);
+  }
+
+  // Broadcast-aware write: only fan out when the broadcasting group is
+  // currently active. This prevents cross-tab input leakage.
+  function getBroadcastTargetSessionIds(): string[] | null {
+    const ws = useTerminalStore.getState().workspaces[workspaceId];
+    const bgId = ws?.broadcastGroupId;
+    if (!bgId || ws.activeGroupId !== bgId) {
+      return null;
+    }
+    const group = ws.groups.find((g) => g.id === bgId);
+    if (!group) {
+      return null;
+    }
+    return collectSessionIds(group.root);
+  }
+
+  function broadcastWrite(data: string) {
+    const targetSessionIds = getBroadcastTargetSessionIds();
+    if (targetSessionIds) {
+      for (const id of targetSessionIds) {
+        enqueueTerminalInput(terminalCacheKey(workspaceId, id), workspaceId, id, data);
+      }
+      return;
+    }
+    enqueueTerminalInput(cacheKey, workspaceId, sessionId, data);
+  }
+
+  function broadcastWriteBytes(bytes: number[]) {
+    const targetSessionIds = getBroadcastTargetSessionIds();
+    if (targetSessionIds) {
+      for (const id of targetSessionIds) {
+        enqueueTerminalInputBytes(terminalCacheKey(workspaceId, id), workspaceId, id, bytes);
+      }
+      return;
+    }
+    enqueueTerminalInputBytes(cacheKey, workspaceId, sessionId, bytes);
+  }
+
+  terminal.attachCustomKeyEventHandler((event) => {
+    if (event.type !== "keydown") return true;
+    if (isTerminalCopyShortcut(event)) {
+      event.preventDefault();
+      event.stopPropagation();
+      const selection = terminal.getSelection();
+      if (selection) {
+        void copyTextToClipboard(selection).catch((error) => {
+          logTerminalWarning("terminal-copy-shortcut-failed", {
+            cacheKey,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
+      return false;
+    }
+    if (isTerminalPasteShortcut(event)) {
+      event.preventDefault();
+      event.stopPropagation();
+      void readTextFromClipboard()
+        .then((text) => {
+          if (text) {
+            terminal.paste(text);
+          }
+        })
+        .catch((error) => {
+          logTerminalWarning("terminal-paste-shortcut-failed", {
+            cacheKey,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        });
+      return false;
+    }
+    // Block broadcast shortcut from reaching the shell
+    if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "i") return false;
+    if (event.metaKey && !event.ctrlKey && event.key === "Backspace") {
+      broadcastWrite("\x15");
+      return false;
+    }
+    if (event.ctrlKey && !event.metaKey && event.key === "Backspace") {
+      broadcastWrite("\x17");
+      return false;
+    }
+    const k = event.key.toLowerCase();
+    if (event.metaKey && (k === "d" || k === "t")) return false;
+    if (event.ctrlKey && k === "t") return false;
+    // Cmd+Arrow (macOS) / Home/End (Linux/Windows) → line navigation
+    const isMac = isMacDesktop();
+    if (isMac && event.metaKey) {
+      switch (event.key) {
+        case "ArrowLeft":
+          // Beginning of line (Ctrl+A)
+          broadcastWrite("\x01");
+          return false;
+        case "ArrowRight":
+          // End of line (Ctrl+E)
+          broadcastWrite("\x05");
+          return false;
+        case "ArrowUp":
+          // Scroll to top (Ctrl+Home)
+          broadcastWrite("\x1b[1;5H");
+          return false;
+        case "ArrowDown":
+          // Scroll to bottom (Ctrl+End)
+          broadcastWrite("\x1b[1;5F");
+          return false;
+      }
+    }
+    // Home/End keys work natively on Linux/Windows — no extra mapping needed
+    return true;
+  });
+  const writeDisposable = terminal.onData((data) => {
+    if (isTerminalResponse(data)) {
+      // Terminal protocol responses go only to the originating session
+      enqueueTerminalProtocolInput(cacheKey, workspaceId, sessionId, data);
+      return;
+    }
+    broadcastWrite(data);
+  });
+
+  const binaryDisposable = terminal.onBinary((data) => {
+    const bytes = Array.from(data, (c) => c.charCodeAt(0));
+    broadcastWriteBytes(bytes);
+  });
+
+  const resizeDisposable = terminal.onResize(({ cols, rows }) => {
+    const current = cachedTerminals.get(cacheKey);
+    if (!current) {
+      return;
+    }
+    sendResizeIfNeeded(workspaceId, sessionId, current, cols, rows);
+  });
+
+  let disposed = false;
+  const entry: SessionTerminal = {
+    terminal,
+    fitAddon,
+    stdinQueue: [],
+    stdinQueueChars: 0,
+    stdinFlushInFlight: false,
+    outputQueue: [],
+    outputQueueChars: 0,
+    lastAppliedSeq: 0,
+    outputDrainInFlight: false,
+    outputDrainTimer: undefined,
+    outputDrainRequestedSeq: 0,
+    outputDrainRetryAttempts: 0,
+    resumeInFlight: false,
+    resumeRetryAttempts: 0,
+    rendererMode: "canvas",
+    flushInProgress: false,
+    flushNonce: 0,
+    flushStallCount: 0,
+    flushTimeoutWindowCount: 0,
+    isAttached: true,
+    evictionTimer: undefined,
+    lastAccessedAt: Date.now(),
+    detachedAt: undefined,
+    needsResumeOnAttach: true,
+    requiresColdReattach: false,
+    debugSample: {
+      chunks: 0,
+      chars: 0,
+      lastLogAt: Date.now(),
+    },
+    rendererDiagnostics,
+    imageAddonCleanup: undefined,
+    webglCleanup: undefined,
+    dispose: () => {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      clearSessionTimers(entry);
+      entry.imageAddonCleanup?.();
+      entry.imageAddonCleanup = undefined;
+      entry.webglCleanup?.();
+      entry.webglCleanup = undefined;
+      textLinkProviderDisposable.dispose();
+      writeDisposable.dispose();
+      binaryDisposable.dispose();
+      resizeDisposable.dispose();
+      terminal.dispose();
+    },
+  };
+  cachedTerminals.set(cacheKey, entry);
+  if (acceleratedTerminalRenderingPreferenceLoaded) {
+    applyAcceleratedRenderingPreference(
+      cacheKey,
+      entry,
+      acceleratedTerminalRenderingEnabled,
+    );
+  }
+  if (SHOW_TERMINAL_DIAGNOSTICS_UI) {
+    void refreshBackendRendererDiagnostics(workspaceId, sessionId);
+  }
+
+  // Synchronous fit — ensures PTY gets correct size before first shell output
+  fitAddon.fit();
+  sendResizeIfNeeded(workspaceId, sessionId, entry, terminal.cols, terminal.rows);
+
+  void resumeSessionOutput(workspaceId, sessionId, "attach");
+  scheduleTerminalFit(workspaceId, sessionId, 0);
+  return entry;
+}
+
+function createTerminalTextLinkProvider(terminal: Terminal): ILinkProvider {
+  return {
+    provideLinks(bufferLineNumber, callback) {
+      const line = terminal.buffer.active.getLine(bufferLineNumber - 1);
+      const lineText = line?.translateToString(true) ?? "";
+      const matches = extractTextLinkMatches(lineText);
+      if (matches.length === 0) {
+        callback(undefined);
+        return;
+      }
+
+      const links: ILink[] = matches.map((match) => ({
+        text: match.text,
+        range: {
+          start: { x: match.startIndex + 1, y: bufferLineNumber },
+          end: { x: match.endIndex, y: bufferLineNumber },
+        },
+        decorations: {
+          pointerCursor: false,
+          underline: false,
+        },
+        activate(event, text) {
+          void navigateLinkTarget(text, {
+            shiftKey: Boolean(event?.shiftKey),
+            sourceLeafId: getWorkspacePaneLeafIdFromEventTarget(event?.target ?? null),
+          });
+        },
+        hover() {
+          terminal.element?.classList.add("xterm-cursor-pointer");
+        },
+        leave() {
+          terminal.element?.classList.remove("xterm-cursor-pointer");
+        },
+      }));
+      callback(links);
+    },
+  };
+}
+
+// ── Split pane components ───────────────────────────────────────────
+
+interface SplitPaneViewProps {
+  node: SplitNode;
+  workspaceId: string;
+  groupId: string;
+  activeIndicatorSessionId: string | null;
+  isBroadcasting: boolean;
+  notificationsBySessionId: Record<string, TerminalNotification>;
+  containerRefs: React.MutableRefObject<Map<string, HTMLDivElement>>;
+  onFocus: (sessionId: string) => void;
+  onTerminalFocus: (sessionId: string) => void;
+  onTerminalBlur: (sessionId: string) => void;
+  onPaneContextMenu?: (sessionId: string, event: React.MouseEvent<HTMLDivElement>) => void;
+  onClose: (sessionId: string) => void;
+  onRatioChange: (containerId: string, ratio: number) => void;
+  ensureTerminal: (sessionId: string) => void;
+  showCloseButton: boolean;
+}
+
+function isXtermFocusTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && target.classList.contains("xterm-helper-textarea");
+}
+
+function SplitPaneView({
+  node,
+  workspaceId,
+  groupId,
+  activeIndicatorSessionId,
+  isBroadcasting,
+  notificationsBySessionId,
+  containerRefs,
+  onFocus,
+  onTerminalFocus,
+  onTerminalBlur,
+  onPaneContextMenu,
+  onClose,
+  onRatioChange,
+  ensureTerminal,
+  showCloseButton,
+}: SplitPaneViewProps) {
+  const { t } = useTranslation("app");
+  if (node.type === "leaf") {
+    const isFocused = node.sessionId === activeIndicatorSessionId || isBroadcasting;
+    const notification = notificationsBySessionId[node.sessionId] ?? null;
+    const notificationPreview = notification
+      ? `${notification.title}: ${notification.body}`
+      : undefined;
+    return (
+      <div
+        className={`terminal-leaf-pane${isFocused ? " terminal-leaf-pane-focused" : ""}${isBroadcasting ? " terminal-leaf-pane-broadcasting" : ""}${notification ? " terminal-leaf-pane-notified" : ""}`}
+        onMouseDown={() => onFocus(node.sessionId)}
+        onFocusCapture={(event) => {
+          if (!isXtermFocusTarget(event.target)) {
+            return;
+          }
+          onTerminalFocus(node.sessionId);
+        }}
+        onBlurCapture={(event) => {
+          if (!isXtermFocusTarget(event.target)) {
+            return;
+          }
+          onTerminalBlur(node.sessionId);
+        }}
+      >
+        <div
+          ref={(el) => {
+            if (!el) {
+              containerRefs.current.delete(node.sessionId);
+              const cacheKey = terminalCacheKey(workspaceId, node.sessionId);
+              const cached = cachedTerminals.get(cacheKey);
+              if (cached) {
+                markCachedTerminalDetached(cacheKey, cached);
+              }
+              return;
+            }
+            containerRefs.current.set(node.sessionId, el);
+            ensureTerminal(node.sessionId);
+          }}
+          className="terminal-viewport"
+          style={{ position: "absolute", inset: 0 }}
+          onContextMenu={(event) => onPaneContextMenu?.(node.sessionId, event)}
+        />
+        {notification && (
+          <span
+            className="terminal-pane-notification-dot"
+            title={notificationPreview}
+            aria-hidden="true"
+          />
+        )}
+        {showCloseButton && (
+          <button
+            type="button"
+            className="terminal-pane-close-btn"
+            onClick={(e) => {
+              e.stopPropagation();
+              onClose(node.sessionId);
+            }}
+            title={t("terminal.closePane")}
+          >
+            <X size={10} />
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <SplitContainerView
+      container={node}
+      workspaceId={workspaceId}
+      groupId={groupId}
+      activeIndicatorSessionId={activeIndicatorSessionId}
+      isBroadcasting={isBroadcasting}
+      notificationsBySessionId={notificationsBySessionId}
+      containerRefs={containerRefs}
+      onFocus={onFocus}
+      onTerminalFocus={onTerminalFocus}
+      onTerminalBlur={onTerminalBlur}
+      onPaneContextMenu={onPaneContextMenu}
+      onClose={onClose}
+      onRatioChange={onRatioChange}
+      ensureTerminal={ensureTerminal}
+    />
+  );
+}
+
+interface SplitContainerViewProps {
+  container: SplitContainerType;
+  workspaceId: string;
+  groupId: string;
+  activeIndicatorSessionId: string | null;
+  isBroadcasting: boolean;
+  notificationsBySessionId: Record<string, TerminalNotification>;
+  containerRefs: React.MutableRefObject<Map<string, HTMLDivElement>>;
+  onFocus: (sessionId: string) => void;
+  onTerminalFocus: (sessionId: string) => void;
+  onTerminalBlur: (sessionId: string) => void;
+  onPaneContextMenu?: (sessionId: string, event: React.MouseEvent<HTMLDivElement>) => void;
+  onClose: (sessionId: string) => void;
+  onRatioChange: (containerId: string, ratio: number) => void;
+  ensureTerminal: (sessionId: string) => void;
+}
+
+interface SplitRatioUpdate {
+  containerId: string;
+  ratio: number;
+}
+
+function countLeafNodes(node: SplitNode): number {
+  if (node.type === "leaf") {
+    return 1;
+  }
+  return countLeafNodes(node.children[0]) + countLeafNodes(node.children[1]);
+}
+
+function collectEqualSplitRatios(node: SplitNode, updates: SplitRatioUpdate[]) {
+  if (node.type === "leaf") {
+    return;
+  }
+  const leftLeafCount = countLeafNodes(node.children[0]);
+  const rightLeafCount = countLeafNodes(node.children[1]);
+  const totalLeafCount = leftLeafCount + rightLeafCount;
+  if (totalLeafCount > 0) {
+    updates.push({
+      containerId: node.id,
+      ratio: leftLeafCount / totalLeafCount,
+    });
+  }
+  collectEqualSplitRatios(node.children[0], updates);
+  collectEqualSplitRatios(node.children[1], updates);
+}
+
+function SplitContainerView({
+  container,
+  workspaceId,
+  groupId,
+  activeIndicatorSessionId,
+  isBroadcasting,
+  notificationsBySessionId,
+  containerRefs,
+  onFocus,
+  onTerminalFocus,
+  onTerminalBlur,
+  onPaneContextMenu,
+  onClose,
+  onRatioChange,
+  ensureTerminal,
+}: SplitContainerViewProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => dragCleanupRef.current?.();
+  }, []);
+
+  const isVertical = container.direction === "vertical";
+  const handleClass = isVertical
+    ? "terminal-split-handle-v"
+    : "terminal-split-handle-h";
+  const flexDir = isVertical ? "row" : "column";
+
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      const el = containerRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const dimension = isVertical ? rect.width : rect.height;
+      const start = isVertical ? rect.left : rect.top;
+      const sessionIds = collectSessionIds(container);
+
+      document.body.style.userSelect = "none";
+
+      const onMove = (moveEvent: MouseEvent) => {
+        const pos = isVertical ? moveEvent.clientX : moveEvent.clientY;
+        const newRatio = (pos - start) / dimension;
+        onRatioChange(container.id, newRatio);
+      };
+      const cleanup = () => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", cleanup);
+        document.body.style.userSelect = "";
+        dragCleanupRef.current = null;
+        for (const id of sessionIds) {
+          scheduleTerminalFit(workspaceId, id, 0);
+        }
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", cleanup);
+      dragCleanupRef.current = cleanup;
+    },
+    [container.id, isVertical, onRatioChange, workspaceId],
+  );
+
+  const firstPct = `${container.ratio * 100}%`;
+  const secondPct = `${(1 - container.ratio) * 100}%`;
+
+  return (
+    <div
+      ref={containerRef}
+      className="terminal-split-container"
+      style={{ flexDirection: flexDir }}
+    >
+      <div style={{ flex: `0 0 calc(${firstPct} - 2px)`, minWidth: 0, minHeight: 0, display: "flex", overflow: "hidden" }}>
+        <SplitPaneView
+          node={container.children[0]}
+          workspaceId={workspaceId}
+          groupId={groupId}
+          activeIndicatorSessionId={activeIndicatorSessionId}
+          isBroadcasting={isBroadcasting}
+          notificationsBySessionId={notificationsBySessionId}
+          containerRefs={containerRefs}
+          onFocus={onFocus}
+          onTerminalFocus={onTerminalFocus}
+          onTerminalBlur={onTerminalBlur}
+          onPaneContextMenu={onPaneContextMenu}
+          onClose={onClose}
+          onRatioChange={onRatioChange}
+          ensureTerminal={ensureTerminal}
+          showCloseButton
+        />
+      </div>
+      <div className={handleClass} onMouseDown={handleMouseDown} />
+      <div style={{ flex: `0 0 calc(${secondPct} - 2px)`, minWidth: 0, minHeight: 0, display: "flex", overflow: "hidden" }}>
+        <SplitPaneView
+          node={container.children[1]}
+          workspaceId={workspaceId}
+          groupId={groupId}
+          activeIndicatorSessionId={activeIndicatorSessionId}
+          isBroadcasting={isBroadcasting}
+          notificationsBySessionId={notificationsBySessionId}
+          containerRefs={containerRefs}
+          onFocus={onFocus}
+          onTerminalFocus={onTerminalFocus}
+          onTerminalBlur={onTerminalBlur}
+          onPaneContextMenu={onPaneContextMenu}
+          onClose={onClose}
+          onRatioChange={onRatioChange}
+          ensureTerminal={ensureTerminal}
+          showCloseButton
+        />
+      </div>
+    </div>
+  );
+}
+
+// ── Grid Preview ────────────────────────────────────────────────────
+
+function GridPreview({ count }: { count: number }) {
+  if (count <= 3) {
+    return (
+      <div className="grid-preview-row">
+        {Array.from({ length: count }, (_, i) => (
+          <div key={i} className="grid-preview-cell" />
+        ))}
+      </div>
+    );
+  }
+  const topCount = Math.ceil(count / 2);
+  const bottomCount = count - topCount;
+  return (
+    <div className="grid-preview-col">
+      <div className="grid-preview-row">
+        {Array.from({ length: topCount }, (_, i) => (
+          <div key={i} className="grid-preview-cell" />
+        ))}
+      </div>
+      <div className="grid-preview-row">
+        {Array.from({ length: bottomCount }, (_, i) => (
+          <div key={i} className="grid-preview-cell" />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── New Tab Dropdown ─────────────────────────────────────────────────
+
+const MAX_PER_HARNESS = 8;
+
+interface NewTabDropdownProps {
+  menuRef: React.RefObject<HTMLDivElement | null>;
+  anchorRect: DOMRect;
+  harnesses: { id: string; name: string }[];
+  repos: Array<{ path: string; name: string; defaultBranch: string }>;
+  onNewTerminal: () => void;
+  onLaunchHarness: (id: string) => void;
+  onMultiLaunch: (ids: string[], broadcast: boolean, worktreeRepoPath?: string | null) => void;
+}
+
+function NewTabDropdown({
+  menuRef,
+  anchorRect,
+  harnesses,
+  repos,
+  onNewTerminal,
+  onLaunchHarness,
+  onMultiLaunch,
+}: NewTabDropdownProps) {
+  const { t } = useTranslation("app");
+  const [mode, setMode] = useState<"default" | "multi">("default");
+  const [quantities, setQuantities] = useState<Map<string, number>>(() => new Map());
+  const [withBroadcast, setWithBroadcast] = useState(true);
+  const [useWorktrees, setUseWorktrees] = useState(false);
+  const [selectedRepoPath, setSelectedRepoPath] = useState<string | null>(repos[0]?.path ?? null);
+
+  useEffect(() => {
+    setSelectedRepoPath((current) => {
+      if (current && repos.some((repo) => repo.path === current)) {
+        return current;
+      }
+      return repos[0]?.path ?? null;
+    });
+  }, [repos]);
+
+  const totalCount = useMemo(() => {
+    let sum = 0;
+    for (const n of quantities.values()) sum += n;
+    return sum;
+  }, [quantities]);
+
+  const expandedIds = useMemo(() => {
+    const ids: string[] = [];
+    for (const [id, qty] of quantities) {
+      for (let i = 0; i < qty; i++) ids.push(id);
+    }
+    return ids;
+  }, [quantities]);
+
+  const selectedWorktreeRepoPath = useMemo(() => {
+    if (!useWorktrees) return null;
+    if (selectedRepoPath && repos.some((repo) => repo.path === selectedRepoPath)) {
+      return selectedRepoPath;
+    }
+    return repos[0]?.path ?? null;
+  }, [useWorktrees, selectedRepoPath, repos]);
+
+  const setQty = (id: string, qty: number) => {
+    setQuantities((prev) => {
+      const next = new Map(prev);
+      const clamped = Math.max(0, Math.min(MAX_PER_HARNESS, qty));
+      if (clamped === 0) next.delete(id);
+      else next.set(id, clamped);
+      return next;
+    });
+  };
+
+  return (
+    <div
+      ref={menuRef}
+      className="terminal-new-dropdown"
+      style={{
+        position: "fixed",
+        top: anchorRect.bottom + 4,
+        right: window.innerWidth - anchorRect.right,
+      }}
+    >
+      {mode === "default" ? (
+        <>
+          <button type="button" className="terminal-new-dropdown-item" onClick={onNewTerminal}>
+            <SquareTerminal size={13} />
+            {t("terminal.terminal")}
+          </button>
+          {harnesses.length > 0 && <div className="terminal-new-dropdown-divider" />}
+          {harnesses.map((h) => (
+            <button
+              key={h.id}
+              type="button"
+              className="terminal-new-dropdown-item"
+              onClick={() => onLaunchHarness(h.id)}
+            >
+              {getHarnessIcon(h.id, 13)}
+              {h.name}
+            </button>
+          ))}
+          {harnesses.length >= 1 && (
+            <>
+              <div className="terminal-new-dropdown-divider" />
+              <button
+                type="button"
+                className="terminal-new-dropdown-item tnd-multi-entry"
+                onClick={() => setMode("multi")}
+              >
+                <Rows2 size={13} />
+                {t("terminal.multiLaunchEntry")}
+              </button>
+            </>
+          )}
+        </>
+      ) : (
+        <>
+          {/* Multi-launch mode: steppers per harness */}
+          <div className="tnd-multi-header">
+            <button type="button" className="tnd-back-btn" onClick={() => { setMode("default"); setQuantities(new Map()); }}>
+              <X size={11} />
+            </button>
+            <span className="tnd-multi-title">{t("terminal.multiLaunchTitle")}</span>
+          </div>
+          <div className="terminal-new-dropdown-divider" />
+          {harnesses.map((h) => {
+            const qty = quantities.get(h.id) ?? 0;
+            return (
+              <div key={h.id} className="tnd-harness-row">
+                <div className="tnd-harness-label">
+                  {getHarnessIcon(h.id, 13)}
+                  <span className="tnd-harness-name">{h.name}</span>
+                </div>
+                <div className="tnd-stepper">
+                  <button
+                    type="button"
+                    className="tnd-stepper-btn"
+                    onClick={() => setQty(h.id, qty - 1)}
+                    disabled={qty <= 0}
+                  >
+                    <Minus size={9} />
+                  </button>
+                  <span className={`tnd-stepper-val${qty > 0 ? " tnd-stepper-val-active" : ""}`}>{qty}</span>
+                  <button
+                    type="button"
+                    className="tnd-stepper-btn"
+                    onClick={() => setQty(h.id, qty + 1)}
+                    disabled={qty >= MAX_PER_HARNESS}
+                  >
+                    <Plus size={9} />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+
+          {totalCount >= 2 && (
+            <>
+              <div className="terminal-new-dropdown-divider" />
+              <div className="tnd-multi-footer">
+                <div className="tnd-multi-preview">
+                  <GridPreview count={totalCount} />
+                </div>
+
+                <div className="tnd-options">
+                  <button
+                    type="button"
+                    className={`tnd-option-card${withBroadcast ? " tnd-option-card-active" : ""}`}
+                    onClick={() => setWithBroadcast(!withBroadcast)}
+                  >
+                    <div className="tnd-option-icon">
+                      <Radio size={13} />
+                    </div>
+                    <div className="tnd-option-text">
+                      <span className="tnd-option-title">{t("terminal.broadcastInput")}</span>
+                      <span className="tnd-option-desc">{t("terminal.broadcastInputDescription")}</span>
+                    </div>
+                    <div className={`tnd-option-toggle${withBroadcast ? " tnd-option-toggle-on" : ""}`}>
+                      <div className="tnd-option-toggle-dot" />
+                    </div>
+                  </button>
+
+                  {repos.length > 0 && (
+                    <div>
+                      <button
+                        type="button"
+                        className={`tnd-option-card${useWorktrees ? " tnd-option-card-active" : ""}`}
+                        onClick={() => setUseWorktrees(!useWorktrees)}
+                      >
+                        <div className="tnd-option-icon">
+                          <GitBranchIcon size={13} />
+                        </div>
+                        <div className="tnd-option-text">
+                          <span className="tnd-option-title">{t("terminal.gitWorktrees")}</span>
+                          <span className="tnd-option-desc">{t("terminal.gitWorktreesDescription")}</span>
+                        </div>
+                        <div className={`tnd-option-toggle${useWorktrees ? " tnd-option-toggle-on" : ""}`}>
+                          <div className="tnd-option-toggle-dot" />
+                        </div>
+                      </button>
+                      {useWorktrees && repos.length > 1 && (
+                        <select
+                          className="tnd-worktree-repo-select"
+                          value={selectedWorktreeRepoPath ?? ""}
+                          onChange={(e) => setSelectedRepoPath(e.target.value || null)}
+                        >
+                          {repos.map((r) => (
+                            <option key={r.path} value={r.path}>{r.name}</option>
+                          ))}
+                        </select>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  className="tnd-launch-btn"
+                  onClick={() => onMultiLaunch(expandedIds, withBroadcast, selectedWorktreeRepoPath)}
+                >
+                  {t("terminal.launchCount", { count: totalCount })}
+                </button>
+              </div>
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── Main component ──────────────────────────────────────────────────
+
+export function TerminalPanel({ workspaceId, embedded = false }: TerminalPanelProps) {
+  const { t } = useTranslation("app");
+  const workspaceState = useTerminalStore((state) => state.workspaces[workspaceId]);
+  const focusMode = useUiStore((state) => state.focusMode);
+  const showSidebar = useUiStore((state) => state.showSidebar);
+  const showGitPanel = useUiStore((state) => state.showGitPanel);
+  const isOpen = workspaceState?.isOpen ?? false;
+  const layoutMode = workspaceState?.layoutMode ?? "chat";
+  const sessions = workspaceState?.sessions ?? [];
+  const loading = workspaceState?.loading ?? false;
+  const error = workspaceState?.error;
+  const groups = workspaceState?.groups ?? [];
+  const notificationsBySessionId = workspaceState?.notificationsBySessionId ?? {};
+  const activeGroupId = workspaceState?.activeGroupId ?? null;
+  const focusedSessionId = workspaceState?.focusedSessionId ?? null;
+  const pendingStartupPreset = workspaceState?.pendingStartupPreset ?? null;
+  const isMac = isMacDesktop();
+  const useTitlebarSafeInset =
+    !embedded && isMac && focusMode && !showSidebar && layoutMode === "terminal";
+  const gitPanelDocked = showGitPanel;
+  const useFocusModeHeaderHeight = !embedded && focusMode && gitPanelDocked;
+  const linuxDesktop = isLinuxDesktop();
+  const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
+
+  const createSession = useTerminalStore((state) => state.createSession);
+  const hydrateNotifications = useTerminalStore((state) => state.hydrateNotifications);
+  const applyNotification = useTerminalStore((state) => state.applyNotification);
+  const clearNotificationLocal = useTerminalStore((state) => state.clearNotificationLocal);
+  const clearNotification = useTerminalStore((state) => state.clearNotification);
+  const syncNotificationFocus = useTerminalStore((state) => state.syncNotificationFocus);
+  const materializeWorkspaceStartupPreset = useTerminalStore(
+    (state) => state.materializeWorkspaceStartupPreset,
+  );
+  const closeSession = useTerminalStore((state) => state.closeSession);
+  const handleSessionExit = useTerminalStore((state) => state.handleSessionExit);
+  const setWorkspaceStatus = useTerminalStore((state) => state.setWorkspaceStatus);
+  const syncSessions = useTerminalStore((state) => state.syncSessions);
+  const splitSession = useTerminalStore((state) => state.splitSession);
+  const setFocusedSession = useTerminalStore((state) => state.setFocusedSession);
+  const setActiveGroup = useTerminalStore((state) => state.setActiveGroup);
+  const updateGroupRatio = useTerminalStore((state) => state.updateGroupRatio);
+  const renameGroup = useTerminalStore((state) => state.renameGroup);
+  const reorderGroups = useTerminalStore((state) => state.reorderGroups);
+  const createMultiSessionGroup = useTerminalStore((state) => state.createMultiSessionGroup);
+  const getGroupWorktrees = useTerminalStore((state) => state.getGroupWorktrees);
+  const removeGroupWorktrees = useTerminalStore((state) => state.removeGroupWorktrees);
+  const repos = useWorkspaceStore((state) => state.repos);
+
+  const [worktreeCloseGroupId, setWorktreeCloseGroupId] = useState<string | null>(null);
+  const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  // Only one tab can be renamed at a time, so a single ref is safe despite being inside .map()
+  const renameInputRef = useRef<HTMLInputElement>(null);
+
+  const [draggingGroupId, setDraggingGroupId] = useState<string | null>(null);
+  const dragStateRef = useRef<{ groupId: string; startX: number; started: boolean; el: HTMLElement } | null>(null);
+  const suppressClickRef = useRef(false);
+  const tabsListRef = useRef<HTMLDivElement>(null);
+
+  const [ctxMenu, setCtxMenu] = useState<{ groupId: string; x: number; y: number } | null>(null);
+  const [terminalCtxMenu, setTerminalCtxMenu] = useState<{
+    sessionId: string;
+    x: number;
+    y: number;
+    selectionText: string;
+  } | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [listenersReadyWorkspaceId, setListenersReadyWorkspaceId] = useState<string | null>(null);
+  const bootstrapCreateInFlightWorkspaceRef = useRef<string | null>(null);
+  const [domFocusedSessionId, setDomFocusedSessionId] = useState<string | null>(null);
+  const focusRetryTimerRef = useRef<number | null>(null);
+
+  const clearFocusRetryTimer = useCallback(() => {
+    if (focusRetryTimerRef.current !== null) {
+      window.clearTimeout(focusRetryTimerRef.current);
+      focusRetryTimerRef.current = null;
+    }
+  }, []);
+
+  const syncCursorIndicator = useCallback(() => {
+    forEachWorkspaceCachedTerminal(workspaceId, (_sessionId, session) => {
+      if (!session.isAttached) {
+        return;
+      }
+      session.terminal.options.cursorInactiveStyle = "none";
+      session.terminal.options.cursorBlink = true;
+    });
+  }, [workspaceId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const requestVersion = getTerminalAcceleratedRenderingPreferenceVersion();
+    ipc
+      .getTerminalAcceleratedRendering()
+      .then((enabled) => {
+        if (
+          cancelled ||
+          getTerminalAcceleratedRenderingPreferenceVersion() !== requestVersion
+        ) {
+          return;
+        }
+        acceleratedTerminalRenderingPreferenceLoaded = true;
+        acceleratedTerminalRenderingEnabled = enabled;
+        forEachWorkspaceCachedTerminal(workspaceId, (sessionId, session) => {
+          applyAcceleratedRenderingPreference(
+            terminalCacheKey(workspaceId, sessionId),
+            session,
+            enabled,
+          );
+        });
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId]);
+
+  useEffect(
+    () =>
+      listenTerminalAcceleratedRenderingChanged((enabled) => {
+        acceleratedTerminalRenderingPreferenceLoaded = true;
+        acceleratedTerminalRenderingEnabled = enabled;
+        forEachWorkspaceCachedTerminal(workspaceId, (sessionId, session) => {
+          applyAcceleratedRenderingPreference(
+            terminalCacheKey(workspaceId, sessionId),
+            session,
+            enabled,
+          );
+        });
+      }),
+    [workspaceId],
+  );
+
+  useEffect(() => listenThemeChanged(applyThemeToAllCachedTerminals), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const requestVersion = getTerminalFontSizePreferenceVersion();
+    ipc
+      .getTerminalFontSize()
+      .then((fontSize) => {
+        if (cancelled || getTerminalFontSizePreferenceVersion() !== requestVersion) {
+          return;
+        }
+        terminalFontSizePreferenceLoaded = true;
+        terminalFontSizePreference = fontSize;
+        forEachWorkspaceCachedTerminal(workspaceId, (sessionId, session) => {
+          applyTerminalFontSizePreference(workspaceId, sessionId, session, fontSize);
+        });
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId]);
+
+  useEffect(
+    () =>
+      listenTerminalFontSizeChanged((fontSize) => {
+        terminalFontSizePreferenceLoaded = true;
+        terminalFontSizePreference = fontSize;
+        forEachWorkspaceCachedTerminal(workspaceId, (sessionId, session) => {
+          applyTerminalFontSizePreference(workspaceId, sessionId, session, fontSize);
+        });
+      }),
+    [workspaceId],
+  );
+
+  useEffect(() => {
+    if (renamingGroupId) {
+      renameInputRef.current?.focus();
+      renameInputRef.current?.select();
+    }
+  }, [renamingGroupId]);
+
+  useEffect(() => {
+    if (renamingGroupId && !groups.some((g) => g.id === renamingGroupId)) {
+      setRenamingGroupId(null);
+    }
+  }, [groups, renamingGroupId]);
+
+  useEffect(() => {
+    if (!ctxMenu && !terminalCtxMenu) return;
+    const handleClose = (e: MouseEvent | KeyboardEvent) => {
+      if (e instanceof KeyboardEvent && e.key !== "Escape") return;
+      if (e instanceof MouseEvent && menuRef.current?.contains(e.target as Node)) return;
+      setCtxMenu(null);
+      setTerminalCtxMenu(null);
+    };
+    document.addEventListener("mousedown", handleClose);
+    document.addEventListener("keydown", handleClose);
+    return () => {
+      document.removeEventListener("mousedown", handleClose);
+      document.removeEventListener("keydown", handleClose);
+    };
+  }, [ctxMenu, terminalCtxMenu]);
+
+  useEffect(() => {
+    setDomFocusedSessionId(null);
+  }, [workspaceId]);
+
+  useEffect(() => {
+    syncCursorIndicator();
+  }, [sessions.length, syncCursorIndicator]);
+
+  useEffect(() => {
+    if (!domFocusedSessionId) return;
+    if (sessions.some((session) => session.id === domFocusedSessionId)) {
+      return;
+    }
+    setDomFocusedSessionId(null);
+  }, [domFocusedSessionId, sessions]);
+
+  useEffect(() => () => clearFocusRetryTimer(), [clearFocusRetryTimer]);
+
+  // ── Auto-detect harness in terminal tabs ──────────────────────────
+  const updateSessionHarness = useTerminalStore((state) => state.updateSessionHarness);
+  const harnessesLoadedOnce = useHarnessStore((s) => s.loadedOnce);
+  const ensureHarnessesScanned = useHarnessStore((s) => s.ensureScanned);
+  const allHarnessesForDetect = useHarnessStore((s) => s.harnesses);
+
+  useEffect(() => {
+    if (harnessesLoadedOnce) {
+      return;
+    }
+    void ensureHarnessesScanned();
+  }, [ensureHarnessesScanned, harnessesLoadedOnce]);
+
+  useEffect(() => {
+    // Build command → harness mapping from installed harnesses
+    const commandMap = new Map<string, { id: string; name: string }>();
+    for (const h of allHarnessesForDetect) {
+      if (h.found && h.command) {
+        commandMap.set(h.command, { id: h.id, name: h.name });
+      }
+    }
+    if (commandMap.size === 0) return;
+
+    let unlisten: (() => void) | null = null;
+
+    listenTerminalForegroundChanged(workspaceId, (event) => {
+      const groups = useTerminalStore.getState().workspaces[workspaceId]?.groups ?? [];
+      const group = groups.find((g) => collectSessionIds(g.root).includes(event.sessionId));
+      if (!group) return;
+
+      const currentMeta = group.sessionMeta?.[event.sessionId];
+      const match = event.name ? commandMap.get(event.name) : null;
+      if (match && currentMeta?.harnessId !== match.id) {
+        updateSessionHarness(workspaceId, event.sessionId, match.id, match.name, true);
+      } else if (!match && currentMeta?.autoDetectedHarness && currentMeta.harnessId) {
+        updateSessionHarness(workspaceId, event.sessionId, null, null, true);
+      }
+    }).then((fn) => { unlisten = fn; });
+
+    return () => { unlisten?.(); };
+  }, [workspaceId, allHarnessesForDetect, updateSessionHarness]);
+
+  const commitRename = useCallback(
+    (groupId: string) => {
+      const trimmed = renameValue.trim();
+      if (trimmed) {
+        renameGroup(workspaceId, groupId, trimmed);
+      }
+      setRenamingGroupId(null);
+    },
+    [renameValue, renameGroup, workspaceId],
+  );
+
+  const cancelRename = useCallback(() => {
+    setRenamingGroupId(null);
+  }, []);
+
+  const startRenameFromMenu = useCallback((groupId: string) => {
+    const group = groups.find((g) => g.id === groupId);
+    if (!group) return;
+    setCtxMenu(null);
+    setRenamingGroupId(groupId);
+    setRenameValue(group.name);
+  }, [groups]);
+
+  const closeGroupFromMenu = useCallback((groupId: string) => {
+    setCtxMenu(null);
+    const group = groups.find((g) => g.id === groupId);
+    if (!group) return;
+    // If group has worktrees, ask user whether to keep or remove them
+    if (getGroupWorktrees(workspaceId, groupId).length > 0) {
+      setWorktreeCloseGroupId(groupId);
+      return;
+    }
+    for (const id of collectSessionIds(group.root)) {
+      void closeSession(workspaceId, id);
+    }
+  }, [groups, closeSession, workspaceId]);
+
+  const openTerminalContextMenu = useCallback(
+    (sessionId: string, event: React.MouseEvent<HTMLDivElement>) => {
+      if (!linuxDesktop) {
+        return;
+      }
+
+      event.preventDefault();
+      setFocusedSession(workspaceId, sessionId);
+      setCtxMenu(null);
+
+      const cached = cachedTerminals.get(terminalCacheKey(workspaceId, sessionId));
+      setTerminalCtxMenu({
+        sessionId,
+        x: event.clientX,
+        y: event.clientY,
+        selectionText: cached?.terminal.getSelection() ?? "",
+      });
+    },
+    [linuxDesktop, setFocusedSession, workspaceId],
+  );
+
+  const copyTerminalSelection = useCallback(
+    async (sessionId: string, selectionText: string) => {
+      setTerminalCtxMenu(null);
+      if (!selectionText) {
+        return;
+      }
+
+      try {
+        await copyTextToClipboard(selectionText);
+      } catch (error) {
+        toast.error(
+          t("terminal.toasts.clipboardWriteFailed", {
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    },
+    [t],
+  );
+
+  const pasteIntoTerminal = useCallback(
+    async (sessionId: string) => {
+      setTerminalCtxMenu(null);
+      const cached = cachedTerminals.get(terminalCacheKey(workspaceId, sessionId));
+      if (!cached) {
+        return;
+      }
+
+      try {
+        const text = await readTextFromClipboard();
+        if (text) {
+          cached.terminal.paste(text);
+        }
+      } catch (error) {
+        toast.error(
+          t("terminal.toasts.clipboardReadFailed", {
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    },
+    [t, workspaceId],
+  );
+
+  const selectAllInTerminal = useCallback((sessionId: string) => {
+    const cached = cachedTerminals.get(terminalCacheKey(workspaceId, sessionId));
+    cached?.terminal.selectAll();
+  }, [workspaceId]);
+
+  useEffect(() => {
+    const handleTerminalEdit = (event: Event) => {
+      const detail = (event as CustomEvent<"copy" | "paste" | "select-all">).detail;
+      const sessionId = domFocusedSessionId ?? focusedSessionId;
+      if (!sessionId) {
+        return;
+      }
+
+      switch (detail) {
+        case "copy": {
+          const cached = cachedTerminals.get(terminalCacheKey(workspaceId, sessionId));
+          const selectionText = cached?.terminal.getSelection() ?? "";
+          void copyTerminalSelection(sessionId, selectionText);
+          return;
+        }
+        case "paste":
+          void pasteIntoTerminal(sessionId);
+          return;
+        case "select-all":
+          selectAllInTerminal(sessionId);
+          return;
+      }
+    };
+
+    window.addEventListener(TERMINAL_EDIT_EVENT, handleTerminalEdit);
+    return () => window.removeEventListener(TERMINAL_EDIT_EVENT, handleTerminalEdit);
+  }, [
+    copyTerminalSelection,
+    domFocusedSessionId,
+    focusedSessionId,
+    pasteIntoTerminal,
+    selectAllInTerminal,
+    workspaceId,
+  ]);
+
+  const handleWorktreeCloseConfirm = useCallback(async () => {
+    if (!worktreeCloseGroupId) return;
+    const group = groups.find((g) => g.id === worktreeCloseGroupId);
+    if (group) {
+      const worktrees = getGroupWorktrees(workspaceId, group.id);
+      const sessionIds = collectSessionIds(group.root);
+      await Promise.all(sessionIds.map((id) => closeSession(workspaceId, id)));
+
+      const remainingSessions = useTerminalStore.getState().workspaces[workspaceId]?.sessions ?? [];
+      const stillOpen = sessionIds.filter((id) => remainingSessions.some((session) => session.id === id));
+      if (stillOpen.length > 0) {
+        toast.error(
+          t("terminal.toasts.failedToCloseSessionsKept", { count: stillOpen.length }),
+        );
+        setWorktreeCloseGroupId(null);
+        return;
+      }
+
+      if (worktrees.length > 0) {
+        try {
+          await removeGroupWorktrees(workspaceId, worktrees);
+        } catch (error) {
+          toast.error(String(error));
+        }
+      }
+    }
+    setWorktreeCloseGroupId(null);
+  }, [worktreeCloseGroupId, groups, getGroupWorktrees, removeGroupWorktrees, closeSession, t, workspaceId]);
+
+  const handleWorktreeCloseCancel = useCallback(async () => {
+    if (!worktreeCloseGroupId) return;
+    const group = groups.find((g) => g.id === worktreeCloseGroupId);
+    if (group) {
+      const sessionIds = collectSessionIds(group.root);
+      await Promise.all(sessionIds.map((id) => closeSession(workspaceId, id)));
+
+      const remainingSessions = useTerminalStore.getState().workspaces[workspaceId]?.sessions ?? [];
+      const stillOpen = sessionIds.filter((id) => remainingSessions.some((session) => session.id === id));
+      if (stillOpen.length > 0) {
+        toast.error(t("terminal.toasts.failedToCloseSessions", { count: stillOpen.length }));
+      }
+    }
+    setWorktreeCloseGroupId(null);
+  }, [worktreeCloseGroupId, groups, closeSession, t, workspaceId]);
+
+  const dismissWorktreeCloseDialog = useCallback(() => {
+    setWorktreeCloseGroupId(null);
+  }, []);
+
+  const handleTabPointerDown = useCallback((e: React.PointerEvent, groupId: string) => {
+    if (renamingGroupId || groups.length <= 1 || e.button !== 0) return;
+    const tabEl = e.currentTarget as HTMLElement;
+    dragStateRef.current = { groupId, startX: e.clientX, started: false, el: tabEl };
+
+    const onMove = (me: PointerEvent) => {
+      const ds = dragStateRef.current;
+      if (!ds) return;
+      if (!ds.started) {
+        if (Math.abs(me.clientX - ds.startX) < 5) return;
+        ds.started = true;
+        suppressClickRef.current = true;
+        setDraggingGroupId(groupId);
+        document.body.style.userSelect = "none";
+        document.body.style.cursor = "grabbing";
+      }
+
+      // Tab follows cursor via direct DOM transform (bypasses React for 60fps)
+      const dx = me.clientX - ds.startX;
+      ds.el.style.transform = `translateX(${dx}px)`;
+
+      // Check for swap with neighboring tabs
+      const listEl = tabsListRef.current;
+      if (!listEl) return;
+      const tabs = Array.from(listEl.children) as HTMLElement[];
+      const currentGroups = useTerminalStore.getState().workspaces[workspaceId]?.groups ?? [];
+      const curIdx = currentGroups.findIndex((g) => g.id === groupId);
+      if (curIdx === -1) return;
+      for (let i = 0; i < tabs.length; i++) {
+        if (i === curIdx) continue;
+        const rect = tabs[i].getBoundingClientRect();
+        const mid = rect.left + rect.width / 2;
+        if (i < curIdx && me.clientX < mid) {
+          // Swapping left — natural position shifts left by swapped tab width
+          ds.startX -= rect.width;
+          reorderGroups(workspaceId, curIdx, i);
+          break;
+        }
+        if (i > curIdx && me.clientX > mid) {
+          // Swapping right — natural position shifts right by swapped tab width
+          ds.startX += rect.width;
+          reorderGroups(workspaceId, curIdx, i);
+          break;
+        }
+      }
+    };
+
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      const ds = dragStateRef.current;
+      if (ds?.started) {
+        ds.el.style.transform = "";
+        setDraggingGroupId(null);
+        requestAnimationFrame(() => { suppressClickRef.current = false; });
+      }
+      dragStateRef.current = null;
+    };
+
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  }, [renamingGroupId, groups.length, workspaceId, reorderGroups]);
+
+  // Component-level refs — only track DOM containers (reset on mount/unmount).
+  // Terminal instances live in the module-level cachedTerminals map.
+  const containerRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+
+  const focusTerminalSession = useCallback((sessionId: string | null) => {
+    clearFocusRetryTimer();
+    if (!sessionId) {
+      return;
+    }
+    forEachWorkspaceCachedTerminal(workspaceId, (currentSessionId, session) => {
+      if (currentSessionId !== sessionId && session.isAttached) {
+        session.terminal.blur();
+        setTerminalFocusState(session, false);
+        refreshTerminalCursor(session);
+      }
+    });
+
+    let attempts = 0;
+    const maxAttempts = 12;
+    const tryFocus = () => {
+      const cacheKey = terminalCacheKey(workspaceId, sessionId);
+      const cached = cachedTerminals.get(cacheKey);
+      if (cached?.isAttached) {
+        focusRetryTimerRef.current = null;
+        cached.terminal.focus();
+        setTerminalFocusState(cached, true);
+        refreshTerminalCursor(cached);
+        return;
+      }
+      if (attempts >= maxAttempts) {
+        focusRetryTimerRef.current = null;
+        return;
+      }
+      attempts += 1;
+      focusRetryTimerRef.current = window.setTimeout(tryFocus, 16);
+    };
+
+    tryFocus();
+  }, [clearFocusRetryTimer, workspaceId]);
+
+  const setTerminalSessionFocus = useCallback((sessionId: string) => {
+    setFocusedSession(workspaceId, sessionId);
+    focusTerminalSession(sessionId);
+  }, [focusTerminalSession, setFocusedSession, workspaceId]);
+
+  // When broadcast mode toggles, lock/unlock the isFocused getter on peer
+  // terminals so xterm.js renders an active blinking cursor on all of them.
+  const broadcastGroupId = workspaceState?.broadcastGroupId ?? null;
+  const broadcastSessionIdsKey = useMemo(() => {
+    if (!broadcastGroupId) return "";
+    const group = groups.find((g) => g.id === broadcastGroupId);
+    if (!group) return "";
+    return collectSessionIds(group.root).join(",");
+  }, [broadcastGroupId, groups]);
+
+  useEffect(() => {
+    const broadcastGroup = broadcastGroupId
+      ? groups.find((g) => g.id === broadcastGroupId)
+      : null;
+    const broadcastIds = broadcastGroup ? new Set(collectSessionIds(broadcastGroup.root)) : null;
+
+    forEachWorkspaceCachedTerminal(workspaceId, (sid, session) => {
+      if (broadcastIds?.has(sid) && session.isAttached) {
+        lockTerminalFocus(session);
+      } else {
+        unlockTerminalFocus(session);
+      }
+    });
+  }, [broadcastGroupId, broadcastSessionIdsKey, groups, workspaceId]);
+
+  const handleTerminalDomFocus = useCallback((sessionId: string) => {
+    setDomFocusedSessionId(sessionId);
+    const ws = useTerminalStore.getState().workspaces[workspaceId];
+    const currentFocusedSessionId = ws?.focusedSessionId ?? null;
+    if (currentFocusedSessionId !== sessionId) {
+      setFocusedSession(workspaceId, sessionId);
+    }
+
+    forEachWorkspaceCachedTerminal(workspaceId, (currentSessionId, session) => {
+      if (currentSessionId === sessionId || !session.isAttached) return;
+      setTerminalFocusState(session, false);
+      refreshTerminalCursor(session);
+    });
+    const cached = cachedTerminals.get(terminalCacheKey(workspaceId, sessionId));
+    if (cached) {
+      setTerminalFocusState(cached, true);
+      refreshTerminalCursor(cached);
+    }
+  }, [setFocusedSession, workspaceId]);
+
+  const handleTerminalDomBlur = useCallback((sessionId: string) => {
+    setDomFocusedSessionId((current) => (current === sessionId ? null : current));
+    const cached = cachedTerminals.get(terminalCacheKey(workspaceId, sessionId));
+    if (cached) {
+      setTerminalFocusState(cached, false);
+      refreshTerminalCursor(cached);
+    }
+  }, [workspaceId]);
+
+  const ensureTerminal = useCallback((sessionId: string) => {
+    const container = containerRefs.current.get(sessionId);
+    if (!container) {
+      return;
+    }
+    const cacheKey = terminalCacheKey(workspaceId, sessionId);
+
+    // Check module-level cache first — re-attach if the instance already exists
+    const cached = cachedTerminals.get(cacheKey);
+    if (cached?.requiresColdReattach) {
+      destroyCachedTerminal(workspaceId, sessionId);
+    } else if (cached) {
+      if (cached.evictionTimer !== undefined) {
+        window.clearTimeout(cached.evictionTimer);
+        cached.evictionTimer = undefined;
+      }
+      cached.terminal.options.cursorInactiveStyle = "none";
+      cached.terminal.options.cursorBlink = true;
+      const el = cached.terminal.element;
+      if (el && el.parentElement !== container) {
+        // Move xterm DOM element to the new container (preserves scrollback)
+        while (container.firstChild) {
+          container.removeChild(container.firstChild);
+        }
+        container.appendChild(el);
+      }
+      cached.isAttached = true;
+      cached.detachedAt = undefined;
+      touchCachedTerminal(cached);
+      scheduleTerminalFit(workspaceId, sessionId, 0);
+      if (cached.needsResumeOnAttach) {
+        void resumeSessionOutput(workspaceId, sessionId, "attach");
+      } else if (cached.outputQueue.length > 0) {
+        scheduleOutputFlush(cacheKey, cached, 0);
+      } else {
+        scheduleOutputDrainIfNeeded(cacheKey, cached, 0);
+      }
+      if (SHOW_TERMINAL_DIAGNOSTICS_UI) {
+        void refreshBackendRendererDiagnostics(workspaceId, sessionId);
+      }
+      return;
+    }
+
+    createCachedTerminal(workspaceId, sessionId, container);
+  }, [workspaceId]);
+
+  // Fit all sessions in the active group — reads store at call time to stay
+  // stable across group tree mutations (e.g. ratio drag) and avoid
+  // ResizeObserver churn.
+  const fitActiveGroup = useCallback(() => {
+    const state = useTerminalStore.getState().workspaces[workspaceId];
+    const gid = state?.activeGroupId;
+    if (!gid) return;
+    const group = state?.groups.find((g) => g.id === gid);
+    if (!group) return;
+    for (const id of collectSessionIds(group.root)) {
+      scheduleTerminalFit(workspaceId, id);
+    }
+  }, [workspaceId]);
+
+  const shouldSuppressNotificationForSession = useCallback((sessionId: string) => {
+    const state = useTerminalStore.getState().workspaces[workspaceId];
+    const terminalVisible =
+      state?.isOpen && (state.layoutMode === "split" || state.layoutMode === "terminal");
+    if (useWorkspaceStore.getState().activeWorkspaceId !== workspaceId) {
+      return false;
+    }
+    if (!terminalVisible) {
+      return false;
+    }
+    if (!document.hasFocus()) {
+      return false;
+    }
+    return state?.focusedSessionId === sessionId;
+  }, [workspaceId]);
+
+  const syncNotificationFocusState = useCallback((windowFocused: boolean) => {
+    const state = useTerminalStore.getState().workspaces[workspaceId];
+    const terminalVisible =
+      state?.isOpen && (state.layoutMode === "split" || state.layoutMode === "terminal");
+    const isActiveWorkspace =
+      terminalVisible && useWorkspaceStore.getState().activeWorkspaceId === workspaceId;
+    const sessionId = isActiveWorkspace
+      ? state?.focusedSessionId ?? null
+      : null;
+    const targetWorkspaceId = windowFocused && isActiveWorkspace ? workspaceId : null;
+    void syncNotificationFocus(targetWorkspaceId, sessionId, windowFocused);
+  }, [syncNotificationFocus, workspaceId]);
+
+  useEffect(() => {
+    syncNotificationFocusState(document.hasFocus());
+  }, [activeWorkspaceId, focusedSessionId, isOpen, layoutMode, syncNotificationFocusState]);
+
+  useEffect(() => {
+    return () => {
+      void syncNotificationFocus(null, null, false);
+    };
+  }, [syncNotificationFocus]);
+
+  useEffect(() => {
+    const handleWindowFocus = () => {
+      syncNotificationFocusState(true);
+    };
+    const handleWindowBlur = () => {
+      forEachWorkspaceCachedTerminal(workspaceId, (_sessionId, session) => {
+        if (!session.isAttached) {
+          return;
+        }
+        session.terminal.blur();
+        setTerminalFocusState(session, false);
+        refreshTerminalCursor(session);
+      });
+      setDomFocusedSessionId(null);
+      syncNotificationFocusState(false);
+    };
+    window.addEventListener("focus", handleWindowFocus);
+    window.addEventListener("blur", handleWindowBlur);
+    return () => {
+      window.removeEventListener("focus", handleWindowFocus);
+      window.removeEventListener("blur", handleWindowBlur);
+    };
+  }, [syncNotificationFocusState, workspaceId]);
+
+  // Register event listeners BEFORE syncing sessions so the initial shell
+  // prompt output is never missed (the PTY starts emitting immediately).
+  useEffect(() => {
+    let unlistenOutput: (() => void) | undefined;
+    let unlistenExit: (() => void) | undefined;
+    let unlistenNotification: (() => void) | undefined;
+    let unlistenNotificationCleared: (() => void) | undefined;
+    let disposed = false;
+    setListenersReadyWorkspaceId(null);
+
+    (async () => {
+      try {
+        const [outputUn, exitUn, notificationUn, notificationClearedUn] = await Promise.all([
+          listenTerminalOutput(workspaceId, (event) => {
+            scheduleTerminalOutputDrain(workspaceId, event.sessionId, event.latestSeq);
+          }),
+          listenTerminalExit(workspaceId, (event) => {
+            destroyCachedTerminal(workspaceId, event.sessionId);
+            handleSessionExit(workspaceId, event.sessionId);
+          }),
+          listenTerminalNotification(workspaceId, (event) => {
+            if (shouldSuppressNotificationForSession(event.sessionId)) {
+              void clearNotification(workspaceId, event.sessionId);
+              return;
+            }
+            applyNotification(workspaceId, event);
+          }),
+          listenTerminalNotificationCleared(workspaceId, (event) => {
+            clearNotificationLocal(workspaceId, event.sessionId);
+          }),
+        ]);
+        if (disposed) {
+          outputUn();
+          exitUn();
+          notificationUn();
+          notificationClearedUn();
+          return;
+        }
+        unlistenOutput = outputUn;
+        unlistenExit = exitUn;
+        unlistenNotification = notificationUn;
+        unlistenNotificationCleared = notificationClearedUn;
+
+        // Now that listeners are ready, sync existing sessions.
+        await syncSessions(workspaceId);
+        if (disposed) return;
+        await hydrateNotifications(workspaceId);
+        if (disposed) return;
+        setListenersReadyWorkspaceId(workspaceId);
+      } catch (listenerError) {
+        if (disposed) {
+          return;
+        }
+        setWorkspaceStatus(workspaceId, false, String(listenerError));
+      }
+    })();
+
+    return () => {
+      disposed = true;
+      unlistenOutput?.();
+      unlistenExit?.();
+      unlistenNotification?.();
+      unlistenNotificationCleared?.();
+    };
+  }, [
+    applyNotification,
+    clearNotification,
+    clearNotificationLocal,
+    handleSessionExit,
+    hydrateNotifications,
+    setWorkspaceStatus,
+    shouldSuppressNotificationForSession,
+    syncSessions,
+    workspaceId,
+  ]);
+
+  useEffect(() => {
+    const listenersReady = listenersReadyWorkspaceId === workspaceId;
+    const action = resolveTerminalBootstrapAction({
+      listenersReady,
+      isOpen,
+      layoutMode,
+      sessionCount: sessions.length,
+      workspaceId,
+      createInFlightWorkspaceId: bootstrapCreateInFlightWorkspaceRef.current,
+      hasPendingStartupPreset: Boolean(pendingStartupPreset),
+    });
+    if (action === "none") {
+      return;
+    }
+
+    bootstrapCreateInFlightWorkspaceRef.current = workspaceId;
+    const runBootstrap = async () => {
+      if (action === "preset" && pendingStartupPreset) {
+        const applied = await materializeWorkspaceStartupPreset(workspaceId, pendingStartupPreset);
+        if (!applied) {
+          await createSession(workspaceId);
+        }
+        return;
+      }
+      await createSession(workspaceId);
+    };
+    void runBootstrap().finally(() => {
+      if (bootstrapCreateInFlightWorkspaceRef.current === workspaceId) {
+        bootstrapCreateInFlightWorkspaceRef.current = null;
+      }
+    });
+  }, [
+    createSession,
+    isOpen,
+    layoutMode,
+    listenersReadyWorkspaceId,
+    materializeWorkspaceStartupPreset,
+    pendingStartupPreset,
+    sessions.length,
+    workspaceId,
+  ]);
+
+  useEffect(() => {
+    for (const session of sessions) {
+      ensureTerminal(session.id);
+    }
+
+    // Dispose terminals for sessions that no longer exist (explicitly closed)
+    const sessionIds = new Set(sessions.map((session) => session.id));
+    const workspacePrefix = terminalWorkspacePrefix(workspaceId);
+    for (const cacheKey of cachedTerminals.keys()) {
+      if (!cacheKey.startsWith(workspacePrefix)) {
+        continue;
+      }
+      const sessionId = cacheKey.slice(workspacePrefix.length);
+      if (!sessionIds.has(sessionId)) {
+        destroyCachedTerminal(workspaceId, sessionId);
+      }
+    }
+  }, [sessions, ensureTerminal, workspaceId]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+    if (layoutMode !== "split" && layoutMode !== "terminal") {
+      return;
+    }
+    focusTerminalSession(focusedSessionId);
+  }, [activeGroupId, focusTerminalSession, focusedSessionId, isOpen, layoutMode, sessions.length]);
+
+  // Fit when active group changes
+  useEffect(() => {
+    fitActiveGroup();
+  }, [activeGroupId, sessions.length, fitActiveGroup]);
+
+  useEffect(() => {
+    function onWindowResize() {
+      fitActiveGroup();
+    }
+
+    window.addEventListener("resize", onWindowResize);
+    return () => window.removeEventListener("resize", onWindowResize);
+  }, [fitActiveGroup]);
+
+  // ResizeObserver: observe all containers in the active group.
+  // Re-subscribes when activeGroupId or sessions.length changes (new
+  // tab or split/close adds/removes auracoder) but NOT on ratio changes.
+  useEffect(() => {
+    if (!activeGroupId || typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const state = useTerminalStore.getState().workspaces[workspaceId];
+    const group = state?.groups.find((g) => g.id === activeGroupId);
+    if (!group) return;
+
+    const ids = collectSessionIds(group.root);
+    const containers: HTMLDivElement[] = [];
+    for (const id of ids) {
+      const el = containerRefs.current.get(id);
+      if (el) containers.push(el);
+    }
+
+    if (containers.length === 0) return;
+
+    const observer = new ResizeObserver(() => fitActiveGroup());
+    for (const el of containers) {
+      observer.observe(el);
+    }
+
+    return () => observer.disconnect();
+    // sessions.length triggers re-subscribe when auracoder are added/removed
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeGroupId, sessions.length, workspaceId, fitActiveGroup]);
+
+  // On unmount/workspace swap: mark cache entries detached but keep the session alive.
+  useEffect(() => {
+    return () => {
+      markWorkspaceTerminalsDetached(workspaceId);
+      containerRefs.current.clear();
+    };
+  }, [workspaceId]);
+
+  const focusedTerminal = useMemo(
+    () => sessions.find((session) => session.id === focusedSessionId) ?? null,
+    [focusedSessionId, sessions],
+  );
+
+  const allHarnesses = useHarnessStore((s) => s.harnesses);
+  const installedHarnesses = useMemo(() => allHarnesses.filter((h) => h.found), [allHarnesses]);
+  const activeRepos = useMemo(
+    () => repos
+      .filter((repo) => repo.isActive)
+      .map((repo) => ({ path: repo.path, name: repo.name, defaultBranch: repo.defaultBranch })),
+    [repos],
+  );
+  const harnessLaunch = useHarnessStore((s) => s.launch);
+  const [newTabMenuOpen, setNewTabMenuOpen] = useState(false);
+  const newTabBtnRef = useRef<HTMLButtonElement>(null);
+  const newTabMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!newTabMenuOpen) return;
+    const handleClose = (e: MouseEvent | KeyboardEvent) => {
+      if (e instanceof KeyboardEvent && e.key !== "Escape") return;
+      if (e instanceof MouseEvent && (newTabMenuRef.current?.contains(e.target as Node) || newTabBtnRef.current?.contains(e.target as Node))) return;
+      setNewTabMenuOpen(false);
+    };
+    document.addEventListener("mousedown", handleClose);
+    document.addEventListener("keydown", handleClose);
+    return () => {
+      document.removeEventListener("mousedown", handleClose);
+      document.removeEventListener("keydown", handleClose);
+    };
+  }, [newTabMenuOpen]);
+
+  const spawnNewSession = useCallback(() => {
+    const active = focusedSessionId
+      ? cachedTerminals.get(terminalCacheKey(workspaceId, focusedSessionId))
+      : undefined;
+    const cols = active?.terminal.cols ?? DEFAULT_COLS;
+    const rows = active?.terminal.rows ?? DEFAULT_ROWS;
+    void createSession(workspaceId, cols, rows);
+  }, [focusedSessionId, createSession, workspaceId]);
+
+  const spawnHarnessSession = useCallback(async (harnessId: string) => {
+    setNewTabMenuOpen(false);
+    const command = await harnessLaunch(harnessId);
+    if (!command) return;
+    const active = focusedSessionId
+      ? cachedTerminals.get(terminalCacheKey(workspaceId, focusedSessionId))
+      : undefined;
+    const cols = active?.terminal.cols ?? DEFAULT_COLS;
+    const rows = active?.terminal.rows ?? DEFAULT_ROWS;
+    const harness = installedHarnesses.find((h) => h.id === harnessId);
+    const sessionId = await createSession(workspaceId, cols, rows, harnessId, harness?.name);
+    if (sessionId) {
+      void writeCommandToNewSession(workspaceId, sessionId, command);
+    }
+  }, [focusedSessionId, createSession, workspaceId, harnessLaunch, installedHarnesses]);
+
+  const spawnMultiHarnessGroup = useCallback(async (harnessIds: string[], withBroadcast: boolean, worktreeRepoPath?: string | null) => {
+    if (harnessIds.length === 0) return;
+
+    const active = focusedSessionId
+      ? cachedTerminals.get(terminalCacheKey(workspaceId, focusedSessionId))
+      : undefined;
+    const cols = active?.terminal.cols ?? DEFAULT_COLS;
+    const rows = active?.terminal.rows ?? DEFAULT_ROWS;
+
+    // Resolve commands for all selected harnesses (cache per unique ID)
+    const commandCache = new Map<string, string>();
+    const harnessMeta: { harnessId: string; command: string; name: string }[] = [];
+    for (const harnessId of harnessIds) {
+      let command = commandCache.get(harnessId);
+      if (command === undefined) {
+        command = await harnessLaunch(harnessId) ?? "";
+        commandCache.set(harnessId, command);
+      }
+      const harness = installedHarnesses.find((h) => h.id === harnessId);
+      if (command && harness) harnessMeta.push({ harnessId, command, name: harness.name });
+    }
+    if (harnessMeta.length === 0) return;
+
+    // Build worktree config if a repo was selected
+    let worktreeConfig: WorkspaceStartupWorktreeConfig | null = null;
+    if (worktreeRepoPath) {
+      const repo = repos.find((r) => r.path === worktreeRepoPath);
+      if (repo) {
+        worktreeConfig = {
+          enabled: true,
+          repoMode: "fixed_repo",
+          repoPath: repo.path,
+          baseBranch: repo.defaultBranch,
+          baseDir: ".auracoder/worktrees",
+          branchPrefix: "auracoder/preset",
+        };
+      }
+    }
+
+    // Create all sessions with correct grid layout in one shot
+    const result = await createMultiSessionGroup(
+      workspaceId,
+      harnessMeta.map(({ harnessId, name }) => ({ harnessId, name })),
+      worktreeConfig,
+      cols,
+      rows,
+    );
+    if (!result) return;
+
+    // Write harness commands to each session concurrently
+    await Promise.all(
+      result.sessionIds.map((sessionId, i) => {
+        const meta = harnessMeta[i];
+        if (meta) return writeCommandToNewSession(workspaceId, sessionId, meta.command);
+      }),
+    );
+
+    // Enable broadcast on the new group
+    if (withBroadcast) {
+      useTerminalStore.getState().toggleBroadcast(workspaceId, result.groupId);
+    }
+
+    // Keep keyboard input usable immediately after creating the group
+    requestAnimationFrame(() => {
+      setTerminalSessionFocus(result.sessionIds[0]);
+    });
+  }, [
+    focusedSessionId,
+    createMultiSessionGroup,
+    workspaceId,
+    repos,
+    harnessLaunch,
+    installedHarnesses,
+    setTerminalSessionFocus,
+  ]);
+
+  const handleSplit = useCallback(
+    (direction: "horizontal" | "vertical") => {
+      if (!domFocusedSessionId) return;
+      const active = cachedTerminals.get(
+        terminalCacheKey(workspaceId, domFocusedSessionId),
+      );
+      const cols = active?.terminal.cols ?? DEFAULT_COLS;
+      const rows = active?.terminal.rows ?? DEFAULT_ROWS;
+      void splitSession(workspaceId, domFocusedSessionId, direction, cols, rows);
+    },
+    [domFocusedSessionId, splitSession, workspaceId],
+  );
+
+  const resolveSessionIdForDiagnostics = useCallback((groupId?: string): string | null => {
+    if (groupId) {
+      const group = groups.find((g) => g.id === groupId);
+      if (!group) {
+        return focusedSessionId;
+      }
+      const groupSessionIds = collectSessionIds(group.root);
+      if (focusedSessionId && groupSessionIds.includes(focusedSessionId)) {
+        return focusedSessionId;
+      }
+      return groupSessionIds[groupSessionIds.length - 1] ?? null;
+    }
+
+    if (focusedSessionId) {
+      return focusedSessionId;
+    }
+
+    const activeGroup = groups.find((group) => group.id === activeGroupId);
+    if (!activeGroup) {
+      return null;
+    }
+    const groupSessionIds = collectSessionIds(activeGroup.root);
+    return groupSessionIds[groupSessionIds.length - 1] ?? null;
+  }, [activeGroupId, focusedSessionId, groups]);
+
+  const copyRendererDiagnostics = useCallback((groupId?: string) => {
+    const targetSessionId = resolveSessionIdForDiagnostics(groupId);
+    if (!targetSessionId) {
+      toast.info(t("terminal.toasts.noSessionForDiagnostics"));
+      return;
+    }
+
+    try {
+      const cacheKey = terminalCacheKey(workspaceId, targetSessionId);
+      const backendEntry = cachedBackendRendererDiagnostics.get(cacheKey);
+      const backend = backendEntry?.diagnostics ?? null;
+      const backendFetchedAt = backendEntry?.fetchedAt ?? null;
+      const session = cachedTerminals.get(cacheKey);
+      const frontend = cloneFrontendDiagnostics(session?.rendererDiagnostics);
+      const frontendRuntime = snapshotFrontendRuntime(cacheKey, session);
+      const payload: RendererDiagnosticsExport = {
+        capturedAt: new Date().toISOString(),
+        workspaceId,
+        sessionId: targetSessionId,
+        backend,
+        backendFetchedAt,
+        frontend,
+        frontendRuntime,
+        userAgent: navigator.userAgent,
+      };
+      // Keep the clipboard write inside the user gesture call stack.
+      void copyTextToClipboard(JSON.stringify(payload, null, 2))
+        .then(() => toast.success(t("terminal.toasts.diagnosticsCopied")))
+        .catch((error) => {
+          toast.error(
+            t("terminal.toasts.diagnosticsCopyFailed", { error: String(error) }),
+          );
+        });
+
+      // Refresh backend snapshot for next time (async; no user gesture requirement).
+      void refreshBackendRendererDiagnostics(workspaceId, targetSessionId);
+    } catch (error) {
+      toast.error(t("terminal.toasts.diagnosticsCopyFailed", { error: String(error) }));
+    }
+  }, [resolveSessionIdForDiagnostics, t, workspaceId]);
+
+  return (
+    <div
+      className={`terminal-panel-root${useTitlebarSafeInset ? " terminal-panel-root-titlebar-safe" : ""}${
+        useFocusModeHeaderHeight ? " terminal-panel-root-focus-tabs" : ""
+      }${
+        !gitPanelDocked ? " terminal-panel-root-compact-tabs" : ""
+      }`}
+    >
+      <div className="terminal-tabs-bar">
+        <div className="terminal-tabs-list" ref={tabsListRef}>
+          {groups.map((group) => {
+            const isActive = group.id === activeGroupId;
+            const groupSessionIds = collectSessionIds(group.root);
+            const groupNotification = groupSessionIds.reduce<TerminalNotification | null>(
+              (latest, sessionId) => {
+                const notification = notificationsBySessionId[sessionId] ?? null;
+                if (!notification) {
+                  return latest;
+                }
+                if (!latest || notification.createdAt > latest.createdAt) {
+                  return notification;
+                }
+                return latest;
+              },
+              null,
+            );
+            const displayHarness = getGroupDisplayHarness(group);
+            const groupWorktrees = getGroupWorktrees(workspaceId, group.id);
+            const groupNotificationPreview = groupNotification
+              ? `${groupNotification.title}: ${groupNotification.body}`
+              : undefined;
+            return (
+              <button
+                key={group.id}
+                type="button"
+                className={`terminal-tab${isActive ? " terminal-tab-active" : ""}${draggingGroupId === group.id ? " terminal-tab-dragging" : ""}`}
+                title={groupNotificationPreview}
+                onClick={() => {
+                  if (suppressClickRef.current) return;
+                  setActiveGroup(workspaceId, group.id);
+                }}
+                onPointerDown={(e) => handleTabPointerDown(e, group.id)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setTerminalCtxMenu(null);
+                  setCtxMenu({ groupId: group.id, x: e.clientX, y: e.clientY });
+                }}
+              >
+                {displayHarness.harnessId
+                  ? getHarnessIcon(displayHarness.harnessId, 12)
+                  : <SquareTerminal size={12} />}
+                {renamingGroupId === group.id ? (
+                  <input
+                    ref={renameInputRef}
+                    type="text"
+                    className="terminal-tab-rename-input"
+                    value={renameValue}
+                    onChange={(e) => setRenameValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") { e.preventDefault(); commitRename(group.id); }
+                      if (e.key === "Escape") { e.preventDefault(); cancelRename(); }
+                    }}
+                    onBlur={() => commitRename(group.id)}
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                ) : (
+                  <span
+                    className="terminal-tab-label"
+                    onDoubleClick={(e) => {
+                      e.stopPropagation();
+                      setRenamingGroupId(group.id);
+                      setRenameValue(group.name);
+                    }}
+                  >
+                    {group.name}
+                  </span>
+                )}
+                {groupWorktrees.length > 0 && (
+                  <span className="terminal-worktree-badge" title={groupWorktrees.map((worktree) => worktree.branch).join(", ")}>
+                    <GitBranchIcon size={10} />
+                  </span>
+                )}
+                {groupNotification && (
+                  <span className="terminal-tab-notification-dot" aria-hidden="true" />
+                )}
+                {groupSessionIds.length > 1 && (
+                  <span className="terminal-tab-badge">{groupSessionIds.length}</span>
+                )}
+                <button
+                  type="button"
+                  className="terminal-tab-close"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    closeGroupFromMenu(group.id);
+                  }}
+                >
+                  <X size={10} />
+                </button>
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="terminal-tabs-actions">
+          <button
+            ref={newTabBtnRef}
+            type="button"
+            className="terminal-add-btn"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => {
+              if (installedHarnesses.length > 0) {
+                setNewTabMenuOpen((v) => !v);
+              } else {
+                spawnNewSession();
+              }
+            }}
+            title={t("terminal.newTerminal")}
+          >
+            <Plus size={13} />
+          </button>
+          {domFocusedSessionId && (
+            <>
+              <button
+                type="button"
+                className="terminal-add-btn"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => handleSplit("vertical")}
+                title={t("terminal.splitRight")}
+              >
+                <Columns2 size={13} />
+              </button>
+              <button
+                type="button"
+                className="terminal-add-btn"
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => handleSplit("horizontal")}
+                title={t("terminal.splitDown")}
+              >
+                <Rows2 size={13} />
+              </button>
+              {(() => {
+                const activeGroup = groups.find((g) => g.id === activeGroupId);
+                const hasManyAuraCoder = activeGroup && collectSessionIds(activeGroup.root).length > 1;
+                if (!hasManyAuraCoder) return null;
+                const isBroadcasting = workspaceState?.broadcastGroupId === activeGroupId;
+                return (
+                  <button
+                    type="button"
+                    className={`terminal-add-btn${isBroadcasting ? " terminal-broadcast-btn-active" : ""}`}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => {
+                      if (activeGroupId) {
+                        useTerminalStore.getState().toggleBroadcast(workspaceId, activeGroupId);
+                      }
+                    }}
+                    title={
+                      isBroadcasting
+                        ? t("terminal.broadcastTitleOn")
+                        : t("terminal.broadcastTitleOff")
+                    }
+                  >
+                    <Radio size={13} />
+                  </button>
+                );
+              })()}
+              {SHOW_TERMINAL_DIAGNOSTICS_UI && (
+                <button
+                  type="button"
+                  className="terminal-add-btn"
+                  onClick={() => void copyRendererDiagnostics()}
+                  title={t("terminal.copyRendererDiagnostics")}
+                >
+                  <Copy size={13} />
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="terminal-body">
+        {workspaceState?.broadcastGroupId === activeGroupId && workspaceState?.broadcastGroupId != null && (
+          <div className="terminal-broadcast-banner">
+            <Radio size={10} />
+            {t("terminal.broadcastBanner")}
+            <button
+              type="button"
+              className="terminal-broadcast-banner-close"
+              onClick={() => {
+                if (activeGroupId) {
+                  useTerminalStore.getState().toggleBroadcast(workspaceId, activeGroupId);
+                }
+              }}
+            >
+              <X size={10} />
+            </button>
+          </div>
+        )}
+        {sessions.length === 0 ? (
+          <div className="terminal-empty-state animate-fade-in">
+            <div className="terminal-empty-state-icon-box">
+              <SquareTerminal size={20} opacity={0.5} />
+            </div>
+            <div>
+              <p className="terminal-empty-state-title">
+                {loading ? t("terminal.emptyStarting") : t("terminal.emptyTitle")}
+              </p>
+              {!loading && (
+                <p className="terminal-empty-state-subtitle">
+                  {t("terminal.emptyHint")}
+                </p>
+              )}
+            </div>
+            {!loading && (
+              <button type="button" className="terminal-new-btn" onClick={spawnNewSession}>
+                <Plus size={12} />
+                {t("terminal.newTerminal")}
+              </button>
+            )}
+          </div>
+        ) : (
+          <div className="terminal-viewport-stack">
+            {groups.map((group) => (
+              <div
+                key={group.id}
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  display: group.id === activeGroupId ? "flex" : "none",
+                }}
+              >
+                <SplitPaneView
+                  node={group.root}
+                  workspaceId={workspaceId}
+                  groupId={group.id}
+                  activeIndicatorSessionId={domFocusedSessionId}
+                  isBroadcasting={workspaceState?.broadcastGroupId === group.id}
+                  notificationsBySessionId={notificationsBySessionId}
+                  containerRefs={containerRefs}
+                  onFocus={setTerminalSessionFocus}
+                  onTerminalFocus={handleTerminalDomFocus}
+                  onTerminalBlur={handleTerminalDomBlur}
+                  onPaneContextMenu={openTerminalContextMenu}
+                  onClose={(id) => void closeSession(workspaceId, id)}
+                  onRatioChange={(containerId, ratio) =>
+                    updateGroupRatio(workspaceId, group.id, containerId, ratio)
+                  }
+                  ensureTerminal={ensureTerminal}
+                  showCloseButton={group.root.type === "split"}
+                />
+              </div>
+            ))}
+          </div>
+        )}
+
+        {error && (
+          <div className="terminal-error-banner">
+            {error}
+          </div>
+        )}
+        {focusedTerminal && (
+          <div className="terminal-meta-bar" title={focusedTerminal.cwd}>
+            <Folder size={10} style={{ opacity: 0.5, flexShrink: 0 }} />
+            <span className="terminal-meta-bar-path">{focusedTerminal.cwd}</span>
+          </div>
+        )}
+      </div>
+
+      {ctxMenu && createPortal(
+        <div
+          ref={menuRef}
+          className="dropdown-menu"
+          style={{ position: "fixed", top: ctxMenu.y, left: ctxMenu.x }}
+        >
+          <button
+            type="button"
+            className="dropdown-item"
+            onClick={() => startRenameFromMenu(ctxMenu.groupId)}
+          >
+            <Pencil size={12} />
+            {t("terminal.rename")}
+          </button>
+          <button
+            type="button"
+            className="dropdown-item"
+            onClick={() => closeGroupFromMenu(ctxMenu.groupId)}
+          >
+            <Trash2 size={12} />
+            {t("terminal.close")}
+          </button>
+          {SHOW_TERMINAL_DIAGNOSTICS_UI && (
+            <button
+              type="button"
+              className="dropdown-item"
+              onClick={() => {
+                setCtxMenu(null);
+                void copyRendererDiagnostics(ctxMenu.groupId);
+              }}
+            >
+              <Copy size={12} />
+              {t("terminal.copyDiagnostics")}
+            </button>
+          )}
+        </div>,
+        document.body,
+      )}
+
+      {terminalCtxMenu && createPortal(
+        <div
+          ref={menuRef}
+          className="dropdown-menu"
+          style={{ position: "fixed", top: terminalCtxMenu.y, left: terminalCtxMenu.x }}
+        >
+          <button
+            type="button"
+            className="dropdown-item"
+            disabled={terminalCtxMenu.selectionText.length === 0}
+            onClick={() =>
+              void copyTerminalSelection(
+                terminalCtxMenu.sessionId,
+                terminalCtxMenu.selectionText,
+              )}
+          >
+            <ClipboardCopy size={12} />
+            {t("terminal.copy")}
+          </button>
+          <button
+            type="button"
+            className="dropdown-item"
+            onClick={() => void pasteIntoTerminal(terminalCtxMenu.sessionId)}
+          >
+            <ClipboardPaste size={12} />
+            {t("terminal.paste")}
+          </button>
+        </div>,
+        document.body,
+      )}
+
+      {newTabMenuOpen && newTabBtnRef.current && createPortal(
+        <NewTabDropdown
+          menuRef={newTabMenuRef}
+          anchorRect={newTabBtnRef.current.getBoundingClientRect()}
+          harnesses={installedHarnesses}
+          repos={activeRepos}
+          onNewTerminal={() => { setNewTabMenuOpen(false); spawnNewSession(); }}
+          onLaunchHarness={(id) => { setNewTabMenuOpen(false); void spawnHarnessSession(id); }}
+          onMultiLaunch={(ids, broadcast, worktreeRepoPath) => { setNewTabMenuOpen(false); void spawnMultiHarnessGroup(ids, broadcast, worktreeRepoPath); }}
+        />,
+        document.body,
+      )}
+
+      <ConfirmDialog
+        open={worktreeCloseGroupId !== null}
+        title={t("terminal.closeAgentGroupTitle")}
+        message={t("terminal.closeAgentGroupMessage")}
+        confirmLabel={t("terminal.removeWorktrees")}
+        cancelLabel={t("terminal.keepWorktrees")}
+        onConfirm={handleWorktreeCloseConfirm}
+        onCancel={handleWorktreeCloseCancel}
+        onDismiss={dismissWorktreeCloseDialog}
+      />
+    </div>
+  );
+}

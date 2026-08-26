@@ -1,0 +1,67 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AuraCoder",
+  "version": "1.0.0",
+  "identifier": "com.auracoder.app",
+  "build": {
+    "beforeDevCommand": "pnpm run dev",
+    "beforeBuildCommand": "node scripts/build-desktop.mjs",
+    "devUrl": "http://localhost:42514",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "enableGTKAppId": true,
+    "windows": [
+      {
+        "create": false,
+        "title": "AuraCoder",
+        "width": 1460,
+        "height": 920,
+        "minWidth": 1080,
+        "minHeight": 680,
+        "resizable": true,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app",
+      "dmg",
+      "deb",
+      "appimage",
+      "nsis"
+    ],
+    "resources": [
+      "sidecar-dist"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://zcb617.github.io/AuraCoder/latest.json"
+      ],
+      "dialog": false,
+      "windows": {
+        "installMode": "passive"
+      },
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDAzNDIzMzlFMDdBQzJFM0YKUldRL0xxd0huak5DQTBVQjlJSy9KUEhlUmFNZ3dUUkp3aFVTZUlXbjJlY3VURGtFaTBYZFZkN1AK"
+    }
+  }
+}

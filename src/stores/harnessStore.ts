@@ -1,0 +1,122 @@
+import { create } from "zustand";
+import { ipc } from "../lib/ipc";
+import type { HarnessInfo } from "../types";
+
+export type HarnessPhase = "idle" | "scanning" | "error";
+
+interface HarnessStore {
+  phase: HarnessPhase;
+  harnesses: HarnessInfo[];
+  npmAvailable: boolean;
+  preferredInstallMethod: string | null;
+  error: string | null;
+  loadedOnce: boolean;
+  launchArgs: Record<string, string>;
+  launchArgsLoaded: boolean;
+
+  scan: () => Promise<void>;
+  ensureScanned: () => Promise<void>;
+  launch: (harnessId: string) => Promise<string | null>;
+  getInstalledHarnesses: () => HarnessInfo[];
+  loadLaunchArgs: () => Promise<void>;
+  saveLaunchArgs: (harnessId: string, args: string) => Promise<boolean>;
+}
+
+let pendingHarnessScan: Promise<void> | null = null;
+
+function requestHarnessScan(
+  set: (partial: Partial<HarnessStore>) => void,
+  get: () => HarnessStore,
+) {
+  if (pendingHarnessScan) {
+    return pendingHarnessScan;
+  }
+
+  if (get().phase === "scanning") {
+    return Promise.resolve();
+  }
+
+  set({ phase: "scanning", error: null });
+  const request = (async () => {
+    try {
+      const report = await ipc.checkHarnesses();
+      set({
+        harnesses: report.harnesses,
+        npmAvailable: report.npmAvailable,
+        preferredInstallMethod: report.preferredInstallMethod,
+        phase: "idle",
+        error: null,
+        loadedOnce: true,
+      });
+    } catch (err) {
+      set({
+        phase: "error",
+        error: err instanceof Error ? err.message : String(err),
+        loadedOnce: true,
+      });
+    } finally {
+      pendingHarnessScan = null;
+    }
+  })();
+
+  pendingHarnessScan = request;
+  return request;
+}
+
+export const useHarnessStore = create<HarnessStore>((set, get) => ({
+  phase: "idle",
+  harnesses: [],
+  npmAvailable: false,
+  preferredInstallMethod: null,
+  error: null,
+  loadedOnce: false,
+  launchArgs: {},
+  launchArgsLoaded: false,
+
+  scan: async () => requestHarnessScan(set, get),
+
+  ensureScanned: async () => {
+    if (get().loadedOnce) {
+      return;
+    }
+    await requestHarnessScan(set, get);
+  },
+
+  launch: async (harnessId: string) => {
+    try {
+      return await ipc.launchHarness(harnessId);
+    } catch {
+      return null;
+    }
+  },
+
+  getInstalledHarnesses: () => {
+    const { harnesses } = get();
+    return harnesses.filter((h) => h.found);
+  },
+
+  loadLaunchArgs: async () => {
+    try {
+      const launchArgs = await ipc.getHarnessLaunchArgs();
+      set({ launchArgs, launchArgsLoaded: true });
+    } catch {
+      set({ launchArgsLoaded: true });
+    }
+  },
+
+  saveLaunchArgs: async (harnessId: string, args: string) => {
+    try {
+      const saved = await ipc.setHarnessLaunchArgs(harnessId, args);
+      const launchArgs = { ...get().launchArgs };
+      if (saved) {
+        launchArgs[harnessId] = saved;
+      } else {
+        delete launchArgs[harnessId];
+      }
+      set({ launchArgs });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+}));

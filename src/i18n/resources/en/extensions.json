@@ -1,0 +1,130 @@
+{
+  "title": "Extension management",
+  "subtitle": "Manage skills, plugins, and MCP for the current agent",
+  "provider": { "label": "Agent" },
+  "workspace": {
+    "none": "No workspace",
+    "hint": "Select a workspace to include project-scoped extensions. Global items are still shown."
+  },
+  "search": { "placeholder": "Search skills, plugins, or MCP..." },
+  "tabs": { "label": "Extension type", "skill": "Skills", "plugin": "Plugins", "mcp": "MCP" },
+  "filters": {
+    "all": "All",
+    "installed": "Installed / configured",
+    "available": "Available",
+    "disabled": "Disabled",
+    "issues": "Issues",
+    "allSources": "All sources",
+    "allScopes": "All scopes"
+  },
+  "categories": {
+    "label": "Categories",
+    "all": "All categories",
+    "uncategorized": "Uncategorized",
+    "mcp": { "plugin": "Plugin provided", "standalone": "Standalone MCP" },
+    "official": {
+      "businessOperations": "Business & Operations",
+      "communication": "Communication",
+      "creativity": "Creativity",
+      "dataAnalytics": "Data & Analytics",
+      "database": "Database",
+      "deployment": "Deployment",
+      "design": "Design",
+      "development": "Development",
+      "developerTools": "Developer Tools",
+      "educationResearch": "Education & Research",
+      "engineering": "Engineering",
+      "finance": "Finance",
+      "learning": "Learning",
+      "location": "Location",
+      "math": "Math",
+      "monitoring": "Monitoring",
+      "other": "Other",
+      "productivity": "Productivity",
+      "security": "Security",
+      "testing": "Testing",
+      "travel": "Travel"
+    }
+  },
+  "sections": { "installed": "Installed / configured", "available": "Available" },
+  "loading": "Loading extensions...",
+  "status": {
+    "available": "Available",
+    "installed": "Installed",
+    "configured": "Configured",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "connected": "Connected",
+    "disconnected": "Disconnected",
+    "authRequired": "Authentication required",
+    "error": "Error"
+  },
+  "scope": {
+    "builtin": "Built in",
+    "user": "User",
+    "project": "Project",
+    "plugin": "Plugin",
+    "managed": "Managed",
+    "local": "Local"
+  },
+  "item": { "noDescription": "No description provided" },
+  "cache": {
+    "notFetched": "The extension catalog has not been fetched yet. The background service is refreshing it asynchronously; you can also request a refresh now.",
+    "requestNow": "Request background refresh",
+    "refreshing": "Refreshing in the background. The current list stays visible until new data is saved.",
+    "refreshFinished": "The current background refresh has finished.",
+    "refreshedAt": "Current data was refreshed {{age}}."
+  },
+  "refreshErrors": {
+    "refreshFailed": "The {{kind}} catalog refresh failed. The last successful data is still shown."
+  },
+  "empty": {
+    "installed": "No installed or configured items match these filters.",
+    "available": "No available items match these filters.",
+    "noOfficialCatalog": "This agent does not provide a verified official catalog for this extension type."
+  },
+  "details": {
+    "title": "Extension details",
+    "status": "Status",
+    "scope": "Scope",
+    "category": "Category",
+    "version": "Version",
+    "source": "Source",
+    "path": "Path",
+    "parentPlugin": "Parent plugin",
+    "included": "Included extensions",
+    "newSession": "A new session may be required for this change to take effect."
+  },
+  "actions": {
+    "install": "Install",
+    "uninstall": "Uninstall",
+    "enable": "Enable",
+    "disable": "Disable",
+    "remove": "Remove",
+    "configure": "Configure",
+    "authenticate": "Authenticate",
+    "logout": "Log out",
+    "open_location": "Open location",
+    "refresh": "Refresh",
+    "retry": "Try again",
+    "none": "No management action is available for this item.",
+    "completed": "Extension updated.",
+    "completedNewSession": "Extension updated. Start a new session to use the change."
+  },
+  "confirm": {
+    "title": "Confirm removal",
+    "message": "Remove {{name}}? Its skills or MCP tools may no longer be available.",
+    "messageWithDependencies": "Remove {{name}}? These included extensions will no longer be available: {{dependencies}}.",
+    "confirm": "Remove"
+  },
+  "readOnly": {
+    "codex_skill_toggle": "Codex does not expose a stable non-interactive skill toggle command.",
+    "codex_remote_plugin_managed": "This Codex remote plugin is managed by the Codex desktop app; no verified CLI uninstall action is available here.",
+    "claude_skill_toggle": "Claude Code does not expose a stable non-interactive skill toggle command.",
+    "plugin_managed_mcp": "This MCP server is managed by its parent plugin.",
+    "mcp_details_unavailable": "MCP configuration details are unavailable from the current runtime.",
+    "managed_policy": "This item is controlled by a managed policy and is read-only here.",
+    "opencode_skill": "OpenCode skills are read-only in this version.",
+    "opencode_plugin_jsonc": "OpenCode plugin changes are read-only so configuration comments and unknown fields are preserved."
+  }
+}

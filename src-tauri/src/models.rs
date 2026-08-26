@@ -1,0 +1,1395 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+
+/// 前端权限组件与三个 CLI 实现之间的统一 JSON 契约。
+pub type PermissionComponentJson = HashMap<String, Value>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDto {
+    pub id: String,
+    pub name: String,
+    pub root_path: String,
+    pub location_kind: String,
+    pub ssh_connection_id: Option<String>,
+    pub connection_display_name: Option<String>,
+    pub connection_enabled: Option<bool>,
+    pub connection_deleted: Option<bool>,
+    pub connection_status: Option<String>,
+    pub scan_depth: i64,
+    pub created_at: String,
+    pub last_opened_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshRemoteDirectoryDto {
+    pub path: String,
+    pub name: String,
+    pub readable: bool,
+    pub enterable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshConnectionDto {
+    pub id: String,
+    pub display_name: String,
+    pub source_kind: String,
+    pub config_alias: Option<String>,
+    pub host_name: String,
+    pub user: String,
+    pub port: u16,
+    pub identity_file: Option<String>,
+    pub host_key_type: String,
+    pub enabled: bool,
+    pub connection_status: String,
+    pub last_connected_at: Option<String>,
+    pub last_error: Option<String>,
+    pub deleted_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshConnectionInput {
+    pub display_name: String,
+    pub host_name: String,
+    pub user: String,
+    pub port: u16,
+    pub identity_file: Option<String>,
+    pub host_key: String,
+    pub config_alias: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshConfigHostDto {
+    pub alias: String,
+    pub host_name: String,
+    pub user: String,
+    pub port: u16,
+    pub identity_file: Option<String>,
+    pub imported: bool,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshConnectionImportResultDto {
+    pub alias: String,
+    pub connection: Option<SshConnectionDto>,
+    pub error: Option<String>,
+    pub restored: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshConnectionTestDto {
+    pub connection_id: String,
+    pub ok: bool,
+    pub os: Option<String>,
+    pub home: Option<String>,
+    pub shell: Option<String>,
+    pub git_version: Option<String>,
+    pub cli_versions: std::collections::BTreeMap<String, String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoDto {
+    pub id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub path: String,
+    pub default_branch: String,
+    pub is_active: bool,
+    pub trust_level: TrustLevelDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceGitSelectionStatusDto {
+    pub configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustLevelDto {
+    Trusted,
+    Standard,
+    Restricted,
+}
+
+impl TrustLevelDto {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TrustLevelDto::Trusted => "trusted",
+            TrustLevelDto::Standard => "standard",
+            TrustLevelDto::Restricted => "restricted",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "trusted" => Self::Trusted,
+            "restricted" => Self::Restricted,
+            _ => Self::Standard,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadDto {
+    pub id: String,
+    pub workspace_id: String,
+    pub repo_id: Option<String>,
+    pub engine_id: String,
+    pub model_id: String,
+    pub engine_thread_id: Option<String>,
+    pub engine_metadata: Option<Value>,
+    pub plan_mode: Option<bool>,
+    pub send_method: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub permission_mode: Option<String>,
+    pub title: String,
+    pub status: ThreadStatusDto,
+    pub message_count: i64,
+    pub total_tokens: i64,
+    pub created_at: String,
+    pub last_activity_at: String,
+}
+
+/// threads 表的局部更新入参；id 必填，其余字段仅在 Some 时更新。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadUpdateDto {
+    /// 待更新线程主键，仅用于 WHERE 条件。
+    pub id: String,
+    /// 工作区主键。
+    pub workspace_id: Option<String>,
+    /// 仓库主键；Some("") 按原值写入规则处理。
+    pub repo_id: Option<String>,
+    /// CLI 工具标识。
+    pub engine_id: Option<String>,
+    /// 模型标识。
+    pub model_id: Option<String>,
+    /// CLI 原生线程标识。
+    pub engine_thread_id: Option<String>,
+    /// CLI 原始 metadata JSON 字符串。
+    pub engine_metadata_json: Option<String>,
+    /// CLI 能力 JSON 字符串。
+    pub engine_capabilities_json: Option<String>,
+    /// 线程标题。
+    pub title: Option<String>,
+    /// 线程状态原始字符串。
+    pub status: Option<String>,
+    /// 归档时间。
+    pub archived_at: Option<String>,
+    /// 消息数量。
+    pub message_count: Option<i64>,
+    /// token 总量。
+    pub total_tokens: Option<i64>,
+    /// 创建时间。
+    pub created_at: Option<String>,
+    /// 最近活动时间。
+    pub last_activity_at: Option<String>,
+    /// 是否启用计划模式。
+    pub plan_mode: Option<bool>,
+    /// 消息发送方式。
+    pub send_method: Option<String>,
+    /// 推理强度。
+    pub reasoning_effort: Option<String>,
+    /// CLI 原始权限 JSON 字符串。
+    pub permission_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTaskRunDto {
+    pub id: String,
+    pub task_id: String,
+    pub scheduled_for: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub thread_id: Option<String>,
+    pub assistant_message_id: Option<String>,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub result_preview: Option<String>,
+    pub acknowledged_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTaskDto {
+    pub id: String,
+    pub description: String,
+    pub enabled: bool,
+    pub execution_device_id: String,
+    pub target_type: String,
+    pub workspace_id: String,
+    pub thread_id: Option<String>,
+    pub runtime_config: Option<Value>,
+    pub schedule_type: String,
+    pub schedule: Value,
+    pub timezone: String,
+    pub next_run_at: Option<String>,
+    pub last_run_at: Option<String>,
+    pub latest_run: Option<ScheduledTaskRunDto>,
+    pub needs_confirmation: bool,
+    pub target_valid: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRemoteThreadDto {
+    pub engine_thread_id: String,
+    pub title: Option<String>,
+    pub preview: String,
+    pub cwd: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub model_id: String,
+    pub reasoning_effort: Option<String>,
+    pub model_provider: String,
+    pub source_kind: String,
+    pub status_type: String,
+    #[serde(default)]
+    pub active_flags: Vec<String>,
+    pub archived: bool,
+    pub local_thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRemoteThreadPageDto {
+    pub threads: Vec<CodexRemoteThreadDto>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeRemoteSessionDto {
+    pub engine_thread_id: String,
+    pub title: Option<String>,
+    pub cwd: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub archived: bool,
+    pub local_thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeRemoteSessionPageDto {
+    pub sessions: Vec<OpenCodeRemoteSessionDto>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadStatusDto {
+    Idle,
+    Streaming,
+    AwaitingApproval,
+    Error,
+    Completed,
+}
+
+impl ThreadStatusDto {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ThreadStatusDto::Idle => "idle",
+            ThreadStatusDto::Streaming => "streaming",
+            ThreadStatusDto::AwaitingApproval => "awaiting_approval",
+            ThreadStatusDto::Error => "error",
+            ThreadStatusDto::Completed => "completed",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "streaming" => Self::Streaming,
+            "awaiting_approval" => Self::AwaitingApproval,
+            "error" => Self::Error,
+            "completed" => Self::Completed,
+            _ => Self::Idle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageDto {
+    pub id: String,
+    pub thread_id: String,
+    pub role: String,
+    pub content: Option<String>,
+    pub blocks: Option<Value>,
+    pub turn_engine_id: Option<String>,
+    pub turn_model_id: Option<String>,
+    pub turn_reasoning_effort: Option<String>,
+    pub schema_version: i64,
+    pub status: MessageStatusDto,
+    pub token_usage: Option<TokenUsageDto>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageWindowCursorDto {
+    pub created_at: String,
+    pub id: String,
+    pub row_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageWindowDto {
+    pub messages: Vec<MessageDto>,
+    pub next_cursor: Option<MessageWindowCursorDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteerReceiptDto {
+    pub client_steer_id: String,
+    pub expected_turn_id: String,
+    pub accepted_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionOutputChunkDto {
+    pub stream: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionOutputDto {
+    pub found: bool,
+    pub output_chunks: Vec<ActionOutputChunkDto>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageStatusDto {
+    Completed,
+    Streaming,
+    Interrupted,
+    Error,
+}
+
+impl MessageStatusDto {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MessageStatusDto::Completed => "completed",
+            MessageStatusDto::Streaming => "streaming",
+            MessageStatusDto::Interrupted => "interrupted",
+            MessageStatusDto::Error => "error",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "streaming" => Self::Streaming,
+            "interrupted" => Self::Interrupted,
+            "error" => Self::Error,
+            _ => Self::Completed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageDto {
+    pub input: u64,
+    pub output: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResultDto {
+    pub thread_id: String,
+    pub thread_title: String,
+    pub workspace_name: String,
+    pub repo_id: Option<String>,
+    pub message_id: String,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineInfoDto {
+    pub id: String,
+    pub name: String,
+    pub models: Vec<EngineModelDto>,
+    pub capabilities: EngineCapabilitiesDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionTargetDto {
+    pub target_key: String,
+    pub kind: String,
+    pub display_name: String,
+    pub connection_id: Option<String>,
+    pub host_name: Option<String>,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+    pub project_path: Option<String>,
+    pub connection_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatProviderUsageDto {
+    pub engine_id: String,
+    pub name: String,
+    pub available: bool,
+    pub windows: Vec<ChatProviderUsageWindowDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatProviderUsageWindowDto {
+    pub kind: String,
+    pub used_percent: u8,
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineCapabilitiesDto {
+    #[serde(default)]
+    pub permission_modes: Vec<String>,
+    #[serde(default)]
+    pub sandbox_modes: Vec<String>,
+    #[serde(default)]
+    pub approval_decisions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineModelDto {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub hidden: bool,
+    pub is_default: bool,
+    pub upgrade: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub availability_nux: Option<EngineModelAvailabilityNuxDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade_info: Option<EngineModelUpgradeInfoDto>,
+    #[serde(default)]
+    pub input_modalities: Vec<String>,
+    #[serde(default)]
+    pub attachment_modalities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<EngineModelLimitsDto>,
+    #[serde(default)]
+    pub supports_personality: bool,
+    pub default_reasoning_effort: String,
+    pub supported_reasoning_efforts: Vec<ReasoningEffortOptionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineModelLimitsDto {
+    pub context_tokens: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineModelAvailabilityNuxDto {
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineModelUpgradeInfoDto {
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade_copy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_link: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migration_markdown: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningEffortOptionDto {
+    pub reasoning_effort: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineHealthDto {
+    pub id: String,
+    pub available: bool,
+    pub version: Option<String>,
+    pub details: Option<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub checks: Vec<String>,
+    #[serde(default)]
+    pub fixes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_diagnostics: Option<CodexProtocolDiagnosticsDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexProtocolDiagnosticsDto {
+    #[serde(default)]
+    pub method_availability: Vec<CodexMethodAvailabilityDto>,
+    #[serde(default)]
+    pub experimental_features: Vec<CodexExperimentalFeatureDto>,
+    #[serde(default)]
+    pub collaboration_modes: Vec<String>,
+    #[serde(default)]
+    pub apps: Vec<CodexAppDto>,
+    #[serde(default)]
+    pub skills: Vec<CodexSkillDto>,
+    #[serde(default)]
+    pub plugin_marketplaces: Vec<CodexPluginMarketplaceDto>,
+    #[serde(default)]
+    pub mcp_servers: Vec<CodexMcpServerDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<CodexAccountStateDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<CodexConfigStateDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_config_warning: Option<CodexConfigWarningDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_account_login: Option<CodexAccountLoginCompletedDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_mcp_oauth: Option<CodexMcpOauthCompletedDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_thread_realtime: Option<CodexThreadRealtimeEventDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_windows_sandbox_setup: Option<CodexWindowsSandboxSetupDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_windows_world_writable_warning: Option<CodexWindowsWorldWritableWarningDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<String>,
+    #[serde(default)]
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexMethodAvailabilityDto {
+    pub method: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexExperimentalFeatureDto {
+    pub name: String,
+    pub enabled: bool,
+    pub default_enabled: bool,
+    pub stage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAppDto {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub is_enabled: bool,
+    pub is_accessible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSkillDto {
+    pub name: String,
+    pub path: String,
+    #[serde(default)]
+    pub description: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeRuntimeCatalogDto {
+    #[serde(default)]
+    pub agents: Vec<OpenCodeAgentDto>,
+    #[serde(default)]
+    pub commands: Vec<OpenCodeCommandDto>,
+    #[serde(default)]
+    pub mcp_servers: Vec<OpenCodeMcpServerDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeAgentDto {
+    pub name: String,
+    pub description: Option<String>,
+    pub mode: String,
+    pub native: bool,
+    pub hidden: bool,
+    pub model_provider_id: Option<String>,
+    pub model_id: Option<String>,
+    pub variant: Option<String>,
+    pub steps: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeCommandDto {
+    pub name: String,
+    pub description: Option<String>,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub source: Option<String>,
+    pub subtask: bool,
+    #[serde(default)]
+    pub hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeMcpServerDto {
+    pub name: String,
+    pub status: String,
+    pub detail: Option<String>,
+    pub raw: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexPluginMarketplaceDto {
+    pub name: String,
+    pub path: String,
+    #[serde(default)]
+    pub plugins: Vec<CodexPluginDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexPluginDto {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub installed: bool,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub developer_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexMcpServerDto {
+    pub name: String,
+    pub auth_status: String,
+    pub tool_count: usize,
+    pub resource_count: usize,
+    pub resource_template_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionProviderCapabilitiesDto {
+    pub has_official_skill_catalog: bool,
+    pub can_toggle_skills: bool,
+    pub has_official_plugin_catalog: bool,
+    pub can_install_plugins: bool,
+    pub can_toggle_plugins: bool,
+    pub has_official_mcp_catalog: bool,
+    pub can_manage_mcp: bool,
+    pub can_authenticate_mcp: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionSourceDto {
+    pub id: String,
+    pub label: String,
+    pub official: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionItemDto {
+    pub id: String,
+    pub provider_id: String,
+    pub kind: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub version: Option<String>,
+    pub scope: String,
+    pub source: Option<String>,
+    pub marketplace: Option<String>,
+    pub path: Option<String>,
+    pub parent_plugin_id: Option<String>,
+    pub category: Option<String>,
+    pub officially_available: bool,
+    pub catalog_authority: Option<String>,
+    pub installed: Option<bool>,
+    pub configured: Option<bool>,
+    pub enabled: Option<bool>,
+    pub health: String,
+    pub auth_state: Option<String>,
+    #[serde(default)]
+    pub available_actions: Vec<String>,
+    pub requires_new_session: bool,
+    pub read_only_reason: Option<String>,
+    pub warning: Option<String>,
+    #[serde(default)]
+    pub insert_text: Option<String>,
+    #[serde(default)]
+    pub panel: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub search_terms: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionCatalogKindRefreshDto {
+    pub kind: String,
+    pub items: Vec<ExtensionItemDto>,
+    pub success: bool,
+}
+
+impl ExtensionCatalogKindRefreshDto {
+    pub fn success(kind: &str, items: Vec<ExtensionItemDto>) -> Self {
+        Self {
+            kind: kind.to_string(),
+            items,
+            success: true,
+        }
+    }
+
+    pub fn failure(kind: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            items: Vec::new(),
+            success: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionCatalogRefreshErrorDto {
+    pub kind: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedExtensionCatalogDto {
+    pub provider_id: String,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub items: Vec<ExtensionItemDto>,
+    #[serde(default)]
+    pub sources: Vec<ExtensionSourceDto>,
+    pub capabilities: ExtensionProviderCapabilitiesDto,
+    pub fetched_at: Option<String>,
+    #[serde(default)]
+    pub kind_fetched_at: std::collections::BTreeMap<String, Option<String>>,
+    pub last_attempt_at: Option<String>,
+    pub next_refresh_at: Option<String>,
+    pub refreshing: bool,
+    pub refresh_completed_at: Option<String>,
+    pub has_snapshot: bool,
+    #[serde(default)]
+    pub refresh_errors: Vec<ExtensionCatalogRefreshErrorDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionActionResultDto {
+    pub provider_id: String,
+    pub kind: String,
+    pub extension_id: String,
+    pub action: String,
+    pub requires_new_session: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAccountStateDto {
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    pub requires_openai_auth: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexConfigStateDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_profile: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub layers: Vec<CodexConfigLayerDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexConfigLayerDto {
+    pub source: String,
+    #[serde(default)]
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexConfigWarningDto {
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_column: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAccountLoginCompletedDto {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexMcpOauthCompletedDto {
+    pub name: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexThreadRealtimeEventDto {
+    pub kind: String,
+    pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_channels: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub samples_per_channel: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexWindowsSandboxSetupDto {
+    pub mode: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexWindowsWorldWritableWarningDto {
+    pub sample_paths: Vec<String>,
+    pub extra_count: u64,
+    pub failed_scan: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeToastDto {
+    pub variant: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineRuntimeUpdatedDto {
+    pub engine_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_diagnostics: Option<CodexProtocolDiagnosticsDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toast: Option<RuntimeToastDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineCheckResultDto {
+    pub command: String,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitStatusDto {
+    pub branch: String,
+    pub files: Vec<GitFileStatusDto>,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFileStatusDto {
+    pub path: String,
+    pub index_status: Option<String>,
+    pub worktree_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitDiffPreviewDto {
+    pub content: String,
+    pub truncated: bool,
+    pub original_bytes: usize,
+    pub returned_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitCompareSourceDto {
+    Changes,
+    Staged,
+}
+
+impl GitCompareSourceDto {
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "staged" => Self::Staged,
+            _ => Self::Changes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitChangeTypeDto {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Untracked,
+    Conflicted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFileCompareDto {
+    pub source: GitCompareSourceDto,
+    pub base_content: String,
+    pub modified_content: String,
+    pub base_label: String,
+    pub modified_label: String,
+    pub change_type: GitChangeTypeDto,
+    pub has_staged_changes: bool,
+    pub has_unstaged_changes: bool,
+    pub is_binary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_editable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitBranchScopeDto {
+    Local,
+    Remote,
+}
+
+impl GitBranchScopeDto {
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "remote" => Self::Remote,
+            _ => Self::Local,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranchDto {
+    pub name: String,
+    pub full_name: String,
+    pub is_current: bool,
+    pub is_remote: bool,
+    pub upstream: Option<String>,
+    pub ahead: usize,
+    pub behind: usize,
+    pub last_commit_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitBranchPageDto {
+    pub entries: Vec<GitBranchDto>,
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitDto {
+    pub hash: String,
+    pub short_hash: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub subject: String,
+    pub body: String,
+    pub authored_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitCommitPageDto {
+    pub entries: Vec<GitCommitDto>,
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitStashDto {
+    pub index: usize,
+    pub name: String,
+    pub branch_hint: Option<String>,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktreeDto {
+    pub path: String,
+    pub display_path: Option<String>,
+    pub head_sha: Option<String>,
+    pub branch: Option<String>,
+    pub is_main: bool,
+    pub is_locked: bool,
+    pub is_prunable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTreeEntryDto {
+    pub path: String,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTreePageDto {
+    pub entries: Vec<FileTreeEntryDto>,
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub has_more: bool,
+    pub scan_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadFileResultDto {
+    pub content: String,
+    pub size_bytes: u64,
+    pub is_binary: bool,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteFileResultDto {
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedEditorFileReferenceDto {
+    pub repo_path: String,
+    pub file_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSessionDto {
+    pub id: String,
+    pub workspace_id: String,
+    pub shell: String,
+    pub cwd: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalNotificationDto {
+    pub id: String,
+    pub workspace_id: String,
+    pub session_id: String,
+    pub source: String,
+    pub title: String,
+    pub body: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalReplayChunkDto {
+    pub seq: u64,
+    pub ts: String,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalResumeSessionDto {
+    pub latest_seq: u64,
+    pub oldest_available_seq: Option<u64>,
+    pub gap: bool,
+    pub chunks: Vec<TerminalReplayChunkDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalEnvSnapshotDto {
+    pub term: Option<String>,
+    pub colorterm: Option<String>,
+    pub term_program: Option<String>,
+    pub term_program_version: Option<String>,
+    pub home: Option<String>,
+    pub user_profile: Option<String>,
+    pub app_data: Option<String>,
+    pub local_app_data: Option<String>,
+    pub xdg_config_home: Option<String>,
+    pub xdg_data_home: Option<String>,
+    pub xdg_cache_home: Option<String>,
+    pub xdg_state_home: Option<String>,
+    pub tmpdir: Option<String>,
+    pub temp: Option<String>,
+    pub tmp: Option<String>,
+    pub lang: Option<String>,
+    pub lc_all: Option<String>,
+    pub lc_ctype: Option<String>,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalResizeSnapshotDto {
+    pub cols: u16,
+    pub rows: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+    pub recorded_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalRendererDiagnosticsDto {
+    pub session_id: String,
+    pub shell: String,
+    pub cwd: String,
+    pub env_snapshot: TerminalEnvSnapshotDto,
+    pub last_resize: Option<TerminalResizeSnapshotDto>,
+    pub io_counters: TerminalIoCountersDto,
+    pub latency: TerminalLatencySnapshotDto,
+    pub output_throttle: TerminalOutputThrottleSnapshotDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalIoCountersDto {
+    pub stdin_writes: u64,
+    pub stdin_bytes: u64,
+    pub stdin_ctrl_c: u64,
+    pub last_stdin_write_duration_ms: Option<u64>,
+    pub stdout_reads: u64,
+    pub stdout_bytes: u64,
+    pub stdout_emits: u64,
+    pub stdout_emit_bytes: u64,
+    pub stdout_dropped_bytes: u64,
+    pub last_stdin_write_at: Option<String>,
+    pub last_stdout_read_at: Option<String>,
+    pub last_stdout_emit_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalOutputThrottleSnapshotDto {
+    pub min_emit_interval_ms: u64,
+    pub max_emit_bytes: u64,
+    pub buffer_bytes: u64,
+    pub buffer_cap_bytes: u64,
+    pub buffer_peak_bytes: u64,
+    pub buffer_trimmed_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalLatencySnapshotDto {
+    pub stdin_to_stdout_read_ms: Option<u64>,
+    pub stdout_read_to_emit_ms: Option<u64>,
+}
+
+// ── Git Remotes ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRemoteDto {
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitInitRepoStatusDto {
+    pub can_initialize: bool,
+    pub blocking_repo_path: Option<String>,
+}
+
+// ── Setup / Onboarding ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DependencyReport {
+    pub node: DepStatus,
+    pub codex: DepStatus,
+    pub git: DepStatus,
+    pub platform: String,
+    pub package_managers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepStatus {
+    pub found: bool,
+    pub version: Option<String>,
+    pub path: Option<String>,
+    pub can_auto_install: bool,
+    pub install_method: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallResult {
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallProgressEvent {
+    pub dependency: String,
+    pub line: String,
+    pub stream: String,
+    pub finished: bool,
+}
+
+// ── Harness Management ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub command: String,
+    pub found: bool,
+    pub version: Option<String>,
+    pub path: Option<String>,
+    pub can_auto_install: bool,
+    pub website: String,
+    pub native: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessReport {
+    pub harnesses: Vec<HarnessInfo>,
+    pub npm_available: bool,
+    /// "mise" or "npm", whichever the current environment should use to
+    /// auto-install npm-packaged harnesses. `None` when neither is
+    /// available. Set to "mise" only inside a Flatpak sandbox where a
+    /// bundled `mise` is resolvable, since outside a sandbox npm-based
+    /// global installs remain the default.
+    pub preferred_install_method: Option<String>,
+}

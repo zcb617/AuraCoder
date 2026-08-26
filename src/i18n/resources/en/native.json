@@ -1,0 +1,25 @@
+{
+  "app": {
+    "submenu": "AuraCoder",
+    "aboutComment": "The open-source cockpit for AI-assisted coding",
+    "websiteLabel": "GitHub"
+  },
+  "menu": {
+    "edit": "Edit",
+    "undo": "Undo",
+    "redo": "Redo",
+    "cut": "Cut",
+    "copy": "Copy",
+    "paste": "Paste",
+    "selectAll": "Select All",
+    "view": "View",
+    "window": "Window",
+    "toggleSidebar": "Toggle Sidebar",
+    "toggleGitPanel": "Toggle Git Panel",
+    "toggleFocusMode": "Toggle Focus Mode",
+    "toggleFullscreen": "Toggle Full Screen",
+    "search": "Search",
+    "toggleTerminal": "Toggle Terminal",
+    "close": "Close"
+  }
+}

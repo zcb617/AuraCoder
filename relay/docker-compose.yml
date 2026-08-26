@@ -1,0 +1,28 @@
+services:
+  auracoder-tunnel-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: reg.docker.0573zzz.com/auracoder-tunnel-relay:0.1.0
+    container_name: auracoder-tunnel-relay
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 18080
+      ATTACHMENT_DIR: /data/attachments
+      NODE_ENV: production
+    ports:
+      - "127.0.0.1:18080:18080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:18080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - auracoder-tunnel-attachments:/data/attachments
+
+volumes:
+  auracoder-tunnel-attachments:

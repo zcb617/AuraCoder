@@ -1,0 +1,33 @@
+{
+  "actions": {
+    "allow": "Allow",
+    "cancel": "Cancel",
+    "close": "Close",
+    "copy": "Copy",
+    "discard": "Discard",
+    "dismiss": "Dismiss",
+    "notNow": "Not now",
+    "remove": "Remove",
+    "refresh": "Refresh",
+    "retry": "Try again",
+    "save": "Save"
+  },
+  "fileReferences": {
+    "resolveFailed": "Could not find {{reference}} in this workspace.",
+    "shiftClickHint": "Shift-click to open in the editor",
+    "clickHint": "Click to open in the editor"
+  },
+  "language": {
+    "label": "Language",
+    "changed": "Language updated. Native menu labels update after restart.",
+    "english": "English",
+    "portugueseBrazil": "Português (Brasil)"
+  },
+  "labels": {
+    "settings": "Settings"
+  },
+  "diff": {
+    "unchangedLines_one": "{{count}} unchanged line",
+    "unchangedLines_other": "{{count}} unchanged lines"
+  }
+}
