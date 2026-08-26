@@ -261,6 +261,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
   archivedThreadsByWorkspace: {},
   activeThreadId: null,
   loading: false,
+  // 创建会话并更新线程集合；失败时保留错误状态并向公共动作传播原始异常。
   createThread: async ({
     workspaceId,
     repoId,
@@ -309,7 +310,8 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       return created.id;
     } catch (error) {
       set({ loading: false, error: String(error) });
-      return null;
+      /* return null; */
+      throw error;
     }
   },
   renameThread: async (threadId, title) => {

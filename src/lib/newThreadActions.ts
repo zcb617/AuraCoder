@@ -2,6 +2,7 @@ import { t } from "../i18n";
 import { useChatStore } from "../stores/chatStore";
 import { useTerminalStore } from "../stores/terminalStore";
 import { useThreadStore } from "../stores/threadStore";
+import { toast } from "../stores/toastStore";
 import { useUiStore } from "../stores/uiStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { resolveNewThreadTargetLayoutMode } from "./newThreadLayout";
@@ -10,6 +11,7 @@ import {
   getWorkspacePaneLayoutMode,
 } from "./workspacePaneNavigation";
 
+/** 创建并激活指定工作区的新会话，失败时仅向用户展示固定业务提示。 */
 export async function createAndActivateWorkspaceThread(
   workspaceId: string | null | undefined,
 ): Promise<string | null> {
@@ -36,11 +38,24 @@ export async function createAndActivateWorkspaceThread(
   applyWorkspaceLayoutMode(workspaceId, targetLayoutMode);
   useWorkspaceStore.getState().setActiveRepo(null, { remember: false });
 
+  /*
   const threadId = await useThreadStore.getState().createThread({
     workspaceId,
     repoId: null,
     title: t("app:sidebar.newThreadTitle"),
   });
+  */
+  let threadId: string | null;
+  try {
+    threadId = await useThreadStore.getState().createThread({
+      workspaceId,
+      repoId: null,
+      title: t("app:sidebar.newThreadTitle"),
+    });
+  } catch {
+    toast.error(t("app:sidebar.newThreadFailed"));
+    return null;
+  }
 
   if (!threadId) {
     return null;

@@ -1192,6 +1192,7 @@ fn autonomy_policy_for_preset(
     Ok(policy)
 }
 
+/// 创建会话并在失败时记录包含运行时参数的完整后端诊断日志。
 #[tauri::command]
 pub async fn create_thread(
     state: State<'_, AppState>,
@@ -1203,6 +1204,12 @@ pub async fn create_thread(
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
 ) -> Result<ThreadDto, String> {
+    let log_workspace_id = workspace_id.clone();
+    let log_repo_id = repo_id.clone();
+    let log_engine_id = engine_id.clone();
+    let log_model_id = model_id.clone();
+
+    /*
     create_thread_with_defaults(
         state.inner(),
         workspace_id,
@@ -1214,6 +1221,31 @@ pub async fn create_thread(
         service_tier,
     )
     .await
+    */
+    match create_thread_with_defaults(
+        state.inner(),
+        workspace_id,
+        repo_id,
+        engine_id,
+        model_id,
+        title,
+        reasoning_effort,
+        service_tier,
+    )
+    .await
+    {
+        Ok(thread) => Ok(thread),
+        Err(error) => {
+            log::error!(
+                "operation=create_thread workspace_id={} repo_id={:?} engine_id={} model_id={} error={error:#}",
+                log_workspace_id,
+                log_repo_id,
+                log_engine_id,
+                log_model_id,
+            );
+            Err(error)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -4,6 +4,7 @@ import type { EngineInfo, Thread } from "../types";
 const mockIpc = vi.hoisted(() => ({
   attachCodexRemoteThread: vi.fn(),
   archiveThread: vi.fn(),
+  createThread: vi.fn(),
   restoreThread: vi.fn(),
   listCodexRemoteThreads: vi.fn(),
   listThreads: vi.fn(),
@@ -80,6 +81,7 @@ describe("threadStore remote Codex discovery", () => {
     mockEngineState.engines = [makeCodexEngine()];
     mockIpc.attachCodexRemoteThread.mockResolvedValue(makeThread("attached"));
     mockIpc.archiveThread.mockResolvedValue(undefined);
+    mockIpc.createThread.mockResolvedValue(makeThread("created"));
     mockIpc.listThreads.mockResolvedValue([makeThread("local")]);
     useThreadStore.setState({
       threads: [],
@@ -89,6 +91,25 @@ describe("threadStore remote Codex discovery", () => {
       loading: false,
       error: undefined,
     });
+  });
+
+  // 创建会话失败时保留 Store 错误状态，并把同一个异常对象传播给公共新建动作。
+  it("rethrows create thread failures without adding a thread", async () => {
+    const error = new Error("create thread failed");
+    mockIpc.createThread.mockRejectedValueOnce(error);
+
+    await expect(
+      useThreadStore.getState().createThread({
+        workspaceId: "workspace-1",
+        repoId: null,
+        title: "New thread",
+      }),
+    ).rejects.toBe(error);
+
+    expect(useThreadStore.getState().loading).toBe(false);
+    expect(useThreadStore.getState().error).toBe(String(error));
+    expect(useThreadStore.getState().threads).toEqual([]);
+    expect(useThreadStore.getState().threadsByWorkspace).toEqual({});
   });
 
   it("attaches every unlinked remote Codex thread before refreshing a workspace", async () => {

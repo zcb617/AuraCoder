@@ -42,6 +42,7 @@
     "unpin": "Desafixar sidebar",
     "newThread": "Nova thread",
     "newThreadTitle": "Nova Thread",
+    "newThreadFailed": "Falha ao criar uma nova conversa",
     "agents": "Agentes",
     "extensions": "Extensões",
     "search": "Buscar",
