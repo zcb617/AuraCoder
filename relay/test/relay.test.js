@@ -260,12 +260,13 @@ test("forwards frames larger than one megabyte", async () => {
 });
 
 test("closes peers that exceed the payload limit and accepts a reconnect", async () => {
-  const { url } = await startRelay();
+  // 默认上限已放宽到 100 MiB；用显式 1 MiB 配置验证超限关闭与重连恢复机制。
+  const { url } = await startRelay({ maxPayloadBytes: 1024 * 1024 });
   const desktop = await connect(url, "desktop");
   const mobile = await connect(url, "mobile");
 
   const closed = new Promise((resolve) => mobile.once("close", (code) => resolve(code)));
-  mobile.send(JSON.stringify({ kind: "request", id: "too-big", payload: "x".repeat(4 * 1024 * 1024 + 1024) }));
+  mobile.send(JSON.stringify({ kind: "request", id: "too-big", payload: "x".repeat(1024 * 1024 + 1024) }));
   assert.equal(await closed, 1009);
 
   // 超限只关闭违规连接，隧道本身保持可用，重连后恢复转发。
