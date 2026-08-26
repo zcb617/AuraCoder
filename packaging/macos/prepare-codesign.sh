@@ -13,9 +13,11 @@ readonly script_directory="${0:A:h}"
 readonly repo_root="${script_directory:h:h}"
 readonly codesign_name="Yunxiang AuraCoder Signing"
 readonly codesign_sha1="B1F0EFB5AC17F0E427F591FEDFE8DA7CAA371274"
-# 从 GitHub Actions Secret 或本地环境读取 P12 导入密码和临时证书内容。
+# 从 GitHub Actions Secret 或本地环境读取临时证书内容；P12 按用户固定要求无密码。
 readonly macos_codesign_p12_base64="${MACOS_CODESIGN_P12_BASE64:-}"
-readonly codesign_password="${MACOS_CODESIGN_P12_PASSWORD:-}"
+# 旧错误实现（已停用）：readonly codesign_password="${MACOS_CODESIGN_P12_PASSWORD:-}"
+# P12 按用户固定要求无密码；空值也用于专用 keychain 的非交互创建和解锁。
+readonly codesign_password=""
 readonly local_codesign_p12="${repo_root}/packaging/macos/certs/YunxiangAuraCoderSigning.p12"
 readonly codesign_keychain="${HOME:?缺少 HOME}/Library/Keychains/YunxiangAuraCoderSigning.keychain-db"
 readonly certificate_workspace="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/YunxiangAuraCoderSigning.XXXXXX")"
@@ -92,6 +94,10 @@ prepare_codesign_identity() {
     /usr/bin/security unlock-keychain \
         -p "${codesign_password}" \
         "${codesign_keychain}"
+    # 设置合理的非交互有效期，避免正式签名过程中专用 keychain 自动锁定。
+    /usr/bin/security set-keychain-settings \
+        -lut 21600 \
+        "${codesign_keychain}"
     ensure_keychain_search_list
 
     if ! codesign_identity_available; then
@@ -100,11 +106,8 @@ prepare_codesign_identity() {
             -P "${codesign_password}" \
             -T /usr/bin/codesign \
             -T /usr/bin/security
-        /usr/bin/security set-key-partition-list \
-            -S apple-tool:,apple:,codesign: \
-            -s \
-            -k "${codesign_password}" \
-            "${codesign_keychain}"
+        # 旧位置的授权逻辑（已停用）：已移至导入分支之后的统一授权位置，确保已有身份同样无弹窗。
+        # /usr/bin/security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${codesign_password}" "${codesign_keychain}"
         /usr/bin/security find-certificate \
             -c "${codesign_name}" \
             -p "${codesign_keychain}" \
@@ -116,6 +119,12 @@ prepare_codesign_identity() {
             "${codesign_cert_pem}"
     fi
 
+    # 统一授权现有或新导入身份的私钥无弹窗使用权限。
+    /usr/bin/security set-key-partition-list \
+        -S apple-tool:,apple:,codesign: \
+        -s \
+        -k "${codesign_password}" \
+        "${codesign_keychain}"
     /usr/bin/security unlock-keychain \
         -p "${codesign_password}" \
         "${codesign_keychain}"
