@@ -29,8 +29,6 @@ uniapp_build/simpleDemo/build
 uniapp_build/.gradle
 uniapp_build/.idea
 uniapp_build/build
-uniapp_build/simpleDemo/src/main/AndroidManifest.xml
-uniapp_build/simpleDemo/build.gradle
 
 .tmp
 .pnpm-store
