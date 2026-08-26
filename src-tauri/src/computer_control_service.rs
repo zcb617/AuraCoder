@@ -123,6 +123,21 @@ fn normalize_arguments(arguments: Value) -> Result<Value, String> {
     }
 }
 
+/// 从电脑操作请求参数中提取请求方指定的进程 PID。
+fn request_pid(arguments: &Value) -> Option<u32> {
+    arguments
+        .as_object()
+        .and_then(|value| value.get("pid"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+/// 判断电脑操作请求是否明确指向当前 AuraCoder 进程。
+fn request_targets_current_process(arguments: &Value) -> bool {
+    request_pid(arguments) == Some(std::process::id())
+}
+
+/// 根据电脑操作参数生成授权展示资源，并保留桌面范围安全限制。
 fn target_resource(tool: &str, arguments: &Value) -> Result<TargetResource, String> {
     let object = arguments.as_object();
     let desktop_scope = object
@@ -167,11 +182,23 @@ fn target_resource(tool: &str, arguments: &Value) -> Result<TargetResource, Stri
             "无法解析目标应用标识对应的实际应用",
         ));
     }
+    // 旧的链式 PID 提取逻辑已由 request_pid 统一处理，保留原实现以便追溯。
+    /*
     if let Some(pid) = object
         .and_then(|value| value.get("pid"))
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
     {
+        if let Some(application) = process_executable_path(pid) {
+            return resolved_application_resource(&application);
+        }
+        return Err(service_error(
+            "target_not_found",
+            "无法读取目标进程的可执行文件名",
+        ));
+    }
+    */
+    if let Some(pid) = request_pid(arguments) {
         if let Some(application) = process_executable_path(pid) {
             return resolved_application_resource(&application);
         }
@@ -213,10 +240,18 @@ fn target_resource(tool: &str, arguments: &Value) -> Result<TargetResource, Stri
             display: "电脑操作运行状态".to_string(),
             scope: "metadata",
         }),
+        // 旧逻辑会把无目标的合法 SDK 工具误判为参数非法，保留原分支以便追溯。
+        /*
         _ => Err(service_error(
             "target_not_found",
             &format!("电脑操作工具 `{tool}` 缺少应用或窗口目标"),
         )),
+        */
+        _ => Ok(TargetResource {
+            key: format!("tool:{}", tool.to_ascii_lowercase()),
+            display: format!("电脑操作工具 {tool}"),
+            scope: operation_kind(tool),
+        }),
     }
 }
 
@@ -391,6 +426,8 @@ fn process_executable_path(_pid: u32) -> Option<String> {
     None
 }
 
+// 旧逻辑按名称、路径或 stem 判断自身，会误判同名但 PID 不同的目标，现已停用。
+/*
 fn target_is_auracoder(application: &str) -> bool {
     let Some(current_path) = std::env::current_exe()
         .ok()
@@ -411,6 +448,7 @@ fn target_is_auracoder(application: &str) -> bool {
             .map(|(left, right)| left.eq_ignore_ascii_case(right))
             .unwrap_or(false)
 }
+*/
 
 fn operation_kind(tool: &str) -> &'static str {
     match tool {
@@ -430,8 +468,9 @@ fn service_error(code: &str, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        application_resource, dynamic_tool_failure, dynamic_tool_success,
-        resolved_application_resource, target_resource, ComputerControlService,
+        application_resource, dynamic_tool_failure, dynamic_tool_success, request_pid,
+        request_targets_current_process, resolved_application_resource, target_resource,
+        ComputerControlService,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -449,11 +488,73 @@ mod tests {
         let _ = Arc::new(service);
     }
 
+    /*
     #[test]
     fn desktop_scope_and_unscoped_input_are_rejected() {
         assert!(target_resource("click", &json!({"scope": "desktop"})).is_err());
         assert!(target_resource("click", &json!({"x": 10, "y": 20})).is_err());
         assert!(target_resource("click", &json!({"path": "notepad.exe"})).is_ok());
+    }
+    */
+
+    #[test]
+    fn desktop_scope_is_rejected_and_unscoped_input_is_accepted() {
+        assert!(target_resource("click", &json!({"scope": "desktop"})).is_err());
+        assert!(target_resource("click", &json!({"x": 10, "y": 20})).is_ok());
+        let current_exe_path = std::env::current_exe()
+            .expect("the current executable path should resolve")
+            .to_string_lossy()
+            .to_string();
+        assert!(target_resource("click", &json!({"path": current_exe_path})).is_ok());
+    }
+
+    #[test]
+    fn accessibility_tree_without_target_uses_derived_tool_resource() {
+        let target = target_resource("get_accessibility_tree", &json!({}))
+            .expect("the SDK tool contract allows an empty argument object");
+
+        assert_eq!(target.key, "tool:get_accessibility_tree");
+        assert_eq!(target.scope, "observe");
+    }
+
+    #[test]
+    fn future_sdk_tool_without_target_uses_derived_tool_resource() {
+        let target = target_resource("future_sdk_observer", &json!({}))
+            .expect("future SDK tools should receive a derived authorization resource");
+
+        assert_eq!(target.key, "tool:future_sdk_observer");
+        assert_eq!(target.scope, "observe");
+    }
+
+    #[test]
+    fn current_pid_is_the_only_self_process_match() {
+        let current_pid = std::process::id();
+        let arguments = json!({"pid": current_pid});
+
+        assert_eq!(request_pid(&arguments), Some(current_pid));
+        assert!(request_targets_current_process(&arguments));
+    }
+
+    #[test]
+    fn different_pid_is_not_treated_as_self_process() {
+        let current_pid = std::process::id();
+        let different_pid = if current_pid == u32::MAX {
+            u32::MIN
+        } else {
+            current_pid.wrapping_add(1)
+        };
+        let arguments = json!({"pid": different_pid});
+
+        assert_eq!(request_pid(&arguments), Some(different_pid));
+        assert!(!request_targets_current_process(&arguments));
+    }
+
+    #[test]
+    fn same_name_without_pid_is_not_treated_as_self_process() {
+        let arguments = json!({"application": "AuraCoder"});
+
+        assert_eq!(request_pid(&arguments), None);
+        assert!(!request_targets_current_process(&arguments));
     }
 
     #[test]
@@ -937,7 +1038,16 @@ impl ComputerControlService {
         }
         let arguments = normalize_arguments(arguments)?;
         let target = target_resource(tool, &arguments)?;
+        // 旧逻辑按目标展示名称判断自身，无法区分同名的其他进程，保留以便追溯。
+        /*
         if target_is_auracoder(&target.display) {
+            return Err(service_error(
+                "target_scope_mismatch",
+                "AuraCoder 不允许把自身窗口作为电脑操作目标",
+            ));
+        }
+        */
+        if request_targets_current_process(&arguments) {
             return Err(service_error(
                 "target_scope_mismatch",
                 "AuraCoder 不允许把自身窗口作为电脑操作目标",
