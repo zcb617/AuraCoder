@@ -20,6 +20,7 @@ const threadId = ref("");
 const scrollTop = ref(0);
 const isAtNewest = ref(true);
 const hasUnseenMessages = ref(false);
+const scrollIntoViewId = ref("");
 const selectedModelId = ref("");
 const selectedReasoningEffort = ref("");
 const selectedAutonomyPreset = ref<AutonomyPreset>("inherit");
@@ -32,6 +33,7 @@ const cancelledAttachments = new Set<string>();
 // 当前页内全屏预览直接复用已显示的图片地址，不新增读取或网络请求。
 const previewImageSource = ref("");
 let initializing = false;
+let suppressUnseenHint = false;
 let unsubscribeState: (() => void) | undefined;
 let lastScrollTop = 0;
 // 记录本次页面是否命中会话级滚动位置；不能用保存值的真假判断，因为 0 是有效位置。
@@ -269,6 +271,8 @@ watch(() => conversation.value?.messageRevision || 0, (revision, previousRevisio
   if (!revision || revision === previousRevision) return;
   // 初次全量加载的 revision 只用于渲染消息，位置由 initializeConversation 统一恢复或定位底部。
   if (initializing) return;
+  // 加载更早消息触发的前插不滚到底、也不弹新消息提示。
+  if (suppressUnseenHint) return;
   void nextTick().then(() => {
     if (isAtNewest.value) scrollToNewest();
     else hasUnseenMessages.value = true;
@@ -384,9 +388,32 @@ async function loadOlder() {
   }
 }
 */
+/*
+已恢复分页锚点加载；保留旧存根以便追溯。
 async function loadOlder() {
   // 旧模板入口仍会被编译；完整取数后该调用不会请求更多消息。
   await conversationStore.loadOlder(auracoderId.value, threadId.value);
+}
+*/
+async function loadOlder() {
+  const current = conversation.value;
+  if (!current || !current.nextCursor || current.loadingOlder) return;
+  // 记录前插前最旧一条作为滚动锚点，加载完成后把视口钉回它。
+  const anchorId = current.messages[0]?.id;
+  suppressUnseenHint = true;
+  try {
+    await conversationStore.loadOlder(auracoderId.value, threadId.value);
+    if (anchorId) {
+      await nextTick();
+      scrollIntoViewId.value = "";
+      await nextTick();
+      scrollIntoViewId.value = `msg-${anchorId}`;
+    }
+  } catch (error) {
+    uni.showToast({ title: error instanceof Error ? error.message : "无法加载历史消息", icon: "none" });
+  } finally {
+    suppressUnseenHint = false;
+  }
 }
 
 /* 重构初版可选择隐藏模型，并给不支持的模型写入 high；保留原实现以便追溯。
@@ -709,12 +736,12 @@ onUnload(() => {
   <view class="conversation-page">
     <view v-if="!auracoderConnectionManager.getState(auracoderId).peerOnline" class="offline-banner">桌面 AuraCoder 当前离线，消息与草稿已保留。</view>
     <view v-if="!conversation && !auracoderConnectionManager.getState(auracoderId).peerOnline" class="empty-state conversation-waiting"><view class="loader"></view><text>正在等待桌面 AuraCoder 连接…</text></view>
-    <scroll-view class="chat-scroll" scroll-y :scroll-top="scrollTop" :scroll-with-animation="false" @scroll="handleChatScroll" @scrolltolower="handleScrollToLower">
+    <scroll-view class="chat-scroll" scroll-y :scroll-top="scrollTop" :scroll-with-animation="false" :scroll-into-view="scrollIntoViewId" @scroll="handleChatScroll" @scrolltolower="handleScrollToLower">
       <view class="chat-content">
-        <!-- 历史消息已改为首次完整取得；保留原分页按钮写法记录。 -->
-        <!-- <button v-if="conversation?.nextCursor" class="load-older" :disabled="conversation.loadingOlder" @tap="loadOlder">{{ conversation.loadingOlder ? '正在加载…' : '加载更早消息' }}</button> -->
+        <!-- 存在更早历史时显示分页入口。 -->
+        <button v-if="conversation?.nextCursor" class="load-older" :disabled="conversation.loadingOlder" @tap="loadOlder">{{ conversation.loadingOlder ? '正在加载…' : '加载更早消息' }}</button>
         <view v-if="conversation?.loading && !conversation.messages.length" class="empty-state"><view class="loader"></view><text>正在加载消息…</text></view>
-        <view v-for="message in conversation?.messages || []" :key="message.id" class="message" :class="message.role">
+        <view v-for="message in conversation?.messages || []" :key="message.id" :id="'msg-' + message.id" class="message" :class="message.role">
           <text class="message-role">{{ message.role === 'user' ? '你' : 'AuraCoder' }}</text>
           <view class="message-body">
             <view v-if="message.attachments?.length" class="message-attachments">

@@ -33,8 +33,8 @@ use crate::{
         threads::create_thread_with_defaults,
     },
     config::app_config::{AppConfig, RemoteAccessConfig, RemoteDeviceConfig},
-    // 历史分页使用的 MessageWindowCursorDto 已停用，保留原引用记录。
-    // models::MessageWindowCursorDto,
+    // 历史分页已恢复：MessageWindowCursorDto 用于 message.list 游标分页。
+    models::MessageWindowCursorDto,
     state::AppState,
 };
 
@@ -43,9 +43,18 @@ const REMOTE_PROTOCOL_VERSION: u32 = 1;
 const REMOTE_BATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// 远程附件单文件上限，与既有聊天附件限制保持一致。
 const REMOTE_ATTACHMENT_MAX_BYTES: usize = 10 * 1024 * 1024;
-// 历史分页窗口限制已停用：手机进入会话时一次读取完整消息。
-// const MESSAGE_WINDOW_DEFAULT_LIMIT: usize = 50;
-// const MESSAGE_WINDOW_MAX_LIMIT: usize = 100;
+// 历史分页窗口限制已恢复（游标分页已启用）：手机进入会话时按页读取消息。
+const MESSAGE_WINDOW_DEFAULT_LIMIT: usize = 50;
+const MESSAGE_WINDOW_MAX_LIMIT: usize = 100;
+/// 单页响应序列化字节预算；低于 Relay 单帧上限并保留信封余量。
+const MESSAGE_PAGE_BUDGET_BYTES: usize = 720 * 1024;
+/// 单条移动消息序列化上限；超过时以占位文本替换 blocks。
+const MESSAGE_SINGLE_MESSAGE_BUDGET_BYTES: usize = 512 * 1024;
+/// 手机端可见文本（text/steer/error/notice 的 content、message 字段）截断上限。
+const MOBILE_VISIBLE_TEXT_MAX_CHARS: usize = 64 * 1024;
+/// 手机端不渲染的输出类字段（action 的 result.output/result.diff、thinking 的 content、diff 块的 diff）截断上限。
+const MOBILE_HIDDEN_OUTPUT_MAX_CHARS: usize = 4 * 1024;
+const MOBILE_TRUNCATED_SUFFIX: &str = "\n... [truncated]";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1543,126 +1552,190 @@ impl RemoteTunnelManager {
                                             }
                                         }
                                         "message.list" => {
+                                            // 已恢复游标分页；旧全量实现保留追溯。
+                                            // 旧实现：一次读取完整历史并按内联逻辑转换后整体响应，超大历史会撑爆 Relay 单帧上限。
+                                            // /*
+                                            // let thread_id = request.payload.get("thread_id")
+                                            //     .and_then(Value::as_str)
+                                            //     .map(str::trim)
+                                            //     .filter(|value| !value.is_empty())
+                                            //     .map(str::to_string)
+                                            //     .ok_or_else(|| "thread_id is required".to_string());
+                                            // match thread_id {
+                                            //     Ok(thread_id) => {
+                                            //         // 历史分页实现已停用：手机首次打开会话时直接取得全部消息。
+                                            //         /*
+                                            //         let cursor = request.payload.get("cursor")
+                                            //             .filter(|value| !value.is_null())
+                                            //             .cloned()
+                                            //             .map(serde_json::from_value::<MessageWindowCursorDto>)
+                                            //             .transpose()
+                                            //             .map_err(|error| error.to_string());
+                                            //         */
+                                            //         let db = state.db.clone();
+                                            //         let query_thread_id = thread_id.clone();
+                                            //         let messages = tokio::task::spawn_blocking(move || {
+                                            //             crate::db::messages::get_thread_messages(&db, &query_thread_id)
+                                            //         })
+                                            //         .await
+                                            //         .map_err(|error| error.to_string())
+                                            //         .and_then(|result| result.map_err(|error| error.to_string()));
+                                            //         match messages {
+                                            //             Ok(messages) => {
+                                            //                 // 历史查询不参与实时消息投递。消息本身全部来自数据库；附件仅暴露
+                                            //                 // 手机显示需要的元数据，桌面绝对路径不发送到远端设备。
+                                            //                 /*
+                                            //                 let versions = messages.iter()
+                                            //                     .map(|message| serde_json::to_string(message)
+                                            //                         .map(|value| (message.id.clone(), value)))
+                                            //                     .collect::<Result<HashMap<String, String>, _>>()
+                                            //                     .map_err(|error| error.to_string());
+                                            //                 match versions {
+                                            //                     Ok(versions) => {
+                                            //                         message_versions.insert(thread_id, versions);
+                                            //                         Ok(json!({ "messages": messages }))
+                                            //                     }
+                                            //                     Err(error) => Err(error),
+                                            //                 }
+                                            //                 */
+                                            //                 let mobile_messages = messages
+                                            //                     .into_iter()
+                                            //                     .map(|message| {
+                                            //                         let attachments = message
+                                            //                             .blocks
+                                            //                             .as_ref()
+                                            //                             .and_then(Value::as_array)
+                                            //                             .map(|blocks| {
+                                            //                                 blocks
+                                            //                                     .iter()
+                                            //                                     .enumerate()
+                                            //                                     .filter_map(|(index, block)| {
+                                            //                                         (block
+                                            //                                             .get("type")
+                                            //                                             .and_then(Value::as_str)
+                                            //                                             == Some("attachment"))
+                                            //                                             .then(|| {
+                                            //                                                 let file_name = block
+                                            //                                                     .get("fileName")
+                                            //                                                     .and_then(Value::as_str)
+                                            //                                                     .unwrap_or("附件");
+                                            //                                                 let mime_type = block
+                                            //                                                     .get("mimeType")
+                                            //                                                     .and_then(Value::as_str)
+                                            //                                                     .unwrap_or_default();
+                                            //                                                 json!({
+                                            //                                                     "id": format!("{}:attachment:{index}", message.id),
+                                            //                                                     "fileName": file_name,
+                                            //                                                     // 历史附件只能由桌面端读取；手机端不能取得或使用桌面绝对路径。
+                                            //                                                     "filePath": "",
+                                            //                                                     "sizeBytes": block.get("sizeBytes").and_then(Value::as_u64).unwrap_or(0),
+                                            //                                                     "mimeType": mime_type,
+                                            //                                                     "source": if mime_type.starts_with("image/") { "image" } else { "file" },
+                                            //                                                     "remoteAttachmentIndex": index,
+                                            //                                                 })
+                                            //                                             })
+                                            //                                     })
+                                            //                                     .collect::<Vec<_>>()
+                                            //                             })
+                                            //                             .unwrap_or_default();
+                                            //                         let mut value = serde_json::to_value(message)
+                                            //                             .map_err(|error| error.to_string())?;
+                                            //                         // blocks 仍供手机渲染文本，但其中的桌面附件路径不能泄露到远端设备。
+                                            //                         if let Some(blocks) = value
+                                            //                             .get_mut("blocks")
+                                            //                             .and_then(Value::as_array_mut)
+                                            //                         {
+                                            //                             for block in blocks {
+                                            //                                 if block.get("type").and_then(Value::as_str)
+                                            //                                     == Some("attachment")
+                                            //                                 {
+                                            //                                     if let Some(object) = block.as_object_mut() {
+                                            //                                         object.insert(
+                                            //                                             "filePath".to_string(),
+                                            //                                             Value::String(String::new()),
+                                            //                                         );
+                                            //                                     }
+                                            //                                 }
+                                            //                             }
+                                            //                         }
+                                            //                         if !attachments.is_empty() {
+                                            //                             if let Some(object) = value.as_object_mut() {
+                                            //                                 object.insert(
+                                            //                                     "attachments".to_string(),
+                                            //                                     Value::Array(attachments),
+                                            //                                 );
+                                            //                             }
+                                            //                         }
+                                            //                         Ok::<Value, String>(value)
+                                            //                     })
+                                            //                     .collect::<Result<Vec<_>, _>>();
+                                            //                 mobile_messages.map(|messages| json!({ "messages": messages }))
+                                            //             }
+                                            //             Err(error) => Err(error),
+                                            //         }
+                                            //     }
+                                            //     Err(error) => Err(error),
+                                            // }
+                                            // */
+                                            // 新实现：按游标分页读取历史，并做页级字节预算封顶。
                                             let thread_id = request.payload.get("thread_id")
                                                 .and_then(Value::as_str)
                                                 .map(str::trim)
                                                 .filter(|value| !value.is_empty())
                                                 .map(str::to_string)
                                                 .ok_or_else(|| "thread_id is required".to_string());
-                                            match thread_id {
-                                                Ok(thread_id) => {
-                                                    // 历史分页实现已停用：手机首次打开会话时直接取得全部消息。
-                                                    /*
-                                                    let cursor = request.payload.get("cursor")
-                                                        .filter(|value| !value.is_null())
-                                                        .cloned()
-                                                        .map(serde_json::from_value::<MessageWindowCursorDto>)
-                                                        .transpose()
-                                                        .map_err(|error| error.to_string());
-                                                    */
+                                            let limit = request.payload.get("limit")
+                                                .and_then(Value::as_u64)
+                                                .and_then(|value| usize::try_from(value).ok())
+                                                .unwrap_or(MESSAGE_WINDOW_DEFAULT_LIMIT)
+                                                .clamp(1, MESSAGE_WINDOW_MAX_LIMIT);
+                                            let cursor = match request.payload.get("cursor") {
+                                                None | Some(Value::Null) => Ok(None),
+                                                Some(value) => serde_json::from_value::<MessageWindowCursorDto>(value.clone())
+                                                    .map(Some)
+                                                    .map_err(|error| format!("cursor is invalid: {error}")),
+                                            };
+                                            match (thread_id, cursor) {
+                                                (Ok(thread_id), Ok(cursor)) => {
                                                     let db = state.db.clone();
                                                     let query_thread_id = thread_id.clone();
-                                                    let messages = tokio::task::spawn_blocking(move || {
-                                                        crate::db::messages::get_thread_messages(&db, &query_thread_id)
+                                                    let window = tokio::task::spawn_blocking(move || {
+                                                        crate::db::messages::get_thread_messages_window_with_row_ids(
+                                                            &db,
+                                                            &query_thread_id,
+                                                            cursor.as_ref(),
+                                                            limit,
+                                                        )
                                                     })
                                                     .await
                                                     .map_err(|error| error.to_string())
                                                     .and_then(|result| result.map_err(|error| error.to_string()));
-                                                    match messages {
-                                                        Ok(messages) => {
-                                                            // 历史查询不参与实时消息投递。消息本身全部来自数据库；附件仅暴露
-                                                            // 手机显示需要的元数据，桌面绝对路径不发送到远端设备。
-                                                            /*
-                                                            let versions = messages.iter()
-                                                                .map(|message| serde_json::to_string(message)
-                                                                    .map(|value| (message.id.clone(), value)))
-                                                                .collect::<Result<HashMap<String, String>, _>>()
-                                                                .map_err(|error| error.to_string());
-                                                            match versions {
-                                                                Ok(versions) => {
-                                                                    message_versions.insert(thread_id, versions);
-                                                                    Ok(json!({ "messages": messages }))
+                                                    match window {
+                                                        Ok((window, row_ids)) => {
+                                                            // 单条消息转手机端结构：附件仅暴露元数据并剥离输出类字段。
+                                                            let converted = window
+                                                                .messages
+                                                                .into_iter()
+                                                                .map(mobile_message_value)
+                                                                .collect::<Result<Vec<_>, _>>();
+                                                            match converted {
+                                                                Ok(mobile_messages) => {
+                                                                    // 页级字节预算封顶：从最旧端丢弃直到整页不超过预算，并重算 nextCursor。
+                                                                    let (mobile_messages, next_cursor) = enforce_message_page_budget(
+                                                                        mobile_messages,
+                                                                        row_ids,
+                                                                        window.next_cursor,
+                                                                        MESSAGE_PAGE_BUDGET_BYTES,
+                                                                    );
+                                                                    Ok(json!({ "messages": mobile_messages, "nextCursor": next_cursor }))
                                                                 }
                                                                 Err(error) => Err(error),
                                                             }
-                                                            */
-                                                            let mobile_messages = messages
-                                                                .into_iter()
-                                                                .map(|message| {
-                                                                    let attachments = message
-                                                                        .blocks
-                                                                        .as_ref()
-                                                                        .and_then(Value::as_array)
-                                                                        .map(|blocks| {
-                                                                            blocks
-                                                                                .iter()
-                                                                                .enumerate()
-                                                                                .filter_map(|(index, block)| {
-                                                                                    (block
-                                                                                        .get("type")
-                                                                                        .and_then(Value::as_str)
-                                                                                        == Some("attachment"))
-                                                                                        .then(|| {
-                                                                                            let file_name = block
-                                                                                                .get("fileName")
-                                                                                                .and_then(Value::as_str)
-                                                                                                .unwrap_or("附件");
-                                                                                            let mime_type = block
-                                                                                                .get("mimeType")
-                                                                                                .and_then(Value::as_str)
-                                                                                                .unwrap_or_default();
-                                                                                            json!({
-                                                                                                "id": format!("{}:attachment:{index}", message.id),
-                                                                                                "fileName": file_name,
-                                                                                                // 历史附件只能由桌面端读取；手机端不能取得或使用桌面绝对路径。
-                                                                                                "filePath": "",
-                                                                                                "sizeBytes": block.get("sizeBytes").and_then(Value::as_u64).unwrap_or(0),
-                                                                                                "mimeType": mime_type,
-                                                                                                "source": if mime_type.starts_with("image/") { "image" } else { "file" },
-                                                                                                "remoteAttachmentIndex": index,
-                                                                                            })
-                                                                                        })
-                                                                                })
-                                                                                .collect::<Vec<_>>()
-                                                                        })
-                                                                        .unwrap_or_default();
-                                                                    let mut value = serde_json::to_value(message)
-                                                                        .map_err(|error| error.to_string())?;
-                                                                    // blocks 仍供手机渲染文本，但其中的桌面附件路径不能泄露到远端设备。
-                                                                    if let Some(blocks) = value
-                                                                        .get_mut("blocks")
-                                                                        .and_then(Value::as_array_mut)
-                                                                    {
-                                                                        for block in blocks {
-                                                                            if block.get("type").and_then(Value::as_str)
-                                                                                == Some("attachment")
-                                                                            {
-                                                                                if let Some(object) = block.as_object_mut() {
-                                                                                    object.insert(
-                                                                                        "filePath".to_string(),
-                                                                                        Value::String(String::new()),
-                                                                                    );
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                    if !attachments.is_empty() {
-                                                                        if let Some(object) = value.as_object_mut() {
-                                                                            object.insert(
-                                                                                "attachments".to_string(),
-                                                                                Value::Array(attachments),
-                                                                            );
-                                                                        }
-                                                                    }
-                                                                    Ok::<Value, String>(value)
-                                                                })
-                                                                .collect::<Result<Vec<_>, _>>();
-                                                            mobile_messages.map(|messages| json!({ "messages": messages }))
                                                         }
                                                         Err(error) => Err(error),
                                                     }
                                                 }
-                                                Err(error) => Err(error),
+                                                (Err(error), _) | (_, Err(error)) => Err(error),
                                             }
                                         }
                                         "message.attachment.preview" => {
@@ -2359,18 +2432,208 @@ impl RemoteTunnelManager {
     }
 }
 
+/// 截断字符串到指定字符数并追加截断标记。
+fn truncate_mobile_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut output: String = value.chars().take(max_chars).collect();
+    output.push_str(MOBILE_TRUNCATED_SUFFIX);
+    output
+}
+
+/// 手机端只渲染 blocks 的 content/summary/message 字段；
+/// 输出类字段不进隧道，可见文本按上限截断。
+fn downsize_mobile_blocks(value: &mut Value) {
+    let Some(blocks) = value.get_mut("blocks").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for block in blocks {
+        let block_type = block.get("type").and_then(Value::as_str).unwrap_or_default();
+        match block_type {
+            "action" => {
+                if let Some(object) = block.as_object_mut() {
+                    object.remove("outputChunks");
+                    object.remove("details");
+                    if let Some(result) = object.get_mut("result").and_then(Value::as_object_mut) {
+                        for key in ["output", "diff", "error"] {
+                            if let Some(text) = result.get(key).and_then(Value::as_str).map(str::to_string) {
+                                result.insert(
+                                    key.to_string(),
+                                    Value::String(truncate_mobile_text(&text, MOBILE_HIDDEN_OUTPUT_MAX_CHARS)),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            "approval" => {
+                if let Some(object) = block.as_object_mut() {
+                    object.remove("details");
+                }
+            }
+            "diff" => {
+                if let Some(object) = block.as_object_mut() {
+                    if let Some(text) = object.get("diff").and_then(Value::as_str).map(str::to_string) {
+                        object.insert("diff".to_string(), Value::String(truncate_mobile_text(&text, MOBILE_HIDDEN_OUTPUT_MAX_CHARS)));
+                    }
+                }
+            }
+            "thinking" => {
+                if let Some(object) = block.as_object_mut() {
+                    if let Some(text) = object.get("content").and_then(Value::as_str).map(str::to_string) {
+                        object.insert("content".to_string(), Value::String(truncate_mobile_text(&text, MOBILE_HIDDEN_OUTPUT_MAX_CHARS)));
+                    }
+                }
+            }
+            "text" | "steer" | "error" | "notice" => {
+                if let Some(object) = block.as_object_mut() {
+                    for key in ["content", "message"] {
+                        if let Some(text) = object.get(key).and_then(Value::as_str).map(str::to_string) {
+                            object.insert(key.to_string(), Value::String(truncate_mobile_text(&text, MOBILE_VISIBLE_TEXT_MAX_CHARS)));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 单条消息转换为手机端结构：附件只保留元数据并剥离桌面路径，
+/// 随后剥离手机端不渲染的输出类字段。
+fn mobile_message_value(message: crate::models::MessageDto) -> Result<Value, String> {
+    // 附件只保留手机显示需要的元数据，桌面绝对路径不发送到远端设备。
+    let attachments = message
+        .blocks
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(index, block)| {
+                    (block
+                        .get("type")
+                        .and_then(Value::as_str)
+                        == Some("attachment"))
+                        .then(|| {
+                            let file_name = block
+                                .get("fileName")
+                                .and_then(Value::as_str)
+                                .unwrap_or("附件");
+                            let mime_type = block
+                                .get("mimeType")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            json!({
+                                "id": format!("{}:attachment:{index}", message.id),
+                                "fileName": file_name,
+                                // 历史附件只能由桌面端读取；手机端不能取得或使用桌面绝对路径。
+                                "filePath": "",
+                                "sizeBytes": block.get("sizeBytes").and_then(Value::as_u64).unwrap_or(0),
+                                "mimeType": mime_type,
+                                "source": if mime_type.starts_with("image/") { "image" } else { "file" },
+                                "remoteAttachmentIndex": index,
+                            })
+                        })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut value = serde_json::to_value(message).map_err(|error| error.to_string())?;
+    // blocks 仍供手机渲染文本，但其中的桌面附件路径不能泄露到远端设备。
+    if let Some(blocks) = value
+        .get_mut("blocks")
+        .and_then(Value::as_array_mut)
+    {
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str)
+                == Some("attachment")
+            {
+                if let Some(object) = block.as_object_mut() {
+                    object.insert(
+                        "filePath".to_string(),
+                        Value::String(String::new()),
+                    );
+                }
+            }
+        }
+    }
+    if !attachments.is_empty() {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "attachments".to_string(),
+                Value::Array(attachments),
+            );
+        }
+    }
+    // 剥离手机端不渲染的输出类字段。
+    downsize_mobile_blocks(&mut value);
+    Ok(value)
+}
+
+/// 页级字节预算：先把单条超限消息替换为占位 blocks，
+/// 再从最旧端丢弃消息直到整页序列化不超过预算；
+/// 只要发生过丢弃，就用幸存最旧一条重算 nextCursor（已知必还有更早历史）。
+fn enforce_message_page_budget(
+    mut messages: Vec<Value>,
+    mut row_ids: Vec<i64>,
+    next_cursor: Option<MessageWindowCursorDto>,
+    budget_bytes: usize,
+) -> (Vec<Value>, Option<MessageWindowCursorDto>) {
+    for message in messages.iter_mut() {
+        let serialized = serde_json::to_string(message).map(|value| value.len()).unwrap_or(0);
+        if serialized > MESSAGE_SINGLE_MESSAGE_BUDGET_BYTES {
+            if let Some(object) = message.as_object_mut() {
+                object.insert(
+                    "blocks".to_string(),
+                    json!([{ "type": "text", "content": "该消息内容过大，请在桌面端查看。" }]),
+                );
+                if let Some(content) = object.get("content").and_then(Value::as_str).map(str::to_string) {
+                    object.insert("content".to_string(), Value::String(truncate_mobile_text(&content, MOBILE_VISIBLE_TEXT_MAX_CHARS)));
+                }
+            }
+        }
+    }
+    let total_bytes = |items: &[Value]| {
+        items
+            .iter()
+            .map(|item| serde_json::to_string(item).map(|value| value.len()).unwrap_or(0))
+            .sum::<usize>()
+    };
+    let mut trimmed = false;
+    while messages.len() > 1 && total_bytes(&messages) > budget_bytes {
+        messages.remove(0);
+        row_ids.remove(0);
+        trimmed = true;
+    }
+    let next_cursor = if trimmed {
+        messages.first().map(|message| MessageWindowCursorDto {
+            created_at: message.get("createdAt").and_then(Value::as_str).unwrap_or_default().to_string(),
+            id: message.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
+            row_id: row_ids.first().copied(),
+        })
+    } else {
+        next_cursor
+    };
+    (messages, next_cursor)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::{
-        build_completed_message_event, decode_relay_header_value, parse_optional_batch_id,
-        parse_remote_attachment_inputs, relay_attachment_url, remote_batch_key, RemoteBatchState,
+        build_completed_message_event, decode_relay_header_value, enforce_message_page_budget,
+        mobile_message_value, parse_optional_batch_id, parse_remote_attachment_inputs,
+        relay_attachment_url, remote_batch_key, truncate_mobile_text, RemoteBatchState,
         RemoteTunnelManager,
     };
     use crate::commands::chat::ChatAttachmentPayload;
     use crate::config::app_config::RemoteAccessConfig;
-    use serde_json::json;
+    use crate::models::{MessageDto, MessageStatusDto, MessageWindowCursorDto};
+    use serde_json::{json, Value};
     use tokio::fs as tokio_fs;
 
     #[test]
@@ -2535,5 +2798,157 @@ mod tests {
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].attachment_key.as_deref(), Some("K-1"));
         assert_eq!(inputs[0].size_bytes, Some(4));
+    }
+
+    #[test]
+    fn mobile_message_value_strips_action_output_and_keeps_summary() {
+        let blocks = json!([
+            {
+                "type": "action",
+                "actionId": "action-1",
+                "actionType": "run",
+                "summary": "keep this summary",
+                "details": { "command": "npm test" },
+                "outputChunks": [{ "stream": "stdout", "content": "chunk" }],
+                "result": { "output": "x".repeat(10_000), "diff": "d", "error": null }
+            },
+            {
+                "type": "attachment",
+                "fileName": "report.txt",
+                "mimeType": "text/plain",
+                "sizeBytes": 123,
+                "filePath": "C:/secret/report.txt"
+            }
+        ]);
+        let message = MessageDto {
+            id: "message-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            role: "assistant".to_string(),
+            content: Some("answer".to_string()),
+            blocks: Some(blocks),
+            turn_engine_id: None,
+            turn_model_id: None,
+            turn_reasoning_effort: None,
+            schema_version: 1,
+            status: MessageStatusDto::Completed,
+            token_usage: None,
+            created_at: "2026-08-01T00:00:00.000Z".to_string(),
+        };
+
+        let value = mobile_message_value(message).expect("convert message to mobile value");
+        let block_values = value.get("blocks").and_then(Value::as_array).unwrap();
+        let action = block_values
+            .iter()
+            .find(|block| block.get("type").and_then(Value::as_str) == Some("action"))
+            .expect("action block should remain");
+        assert!(action.get("outputChunks").is_none());
+        assert!(action.get("details").is_none());
+        assert_eq!(
+            action.get("summary").and_then(Value::as_str),
+            Some("keep this summary")
+        );
+        let result = action.get("result").and_then(Value::as_object).unwrap();
+        let output = result.get("output").and_then(Value::as_str).unwrap();
+        assert!(output.ends_with(super::MOBILE_TRUNCATED_SUFFIX));
+        assert_eq!(
+            output.chars().count(),
+            super::MOBILE_HIDDEN_OUTPUT_MAX_CHARS + super::MOBILE_TRUNCATED_SUFFIX.chars().count()
+        );
+
+        let attachments = value.get("attachments").and_then(Value::as_array).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0].get("filePath").and_then(Value::as_str),
+            Some("")
+        );
+        let attachment_block = block_values
+            .iter()
+            .find(|block| block.get("type").and_then(Value::as_str) == Some("attachment"))
+            .expect("attachment block should remain");
+        assert_eq!(
+            attachment_block.get("filePath").and_then(Value::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn truncate_mobile_text_appends_suffix_only_when_needed() {
+        assert_eq!(truncate_mobile_text("", 10), "");
+        assert_eq!(truncate_mobile_text("short", 10), "short");
+        let long = "x".repeat(100);
+        let truncated = truncate_mobile_text(&long, 10);
+        assert!(truncated.ends_with(super::MOBILE_TRUNCATED_SUFFIX));
+        assert_eq!(
+            truncated.chars().count(),
+            10 + super::MOBILE_TRUNCATED_SUFFIX.chars().count()
+        );
+    }
+
+    #[test]
+    fn enforce_message_page_budget_drops_oldest_and_recomputes_cursor() {
+        let messages: Vec<Value> = (1..=5)
+            .map(|index| {
+                json!({
+                    "id": format!("m{index}"),
+                    "createdAt": "2026-08-01T00:00:00.000Z",
+                    "content": "x".repeat(100),
+                })
+            })
+            .collect();
+        let row_ids = vec![1, 2, 3, 4, 5];
+        let next_cursor = Some(MessageWindowCursorDto {
+            created_at: "2026-08-01T00:00:00.000Z".to_string(),
+            id: "m1".to_string(),
+            row_id: Some(1),
+        });
+        // 每条约 100 字节；预算只容纳 2 条，最旧的 m1/m2/m3 被丢弃。
+        let single_size = messages[0].to_string().len();
+        let budget = single_size * 2;
+        let (kept, recomputed) = enforce_message_page_budget(
+            messages.clone(),
+            row_ids.clone(),
+            next_cursor.clone(),
+            budget,
+        );
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].get("id").and_then(Value::as_str), Some("m4"));
+        assert_eq!(kept[1].get("id").and_then(Value::as_str), Some("m5"));
+        let recomputed = recomputed.expect("cursor should be recomputed after trimming");
+        assert_eq!(recomputed.id, "m4");
+        assert_eq!(recomputed.row_id, Some(4));
+
+        // 未触发裁剪时 next_cursor 原样返回。
+        let (kept_all, untouched) = enforce_message_page_budget(
+            messages.clone(),
+            row_ids,
+            next_cursor.clone(),
+            usize::MAX,
+        );
+        assert_eq!(kept_all.len(), 5);
+        let untouched = untouched.expect("cursor should be untouched without trimming");
+        assert_eq!(untouched.id, "m1");
+        assert_eq!(untouched.row_id, Some(1));
+    }
+
+    #[test]
+    fn enforce_message_page_budget_replaces_single_oversize_message() {
+        let messages = vec![json!({
+            "id": "m-oversize",
+            "createdAt": "2026-08-01T00:00:00.000Z",
+            "content": "x".repeat(super::MESSAGE_SINGLE_MESSAGE_BUDGET_BYTES + 1024),
+        })];
+        let (kept, next_cursor) = enforce_message_page_budget(
+            messages,
+            vec![1],
+            None,
+            super::MESSAGE_PAGE_BUDGET_BYTES,
+        );
+        assert_eq!(kept.len(), 1);
+        assert!(next_cursor.is_none());
+        let blocks = kept[0].get("blocks").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            blocks[0].get("content").and_then(Value::as_str),
+            Some("该消息内容过大，请在桌面端查看。")
+        );
     }
 }

@@ -693,6 +693,19 @@ pub fn get_thread_messages_window(
     cursor: Option<&MessageWindowCursorDto>,
     limit: usize,
 ) -> anyhow::Result<MessageWindowDto> {
+    let (window, _) = get_thread_messages_window_with_row_ids(db, thread_id, cursor, limit)?;
+    Ok(window)
+}
+
+/*
+// 远程分页需要 rowid 以支持预算裁剪后重算游标；公共入口委托到带 rowid 版本。
+// 原 get_thread_messages_window 旧实现保留追溯：
+pub fn get_thread_messages_window(
+    db: &Database,
+    thread_id: &str,
+    cursor: Option<&MessageWindowCursorDto>,
+    limit: usize,
+) -> anyhow::Result<MessageWindowDto> {
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
         "SELECT id, thread_id, role, content, blocks_json, schema_version, status,
@@ -766,6 +779,98 @@ pub fn get_thread_messages_window(
         messages,
         next_cursor,
     })
+}
+*/
+
+/// 分页获取线程消息窗口，并返回与升序后的 messages 按下标一一对应的 rowid 列表。
+/// 远程分页需要 rowid 以支持预算裁剪后重算游标；公共入口委托到带 rowid 版本。
+pub fn get_thread_messages_window_with_row_ids(
+    db: &Database,
+    thread_id: &str,
+    cursor: Option<&MessageWindowCursorDto>,
+    limit: usize,
+) -> anyhow::Result<(MessageWindowDto, Vec<i64>)> {
+    let conn = db.connect()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, thread_id, role, content, blocks_json, schema_version, status,
+            token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at, rowid
+     FROM messages
+     WHERE thread_id = ?1
+       AND (
+         ?2 IS NULL
+         OR created_at < ?2
+         OR (
+           created_at = ?2
+           AND (
+             (?3 IS NOT NULL AND rowid < ?3)
+             OR (?3 IS NULL AND ?4 IS NOT NULL AND id < ?4)
+           )
+         )
+       )
+     ORDER BY created_at DESC, rowid DESC
+     LIMIT ?5",
+    )?;
+
+    let cursor_created_at = cursor.map(|value| value.created_at.as_str());
+    let cursor_row_id = cursor.and_then(|value| value.row_id);
+    let cursor_id = cursor.map(|value| value.id.as_str());
+    let query_limit = limit.max(1).saturating_add(1) as i64;
+    let rows = stmt.query_map(
+        params![
+            thread_id,
+            cursor_created_at,
+            cursor_row_id,
+            cursor_id,
+            query_limit
+        ],
+        |row| {
+            let message = map_message_row(row)?;
+            let row_id: i64 = row.get(13)?;
+            Ok((message, row_id))
+        },
+    )?;
+
+    let mut messages_desc: Vec<(MessageDto, i64)> = Vec::new();
+    for row in rows {
+        messages_desc.push(row?);
+    }
+
+    let page_limit = limit.max(1);
+    let has_more = messages_desc.len() > page_limit;
+    if has_more {
+        messages_desc.pop();
+    }
+
+    let next_cursor = if has_more {
+        messages_desc
+            .last()
+            .map(|(message, row_id)| MessageWindowCursorDto {
+                created_at: message.created_at.clone(),
+                id: message.id.clone(),
+                row_id: Some(*row_id),
+            })
+    } else {
+        None
+    };
+
+    messages_desc.reverse();
+    // 按最终升序收集 rowid，与下方构造的 messages 按下标一一对应。
+    let row_ids = messages_desc
+        .iter()
+        .map(|(_, row_id)| *row_id)
+        .collect::<Vec<_>>();
+    let mut messages: Vec<MessageDto> = messages_desc
+        .into_iter()
+        .map(|(message, _)| message)
+        .collect();
+    reconcile_answered_approvals_for_messages(&conn, &mut messages)?;
+    Ok((
+        MessageWindowDto {
+            messages,
+            next_cursor,
+        },
+        row_ids,
+    ))
 }
 
 pub fn get_message_blocks(db: &Database, message_id: &str) -> anyhow::Result<Option<Value>> {
@@ -2292,6 +2397,117 @@ mod tests {
         let (status, decision) = approval_block_status(blocks).unwrap();
         assert_eq!(status, "answered");
         assert_eq!(decision, None);
+    }
+
+    #[test]
+    fn get_thread_messages_window_paginates_without_duplicates() {
+        let db = test_db();
+        let thread_id = test_thread(&db);
+        for index in 0..5 {
+            insert_user_message(
+                &db,
+                &thread_id,
+                &format!("message {index}"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        // 连续插入的消息 created_at 很可能相同，正好覆盖 rowid 稳定排序；
+        // 翻页时以本页最旧一条作为游标，绝不允许重复或遗漏。
+        let first = get_thread_messages_window(&db, &thread_id, None, 2).unwrap();
+        assert_eq!(first.messages.len(), 2);
+        let first_cursor = first.next_cursor.expect("more history should exist");
+        let first_ids = first
+            .messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+
+        let second = get_thread_messages_window(&db, &thread_id, Some(&first_cursor), 2).unwrap();
+        assert_eq!(second.messages.len(), 2);
+        let second_cursor = second.next_cursor.expect("more history should exist");
+        let second_ids = second
+            .messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+
+        let third = get_thread_messages_window(&db, &thread_id, Some(&second_cursor), 2).unwrap();
+        assert_eq!(third.messages.len(), 1);
+        assert!(third.next_cursor.is_none());
+        let third_ids = third
+            .messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+
+        let all_ids = [first_ids, second_ids, third_ids].concat();
+        let unique_ids = all_ids.iter().cloned().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique_ids.len(), 5);
+        assert_eq!(all_ids.len(), 5);
+
+        // 分页拼接顺序必须与一次取全部（limit=10）的顺序完全一致。
+        let full = get_thread_messages_window(&db, &thread_id, None, 10).unwrap();
+        let full_ids = full
+            .messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(all_ids, full_ids);
+    }
+
+    #[test]
+    fn get_thread_messages_window_next_cursor_none_when_page_covers_all() {
+        let db = test_db();
+        let thread_id = test_thread(&db);
+        for index in 0..3 {
+            insert_user_message(
+                &db,
+                &thread_id,
+                &format!("message {index}"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let window = get_thread_messages_window(&db, &thread_id, None, 5).unwrap();
+        assert_eq!(window.messages.len(), 3);
+        assert!(window.next_cursor.is_none());
+    }
+
+    #[test]
+    fn get_thread_messages_window_with_row_ids_returns_aligned_row_ids() {
+        let db = test_db();
+        let thread_id = test_thread(&db);
+        for index in 0..3 {
+            insert_user_message(
+                &db,
+                &thread_id,
+                &format!("message {index}"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let (window, row_ids) =
+            get_thread_messages_window_with_row_ids(&db, &thread_id, None, 2).unwrap();
+        assert_eq!(window.messages.len(), 2);
+        assert_eq!(row_ids.len(), 2);
+        // 升序后的 messages 对应升序的 rowid。
+        assert!(row_ids[0] < row_ids[1]);
+        // 游标指向本页最旧一条，即升序后第一条，其 rowid 必须与 row_ids[0] 一致。
+        let next_cursor = window.next_cursor.expect("more history should exist");
+        assert_eq!(next_cursor.row_id, Some(row_ids[0]));
     }
 
     #[test]

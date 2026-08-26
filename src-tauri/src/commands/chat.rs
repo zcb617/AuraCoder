@@ -375,6 +375,13 @@ pub async fn save_pasted_image_attachment(
     })
 }
 
+/// 预览图最长边；原图超过时逐级缩小直到编码字节数达标。
+const ATTACHMENT_PREVIEW_MAX_DIMENSION: u32 = 1600;
+/// 预览图编码后字节上限；base64 膨胀后约 933KB，低于 Relay 单帧上限并保留信封余量。
+const ATTACHMENT_PREVIEW_MAX_BYTES: usize = 700 * 1024;
+/// 缩略图 JPEG 编码质量；越高越清晰但编码体积越大。
+const ATTACHMENT_PREVIEW_JPEG_QUALITY: u8 = 80;
+
 #[tauri::command]
 pub async fn read_attachment_preview(
     file_path: String,
@@ -401,6 +408,8 @@ pub async fn read_attachment_preview(
         return Ok(None);
     }
 
+    // 原图直出会撑爆 Relay 单帧；改为缩略图编码（旧实现保留备查）。
+    /*
     let bytes = tokio_fs::read(&file_path)
         .await
         .map_err(|error| format!("failed to read attachment preview: {error}"))?;
@@ -409,6 +418,61 @@ pub async fn read_attachment_preview(
         mime_type: preview_mime_type,
         data_base64: BASE64.encode(bytes),
     }))
+    */
+
+    let bytes = tokio_fs::read(&file_path)
+        .await
+        .map_err(|error| format!("failed to read attachment preview: {error}"))?;
+
+    // SVG 是矢量格式，不参与位图缩放；超限则放弃预览。
+    if preview_mime_type == "image/svg+xml" {
+        if bytes.len() > ATTACHMENT_PREVIEW_MAX_BYTES {
+            return Ok(None);
+        }
+        return Ok(Some(AttachmentPreviewPayload {
+            mime_type: preview_mime_type,
+            data_base64: BASE64.encode(bytes),
+        }));
+    }
+
+    let Ok(image) = image::load_from_memory(&bytes) else {
+        return Ok(None);
+    };
+    let has_alpha = image.color().has_alpha();
+    let (format, mime_type) = if has_alpha {
+        (image::ImageFormat::Png, "image/png")
+    } else {
+        (image::ImageFormat::Jpeg, "image/jpeg")
+    };
+    for dimension in [ATTACHMENT_PREVIEW_MAX_DIMENSION, 1280, 960, 640] {
+        let resized = if image.width() > dimension || image.height() > dimension {
+            image.thumbnail(dimension, dimension)
+        } else {
+            image.clone()
+        };
+        let mut buffer: Vec<u8> = Vec::new();
+        let encoded = if has_alpha {
+            resized
+                .write_to(&mut std::io::Cursor::new(&mut buffer), format)
+                .map(|_| ())
+        } else {
+            image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut std::io::Cursor::new(&mut buffer),
+                ATTACHMENT_PREVIEW_JPEG_QUALITY,
+            )
+            .encode_image(&resized)
+        };
+        let Ok(()) = encoded else {
+            return Ok(None);
+        };
+        if buffer.len() <= ATTACHMENT_PREVIEW_MAX_BYTES {
+            return Ok(Some(AttachmentPreviewPayload {
+                mime_type: mime_type.to_string(),
+                data_base64: BASE64.encode(&buffer),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 fn pasted_image_extension(_file_name: &str, mime_type: &str) -> Option<&'static str> {
@@ -6181,6 +6245,8 @@ mod tests {
         terminal::TerminalManager,
         terminal_notifications::TerminalNotificationManager,
     };
+    // Engine trait 已由 use super::* 从父模块带入作用域，此行冗余（保留记录）。
+    // use base64::Engine as _;
     use rusqlite::params;
     use uuid::Uuid;
 
@@ -7723,6 +7789,107 @@ mod tests {
                 .expect("last model should resolve without a catalog"),
             "gpt-5.1-codex-mini"
         );
+    }
+
+    /// 大图（3000×2000 无透明 PNG）预览应逐级缩小并转 JPEG 编码，编码字节数与边长均不超过上限。
+    #[tokio::test]
+    async fn read_attachment_preview_shrinks_large_images() {
+        let root = std::env::temp_dir().join(format!(
+            "auracoder-attachment-preview-large-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("failed to create temp root for large image");
+        let file_path = root.join("large.png");
+        image::RgbImage::from_pixel(3000, 2000, image::Rgb([120, 60, 30]))
+            .save(&file_path)
+            .expect("failed to save large preview image");
+
+        let preview = read_attachment_preview(
+            file_path.display().to_string(),
+            Some("image/png".to_string()),
+        )
+        .await
+        .expect("large image preview should succeed");
+
+        let payload = preview.expect("large image preview should be Some");
+        assert_eq!(payload.mime_type, "image/jpeg");
+        let bytes = BASE64
+            .decode(payload.data_base64.as_bytes())
+            .expect("preview data should decode as base64");
+        assert!(
+            bytes.len() <= ATTACHMENT_PREVIEW_MAX_BYTES,
+            "preview bytes {} should not exceed limit {}",
+            bytes.len(),
+            ATTACHMENT_PREVIEW_MAX_BYTES
+        );
+        let decoded =
+            image::load_from_memory(&bytes).expect("preview bytes should decode as an image");
+        assert!(decoded.width() <= ATTACHMENT_PREVIEW_MAX_DIMENSION);
+        assert!(decoded.height() <= ATTACHMENT_PREVIEW_MAX_DIMENSION);
+
+        fs::remove_dir_all(&root).expect("failed to clean up large image temp dir");
+    }
+
+    /// 小图（100×100 带透明 PNG）预览应保持原尺寸并保留透明通道（PNG），不做放大。
+    #[tokio::test]
+    async fn read_attachment_preview_keeps_small_images_at_original_size() {
+        let root = std::env::temp_dir().join(format!(
+            "auracoder-attachment-preview-small-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("failed to create temp root for small image");
+        let file_path = root.join("small.png");
+        image::RgbaImage::from_pixel(100, 100, image::Rgba([10, 20, 30, 128]))
+            .save(&file_path)
+            .expect("failed to save small preview image");
+
+        let preview = read_attachment_preview(
+            file_path.display().to_string(),
+            Some("image/png".to_string()),
+        )
+        .await
+        .expect("small image preview should succeed");
+
+        let payload = preview.expect("small image preview should be Some");
+        assert_eq!(payload.mime_type, "image/png");
+        let bytes = BASE64
+            .decode(payload.data_base64.as_bytes())
+            .expect("preview data should decode as base64");
+        assert!(
+            bytes.len() <= ATTACHMENT_PREVIEW_MAX_BYTES,
+            "preview bytes {} should not exceed limit {}",
+            bytes.len(),
+            ATTACHMENT_PREVIEW_MAX_BYTES
+        );
+        let decoded =
+            image::load_from_memory(&bytes).expect("preview bytes should decode as an image");
+        assert_eq!(decoded.width(), 100);
+        assert_eq!(decoded.height(), 100);
+
+        fs::remove_dir_all(&root).expect("failed to clean up small image temp dir");
+    }
+
+    /// 非图片附件（text/plain）预览应返回 None，不产生编码数据。
+    #[tokio::test]
+    async fn read_attachment_preview_rejects_non_image() {
+        let root = std::env::temp_dir().join(format!(
+            "auracoder-attachment-preview-text-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("failed to create temp root for text file");
+        let file_path = root.join("hello.txt");
+        fs::write(&file_path, "hello world").expect("failed to write text file");
+
+        let preview = read_attachment_preview(
+            file_path.display().to_string(),
+            Some("text/plain".to_string()),
+        )
+        .await
+        .expect("non-image preview should not error");
+
+        assert!(preview.is_none());
+
+        fs::remove_dir_all(&root).expect("failed to clean up text file temp dir");
     }
 }
 

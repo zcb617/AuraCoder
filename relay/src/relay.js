@@ -5,8 +5,11 @@ import { readFile, readdir, rename, rm, mkdir, writeFile } from "fs/promises";
 import { join } from "path";
 import { timingSafeEqual } from "crypto";
 
-const DEFAULT_MAX_PAYLOAD_BYTES = 1024 * 1024;
-const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
+// 旧值 1 MiB 会把手机端会话分页响应误判为超限帧导致桌面断线，保留记录：
+// const DEFAULT_MAX_PAYLOAD_BYTES = 1024 * 1024;
+// 分页预算在 PC 端控制在 720 KiB 以内，4 MiB 仅作信封与未来余量，不是放大入口。
+const DEFAULT_MAX_PAYLOAD_BYTES = 100 * 1024 * 1024;
+const DEFAULT_MAX_BUFFERED_BYTES = 100 * 1024 * 1024;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 25_000;
 const DEFAULT_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;

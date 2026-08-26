@@ -242,3 +242,38 @@ test("rejects an attachment larger than 10 MiB", async () => {
   assert.equal(response.status, 413);
   desktop.close();
 });
+
+test("forwards frames larger than one megabyte", async () => {
+  const { url } = await startRelay();
+  const desktop = await connect(url, "desktop");
+  const mobile = await connect(url, "mobile");
+
+  const payload = "x".repeat(1_500_000);
+  const received = nextMessage(desktop);
+  mobile.send(JSON.stringify({ kind: "request", id: "big-1", payload }));
+  const frame = JSON.parse((await received).data.toString());
+  assert.equal(frame.id, "big-1");
+  assert.equal(frame.payload.length, 1_500_000);
+
+  desktop.close();
+  mobile.close();
+});
+
+test("closes peers that exceed the payload limit and accepts a reconnect", async () => {
+  const { url } = await startRelay();
+  const desktop = await connect(url, "desktop");
+  const mobile = await connect(url, "mobile");
+
+  const closed = new Promise((resolve) => mobile.once("close", (code) => resolve(code)));
+  mobile.send(JSON.stringify({ kind: "request", id: "too-big", payload: "x".repeat(4 * 1024 * 1024 + 1024) }));
+  assert.equal(await closed, 1009);
+
+  // 超限只关闭违规连接，隧道本身保持可用，重连后恢复转发。
+  const reconnected = await connect(url, "mobile");
+  const received = nextMessage(desktop);
+  reconnected.send(JSON.stringify({ kind: "request", id: "after-reconnect" }));
+  assert.equal(JSON.parse((await received).data.toString()).id, "after-reconnect");
+
+  desktop.close();
+  reconnected.close();
+});

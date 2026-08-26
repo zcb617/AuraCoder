@@ -1,6 +1,6 @@
 import { reactive } from "vue";
 import { deleteBatchAttachments, uploadAttachmentBatch } from "../attachments";
-import type { AttachmentBatchItem, AttachmentBatchState, ChatAttachment, Message, RemoteEvent } from "../types";
+import type { AttachmentBatchItem, AttachmentBatchState, ChatAttachment, Message, MessageWindow, MessageWindowCursor, RemoteEvent } from "../types";
 import { auracoderConnectionManager } from "./auracoder-connection";
 import { auracoderDeviceStore } from "./auracoder-device";
 // 旧的整段会话快照会同时携带项目列表信息；该快照推送已停用。
@@ -9,7 +9,9 @@ import { auracoderDeviceStore } from "./auracoder-device";
 interface ConversationState {
   messages: Message[];
   // 旧模板仍会读取这两个字段；完整取数后始终为空和 false，不再触发分页。
-  nextCursor: null;
+  // nextCursor: null;
+  // 服务端游标；null 表示没有更早历史。
+  nextCursor: MessageWindowCursor | null;
   draft: string;
   attachments: ChatAttachment[];
   // 点击发送后冻结的批次；编辑区后续变化不修改该快照。
@@ -109,6 +111,54 @@ function mergeWindow(state: ConversationState, window: MessageWindow, source: Me
   if (state.messages.length === window.messages.length) state.nextCursor = window.nextCursor;
 }
 */
+
+type MessageWindowSource = "initial" | "older";
+
+function mergeWindow(state: ConversationState, window: MessageWindow, source: MessageWindowSource) {
+  if (source === "initial") {
+    state.messages = window.messages.slice();
+    state.nextCursor = window.nextCursor;
+    return;
+  }
+  const incomingIds = new Set(window.messages.map((message) => message.id));
+  // 服务端已按 created_at、rowid 返回稳定顺序；不能再按 UUID 重排。
+  state.messages = [...window.messages, ...state.messages.filter((message) => !incomingIds.has(message.id))];
+  state.nextCursor = window.nextCursor;
+}
+
+/** 为一批消息并发加载历史图片预览；两路并发限制避免占满手机和隧道内存。 */
+async function loadImagePreviews(auracoderId: string, threadId: string, state: ConversationState, messages: Message[]) {
+  const previewTargets = messages.flatMap((message) => (message.attachments || [])
+    .filter((attachment) => attachment.source === "image" && Number.isInteger(attachment.remoteAttachmentIndex))
+    .map((attachment) => ({
+      messageId: message.id,
+      attachmentId: attachment.id,
+      attachmentIndex: attachment.remoteAttachmentIndex as number,
+    })));
+  for (let start = 0; start < previewTargets.length; start += 2) {
+    await Promise.all(previewTargets.slice(start, start + 2).map(async (target) => {
+      try {
+        const preview = await auracoderConnectionManager.request<{ mimeType?: string; dataBase64?: string } | null>(
+          auracoderId,
+          "message.attachment.preview",
+          {
+            thread_id: threadId,
+            message_id: target.messageId,
+            attachment_index: target.attachmentIndex,
+          },
+        );
+        if (!preview?.mimeType || !preview.dataBase64) return;
+        const currentMessage = state.messages.find((message) => message.id === target.messageId);
+        const currentAttachment = currentMessage?.attachments?.find((attachment) => attachment.id === target.attachmentId);
+        if (!currentAttachment || currentAttachment.remoteAttachmentIndex !== target.attachmentIndex) return;
+        currentAttachment.previewUrl = `data:${preview.mimeType};base64,${preview.dataBase64}`;
+        state.messageRevision += 1;
+      } catch {
+        // 单个历史文件已不存在或无法读取时，仍保留其文字和附件名称，不中断整个会话加载。
+      }
+    }));
+  }
+}
 
 auracoderConnectionManager.subscribe((auracoderId, event: RemoteEvent) => {
   if (event.event !== "thread.message.completed") return;
@@ -293,7 +343,7 @@ export const conversationStore = {
       // 旧版页面级订阅已停用；保留旧调用说明，设备级连接始终接收事件。
       // await auracoderConnectionManager.request(auracoderId, "thread.subscribe", { thread_id: threadId });
       // message.list 是进入会话后清除未读的全量同步边界。
-      const result = await auracoderConnectionManager.request<{ messages: Message[] }>(auracoderId, "message.list", { thread_id: threadId });
+      const result = await auracoderConnectionManager.request<MessageWindow>(auracoderId, "message.list", { thread_id: threadId, limit: 50 });
       const incoming = Array.isArray(result.messages) ? result.messages : [];
       /*
       旧实现把本地回显混入重新打开时的服务端完整历史。message.send 的响应不返回用户消息，
@@ -314,9 +364,13 @@ export const conversationStore = {
       state.messages = [...mergedIncoming, ...preserved];
       */
       // 重新进入会话时，消息列表只采用本次 message.list 返回的服务端历史；不拼接任何本地回显。
-      state.messages = incoming;
+      // state.messages = incoming;
+      // 恢复分页加载后，initial 模式用最新一页替换本地历史并保存服务端游标。
+      mergeWindow(state, { messages: incoming, nextCursor: result.nextCursor ?? null }, "initial");
       state.messageRevision += 1;
       this.clearUnreadAfterSync(auracoderId, threadId);
+      /*
+      图片预览两路并发加载已抽取为模块级 loadImagePreviews，供 open 与 loadOlder 复用；保留原内联实现以便追溯。
       // 图片预览由桌面 AuraCoder 按消息附件返回；两路并发限制可避免包含大量历史图片时占满手机和隧道内存。
       const previewTargets = incoming.flatMap((message) => (message.attachments || [])
         .filter((attachment) => attachment.source === "image" && Number.isInteger(attachment.remoteAttachmentIndex))
@@ -348,6 +402,8 @@ export const conversationStore = {
           }
         }));
       }
+      */
+      await loadImagePreviews(auracoderId, threadId, state, incoming);
       /*
       const loadedCursors = new Set<string>();
       while (state.nextCursor) {
@@ -386,8 +442,29 @@ export const conversationStore = {
     }
   },
   */
+  /*
+  已恢复游标分页加载；保留旧存根以便追溯。
   async loadOlder(_auracoderId: string, _threadId: string) {
     // 会话已在首次打开时完整取得；保留旧模板入口但不再发起请求。
+  },
+  */
+  async loadOlder(auracoderId: string, threadId: string) {
+    const state = this.getState(auracoderId, threadId);
+    if (!state.nextCursor || state.loadingOlder) return;
+    state.loadingOlder = true;
+    try {
+      const window = await auracoderConnectionManager.request<MessageWindow>(auracoderId, "message.list", {
+        thread_id: threadId,
+        cursor: state.nextCursor,
+        limit: 50,
+      });
+      const incoming = Array.isArray(window.messages) ? window.messages : [];
+      mergeWindow(state, { messages: incoming, nextCursor: window.nextCursor ?? null }, "older");
+      state.messageRevision += 1;
+      await loadImagePreviews(auracoderId, threadId, state, incoming);
+    } finally {
+      state.loadingOlder = false;
+    }
   },
   async send(auracoderId: string, threadId: string, modelId: string, reasoningEffort: string) {
     const state = this.getState(auracoderId, threadId);
