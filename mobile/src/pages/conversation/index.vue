@@ -910,7 +910,7 @@ onUnload(() => {
 	.conversation-header-status-dot { width: 6px; height: 6px; flex-shrink: 0; margin: 0 5px 0 0; border-radius: 50%; background: #667080; }
 	.conversation-header-status-dot.online { background: var(--accent); box-shadow: 0 0 0 3px rgba(70, 211, 154, .12); }
 	/* 旧值：flex: 0 0 104px; */
-	.conversation-header-actions { display: flex; min-width: 0; flex: 0 0 88px; flex-shrink: 0; padding: 0; align-items: center; justify-content: space-evenly; }
+	.conversation-header-actions { /* display: flex; */ display: none; min-width: 0; flex: 0 0 88px; flex-shrink: 0; padding: 0; align-items: center; justify-content: space-evenly; }
 	.conversation-header-desktop-icon, .conversation-header-more-icon { display: flex; width: 50%; height: 100%; align-items: center; justify-content: center; }
 	.conversation-header-desktop-icon { flex-direction: column; }
 	.conversation-header-desktop-screen { width: 18px; height: 12px; box-sizing: border-box; border: 1.5px solid var(--text); border-radius: 2px; }
