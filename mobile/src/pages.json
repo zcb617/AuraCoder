@@ -25,10 +25,7 @@
     {
       "path": "pages/conversation/index",
       "style": {
-        "navigationStyle": "default",
-        "navigationBarTitleText": "会话",
-        "navigationBarTextStyle": "white",
-        "navigationBarBackgroundColor": "#0d1016",
+        "navigationStyle": "custom",
         "backgroundColor": "#0d1016",
         "backgroundTextStyle": "light"
       }
