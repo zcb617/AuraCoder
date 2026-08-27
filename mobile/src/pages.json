@@ -48,7 +48,7 @@
       "path": "pages/settings/auracoder/index",
       "style": {
         "navigationStyle": "default",
-        "navigationBarTitleText": "我的 AuraCoder",
+        "navigationBarTitleText": "Remote",
         "navigationBarTextStyle": "white",
         "navigationBarBackgroundColor": "#0d1016",
         "backgroundColor": "#0d1016",
@@ -59,7 +59,7 @@
       "path": "pages/settings/auracoder/add",
       "style": {
         "navigationStyle": "default",
-        "navigationBarTitleText": "添加 AuraCoder",
+        "navigationBarTitleText": "添加连接",
         "navigationBarTextStyle": "white",
         "navigationBarBackgroundColor": "#0d1016",
         "backgroundColor": "#0d1016",

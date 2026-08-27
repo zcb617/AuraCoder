@@ -192,6 +192,25 @@ fn device_name_from_payload(payload: &Value) -> String {
         .unwrap_or_else(|| "AuraCoder Mobile".to_string())
 }
 
+/// 读取桌面本机电脑名称，用于手机端识别远端 PC 的可理解显示名称。
+fn desktop_name() -> String {
+    match hostname::get() {
+        Ok(value) => {
+            let name = value.to_string_lossy().trim().to_string();
+            if name.is_empty() {
+                log::warn!("读取桌面电脑名称成功但返回空字符串");
+                "AuraCoder PC".to_string()
+            } else {
+                name
+            }
+        }
+        Err(error) => {
+            log::warn!("读取桌面电脑名称失败：{error}");
+            "AuraCoder PC".to_string()
+        }
+    }
+}
+
 /// 解析可选批次 ID；字段缺失表示旧客户端，字段存在但非法则拒绝请求。
 fn parse_optional_batch_id(payload: &Value) -> Result<Option<String>, String> {
     let Some(value) = payload.get("batch_id") else {
@@ -961,6 +980,7 @@ impl RemoteTunnelManager {
                 "version": REMOTE_PROTOCOL_VERSION,
                 "endpoint": runtime.config.endpoint,
                 "tunnel_id": runtime.config.tunnel_id,
+                "desktop_name": desktop_name(),
                 "relay_credential": runtime.config.credential,
                 "pairing_token": pairing_token,
                 "expires_at": runtime.pairing_expires_at.map(|value| value.to_rfc3339()),
@@ -1316,6 +1336,7 @@ impl RemoteTunnelManager {
                                                     Ok(json!({
                                                         "device_credential": device_credential,
                                                         "device_id": device.id,
+                                                        "desktop_name": desktop_name(),
                                                     }))
                                                 }
                                                 Err(error) => Err(error),
@@ -1377,7 +1398,8 @@ impl RemoteTunnelManager {
                                                     // `device.identify` 是设备在线注册点，重连时会覆盖同一 deviceId。
                                                     manager.online_devices.write().await.insert(device.id.clone());
                                                     let _ = app.emit("remote-access-updated", manager.status().await);
-                                                    Ok(json!({ "device_id": device.id }))
+                                                    // 历史实现保留：Ok(json!({ "device_id": device.id }))
+                                                    Ok(json!({ "device_id": device.id, "desktop_name": desktop_name() }))
                                                 }
                                                 Ok(None) => Err("Remote device is no longer authorized".to_string()),
                                                 Err(error) => Err(error),

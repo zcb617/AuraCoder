@@ -5,7 +5,9 @@ import { auracoderConnectionManager } from "../../stores/auracoder-connection";
 import { auracoderDeviceStore } from "../../stores/auracoder-device";
 import { workspaceStore } from "../../stores/workspace";
 
-const devices = auracoderDeviceStore.devices;
+// 历史实现保留：const devices = auracoderDeviceStore.devices;
+const allDevices = auracoderDeviceStore.devices;
+const enabledDevices = auracoderDeviceStore.enabledDevices;
 const activeAuraCoderId = auracoderDeviceStore.activeAuraCoderId;
 const stateByAuraCoderId = auracoderConnectionManager.stateByAuraCoderId;
 const workspaces = computed(() => activeAuraCoderId.value ? workspaceStore.getItems(activeAuraCoderId.value) : []);
@@ -106,9 +108,9 @@ onUnload(() => {
 
     <scroll-view class="remote-content-scroll" scroll-y>
       <view class="remote-content-page">
-        <scroll-view v-if="devices.length" class="remote-device-strip" scroll-x>
+        <scroll-view v-if="enabledDevices.length" class="remote-device-strip" scroll-x>
           <button
-            v-for="device in devices"
+            v-for="device in enabledDevices"
             :key="device.auracoderId"
             class="remote-device-chip"
             :class="{ active: device.auracoderId === activeAuraCoderId }"
@@ -120,10 +122,16 @@ onUnload(() => {
           </button>
         </scroll-view>
 
-        <view v-if="!devices.length" class="empty-state no-device">
+        <view v-if="!allDevices.length" class="empty-state no-device">
           <text class="empty-logo">A</text>
           <text>尚未添加 AuraCoder</text>
           <text>添加桌面 AuraCoder 后，即可查看项目与会话。</text>
+          <button class="primary-button compact-button" @tap="openAuraCoderSettings">前往设置</button>
+        </view>
+
+        <view v-else-if="!enabledDevices.length" class="empty-state no-device">
+          <text>尚未启用远端 PC</text>
+          <text>请在 Remote 设置中开启需要显示的电脑。</text>
           <button class="primary-button compact-button" @tap="openAuraCoderSettings">前往设置</button>
         </view>
 
@@ -147,12 +155,31 @@ onUnload(() => {
       </view>
     </scroll-view>
 
-    <view v-if="devices.length" class="remote-search-bar">
+    <view v-if="enabledDevices.length" class="remote-search-bar">
       <view class="search-icon" />
       <input v-model="searchKeyword" class="remote-search-input" placeholder="搜索项目" />
     </view>
   </view>
 </template>
+
+<!-- 旧项目页设备区模板保留：原逻辑直接展示全部设备，当前业务改为仅展示启用设备。 -->
+<!--
+<template>
+  <view class="mobile-shell home-shell">
+    <scroll-view class="remote-content-scroll" scroll-y>
+      <view class="remote-content-page">
+        <scroll-view v-if="devices.length" class="remote-device-strip" scroll-x>
+          <button v-for="device in devices" :key="device.auracoderId" class="remote-device-chip" :class="{ active: device.auracoderId === activeAuraCoderId }" @tap="selectAuraCoder(device.auracoderId)">
+            <view class="device-online-dot" :class="{ online: stateByAuraCoderId[device.auracoderId]?.peerOnline }" />
+            <view class="device-computer-icon" />
+            <text class="device-name">{{ device.name }}</text>
+          </button>
+        </scroll-view>
+      </view>
+    </scroll-view>
+  </view>
+</template>
+-->
 
 <style scoped>
 .home-shell { position: relative; height: 100vh; overflow: hidden; }

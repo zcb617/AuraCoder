@@ -1,32 +1,59 @@
 export interface PairingConfig {
+  /** 配对协议版本。 */
   version: 1;
+  /** Relay 服务端点。 */
   endpoint: string;
+  /** 远程 PC 隧道标识，仅用于内部路由和鉴权。 */
   tunnel_id: string;
+  /** Relay 连接凭据。 */
   relay_credential: string;
+  /** 首次配对令牌。 */
   pairing_token?: string;
+  /** 设备凭据，用于后续身份确认。 */
   device_credential?: string;
-  // 桌面端为当前手机分配的稳定设备 ID；重连时继续复用该 ID。
+  /** 手机设备在桌面端登记的稳定标识。 */
   device_id?: string;
+  /** 桌面端本机电脑名称，用于手机端显示远端 PC。 */
+  desktop_name?: string;
+  /** 配对令牌过期时间。 */
   expires_at?: string;
 }
 
 export interface PairedAuraCoder {
+  /** 手机端设备记录 ID。 */
   auracoderId: string;
+  /** 设备显示名称，可为电脑名或用户自定义名称。 */
   name: string;
+  /** Relay 服务端点。 */
   endpoint: string;
+  /** 远程 PC 隧道标识，仅用于内部路由和鉴权。 */
   tunnelId: string;
+  /** Relay 连接凭据。 */
   relayCredential: string;
+  /** 后续身份确认使用的设备凭据。 */
   deviceCredential?: string;
-  // deviceId 只在当前 auracoderId 范围内有效，用于设备级实时事件校验。
+  /** deviceId 只在当前 auracoderId 范围内有效，用于设备级实时事件校验。 */
   deviceId?: string;
+  /** 首次配对令牌。 */
   pairingToken?: string;
+  /** 配对令牌过期时间。 */
   expiresAt?: string;
+  /** 首次配对时间。 */
   pairedAt: string;
+  /** 最近一次连接成功时间。 */
   lastConnectedAt?: string;
+  /** 桌面端本机电脑名称，用于设备管理和项目首页显示。 */
+  desktopName?: string;
+  /** 设备是否启用；关闭时保留配对凭据但不建立连接。 */
+  enabled: boolean;
+  /** 名称是否由用户手动修改，手动名称不被桌面电脑名覆盖。 */
+  nameCustomized?: boolean;
 }
 
 export interface MobileAuraCoderSettings {
+  /** 按设备管理页顺序保存的远程 PC 设备列表。 */
   devices: PairedAuraCoder[];
+  /** 项目首页当前选中的启用设备 ID。 */
   activeAuraCoderId: string | null;
 }
 

@@ -268,7 +268,14 @@ export class RemoteClient {
       this.deviceIdentifying = true;
       // request 需要 peerOnline 为 true；在身份确认完成前不对页面广播在线状态。
       this.peerOnline = true;
+      /*
+      历史实现保留：
       void this.request<{ device_id?: string }>("device.identify", {
+        device_name: deviceName,
+        device_id: this.deviceId || undefined,
+      });
+      */
+      void this.request<{ device_id?: string; desktop_name?: string }>("device.identify", {
         device_name: deviceName,
         device_id: this.deviceId || undefined,
       })
@@ -280,7 +287,13 @@ export class RemoteClient {
             throw new Error("桌面未返回设备身份");
           }
           this.deviceId = confirmedDeviceId;
-          this.config = { ...this.config!, device_id: this.deviceId };
+          /* 历史实现保留：this.config = { ...this.config!, device_id: this.deviceId }; */
+          const desktopName = typeof result.desktop_name === "string" ? result.desktop_name.trim() : "";
+          this.config = {
+            ...this.config!,
+            device_id: this.deviceId,
+            desktop_name: desktopName || this.config!.desktop_name,
+          };
           this.onPaired(this.config);
           this.onState({ relayConnected: true, peerOnline: true, lastError: null });
           this.flushDeferredEvents();
@@ -301,16 +314,32 @@ export class RemoteClient {
     }
     this.pairingInProgress = true;
     this.onState({ relayConnected: true, peerOnline: false, lastError: null });
-    void this.request<{ device_credential: string; device_id?: string }>("device.pair", { device_name: deviceName })
+    /*
+    历史实现保留：
+    void this.request<{ device_credential: string; device_id?: string }>("device.pair", { device_name: deviceName });
+    */
+    void this.request<{ device_credential: string; device_id?: string; desktop_name?: string }>("device.pair", { device_name: deviceName })
       .then((result) => {
         if (!this.config) return;
         if (typeof result.device_id === "string" && result.device_id) this.deviceId = result.device_id;
+        const desktopName = typeof result.desktop_name === "string" ? result.desktop_name.trim() : "";
+        /*
+        历史实现保留：
         this.config = {
           ...this.config,
           device_credential: result.device_credential,
           device_id: this.deviceId || undefined,
           pairing_token: undefined,
           expires_at: undefined,
+        };
+        */
+        this.config = {
+          ...this.config,
+          device_credential: result.device_credential,
+          device_id: this.deviceId || undefined,
+          pairing_token: undefined,
+          expires_at: undefined,
+          desktop_name: desktopName || this.config.desktop_name,
         };
         this.onPaired(this.config);
         this.onState({ relayConnected: true, peerOnline: true, lastError: null });
