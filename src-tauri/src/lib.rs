@@ -598,6 +598,15 @@ pub fn run() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| match event {
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } => {
+            if let Some(main_window) = app_handle.get_webview_window("main") {
+                show_main_window(&main_window);
+            }
+        }
         RunEvent::ExitRequested { .. } | RunEvent::Exit => {
             let terminals = app_handle.state::<AppState>().terminals.clone();
             let keep_awake = app_handle.state::<AppState>().keep_awake.clone();
@@ -778,14 +787,14 @@ fn request_tray_exit(
 
 fn show_main_window(window: &WebviewWindow) {
     if let Err(error) = window.show() {
-        log::error!("failed to show main window from tray: {error}");
+        log::error!("failed to show main window: {error}");
         return;
     }
     if let Err(error) = window.unminimize() {
-        log::warn!("failed to restore main window from tray: {error}");
+        log::warn!("failed to restore main window: {error}");
     }
     if let Err(error) = window.set_focus() {
-        log::warn!("failed to focus main window from tray: {error}");
+        log::warn!("failed to focus main window: {error}");
     }
 }
 
