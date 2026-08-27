@@ -147,7 +147,8 @@ export function App() {
   const loadEngines = useEngineStore((s) => s.load);
   const preloadEngineCatalogs = useEngineStore((s) => s.preloadCatalogs);
   const applyCliServicesUpdated = useEngineStore((s) => s.applyCliServicesUpdated);
-  const engines = useEngineStore((s) => s.engines);
+  // 旧实现读取 engines 并作为会话加载 effect 依赖；effect 正文不使用该目录，保留注释避免引擎加载导致重复同步。
+  // const engines = useEngineStore((s) => s.engines);
   const applyEngineRuntimeUpdate = useEngineStore((s) => s.applyRuntimeUpdate);
   const loadKeepAwake = useKeepAwakeStore((s) => s.load);
   const loadTerminalNotificationSettings = useTerminalNotificationSettingsStore((s) => s.load);
@@ -256,7 +257,7 @@ export function App() {
       });
     }
   }, [
-    engines,
+    // engines,
     workspaces,
     refreshAllThreads,
     reloadThreadsFromLocalDatabase,

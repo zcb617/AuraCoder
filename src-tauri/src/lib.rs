@@ -434,6 +434,7 @@ pub fn run() {
             commands::chat::search_messages,
             commands::workspace::open_workspace,
             commands::workspace::list_workspaces,
+            commands::workspace::refresh_local_project_sessions,
             commands::workspace::list_archived_workspaces,
             commands::workspace::get_ssh_connection_home,
             commands::workspace::list_ssh_directories,

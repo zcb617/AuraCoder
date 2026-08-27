@@ -6,6 +6,7 @@ const mockIpc = vi.hoisted(() => ({
   archiveThread: vi.fn(),
   createThread: vi.fn(),
   restoreThread: vi.fn(),
+  refreshLocalProjectSessions: vi.fn(),
   listCodexRemoteThreads: vi.fn(),
   listThreads: vi.fn(),
 }));
@@ -26,10 +27,14 @@ vi.mock("./engineStore", () => ({
 
 import { useThreadStore } from "./threadStore";
 
-function makeThread(id: string, lastActivityAt = new Date(0).toISOString()): Thread {
+function makeThread(
+  id: string,
+  lastActivityAt = new Date(0).toISOString(),
+  workspaceId = "workspace-1",
+): Thread {
   return {
     id,
-    workspaceId: "workspace-1",
+    workspaceId,
     engineId: "codex",
     modelId: "gpt-5.6",
     engineThreadId: `engine-${id}`,
@@ -285,5 +290,78 @@ describe("threadStore remote Codex discovery", () => {
     expect(useThreadStore.getState().threads).toEqual([]);
     expect(useThreadStore.getState().loading).toBe(false);
     expect(useThreadStore.getState().error).toBe(String(error));
+  });
+
+  it("refreshes every workspace serially before reading its local thread cache", async () => {
+    const workspaceIds = ["workspace-a", "workspace-b", "workspace-c"];
+    mockIpc.listThreads.mockImplementation((workspaceId: string) =>
+      Promise.resolve([makeThread(`${workspaceId}-thread`, new Date(0).toISOString(), workspaceId)]),
+    );
+    mockIpc.refreshLocalProjectSessions.mockResolvedValue(undefined);
+
+    await useThreadStore.getState().refreshAllThreads(workspaceIds);
+
+    expect(mockIpc.refreshLocalProjectSessions).toHaveBeenCalledTimes(3);
+    expect(mockIpc.listThreads).toHaveBeenCalledTimes(3);
+    for (const workspaceId of workspaceIds) {
+      expect(mockIpc.refreshLocalProjectSessions).toHaveBeenCalledWith(workspaceId);
+      expect(mockIpc.listThreads).toHaveBeenCalledWith(workspaceId);
+      expect(useThreadStore.getState().threadsByWorkspace[workspaceId]).toEqual([
+        makeThread(`${workspaceId}-thread`, new Date(0).toISOString(), workspaceId),
+      ]);
+    }
+    const callSequence = [
+      ...mockIpc.refreshLocalProjectSessions.mock.invocationCallOrder.map((order: number, index: number) => ({
+        order,
+        label: `refresh-${workspaceIds[index]}`,
+      })),
+      ...mockIpc.listThreads.mock.invocationCallOrder.map((order: number, index: number) => ({
+        order,
+        label: `list-${workspaceIds[index]}`,
+      })),
+    ]
+      .sort((left, right) => left.order - right.order)
+      .map((call) => call.label);
+    expect(callSequence).toEqual([
+      "refresh-workspace-a",
+      "list-workspace-a",
+      "refresh-workspace-b",
+      "list-workspace-b",
+      "refresh-workspace-c",
+      "list-workspace-c",
+    ]);
+    expect(mockIpc.listCodexRemoteThreads).not.toHaveBeenCalled();
+    expect(Object.keys(useThreadStore.getState().threadsByWorkspace).sort()).toEqual(
+      workspaceIds.slice().sort(),
+    );
+  });
+
+  it("continues reading and refreshing later workspaces when one local sync fails", async () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const syncError = new Error("workspace-a sync failed");
+    mockIpc.refreshLocalProjectSessions
+      .mockRejectedValueOnce(syncError)
+      .mockResolvedValueOnce(undefined);
+    mockIpc.listThreads.mockImplementation((workspaceId: string) =>
+      Promise.resolve([makeThread(`${workspaceId}-thread`, new Date(0).toISOString(), workspaceId)]),
+    );
+
+    await useThreadStore.getState().refreshAllThreads(["workspace-a", "workspace-b"]);
+
+    expect(mockIpc.refreshLocalProjectSessions).toHaveBeenNthCalledWith(1, "workspace-a");
+    expect(mockIpc.refreshLocalProjectSessions).toHaveBeenNthCalledWith(2, "workspace-b");
+    expect(mockIpc.listThreads).toHaveBeenNthCalledWith(1, "workspace-a");
+    expect(mockIpc.listThreads).toHaveBeenNthCalledWith(2, "workspace-b");
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining("workspace-a"),
+      syncError,
+    );
+    expect(useThreadStore.getState().threadsByWorkspace["workspace-a"]).toEqual([
+      makeThread("workspace-a-thread", new Date(0).toISOString(), "workspace-a"),
+    ]);
+    expect(useThreadStore.getState().threadsByWorkspace["workspace-b"]).toEqual([
+      makeThread("workspace-b-thread", new Date(0).toISOString(), "workspace-b"),
+    ]);
+    warning.mockRestore();
   });
 });

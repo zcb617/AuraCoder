@@ -39,6 +39,8 @@ use super::{
 const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const NODE_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLAUDE_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
+// 本机 Claude 会话摘要请求的最长等待时间，避免历史读取长期占用调用方。
+const CLAUDE_SESSION_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 const CLAUDE_RUNTIME_INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const ARCHIVED_CLAUDE_SDK_NODE_MODULES: &str = "claude-sdk-node_modules.tar.gz";
 const SIDECAR_EVENT_BUFFER_CAPACITY: usize = 1024;
@@ -167,6 +169,10 @@ enum SidecarEvent {
         #[serde(rename = "bundledClaudeCodeVersion")]
         bundled_claude_code_version: Option<String>,
     },
+    Sessions {
+        id: Option<String>,
+        sessions: Vec<ClaudeSessionSummary>,
+    },
     Error {
         id: Option<String>,
         message: String,
@@ -219,6 +225,7 @@ impl SidecarEvent {
             | SidecarEvent::Notice { id, .. }
             | SidecarEvent::UsageLimitsUpdated { id, .. }
             | SidecarEvent::Models { id, .. }
+            | SidecarEvent::Sessions { id, .. }
             | SidecarEvent::Error { id, .. }
             | SidecarEvent::Version { id, .. }
             | SidecarEvent::ComputerControlToolCall { id, .. } => id.as_deref(),
@@ -262,6 +269,20 @@ pub(crate) struct SidecarModelInfo {
     #[serde(default)]
     supported_effort_levels: Vec<String>,
     resolved_model: Option<String>,
+}
+
+/// 本机 Claude 历史会话摘要，供 CLI 项目会话列表展示和精确过滤使用。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClaudeSessionSummary {
+    /// Claude 历史会话唯一标识。
+    pub(crate) id: String,
+    /// 会话实际工作目录。
+    pub(crate) cwd: String,
+    /// 首条用户消息生成的会话标题。
+    pub(crate) title: String,
+    /// 会话文件最近更新时间。
+    pub(crate) updated_at: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1035,6 +1056,48 @@ impl ClaudeSidecarEngine {
         })
         .await
         .context("timed out reading Claude usage limits")?
+    }
+
+    /// 按项目根目录读取本机 Claude 历史会话摘要，并保持请求错误上下文。
+    pub async fn list_sessions_for_cwd(
+        &self,
+        cwd: &str,
+    ) -> anyhow::Result<Vec<ClaudeSessionSummary>> {
+        let transport = self.ensure_transport().await?;
+        let request_id = Uuid::new_v4().to_string();
+        let mut receiver = transport.subscribe();
+        transport
+            .send_command(&serde_json::json!({
+                "id": request_id,
+                "method": "list_sessions",
+                "params": { "cwd": cwd },
+            }))
+            .await
+            .context("发送本机 Claude 会话读取命令失败")?;
+
+        timeout(CLAUDE_SESSION_DISCOVERY_TIMEOUT, async {
+            loop {
+                match receiver.recv().await {
+                    Ok(SidecarEvent::Sessions { id, sessions })
+                        if id.as_deref() == Some(request_id.as_str()) =>
+                    {
+                        return Ok(sessions);
+                    }
+                    Ok(SidecarEvent::Error { id, message, .. })
+                        if id.as_deref() == Some(request_id.as_str()) =>
+                    {
+                        anyhow::bail!(message);
+                    }
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        anyhow::bail!("本机 Claude 会话读取期间 sidecar 已关闭");
+                    }
+                }
+            }
+        })
+        .await
+        .context("读取本机 Claude 会话超时")?
     }
 
     async fn fetch_models_from_runtime(&self) -> anyhow::Result<Vec<ModelInfo>> {
@@ -2446,6 +2509,7 @@ impl Engine for ClaudeSidecarEngine {
                                 }
                                 SidecarEvent::Ready
                                 | SidecarEvent::Models { .. }
+                                | SidecarEvent::Sessions { .. }
                                 | SidecarEvent::Version { .. } => {}
                             }
                         }
@@ -2587,6 +2651,33 @@ impl Engine for ClaudeSidecarEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deserializes_sessions_events_and_preserves_request_id() {
+        let event: SidecarEvent = serde_json::from_value(serde_json::json!({
+            "type": "sessions",
+            "id": "request-1",
+            "sessions": [{
+                "id": "session-1",
+                "cwd": "/workspace/project",
+                "title": "Project session",
+                "updatedAt": "2026-08-27T00:00:00.000Z"
+            }]
+        }))
+        .expect("sessions should deserialize");
+
+        assert_eq!(event.request_id(), Some("request-1"));
+        match event {
+            SidecarEvent::Sessions { sessions, .. } => {
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].id, "session-1");
+                assert_eq!(sessions[0].cwd, "/workspace/project");
+                assert_eq!(sessions[0].title, "Project session");
+                assert_eq!(sessions[0].updated_at, "2026-08-27T00:00:00.000Z");
+            }
+            other => panic!("unexpected event variant: {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn service_setters_are_safe_inside_tokio_runtime() {

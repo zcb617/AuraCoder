@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 // Bridges the Claude Agent SDK to a stdio-based JSON-line protocol for AuraCoder.
 
+const { createReadStream } = await import("no" + "de:fs");
+const { readdir, stat } = await import("no" + "de:fs/promises");
+const { default: os } = await import("no" + "de:os");
+
 import { readFile } from "node:fs/promises";
 import { ChildProcess, execFile } from "node:child_process";
 import path from "node:path";
@@ -124,6 +128,10 @@ const pendingApprovals = new Map();
 let shuttingDown = false;
 const claudeCodeExecutable = process.env.PANES_CLAUDE_CODE_EXECUTABLE?.trim() || null;
 const execFileAsync = promisify(execFile);
+// 本机 Claude 会话扫描最多返回的摘要数量，避免历史文件过多阻塞 IPC。
+const MAX_CLAUDE_SESSIONS = 500;
+// 本机 Claude 会话摘要读取的最大 JSONL 行数，避免读取完整历史内容。
+const MAX_CLAUDE_TRANSCRIPT_LINES = 200;
 const claudeUsageUrl =
   process.env.PANES_CLAUDE_USAGE_URL?.trim() || "https://api.anthropic.com/api/oauth/usage";
 const claudeUsageFetchDisabled = ["1", "true", "yes"].includes(
@@ -1641,6 +1649,151 @@ async function* holdModelDiscoveryOpen() {
   await new Promise(() => {});
 }
 
+/** 根据 Claude 会话 cwd 计算本机历史目录名称，保持与远端会话服务一致。 */
+function claudeProjectDirectoryName(cwd) {
+  return path.resolve(cwd).replace(/[^a-zA-Z0-9-]/g, "-");
+}
+
+/** 返回本机 Claude 历史文件所在的用户项目目录。 */
+function claudeProjectsRoot() {
+  return path.join(os.homedir(), ".claude", "projects");
+}
+
+/** 从 Claude 用户消息内容提取首条可展示文本。 */
+function extractClaudeSessionText(content) {
+  if (typeof content === "string") {
+    return content.trim();
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .filter((item) => item && item.type === "text" && typeof item.text === "string")
+    .map((item) => item.text.trim())
+    .find(Boolean) ?? "";
+}
+
+/** 生成本机 Claude 会话标题，保持首条用户文本的业务展示语义。 */
+function claudeSessionTitle(sessionId, candidate) {
+  const title = candidate.trim().replace(/\s+/g, " ");
+  return title ? title.slice(0, 120) : `Claude session ${sessionId.slice(0, 8)}`;
+}
+
+/** 读取单个 Claude JSONL 文件的会话摘要并精确校验 cwd。 */
+async function readClaudeSessionSummary(filePath, expectedCwd) {
+  const fileName = path.basename(filePath);
+  const sessionId = fileName.endsWith(".jsonl")
+    ? fileName.slice(0, -".jsonl".length)
+    : "";
+  if (!sessionId) {
+    return null;
+  }
+  let sessionCwd = "";
+  let firstPrompt = "";
+  const lines = createInterface({
+    input: createReadStream(filePath, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+  let lineCount = 0;
+  for await (const line of lines) {
+    lineCount += 1;
+    if (lineCount > MAX_CLAUDE_TRANSCRIPT_LINES) {
+      break;
+    }
+    try {
+      const record = JSON.parse(line);
+      if (!sessionCwd && typeof record.cwd === "string") {
+        sessionCwd = path.resolve(record.cwd);
+      }
+      if (!firstPrompt && record.type === "user") {
+        firstPrompt = extractClaudeSessionText(record.message?.content);
+      }
+      if (sessionCwd && firstPrompt) {
+        break;
+      }
+    } catch {
+      // Claude 正在追加的末行可能尚未形成完整 JSON，只忽略该行。
+    }
+  }
+  if (sessionCwd !== expectedCwd) {
+    return null;
+  }
+  const fileStat = await stat(filePath);
+  return {
+    id: sessionId,
+    cwd: sessionCwd,
+    title: claudeSessionTitle(sessionId, firstPrompt),
+    updatedAt: fileStat.mtime.toISOString(),
+  };
+}
+
+/** 扫描指定 cwd 对应的本机 Claude 项目目录并返回排序后的会话摘要。 */
+async function listClaudeSessions(cwd) {
+  const expectedCwd = path.resolve(cwd);
+  const directory = path.join(
+    claudeProjectsRoot(),
+    claudeProjectDirectoryName(expectedCwd),
+  );
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+  const files = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
+    .map((entry) => path.join(directory, entry.name));
+  const nestedFiles = await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory())
+      .map(async (entry) => {
+        const nestedDirectory = path.join(directory, entry.name);
+        const nestedEntries = await readdir(nestedDirectory, { withFileTypes: true });
+        return nestedEntries
+          .filter((nested) => nested.isFile() && nested.name.endsWith(".jsonl"))
+          .map((nested) => path.join(nestedDirectory, nested.name));
+      }),
+  );
+  files.push(...nestedFiles.flat());
+  const sessions = [];
+  for (const filePath of files) {
+    const summary = await readClaudeSessionSummary(filePath, expectedCwd);
+    if (summary) {
+      sessions.push(summary);
+    }
+  }
+  sessions.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  return sessions.slice(0, MAX_CLAUDE_SESSIONS);
+}
+
+/** 处理本机 Claude 历史会话查询命令并返回关联请求 ID 的协议事件。 */
+async function handleListSessions(req) {
+  const { id, params = {} } = req;
+  const cwd = typeof params.cwd === "string" ? params.cwd.trim() : "";
+  if (!cwd) {
+    emit({
+      id,
+      type: "error",
+      message: "Claude list_sessions requires a non-empty cwd.",
+      recoverable: false,
+    });
+    return;
+  }
+  try {
+    emit({ id, type: "sessions", sessions: await listClaudeSessions(cwd) });
+  } catch (error) {
+    emit({
+      id,
+      type: "error",
+      message: error instanceof Error ? error.message : String(error),
+      recoverable: false,
+    });
+  }
+}
+
 async function handleListModels(req) {
   const { id, params = {} } = req;
   const options = applyClaudeRuntime({
@@ -2514,6 +2667,11 @@ rl.on("line", (line) => {
 
   if (req.method === "list_models") {
     void handleListModels(req);
+    return;
+  }
+
+  if (req.method === "list_sessions") {
+    void handleListSessions(req);
     return;
   }
 

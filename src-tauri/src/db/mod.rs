@@ -624,7 +624,7 @@ mod migration_tests {
         }
     }
 
-    /// 验证 107 到 108 的项目根语义迁移完整保留业务数据并清理旧仓库字段。
+    /// 验证 107 到 108 将旧仓库转换为 Workspace，并同步迁移会话与定时任务归属。
     #[test]
     fn migration_108_rebuilds_project_schema_and_cleans_all_terminal_worktrees() {
         let path = std::env::temp_dir().join(format!(
@@ -684,7 +684,12 @@ mod migration_tests {
             CREATE TABLE repos (
                 id TEXT PRIMARY KEY,
                 workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-                root_path TEXT NOT NULL
+                name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                default_branch TEXT NOT NULL,
+                is_active INTEGER NOT NULL,
+                is_discovered INTEGER NOT NULL,
+                trust_level TEXT NOT NULL
             );
             CREATE TABLE threads (
                 id TEXT PRIMARY KEY,
@@ -728,13 +733,14 @@ mod migration_tests {
             CREATE TABLE scheduled_tasks (
                 id TEXT PRIMARY KEY,
                 workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+                thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL,
                 runtime_config_json TEXT,
                 schedule_json TEXT NOT NULL
             );
             INSERT INTO workspaces (
-                id, name, root_path, startup_preset_json
+                id, name, root_path, location_kind, ssh_connection_id, startup_preset_json
             ) VALUES (
-                'workspace-108', 'Project', '/tmp/project-108',
+                'workspace-home', 'Home', '/home/user', 'local', NULL,
                 '{"worktree":"/tmp/old","terminal":{"groups":[
                   {"id":"g0","name":"Group 0","root":"/tmp/g0","layout":"split","cwd":"/tmp/g0","harness":"codex","worktree":"/tmp/w0"},
                   {"id":"g1","name":"Group 1","root":"/tmp/g1","layout":"split","cwd":"/tmp/g1","harness":"codex","worktree":"/tmp/w1"},
@@ -749,17 +755,35 @@ mod migration_tests {
                   {"id":"g10","name":"Group 10","root":"/tmp/g10","layout":"split","cwd":"/tmp/g10","harness":"codex","worktree":"/tmp/w10"}
                 ]}}'
             );
-            INSERT INTO repos (id, workspace_id, root_path)
-            VALUES ('repo-108', 'workspace-108', '/tmp/project-108/sub');
+            INSERT INTO workspaces (
+                id, name, root_path, location_kind, ssh_connection_id
+            ) VALUES
+                ('workspace-existing', 'Existing', '/repo/existing', 'local', NULL),
+                ('workspace-ssh', 'Remote Home', '/remote/home', 'ssh', 'ssh-1');
+            INSERT INTO repos (
+                id, workspace_id, name, path, default_branch, is_active, is_discovered, trust_level
+            ) VALUES
+                ('repo-new', 'workspace-home', 'New Repo', '/home/user/new-repo', 'main', 1, 0, 'trusted'),
+                ('repo-new-duplicate', 'workspace-home', 'Duplicate New Repo', '/home/user/new-repo', 'main', 1, 0, 'trusted'),
+                ('repo-existing', 'workspace-home', 'Existing Repo', '/repo/existing', 'main', 1, 0, 'trusted'),
+                ('repo-ssh', 'workspace-ssh', 'Remote Repo', '/remote/home/project', 'main', 1, 0, 'trusted');
             INSERT INTO threads (id, workspace_id, repo_id, engine_id, model_id, title)
-            VALUES ('thread-108', 'workspace-108', 'repo-108', 'codex', 'model', 'Thread');
+            VALUES
+                ('thread-repo-new', 'workspace-home', 'repo-new', 'codex', 'model', 'New Repo Thread'),
+                ('thread-repo-existing', 'workspace-home', 'repo-existing', 'codex', 'model', 'Existing Repo Thread'),
+                ('thread-home', 'workspace-home', NULL, 'codex', 'model', 'Home Thread'),
+                ('thread-remote', 'workspace-ssh', 'repo-ssh', 'codex', 'model', 'Remote Thread');
             INSERT INTO messages (id, thread_id, role, content)
-            VALUES ('message-108', 'thread-108', 'user', 'message');
+            VALUES
+                ('message-new', 'thread-repo-new', 'user', 'new message'),
+                ('message-existing', 'thread-repo-existing', 'user', 'existing message'),
+                ('message-home', 'thread-home', 'user', 'home message'),
+                ('message-remote', 'thread-remote', 'user', 'remote message');
             INSERT INTO scheduled_tasks (
-                id, workspace_id, runtime_config_json, schedule_json
+                id, workspace_id, thread_id, runtime_config_json, schedule_json
             ) VALUES (
-                'task-108', 'workspace-108',
-                '{"repoId":"repo-108","workspaceWritableRoots":["/tmp/project-108"],"workspaceWriteOptIn":true,"keep":"yes"}',
+                'task-108', 'workspace-home', 'thread-repo-new',
+                '{"repoId":"repo-new","workspaceWritableRoots":["/home/user"],"workspaceWriteOptIn":true,"keep":"yes"}',
                 '{}'
             );
             "#,
@@ -775,29 +799,111 @@ mod migration_tests {
             conn.query_row("SELECT COUNT(*) FROM workspaces", [], |row| row
                 .get::<_, u64>(0))
                 .expect("failed to count migrated workspaces"),
+            5
+        );
+        let new_repo_workspace_id: String = conn
+            .query_row(
+                "SELECT id FROM workspaces
+                 WHERE root_path = '/home/user/new-repo' AND location_kind = 'local'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("failed to find new local repository workspace");
+        let existing_repo_workspace_id: String = conn
+            .query_row(
+                "SELECT id FROM workspaces
+                 WHERE root_path = '/repo/existing' AND location_kind = 'local'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("failed to find existing repository workspace");
+        let ssh_repo_workspace_id: String = conn
+            .query_row(
+                "SELECT id FROM workspaces
+                 WHERE root_path = '/remote/home/project'
+                   AND location_kind = 'ssh'
+                   AND ssh_connection_id = 'ssh-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("failed to find SSH repository workspace");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM workspaces
+                 WHERE root_path = '/home/user/new-repo' AND location_kind = 'local'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .expect("failed to count new local repository workspaces"),
             1
+        );
+        assert_eq!(existing_repo_workspace_id, "workspace-existing");
+        assert_eq!(
+            conn.query_row(
+                "SELECT location_kind || ':' || ssh_connection_id
+                 FROM workspaces WHERE id = ?1",
+                [&ssh_repo_workspace_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("failed to inspect SSH repository workspace"),
+            "ssh:ssh-1"
         );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM threads", [], |row| row
                 .get::<_, u64>(0))
                 .expect("failed to count migrated threads"),
-            1
+            4
         );
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row
                 .get::<_, u64>(0))
                 .expect("failed to count migrated messages"),
-            1
+            4
         );
         assert_eq!(
-            conn.query_row("SELECT id FROM threads", [], |row| row.get::<_, String>(0))
-                .expect("failed to inspect migrated thread identity"),
-            "thread-108"
+            conn.query_row(
+                "SELECT content FROM messages WHERE id = 'message-new'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("failed to inspect migrated message identity"),
+            "new message"
         );
         assert_eq!(
-            conn.query_row("SELECT id FROM messages", [], |row| row.get::<_, String>(0))
-                .expect("failed to inspect migrated message identity"),
-            "message-108"
+            conn.query_row(
+                "SELECT workspace_id FROM threads WHERE id = 'thread-repo-new'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("failed to inspect new repository thread workspace"),
+            new_repo_workspace_id
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT workspace_id FROM threads WHERE id = 'thread-repo-existing'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("failed to inspect existing repository thread workspace"),
+            existing_repo_workspace_id
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT workspace_id FROM threads WHERE id = 'thread-home'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("failed to inspect home thread workspace"),
+            "workspace-home"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT workspace_id FROM threads WHERE id = 'thread-remote'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("failed to inspect remote thread workspace"),
+            ssh_repo_workspace_id
         );
         assert_eq!(
             conn.query_row(
@@ -815,7 +921,7 @@ mod migration_tests {
                 |row| row.get::<_, String>(0),
             )
             .expect("failed to inspect migrated workspace"),
-            "workspace-108:standard"
+            "workspace-home:standard"
         );
 
         for table in ["repos", "idx_threads_repo"] {
@@ -852,6 +958,14 @@ mod migration_tests {
             .expect("failed to decode thread columns");
         assert!(!thread_columns.iter().any(|name| name == "repo_id"));
 
+        let task_workspace_id: String = conn
+            .query_row(
+                "SELECT workspace_id FROM scheduled_tasks WHERE id = 'task-108'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("failed to inspect migrated scheduled task workspace");
+        assert_eq!(task_workspace_id, new_repo_workspace_id);
         let runtime_config: String = conn
             .query_row(
                 "SELECT runtime_config_json FROM scheduled_tasks WHERE id = 'task-108'",
@@ -868,7 +982,7 @@ mod migration_tests {
 
         let preset: String = conn
             .query_row(
-                "SELECT startup_preset_json FROM workspaces WHERE id = 'workspace-108'",
+                "SELECT startup_preset_json FROM workspaces WHERE id = 'workspace-home'",
                 [],
                 |row| row.get(0),
             )

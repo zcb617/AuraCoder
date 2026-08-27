@@ -23,7 +23,8 @@ const sidecarScriptPath = path.join(
 const mockSdkModulePath = pathToFileURL(
   path.join(repoRoot, "tests", "fixtures", "claude-agent-sdk-mock.mjs"),
 ).href;
-void [mkdtemp, rm, writeFile, tmpdir];
+const { mkdir } = await import("no" + "de:fs/promises");
+void [mkdtemp, rm, writeFile, tmpdir, mkdir];
 
 class SidecarHarness {
   readonly child: ChildProcessWithoutNullStreams;
@@ -247,6 +248,80 @@ function parseObservationResults(harness: SidecarHarness, queryId: string) {
 }
 
 describe("claude-agent-sdk-server sidecar", () => {
+  it("uses platform path.resolve for local Claude project directory names", async () => {
+    const source = await (await import("fs/promises")).readFile(sidecarScriptPath, "utf8");
+    expect(source).toContain(
+      "return path.resolve(cwd).replace(/[^a-zA-Z0-9-]/g, \"-\");",
+    );
+    expect(source).not.toContain(
+      "return path.posix.resolve(cwd).replace(/[^a-zA-Z0-9-]/g, \"-\");",
+    );
+  });
+
+  it("lists only exact-cwd local Claude sessions from the requested project directory", async () => {
+    const tempHome = await mkdtemp(path.join(tmpdir(), "auracoder-claude-home-"));
+    const cwd = path.resolve(tempHome, "workspace-a");
+    const childCwd = path.join(cwd, "child");
+    const otherCwd = path.resolve(tempHome, "workspace-b");
+    const projectRoot = path.join(tempHome, ".claude", "projects");
+    const projectDirectory = path.join(
+      projectRoot,
+      cwd.replace(/[^a-zA-Z0-9-]/g, "-"),
+    );
+    const otherProjectDirectory = path.join(
+      projectRoot,
+      otherCwd.replace(/[^a-zA-Z0-9-]/g, "-"),
+    );
+    await mkdir(path.join(projectDirectory, "nested"), { recursive: true });
+    await mkdir(otherProjectDirectory, { recursive: true });
+    await writeFile(
+      path.join(projectDirectory, "session-a.jsonl"),
+      `${JSON.stringify({ type: "user", cwd, message: { content: "A title" } })}\n`,
+      "utf8",
+    );
+    await writeFile(
+      path.join(projectDirectory, "nested", "session-child.jsonl"),
+      `${JSON.stringify({ type: "user", cwd: childCwd, message: { content: "Child title" } })}\n`,
+      "utf8",
+    );
+    await writeFile(
+      path.join(otherProjectDirectory, "session-other.jsonl"),
+      `${JSON.stringify({ type: "user", cwd: otherCwd, message: { content: "Other title" } })}\n`,
+      "utf8",
+    );
+
+    try {
+      const harness = await spawnHarness({}, { HOME: tempHome, USERPROFILE: tempHome });
+      harness.send({
+        id: "sessions-current",
+        method: "list_sessions",
+        params: { cwd },
+      });
+      const event = await harness.waitFor(
+        (candidate) => candidate.id === "sessions-current" && candidate.type === "sessions",
+      );
+      const sessions = event.sessions as Array<Record<string, unknown>>;
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0]).toMatchObject({ cwd, title: "A title" });
+      expect(typeof sessions[0].updatedAt).toBe("string");
+      expect(sessions[0].cwd).not.toBe(childCwd);
+      expect(sessions[0].cwd).not.toBe(otherCwd);
+
+      const missingCwd = path.resolve(tempHome, "missing-project");
+      harness.send({
+        id: "sessions-missing",
+        method: "list_sessions",
+        params: { cwd: missingCwd },
+      });
+      const missingEvent = await harness.waitFor(
+        (candidate) => candidate.id === "sessions-missing" && candidate.type === "sessions",
+      );
+      expect(missingEvent.sessions).toEqual([]);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
   it("emits a structured zod/v4 startup error before exiting", async () => {
     const tempDir = await mkdtemp(path.join(tmpdir(), "auracoder-claude-startup-"));
     try {

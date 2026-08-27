@@ -774,7 +774,9 @@ impl CliTool for CodexCli {
         let is_ssh = context.location_kind == CliLocationKind::Ssh;
         let mut sessions = summaries
             .into_iter()
-            .filter(|session| path_utils::is_path_within_root(&session.cwd, &workspace.root_path))
+            // 旧边界逻辑允许子目录会话归入父项目，保留注释作为迁移留痕。
+            // .filter(|session| path_utils::is_path_within_root(&session.cwd, &workspace.root_path))
+            .filter(|session| path_utils::paths_equal(&session.cwd, &workspace.root_path))
             .map(|session| Self::map_session(session, is_ssh))
             .collect::<Vec<_>>();
         for session in &mut sessions {
@@ -842,7 +844,9 @@ impl CliTool for CodexCli {
             }
         }
         anyhow::ensure!(
-            path_utils::is_path_within_root(&summary.cwd, &workspace.root_path),
+            // 旧边界逻辑允许子目录会话归入父项目，保留注释作为迁移留痕。
+            // path_utils::is_path_within_root(&summary.cwd, &workspace.root_path),
+            path_utils::paths_equal(&summary.cwd, &workspace.root_path),
             "Codex 会话不属于当前 workspace"
         );
         Ok(Self::map_session(

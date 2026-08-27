@@ -467,11 +467,11 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
 
     set({ loading: true, error: undefined });
     try {
+      /*
+      旧启动执行逻辑通过 Promise.all 并行发现远端 Codex，会话边界不再符合本地项目逐项同步要求，保留但禁止执行：
       const results = await Promise.all(
         workspaceIds.map(async (workspaceId) => {
           const localThreads = await ipc.listThreads(workspaceId);
-          // 旧逻辑先发现、后读取本地会话，无法按刷新前快照判断远端更新时间；顺序错误，禁止执行。
-          // await discoverCodexRemoteThreads(workspaceId);
           await discoverCodexRemoteThreads(workspaceId, localThreads);
           return {
             workspaceId,
@@ -479,6 +479,24 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
           };
         }),
       );
+      */
+      const results: Array<{ workspaceId: string; threads: Thread[] }> = [];
+      for (const workspaceId of workspaceIds) {
+        try {
+          await ipc.refreshLocalProjectSessions(workspaceId);
+        } catch (error) {
+          console.warn(
+            `Failed to refresh local project sessions for workspace ${workspaceId}: ${String(error)}`,
+            error,
+          );
+        }
+        // 旧启动路径通过 listThreads + discoverCodexRemoteThreads 发现远端会话；
+        // await discoverCodexRemoteThreads(workspaceId, await ipc.listThreads(workspaceId));
+        results.push({
+          workspaceId,
+          threads: await ipc.listThreads(workspaceId),
+        });
+      }
 
       // const threadsByWorkspace = results.reduce<Record<string, Thread[]>>((acc, item) => {
       //   acc[item.workspaceId] = item.threads;

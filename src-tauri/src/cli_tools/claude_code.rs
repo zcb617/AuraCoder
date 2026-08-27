@@ -19,7 +19,7 @@ use crate::{
     db,
     engines::{
         capabilities_for_engine, claude_remote::RemoteClaudeSessionNotFoundError,
-        claude_sidecar::ClaudeSidecarEngine, map_engine_capabilities, map_model_info,
+        claude_sidecar::{ClaudeSessionSummary, ClaudeSidecarEngine}, map_engine_capabilities, map_model_info,
         map_provider_usage, ApprovalRequestRoute, CodexRuntimeEvent, Engine, EngineCapabilities,
         EngineEvent, EngineSteerReceipt, EngineThread, ModelInfo, SandboxPolicy, ThreadScope,
         ThreadSyncSnapshot, TurnInput,
@@ -286,6 +286,17 @@ pub struct ClaudeCodeCli {
     remote_turn_use:
         Arc<Mutex<Option<remote_project_claude_runtime_service::RemoteClaudeServiceUse>>>,
     session_handles: Arc<ClaudeCodeSessionHandleRegistry>,
+}
+
+/// 判断本机 Claude 会话是否符合用户输入的标题或会话 ID 搜索条件。
+fn matches_claude_session_search(
+    session: &ClaudeSessionSummary,
+    query: Option<&str>,
+) -> bool {
+    query.map_or(true, |query| {
+        session.title.to_lowercase().contains(&query.to_lowercase())
+            || session.id.contains(query)
+    })
 }
 
 impl Clone for ClaudeCodeCli {
@@ -825,8 +836,52 @@ impl CliTool for ClaudeCodeCli {
         archived: Option<bool>,
     ) -> Result<Vec<CliSessionSnapshot>> {
         let workspace = self.load_workspace(context).await?;
-        if context.location_kind == CliLocationKind::Local || archived == Some(true) {
+        if archived == Some(true) {
             return Ok(Vec::new());
+        }
+
+        if context.location_kind == CliLocationKind::Local {
+            let summaries = self
+                .local_engine()
+                .await
+                .context("读取本机 Claude 会话失败")?
+                .list_sessions_for_cwd(&workspace.root_path)
+                .await
+                .context("读取本机 Claude 会话失败")?;
+            let query = search_term.map(str::trim).filter(|value| !value.is_empty());
+            return Ok(summaries
+                .into_iter()
+                .filter(|session| path_utils::paths_equal(&session.cwd, &workspace.root_path))
+                .filter(|session| matches_claude_session_search(session, query))
+                .map(|session| {
+                    let metadata = json!({
+                        "sshRemote": false,
+                        "claudeRemoteCwd": session.cwd.clone(),
+                        "claudeRemote": {
+                            "id": session.id.clone(),
+                            "cwd": session.cwd.clone(),
+                            "title": session.title.clone(),
+                            "updatedAt": session.updated_at.clone(),
+                        },
+                    });
+                    CliSessionSnapshot {
+                        engine_thread_id: session.id,
+                        title: session.title,
+                        preview: None,
+                        cwd: session.cwd,
+                        model_id: "unknown".to_string(),
+                        reasoning_effort: None,
+                        created_at: None,
+                        updated_at: Some(session.updated_at),
+                        source_kind: Some("claude".to_string()),
+                        raw_status: Some("idle".to_string()),
+                        active_flags: Vec::new(),
+                        status: ThreadStatusDto::Idle,
+                        archived: false,
+                        metadata,
+                    }
+                })
+                .collect());
         }
 
         let connection_id =
@@ -981,7 +1036,9 @@ impl CliTool for ClaudeCodeCli {
             session.session_id
         );
         anyhow::ensure!(
-            path_utils::is_path_within_root(&session.cwd, &workspace.root_path),
+            // 旧边界逻辑允许子目录会话归入父项目，保留注释作为迁移留痕。
+            // path_utils::is_path_within_root(&session.cwd, &workspace.root_path),
+            path_utils::paths_equal(&session.cwd, &workspace.root_path),
             "SSH 远端 Claude 会话不属于当前 workspace: session_id={engine_thread_id} cwd={} workspace_root={}",
             session.cwd,
             workspace.root_path
@@ -1999,5 +2056,21 @@ mod tests {
     fn permissions_reject_invalid_non_empty_json() {
         let error = permissions_from_thread(&permission_thread(Some("[1]"), None)).unwrap_err();
         assert!(error.to_string().contains("必须是对象"));
+    }
+
+    #[test]
+    fn local_claude_session_search_matches_title_or_id_and_excludes_other_sessions() {
+        let session = ClaudeSessionSummary {
+            id: "session-abc123".to_string(),
+            cwd: "/workspace/project".to_string(),
+            title: "Deploy production".to_string(),
+            updated_at: "2026-08-27T00:00:00Z".to_string(),
+        };
+
+        assert!(matches_claude_session_search(&session, Some("production")));
+        assert!(matches_claude_session_search(&session, Some("abc123")));
+        assert!(matches_claude_session_search(&session, Some("DEPLOY")));
+        assert!(!matches_claude_session_search(&session, Some("staging")));
+        assert!(matches_claude_session_search(&session, None));
     }
 }

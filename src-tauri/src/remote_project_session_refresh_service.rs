@@ -46,6 +46,18 @@ pub struct SshRemoteProjectSessionRefreshReport {
     pub failed_cli_ids: Vec<String>,
 }
 
+/// 单个本地工作区的会话同步报告。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalProjectSessionRefreshReport {
+    /// 工作区唯一标识。
+    pub workspace_id: String,
+    /// 成功同步的 CLI。
+    pub succeeded_cli_ids: Vec<String>,
+    /// 失败的 CLI。
+    pub failed_cli_ids: Vec<String>,
+}
+
 static REFRESHING_WORKSPACES: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -133,7 +145,7 @@ pub async fn refresh_ssh_remote_project_sessions(
     for cli_id in cli_ids {
         match cli_id.as_str() {
             "codex" | "opencode" | "claude" => {
-                match sync_cli(app, &workspace, &connection_id, &cli_id, db.clone()).await {
+                match sync_cli(app, &workspace, Some(&connection_id), &cli_id, db.clone()).await {
                     Ok(()) => report.succeeded_cli_ids.push(cli_id),
                     Err(error) => {
                         log::warn!(
@@ -168,6 +180,11 @@ fn is_enabled_ssh_workspace(workspace: &WorkspaceDto) -> bool {
         && workspace.connection_deleted != Some(true)
 }
 
+/// 判断工作区是否允许走本机历史会话同步入口。
+fn is_local_workspace(workspace: &WorkspaceDto) -> bool {
+    workspace.location_kind != "ssh"
+}
+
 async fn load_workspace(db: Arc<Database>, workspace_id: &str) -> Result<WorkspaceDto> {
     let id = workspace_id.to_string();
     let workspace =
@@ -179,27 +196,71 @@ async fn load_workspace(db: Arc<Database>, workspace_id: &str) -> Result<Workspa
         .ok_or_else(|| anyhow::anyhow!("enabled SSH workspace not found: {workspace_id}"))
 }
 
+/// 从数据库读取并校验一个本地工作区，拒绝 SSH 工作区误用本地同步入口。
+async fn load_local_workspace(db: Arc<Database>, workspace_id: &str) -> Result<WorkspaceDto> {
+    let id = workspace_id.to_string();
+    let workspace =
+        tokio::task::spawn_blocking(move || workspaces::find_workspace_by_id(db.as_ref(), &id))
+            .await
+            .context("读取本地 workspace 任务失败")??;
+    workspace
+        .filter(is_local_workspace)
+        .ok_or_else(|| anyhow::anyhow!("本地 workspace 不存在或实际为 SSH 项目: {workspace_id}"))
+}
+
+/// 按固定的 Codex、OpenCode、Claude 顺序同步一个本地工作区的历史会话。
+pub async fn refresh_local_project_sessions(
+    app: &AppHandle,
+    db: Arc<Database>,
+    workspace_id: &str,
+) -> Result<LocalProjectSessionRefreshReport> {
+    let _guard = WorkspaceRefreshGuard::acquire(workspace_id)
+        .ok_or_else(|| anyhow::anyhow!("workspace refresh already in progress: {workspace_id}"))?;
+    let workspace = load_local_workspace(db.clone(), workspace_id).await?;
+    let mut report = LocalProjectSessionRefreshReport {
+        workspace_id: workspace_id.to_string(),
+        succeeded_cli_ids: Vec::new(),
+        failed_cli_ids: Vec::new(),
+    };
+    for cli_id in ["codex", "opencode", "claude"] {
+        match sync_cli(app, &workspace, None, cli_id, db.clone()).await {
+            Ok(()) => report.succeeded_cli_ids.push(cli_id.to_string()),
+            Err(error) => {
+                log::warn!(
+                    "同步本地项目 CLI 失败: workspace_id={} cli_id={} error={error:#}",
+                    workspace_id,
+                    cli_id
+                );
+                report.failed_cli_ids.push(cli_id.to_string());
+            }
+        }
+    }
+    Ok(report)
+}
+
 async fn sync_cli(
     app: &AppHandle,
     workspace: &WorkspaceDto,
-    connection_id: &str,
+    connection_id: Option<&str>,
     cli_id: &str,
     db: Arc<Database>,
 ) -> Result<()> {
-    // 会话扫描前先登记常驻服务。应用启动时首次建立服务并写入 Map，后续刷新复用
-    // 已登记的服务；CLI 实现仍走各自的读取逻辑，但服务不会因一次扫描结束而关闭。
-    cli_service_lifecycle::set(connection_id, cli_id)
-        .await
-        .with_context(|| {
-            format!(
-                "启动并登记 SSH 远端 CLI 服务失败: connection_id={connection_id} cli_id={cli_id}"
-            )
-        })?;
+    if let Some(connection_id) = connection_id {
+        // 会话扫描前先登记常驻服务。应用启动时首次建立服务并写入 Map，后续刷新复用
+        // 已登记的服务；CLI 实现仍走各自的读取逻辑，但服务不会因一次扫描结束而关闭。
+        cli_service_lifecycle::set(connection_id, cli_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "启动并登记 SSH 远端 CLI 服务失败: connection_id={connection_id} cli_id={cli_id}"
+                )
+            })?;
 
-    if let Err(error) =
-        notify_app_startup_progress(app, "syncing-remote-sessions", "正在同步远端会话……")
-    {
-        log::warn!("发送启动进度失败: {error:#}");
+        if let Err(error) =
+            notify_app_startup_progress(app, "syncing-remote-sessions", "正在同步远端会话……")
+        {
+            log::warn!("发送启动进度失败: {error:#}");
+        }
     }
 
     if cli_id == "codex" {
@@ -1110,5 +1171,14 @@ mod tests {
             session.updated_at.as_deref(),
             Some("2026-08-14T09:00:00.000Z")
         );
+    }
+
+    #[test]
+    fn local_workspace_predicate_rejects_ssh_workspace() {
+        let (_db, mut workspace) = test_database_and_workspace();
+        workspace.location_kind = "local".to_string();
+        assert!(is_local_workspace(&workspace));
+        workspace.location_kind = "ssh".to_string();
+        assert!(!is_local_workspace(&workspace));
     }
 }

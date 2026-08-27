@@ -192,6 +192,8 @@ export const ipc = {
   showAgentNotification: (title: string, body: string) =>
     invoke<void>("show_agent_notification", { title, body }),
   listWorkspaces: () => invoke<Workspace[]>("list_workspaces"),
+  refreshLocalProjectSessions: (workspaceId: string) =>
+    invoke<void>("refresh_local_project_sessions", { workspaceId }),
   listArchivedWorkspaces: () => invoke<Workspace[]>("list_archived_workspaces"),
   getSshConnectionHome: (connectionId: string) =>
     invoke<SshConnectionTest>("get_ssh_connection_home", { connectionId }),

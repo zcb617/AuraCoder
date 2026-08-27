@@ -47,6 +47,29 @@ pub async fn list_workspaces(state: State<'_, AppState>) -> Result<Vec<Workspace
     run_db(state.db.clone(), db::workspaces::list_workspaces).await
 }
 
+/// 启动时按项目同步本地 Codex、OpenCode 与 Claude 历史会话，并返回各 CLI 同步结果。
+#[tauri::command]
+pub async fn refresh_local_project_sessions(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> Result<crate::remote_project_session_refresh_service::LocalProjectSessionRefreshReport, String>
+{
+    crate::remote_project_session_refresh_service::refresh_local_project_sessions(
+        &app,
+        state.db.clone().into(),
+        &workspace_id,
+    )
+    .await
+    .map_err(|error| {
+        log::warn!(
+            "刷新本地项目会话失败: workspace_id={} error={error:#}",
+            workspace_id
+        );
+        format!("刷新本地项目会话失败: {error:#}")
+    })
+}
+
 #[tauri::command]
 pub async fn list_archived_workspaces(
     state: State<'_, AppState>,
