@@ -2578,8 +2578,31 @@ fn truncate_mobile_text(value: &str, max_chars: usize) -> String {
     output
 }
 
-/// 手机端只渲染 blocks 的 content/summary/message 字段；
-/// 输出类字段不进隧道，可见文本按上限截断。
+/// 从完整 unified Diff 统计手机端所需的文件、新增和删除数量。
+fn mobile_diff_summary(diff: &str) -> Value {
+    let mut file_count = 0_u64;
+    let mut additions = 0_u64;
+    let mut deletions = 0_u64;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            file_count += 1;
+        } else if line.starts_with('+') && !line.starts_with("+++ ") {
+            additions += 1;
+        } else if line.starts_with('-') && !line.starts_with("--- ") {
+            deletions += 1;
+        }
+    }
+    if file_count == 0 && (additions > 0 || deletions > 0) {
+        file_count = 1;
+    }
+    json!({
+        "fileCount": file_count,
+        "additions": additions,
+        "deletions": deletions,
+    })
+}
+
+/// 为手机端消息剥离输出详情并附加 Diff 汇总，可见文本按协议上限截断。
 fn downsize_mobile_blocks(value: &mut Value) {
     let Some(blocks) = value.get_mut("blocks").and_then(Value::as_array_mut) else {
         return;
@@ -2592,6 +2615,9 @@ fn downsize_mobile_blocks(value: &mut Value) {
                     object.remove("outputChunks");
                     object.remove("details");
                     if let Some(result) = object.get_mut("result").and_then(Value::as_object_mut) {
+                        if let Some(diff) = result.get("diff").and_then(Value::as_str).map(str::to_string) {
+                            result.insert("mobileSummary".to_string(), mobile_diff_summary(&diff));
+                        }
                         for key in ["output", "diff", "error"] {
                             if let Some(text) = result.get(key).and_then(Value::as_str).map(str::to_string) {
                                 result.insert(
@@ -2611,6 +2637,7 @@ fn downsize_mobile_blocks(value: &mut Value) {
             "diff" => {
                 if let Some(object) = block.as_object_mut() {
                     if let Some(text) = object.get("diff").and_then(Value::as_str).map(str::to_string) {
+                        object.insert("mobileSummary".to_string(), mobile_diff_summary(&text));
                         object.insert("diff".to_string(), Value::String(truncate_mobile_text(&text, MOBILE_HIDDEN_OUTPUT_MAX_CHARS)));
                     }
                 }
@@ -3057,6 +3084,7 @@ mod tests {
 
     #[test]
     fn mobile_message_value_strips_action_output_and_keeps_summary() {
+        let unified_diff = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1,2 @@\n-old\n+new\n+added\ndiff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-kept\n+changed\n";
         let blocks = json!([
             {
                 "type": "action",
@@ -3065,8 +3093,9 @@ mod tests {
                 "summary": "keep this summary",
                 "details": { "command": "npm test" },
                 "outputChunks": [{ "stream": "stdout", "content": "chunk" }],
-                "result": { "output": "x".repeat(10_000), "diff": "d", "error": null }
+                "result": { "output": "x".repeat(10_000), "diff": unified_diff, "error": null }
             },
+            { "type": "diff", "diff": unified_diff, "scope": "turn" },
             {
                 "type": "attachment",
                 "fileName": "report.txt",
@@ -3109,6 +3138,25 @@ mod tests {
             output.chars().count(),
             super::MOBILE_HIDDEN_OUTPUT_MAX_CHARS + super::MOBILE_TRUNCATED_SUFFIX.chars().count()
         );
+        let action_summary = result
+            .get("mobileSummary")
+            .and_then(Value::as_object)
+            .expect("action Diff summary should remain");
+        assert_eq!(action_summary.get("fileCount").and_then(Value::as_u64), Some(2));
+        assert_eq!(action_summary.get("additions").and_then(Value::as_u64), Some(3));
+        assert_eq!(action_summary.get("deletions").and_then(Value::as_u64), Some(2));
+
+        let diff_block = block_values
+            .iter()
+            .find(|block| block.get("type").and_then(Value::as_str) == Some("diff"))
+            .expect("diff block should remain");
+        let diff_summary = diff_block
+            .get("mobileSummary")
+            .and_then(Value::as_object)
+            .expect("top-level Diff summary should remain");
+        assert_eq!(diff_summary.get("fileCount").and_then(Value::as_u64), Some(2));
+        assert_eq!(diff_summary.get("additions").and_then(Value::as_u64), Some(3));
+        assert_eq!(diff_summary.get("deletions").and_then(Value::as_u64), Some(2));
 
         let attachments = value.get("attachments").and_then(Value::as_array).unwrap();
         assert_eq!(attachments.len(), 1);

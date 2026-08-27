@@ -254,6 +254,10 @@ const selectedModel = computed(() => visibleModels.value.find((item) => item.id 
   ?? visibleModels.value.find((item) => item.isDefault)
   ?? visibleModels.value[0]
   ?? null);
+// 当前会话所绑定的配对设备，供顶部会话上下文显示桌面电脑名。
+const pairedDevice = computed(() => auracoderId.value ? auracoderDeviceStore.getDevice(auracoderId.value) : null);
+// 顶部会话栏的电脑显示名优先使用桌面名，兼容旧设备记录的自定义名称。
+const desktopDeviceName = computed(() => pairedDevice.value?.desktopName || pairedDevice.value?.name || "桌面 AuraCoder");
 
 function scrollToNewest() {
   isAtNewest.value = true;
@@ -771,6 +775,14 @@ onUnload(() => {
   </view>
   </view>
   <view class="conversation-page">
+    <view class="conversation-header">
+      <text class="conversation-title">{{ thread?.title || '新会话' }}</text>
+      <view class="conversation-context">
+        <text class="conversation-context-text">{{ workspace?.name || '未命名工作区' }}</text>
+        <text class="conversation-context-separator">·</text>
+        <view class="conversation-device"><view class="conversation-status-dot" :class="{ online: auracoderConnectionManager.getState(auracoderId).peerOnline }"/><text class="conversation-context-text">{{ desktopDeviceName }}</text></view>
+      </view>
+    </view>
     <view v-if="!auracoderConnectionManager.getState(auracoderId).peerOnline" class="offline-banner">桌面 AuraCoder 当前离线，消息与草稿已保留。</view>
     <view v-if="!conversation && !auracoderConnectionManager.getState(auracoderId).peerOnline" class="empty-state conversation-waiting"><view class="loader"></view><text>正在等待桌面 AuraCoder 连接…</text></view>
     <scroll-view class="chat-scroll" scroll-y :scroll-top="scrollTop" :scroll-with-animation="false" :scroll-into-view="scrollIntoViewId" @scroll="handleChatScroll" @scrolltolower="handleScrollToLower">
@@ -843,8 +855,16 @@ onUnload(() => {
 
 <style scoped>
 .conversation-page { display: grid; height: 100vh; grid-template-rows: auto auto minmax(0, 1fr) auto; background: var(--bg); }.conversation-meta { display: flex; padding: 8px 12px; gap: 7px; overflow-x: auto; border-bottom: 1px solid var(--line); white-space: nowrap; }.meta-chip { min-height: 28px; padding: 0 10px; overflow: hidden; border-radius: 999px; color: var(--muted); background: var(--surface); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }.offline-banner { padding: 7px 12px; color: #f7c06e; background: rgba(247,192,110,.1); font-size: 10px; text-align: center; }.chat-scroll { height: 100%; }.chat-content { padding: 16px 13px 22px; }.markdown { display: block; padding: 11px 13px; border: 1px solid var(--line); border-radius: 5px 15px 15px 15px; background: var(--surface); font-size: 13px; line-height: 1.65; }.message.user .markdown { border-color: rgba(70, 211, 154, .18); border-radius: 15px 5px 15px 15px; background: rgba(38, 117, 87, .28); }.composer { display: flex; padding: 8px 10px calc(10px + env(safe-area-inset-bottom)); flex-direction: column; gap: 8px; border-top: 1px solid var(--line); }.composer-row { display: grid; grid-template-columns: 42px minmax(0, 1fr) 54px; align-items: end; gap: 7px; }.attachment-button { display: flex; width: 42px; height: 42px; align-items: center; justify-content: center; border-radius: 13px; color: var(--text); background: var(--raised); font-size: 24px; font-weight: 300; }.composer-input { width: 100%; min-height: 42px; max-height: 126px; padding: 10px 11px; border: 1px solid var(--line); border-radius: 13px; color: var(--text); background: var(--surface); font-size: 13px; }.send { width: 54px; height: 42px; border-radius: 13px; color: #07140f; background: var(--accent); font-size: 11px; font-weight: 800; }.send.stop { color: #fff; background: var(--danger); }.input-placeholder { color: #6c7686; }.attachment-strip { width: 100%; white-space: nowrap; }.attachment-list { display: inline-flex; gap: 7px; }.attachment-item { display: inline-flex; max-width: 210px; padding: 7px 8px; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }.attachment-item view { min-width: 0; }.attachment-item text { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.attachment-item text:first-child { font-size: 10px; }.attachment-item text:last-child { margin-top: 3px; color: var(--muted); font-size: 8px; }.attachment-remove { padding: 3px 5px; border-radius: 5px; color: var(--muted); background: rgba(255,255,255,.06); font-size: 9px; }.message { max-width: 92%; margin-bottom: 18px; }.message.user { margin-left: auto; }.message-role { display: block; margin: 0 7px 6px; color: var(--muted); font-size: 9px; font-weight: 700; }.message.user .message-role { text-align: right; } /* 本地消息附件位于正文上方，图片和普通文件分别排列。 */ .message-attachments { display: flex; margin-bottom: 7px; flex-direction: column; gap: 7px; }.message-images { display: flex; flex-wrap: wrap; gap: 6px; }.message-image-trigger { width: 104px; height: 104px; }.message-image { width: 104px; height: 104px; border-radius: 9px; background: var(--surface); }.message-files { display: flex; flex-direction: column; gap: 5px; }.message-file-item { display: flex; min-width: 0; padding: 7px 9px; flex-direction: column; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }.message-file-name { overflow: hidden; color: var(--text); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }.message-file-meta { margin-top: 3px; color: var(--muted); font-size: 8px; }.streaming { display: block; margin: 5px 7px 0; color: var(--accent); font-size: 9px; }.load-older { width: 128px; min-height: 34px; margin: 0 auto 18px; color: var(--muted); font-size: 10px; }
-.conversation-page { display: flex; height: 100vh; flex-direction: column; background: var(--bg); }
-.chat-scroll { height: auto; min-height: 0; flex: 1; }
+	.conversation-page { display: flex; height: 100vh; flex-direction: column; background: var(--bg); }
+	.conversation-header { flex-shrink: 0; padding: calc(10px + env(safe-area-inset-top)) 14px 10px; overflow: hidden; border-bottom: 1px solid var(--line); background: var(--bg); }
+	.conversation-title { display: block; overflow: hidden; color: var(--text); font-size: 16px; font-weight: 700; line-height: 22px; text-overflow: ellipsis; white-space: nowrap; }
+	.conversation-context { display: flex; min-width: 0; margin-top: 4px; align-items: center; color: var(--muted); font-size: 11px; line-height: 16px; }
+	.conversation-context-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.conversation-context-separator { flex-shrink: 0; margin: 0 7px; color: var(--muted); }
+	.conversation-device { display: flex; min-width: 0; align-items: center; }
+	.conversation-status-dot { width: 6px; height: 6px; flex-shrink: 0; margin-right: 5px; border-radius: 50%; background: #667080; }
+	.conversation-status-dot.online { background: var(--accent); box-shadow: 0 0 0 3px rgba(70, 211, 154, .12); }
+	.chat-scroll { height: auto; min-height: 0; flex: 1; }
 .chat-content { min-height: 100%; }
 .composer { flex-shrink: 0; background: var(--bg); }
 /* 重构初版的局部样式覆盖了既有输入区控件尺寸，保留以便追溯。 */
