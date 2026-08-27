@@ -661,17 +661,40 @@ describe("claude-agent-sdk-server sidecar", () => {
     expect(newEvents.some((event) => event.type === "text_delta")).toBe(false);
   });
 
-  it("denies Write in read-only mode even when writableRoots are present", async () => {
+  it("allows read-only subagent reads and directly denies writes without approval", async () => {
     const harness = await spawnHarness({
       steps: [
+        {
+          type: "permission",
+          toolName: "Read",
+          input: { file_path: path.join(repoRoot, "allowed.txt") },
+          toolUseID: "read-read-only",
+          options: { agentID: "coder-1", requestId: "request-read-only-read" },
+        },
+        {
+          type: "permission",
+          toolName: "Glob",
+          input: { pattern: "*.txt", path: repoRoot },
+          toolUseID: "glob-read-only",
+          options: { agentID: "coder-1", requestId: "request-read-only-glob" },
+        },
+        {
+          type: "permission",
+          toolName: "Grep",
+          input: { pattern: "content", path: repoRoot },
+          toolUseID: "grep-read-only",
+          options: { agentID: "coder-1", requestId: "request-read-only-grep" },
+        },
         {
           type: "permission",
           toolName: "Write",
           input: { file_path: path.join(repoRoot, "allowed.txt") },
           toolUseID: "write-read-only",
+          options: { agentID: "coder-1", requestId: "request-read-only-write" },
         },
       ],
       emitObservationResult: true,
+      emitQueryOptions: true,
       sessionId: "session-read-only",
     });
 
@@ -691,9 +714,13 @@ describe("claude-agent-sdk-server sidecar", () => {
     );
 
     const observations = parseObservationResults(harness, "query-read-only");
-    expect(observations).toHaveLength(1);
-    expect(observations[0]?.result.behavior).toBe("deny");
-    expect(observations[0]?.result.message).toBe("File writes are disabled for this Claude thread.");
+    expect(observations[0]?.type).toBe("query_options");
+    expect(observations[0]?.result.permissionMode).toBe("dontAsk");
+    expect(observations.slice(1).map((item) => item.result.behavior)).toEqual([
+      "allow", "allow", "allow", "deny",
+    ]);
+    expect(observations[4]?.result.message).toBe("File writes are disabled for this Claude thread.");
+    expect(harness.events.some((event) => event.id === "query-read-only" && event.type === "approval_requested")).toBe(false);
   });
 
   it("workspace-write allows approved roots and denies paths outside them", async () => {
@@ -705,15 +732,18 @@ describe("claude-agent-sdk-server sidecar", () => {
           toolName: "Write",
           input: { file_path: path.join(repoRoot, "inside.txt") },
           toolUseID: "write-inside",
+          options: { agentID: "coder-1", requestId: "request-workspace-inside" },
         },
         {
           type: "permission",
           toolName: "Write",
           input: { file_path: outsidePath },
           toolUseID: "write-outside",
+          options: { agentID: "coder-1", requestId: "request-workspace-outside" },
         },
       ],
       emitObservationResult: true,
+      emitQueryOptions: true,
       sessionId: "session-workspace-write",
     });
 
@@ -723,7 +753,7 @@ describe("claude-agent-sdk-server sidecar", () => {
       params: {
         prompt: "attempt writes",
         cwd: repoRoot,
-        approvalPolicy: "trusted",
+        approvalPolicy: "acceptEdits",
         sandboxMode: "workspace-write",
         writableRoots: [repoRoot],
       },
@@ -734,10 +764,11 @@ describe("claude-agent-sdk-server sidecar", () => {
     );
 
     const observations = parseObservationResults(harness, "query-workspace-write");
-    expect(observations).toHaveLength(2);
-    expect(observations[0]?.result.behavior).toBe("allow");
-    expect(observations[1]?.result.behavior).toBe("deny");
-    expect(observations[1]?.result.message).toBe(
+    expect(observations[0]?.type).toBe("query_options");
+    expect(observations[0]?.result.permissionMode).toBe("acceptEdits");
+    expect(observations[1]?.result.behavior).toBe("allow");
+    expect(observations[2]?.result.behavior).toBe("deny");
+    expect(observations[2]?.result.message).toBe(
       "This file path is outside the approved writable roots for the thread.",
     );
   });
@@ -773,6 +804,42 @@ describe("claude-agent-sdk-server sidecar", () => {
     const observations = parseObservationResults(harness, "query-default-root");
     expect(observations).toHaveLength(1);
     expect(observations[0]?.result.behavior).toBe("allow");
+  });
+
+  it("fully autonomous subagent writes use bypassPermissions without approval", async () => {
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "permission",
+          toolName: "Write",
+          input: { file_path: path.join(repoRoot, "inside-full.txt") },
+          toolUseID: "write-full",
+          options: { agentID: "coder-1", requestId: "request-full-write" },
+        },
+      ],
+      emitObservationResult: true,
+      emitQueryOptions: true,
+      sessionId: "session-full",
+    });
+
+    harness.send({
+      id: "query-full",
+      method: "query",
+      params: {
+        prompt: "write autonomously",
+        cwd: repoRoot,
+        approvalPolicy: "bypassPermissions",
+        sandboxMode: "workspace-write",
+        writableRoots: [repoRoot],
+      },
+    });
+
+    await harness.waitFor((event) => event.id === "query-full" && event.type === "turn_completed");
+    const observations = parseObservationResults(harness, "query-full");
+    expect(observations[0]?.result.permissionMode).toBe("bypassPermissions");
+    expect(observations[0]?.result.allowDangerouslySkipPermissions).toBe(true);
+    expect(observations[1]?.result.behavior).toBe("allow");
+    expect(harness.events.some((event) => event.id === "query-full" && event.type === "approval_requested")).toBe(false);
   });
 
   it("uses interactive default permission mode for non-plan queries", async () => {
@@ -1486,10 +1553,11 @@ describe("claude-agent-sdk-server sidecar", () => {
           toolName: "Bash",
           input: { command: "npm test" },
           toolUseID: "permission-tool-1",
-          options: { suggestions },
+          options: { suggestions, agentID: "coder-1", requestId: "request-approval-1" },
         },
       ],
       emitObservationResult: true,
+      emitQueryOptions: true,
       sessionId: "session-approval",
     });
 
@@ -1506,6 +1574,11 @@ describe("claude-agent-sdk-server sidecar", () => {
     const approvalEvent = await harness.waitFor(
       (event) => event.id === "query-approval" && event.type === "approval_requested",
     );
+    expect(approvalEvent.details).toMatchObject({
+      _claudeAgentId: "coder-1",
+      _claudeToolUseId: "permission-tool-1",
+      _claudeRequestId: "request-approval-1",
+    });
     harness.send({
       method: "approval_response",
       params: {
@@ -1526,10 +1599,12 @@ describe("claude-agent-sdk-server sidecar", () => {
       result: Record<string, unknown>;
     }>;
 
-    expect(observations).toHaveLength(1);
-    expect(observations[0]?.type).toBe("permission_result");
-    expect(observations[0]?.result.behavior).toBe("allow");
-    expect(observations[0]?.result.updatedPermissions).toEqual(suggestions);
+    expect(observations).toHaveLength(2);
+    expect(observations[0]?.type).toBe("query_options");
+    expect(observations[0]?.result.permissionMode).toBe("default");
+    expect(observations[1]?.type).toBe("permission_result");
+    expect(observations[1]?.result.behavior).toBe("allow");
+    expect(observations[1]?.result.updatedPermissions).toEqual(suggestions);
   });
 
   it("routes AskUserQuestion approvals through updatedInput answers", async () => {
@@ -1652,7 +1727,7 @@ describe("claude-agent-sdk-server sidecar", () => {
       params: {
         prompt: "request approval",
         cwd: repoRoot,
-        approvalPolicy: "restricted",
+        approvalPolicy: "default",
       },
     });
 
@@ -1713,7 +1788,7 @@ describe("claude-agent-sdk-server sidecar", () => {
       params: {
         prompt: "deny the tool",
         cwd: repoRoot,
-        approvalPolicy: "restricted",
+        approvalPolicy: "default",
       },
     });
 
@@ -1765,7 +1840,7 @@ describe("claude-agent-sdk-server sidecar", () => {
       params: {
         prompt: "wait for approval",
         cwd: repoRoot,
-        approvalPolicy: "restricted",
+        approvalPolicy: "default",
       },
     });
 

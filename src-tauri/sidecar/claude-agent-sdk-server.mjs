@@ -425,6 +425,7 @@ function collectCandidatePaths(toolName, toolInput, cwd) {
   return paths;
 }
 
+/*
 function resolvePermissionMode(approvalPolicy, allowNetwork) {
   switch (approvalPolicy) {
     case "restricted":
@@ -442,7 +443,39 @@ function resolvePermissionMode(approvalPolicy, allowNetwork) {
       return allowNetwork ? "trusted" : "standard";
   }
 }
+*/
 
+/** 将 AuraCoder 权限策略映射为 Claude SDK 原生权限选项和审批决策模式。 */
+function resolveClaudeSdkPermissionOptions(approvalPolicy, planMode) {
+  if (planMode) {
+    return {
+      sdkPermissionMode: "plan",
+      decisionMode: "ask",
+      allowDangerouslySkipPermissions: false,
+    };
+  }
+  switch (approvalPolicy) {
+    case "dontAsk":
+    case "restricted":
+      return { sdkPermissionMode: "dontAsk", decisionMode: "read-only", allowDangerouslySkipPermissions: false };
+    case "default":
+    case "standard":
+      return { sdkPermissionMode: "default", decisionMode: "ask", allowDangerouslySkipPermissions: false };
+    case "acceptEdits":
+    case "trusted":
+      return { sdkPermissionMode: "acceptEdits", decisionMode: "workspace-auto", allowDangerouslySkipPermissions: false };
+    case "bypassPermissions":
+    case "never":
+      return { sdkPermissionMode: "bypassPermissions", decisionMode: "full", allowDangerouslySkipPermissions: true };
+    case "untrusted":
+    case "on-failure":
+    case "on-request":
+    default:
+      return { sdkPermissionMode: "default", decisionMode: "ask", allowDangerouslySkipPermissions: false };
+  }
+}
+
+/*
 function requiresApproval(permissionMode, toolName) {
   if (
     typeof toolName === "string" &&
@@ -458,6 +491,13 @@ function requiresApproval(permissionMode, toolName) {
   }
   return !["Read", "Glob", "Grep", "ExitPlanMode", "EnterPlanMode"].includes(toolName);
 }
+*/
+/*
+// 旧 permissionMode 审批判定已由 resolveClaudeSdkPermissionOptions 和 buildPermissionHandler 接替。
+function requiresApprovalLegacy(permissionMode, toolName) {
+  return requiresApproval(permissionMode, toolName);
+}
+*/
 
 function createQueryContext(id) {
   return {
@@ -817,25 +857,40 @@ function emitDeniedToolCompletion(context, toolUseId, errorMessage) {
   });
 }
 
-function emitApprovalRequest(context, actionType, summary, details) {
+/** 发出 AuraCoder 可展示的审批请求，并附加 Claude 子代理关联元数据。 */
+function emitApprovalRequest(context, actionType, summary, details, metadata = {}) {
   const approvalId = `${context.id}:approval:${context.pendingApprovalIds.size + 1}:${Date.now()}`;
+  const mergedDetails = {
+    ...(details ?? {}),
+    ...(typeof metadata.agentID === "string" && metadata.agentID.length > 0
+      ? { _claudeAgentId: metadata.agentID }
+      : {}),
+    ...(typeof metadata.toolUseID === "string" && metadata.toolUseID.length > 0
+      ? { _claudeToolUseId: metadata.toolUseID }
+      : {}),
+    ...(typeof metadata.requestId === "string" && metadata.requestId.length > 0
+      ? { _claudeRequestId: metadata.requestId }
+      : {}),
+  };
   emit({
     id: context.id,
     type: "approval_requested",
     approvalId,
     actionType,
     summary,
-    details,
+    details: mergedDetails,
   });
   return approvalId;
 }
 
-async function requestPermissionApproval(context, toolName, toolInput, suggestions = []) {
+/** 请求受控 Claude 工具授权，并将子代理标识传递到审批事件详情。 */
+async function requestPermissionApproval(context, toolName, toolInput, suggestions = [], metadata = {}) {
   const approvalId = emitApprovalRequest(
     context,
     mapToolNameToActionType(toolName),
     summarizeTool(toolName, toolInput),
     toolInput ?? {},
+    metadata,
   );
 
   const permission = await new Promise((resolve) => {
@@ -990,11 +1045,15 @@ function buildPermissionHandler({
   approvalPolicy,
 }) {
   const normalizedRoots = writableRoots.map((root) => path.resolve(root));
-  const permissionMode = resolvePermissionMode(approvalPolicy, allowNetwork);
+  const resolvedApprovalPolicy = approvalPolicy ?? (sandboxMode === "read-only" ? "restricted" : undefined);
+  const permissionOptions = resolveClaudeSdkPermissionOptions(resolvedApprovalPolicy, false);
+  const { decisionMode } = permissionOptions;
 
   return async (toolName, input, options) => {
     const toolInput = input ?? {};
     const toolUseId = options?.toolUseID;
+    const agentId = options?.agentID;
+    const requestId = options?.requestId;
 
     if (toolName === "AskUserQuestion") {
       const permission = await requestAskUserQuestionApproval(context, toolInput);
@@ -1025,6 +1084,14 @@ function buildPermissionHandler({
     // AuraCoder 自己的电脑操作代理会在每次真实 CUA 调用时弹出独立授权窗口；
     // 这里直接放行到代理，避免 Claude 的通用工具审批再弹一次。
     if (toolName.startsWith("mcp__auracoder-computer-control__")) {
+      if (decisionMode === "read-only") {
+        const permission = {
+          behavior: "deny",
+          message: "Tool execution is disabled in read-only mode.",
+        };
+        emitDeniedToolCompletion(context, toolUseId, permission.message);
+        return permission;
+      }
       return { behavior: "allow" };
     }
 
@@ -1058,7 +1125,19 @@ function buildPermissionHandler({
       }
     }
 
-    if (!requiresApproval(permissionMode, toolName)) {
+    if (decisionMode === "read-only") {
+      if (["Read", "Glob", "Grep", "ExitPlanMode", "EnterPlanMode"].includes(toolName)) {
+        return { behavior: "allow" };
+      }
+      const permission = {
+        behavior: "deny",
+        message: "Tool execution is disabled in read-only mode.",
+      };
+      emitDeniedToolCompletion(context, toolUseId, permission.message);
+      return permission;
+    }
+
+    if (decisionMode === "workspace-auto" || decisionMode === "full") {
       return { behavior: "allow" };
     }
 
@@ -1067,6 +1146,7 @@ function buildPermissionHandler({
       toolName,
       toolInput,
       options?.suggestions,
+      { agentID: agentId, toolUseID: toolUseId, requestId },
     );
     if (permission.behavior === "deny") {
       emitDeniedToolCompletion(context, toolUseId, permission.message);
@@ -1647,7 +1727,8 @@ async function handleQuery(req, persistentSession = null) {
       "Grep",
       ...(allowNetwork ? ["WebFetch"] : []),
     ];
-  const permissionMode = resolvePermissionMode(approvalPolicy, allowNetwork);
+  const resolvedApprovalPolicy = approvalPolicy ?? (sandboxMode === "read-only" ? "restricted" : undefined);
+  const permissionOptions = resolveClaudeSdkPermissionOptions(resolvedApprovalPolicy, planMode);
 
   const sessionCwd = cwd || process.cwd();
   let actualSessionId = null;
@@ -1666,7 +1747,11 @@ async function handleQuery(req, persistentSession = null) {
       toolList.push("mcp__auracoder-thread__*");
     }
     const automaticallyAllowedTools = enforceApprovalRouting
-      ? toolList.filter((toolName) => !requiresApproval(permissionMode, toolName))
+      ? permissionOptions.decisionMode === "read-only"
+        ? toolList.filter((toolName) => ["Read", "Glob", "Grep", "ExitPlanMode", "EnterPlanMode"].includes(toolName))
+        : permissionOptions.decisionMode === "ask"
+          ? toolList.filter((toolName) => ["Read", "Glob", "Grep", "ExitPlanMode", "EnterPlanMode"].includes(toolName))
+          : toolList
       : toolList;
 
     const options = applyClaudeRuntime({
@@ -1676,7 +1761,10 @@ async function handleQuery(req, persistentSession = null) {
         normalizedSandboxMode,
         normalizedWritableRoots,
       ),
-      permissionMode: planMode ? "plan" : "default",
+      permissionMode: permissionOptions.sdkPermissionMode,
+      ...(permissionOptions.allowDangerouslySkipPermissions
+        ? { allowDangerouslySkipPermissions: true }
+        : {}),
       allowedTools: automaticallyAllowedTools,
       ...(auracoderComputerControlServer || auracoderThreadServer
         ? {
@@ -1694,7 +1782,7 @@ async function handleQuery(req, persistentSession = null) {
         writableRoots: normalizedWritableRoots,
         sandboxMode: normalizedSandboxMode,
         allowNetwork: Boolean(allowNetwork),
-        approvalPolicy,
+        approvalPolicy: resolvedApprovalPolicy,
       }),
       settingSources: Array.isArray(settingSources)
         ? settingSources.filter((source) => ["user", "project", "local"].includes(source))
@@ -1723,8 +1811,10 @@ async function handleQuery(req, persistentSession = null) {
       },
       settings: {
         permissions: {
-          defaultMode: planMode ? "plan" : "default",
-          disableBypassPermissionsMode: "disable",
+          defaultMode: permissionOptions.sdkPermissionMode,
+          ...(permissionOptions.decisionMode === "full"
+            ? {}
+            : { disableBypassPermissionsMode: "disable" }),
         },
       },
       includePartialMessages: true,

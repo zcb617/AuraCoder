@@ -117,6 +117,7 @@ export function query({ prompt, options }) {
         type: "query_options",
         result: clone({
           permissionMode: options?.permissionMode,
+          allowDangerouslySkipPermissions: options?.allowDangerouslySkipPermissions,
           settings: options?.settings,
           sandbox: clone(options?.sandbox),
           settingSources: clone(options?.settingSources),

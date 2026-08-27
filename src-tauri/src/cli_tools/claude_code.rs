@@ -127,6 +127,10 @@ fn permissions_from_thread(thread: &ThreadDto) -> Result<PermissionComponentJson
 
     let mut result = default_permission_component();
     let preset = match (mode, sandbox, network) {
+        (Some("dontAsk"), Some("read-only"), Some(false)) => Some("read-only"),
+        (Some("default"), Some("workspace-write"), Some(false)) => Some("ask"),
+        (Some("acceptEdits"), Some("workspace-write"), None) => Some("auto"),
+        (Some("bypassPermissions"), Some("workspace-write"), Some(true)) => Some("full"),
         (Some("restricted"), Some("read-only"), Some(false)) => Some("read-only"),
         (Some("standard"), Some("workspace-write"), Some(false)) => Some("ask"),
         (Some("trusted"), Some("workspace-write"), Some(true)) => Some("full"),
@@ -142,6 +146,10 @@ fn permissions_from_thread(thread: &ThreadDto) -> Result<PermissionComponentJson
 
     let approval_value = match mode {
         None => "automatic",
+        Some("dontAsk") => "restricted",
+        Some("default") => "ask",
+        Some("acceptEdits") => "autonomous",
+        Some("bypassPermissions") => "autonomous",
         Some("restricted") => "restricted",
         Some("standard") => "ask",
         Some("trusted") => "autonomous",
@@ -154,6 +162,17 @@ fn permissions_from_thread(thread: &ThreadDto) -> Result<PermissionComponentJson
     };
     set_permission_array(&mut result, "approval", approval_values);
 
+    /*
+    // 原先按 permissionMode 强制推导 sandbox 的实现保留如下，现由实际保存字段读取接替：
+    let sandbox_value = match (mode, sandbox) {
+        (Some("dontAsk"), _) => "read-only",
+        (Some("default") | Some("acceptEdits") | Some("bypassPermissions"), _) => "workspace-write",
+        (_, Some("read-only")) => "read-only",
+        (_, Some("workspace-write")) => "workspace-write",
+        (_, None) => "automatic",
+        _ => "",
+    };
+    */
     let sandbox_value = match sandbox {
         None => "automatic",
         Some("read-only") => "read-only",
@@ -167,6 +186,18 @@ fn permissions_from_thread(thread: &ThreadDto) -> Result<PermissionComponentJson
     };
     set_permission_array(&mut result, "sandbox", sandbox_values);
 
+    /*
+    // 原先按 permissionMode 强制推导 network 的实现保留如下，现由实际保存字段读取接替：
+    let network_value = match (mode, network) {
+        (Some("dontAsk"), _) => "restricted",
+        (Some("default"), _) => "restricted",
+        (Some("bypassPermissions"), _) => "enabled",
+        (_, Some(true)) => "enabled",
+        (_, Some(false)) => "restricted",
+        (_, None) => "automatic",
+        _ => "automatic",
+    };
+    */
     let network_value = match network {
         None => "automatic",
         Some(true) => "enabled",
@@ -995,12 +1026,16 @@ impl CliTool for ClaudeCodeCli {
         let (mode, sandbox_mode, allow_network) = match preset {
             Some("automatic") => (None, None, None),
             None if autonomy_is_empty || (approval.is_none() && sandbox.is_none() && network.is_none()) => (None, None, None),
-            Some("read-only") => (Some("restricted"), Some("read-only"), Some(false)),
-            Some("ask") => (Some("standard"), Some("workspace-write"), Some(false)),
-            Some("auto") => (Some("trusted"), Some("workspace-write"), None),
-            Some("full") => (Some("trusted"), Some("workspace-write"), Some(true)),
+            Some("read-only") => (Some("dontAsk"), Some("read-only"), Some(false)),
+            Some("ask") => (Some("default"), Some("workspace-write"), Some(false)),
+            Some("auto") => (Some("acceptEdits"), Some("workspace-write"), None),
+            Some("full") => (Some("bypassPermissions"), Some("workspace-write"), Some(true)),
             _ => (
+                /*
+                // 旧权限 preset 映射已由 SDK 原生 permissionMode 接替：
                 match approval { Some("restricted") => Some("restricted"), Some("ask") => Some("standard"), Some("autonomous") => Some("trusted"), _ => None },
+                */
+                match approval { Some("restricted") => Some("dontAsk"), Some("ask") => Some("default"), Some("autonomous") => Some("bypassPermissions"), _ => None },
                 match sandbox { Some("read-only") => Some("read-only"), Some("workspace-write") => Some("workspace-write"), _ => None },
                 match network { Some("enabled") => Some(true), Some("restricted") => Some(false), _ => None },
             ),
@@ -1027,12 +1062,34 @@ impl CliTool for ClaudeCodeCli {
             .and_then(|value| serde_json::from_str::<Value>(value).ok())
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
+        let approval_policy = object
+            .get("permissionMode")
+            .or_else(|| object.get("approvalPolicy"))
+            .or_else(|| object.get("claudePermissionMode"))
+            .and_then(Value::as_str)
+            .map(|mode| match mode {
+                "restricted" => "dontAsk",
+                "standard" => "default",
+                "trusted" => {
+                    if object.get("allowNetwork").and_then(Value::as_bool) == Some(true) {
+                        "bypassPermissions"
+                    } else {
+                        "acceptEdits"
+                    }
+                }
+                _ => mode,
+            })
+            .map(|mode| json!(mode));
+        /*
+        // 旧 runtime 权限直接透传逻辑已由上面的历史值归一化接替：
+        let approval_policy = object
+            .get("permissionMode")
+            .or_else(|| object.get("approvalPolicy"))
+            .or_else(|| object.get("claudePermissionMode"))
+            .cloned();
+        */
         Ok(CliRuntimePermissions {
-            approval_policy: object
-                .get("permissionMode")
-                .or_else(|| object.get("approvalPolicy"))
-                .or_else(|| object.get("claudePermissionMode"))
-                .cloned(),
+            approval_policy,
             sandbox_mode: object
                 .get("sandboxMode")
                 .and_then(Value::as_str)
@@ -1078,10 +1135,14 @@ impl CliTool for ClaudeCodeCli {
                     .filter(|value| !value.is_empty())
                     .map(str::to_lowercase)
                     .ok_or_else(|| anyhow::anyhow!("Claude permission mode must be a string"))?;
-                anyhow::ensure!(
-                    matches!(normalized.as_str(), "restricted" | "standard" | "trusted"),
-                    "invalid Claude permission mode `{normalized}`. expected one of: restricted, standard, trusted"
-                );
+                anyhow::ensure!(matches!(normalized.as_str(), "dontask" | "default" | "acceptedits" | "bypasspermissions" | "restricted" | "standard" | "trusted"), "invalid Claude permission mode `{normalized}`. expected one of: dontAsk, default, acceptEdits, bypassPermissions");
+                let normalized = match normalized.as_str() {
+                    "dontask" | "restricted" => "dontAsk",
+                    "default" | "standard" => "default",
+                    "acceptedits" => "acceptEdits",
+                    "bypasspermissions" | "trusted" => "bypassPermissions",
+                    _ => unreachable!(),
+                };
                 Some(json!(normalized))
             } else {
                 None
@@ -1803,6 +1864,46 @@ mod tests {
     }
 
     #[test]
+    fn permissions_read_native_permission_modes() {
+        let expected = [
+            ("dontAsk", "read-only", "restricted", "read-only", "restricted"),
+            ("default", "ask", "ask", "workspace-write", "restricted"),
+            ("acceptEdits", "auto", "autonomous", "workspace-write", "automatic"),
+            ("bypassPermissions", "full", "autonomous", "workspace-write", "enabled"),
+        ];
+        for (mode, preset, approval, sandbox, network) in expected {
+            let network_field = if mode == "acceptEdits" { "" } else { ",\"allowNetwork\":false" };
+            let network_field = if mode == "dontAsk" { ",\"allowNetwork\":false" } else { network_field };
+            let network_field = if mode == "bypassPermissions" { ",\"allowNetwork\":true" } else { network_field };
+            let values = permissions_from_thread(&permission_thread(
+                Some(&format!(r#"{{"permissionMode":"{mode}","sandboxMode":"{sandbox}"{network_field}}}"#)),
+                None,
+            ))
+            .unwrap();
+            assert_eq!(values.get("autonomyPreset"), Some(&json!([preset])));
+            assert_eq!(values.get("approval"), Some(&json!([approval])));
+            assert_eq!(values.get("sandbox"), Some(&json!([sandbox])));
+            assert_eq!(values.get("network"), Some(&json!([network])));
+        }
+    }
+
+    #[test]
+    fn permissions_save_native_permission_modes() {
+        let cases = [
+            ("dontAsk", "read-only", false),
+            ("default", "workspace-write", false),
+            ("acceptEdits", "workspace-write", false),
+            ("bypassPermissions", "workspace-write", true),
+        ];
+        for (mode, sandbox, network) in cases {
+            let raw = raw_permissions_value(&permission_thread(None, None), Some(mode), Some(sandbox), Some(network));
+            assert_eq!(raw["permissionMode"], json!(mode));
+            assert_eq!(raw["sandboxMode"], json!(sandbox));
+            assert_eq!(raw["allowNetwork"], json!(network));
+        }
+    }
+
+    #[test]
     fn permissions_save_preserves_unknown_fields_and_clears_legacy_fields() {
         let thread = permission_thread(
             Some(
@@ -1810,8 +1911,12 @@ mod tests {
             ),
             None,
         );
-        let raw = raw_permissions_value(&thread, Some("trusted"), Some("workspace-write"), Some(true));
+        let raw = raw_permissions_value(&thread, Some("bypassPermissions"), Some("workspace-write"), Some(true));
+        assert_eq!(raw["permissionMode"], json!("bypassPermissions"));
+        /*
+        // 旧 trusted 保存值已由 SDK 原生 bypassPermissions 接替：
         assert_eq!(raw["permissionMode"], json!("trusted"));
+        */
         assert_eq!(raw["sandboxMode"], json!("workspace-write"));
         assert_eq!(raw["allowNetwork"], json!(true));
         assert_eq!(raw["allow"], json!(["Read"]));
