@@ -47,6 +47,8 @@ export interface Thread {
   id: string;
   workspaceId: string;
   engineId: string;
+  /** CLI 原生会话标识；空会话为 null/缺省，用于判断是否还能切换 CLI。 */
+  engineThreadId?: string | null;
   modelId: string;
   engineMetadata?: Record<string, unknown> | null;
   title: string;

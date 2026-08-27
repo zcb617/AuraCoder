@@ -34,7 +34,7 @@ use crate::{
     },
     config::app_config::{AppConfig, RemoteAccessConfig, RemoteDeviceConfig},
     // 历史分页已恢复：MessageWindowCursorDto 用于 message.list 游标分页。
-    models::MessageWindowCursorDto,
+    models::{EngineInfoDto, MessageWindowCursorDto, ThreadDto},
     state::AppState,
 };
 
@@ -726,6 +726,54 @@ async fn process_batched_attachment_upload(
     serde_json::to_value(attachment).map_err(|error| error.to_string())
 }
 
+/// 手机端 thread.update_runtime 的纯校验与解析：
+/// 只允许未开始的空会话切换 CLI，并解析最终写入的引擎、模型与思考强度。
+/// 独立成自由函数是为了让单测直接覆盖三个判定分支（与 build_completed_message_event 同款模式）。
+fn resolve_remote_runtime_update(
+    thread: &ThreadDto,
+    engines: &[EngineInfoDto],
+    engine_id: &str,
+    model_id: Option<String>,
+    reasoning_effort: Option<String>,
+) -> Result<(String, String, Option<String>), String> {
+    if thread.message_count > 0 || thread.engine_thread_id.is_some() {
+        return Err("thread already started; runtime cannot be changed".to_string());
+    }
+    let engine = engines
+        .iter()
+        .find(|item| item.id == engine_id)
+        .ok_or_else(|| format!("unknown engine_id: {engine_id}"))?;
+    let resolved_model = match model_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => {
+            let visible: Vec<&crate::models::EngineModelDto> =
+                engine.models.iter().filter(|item| !item.hidden).collect();
+            visible
+                .iter()
+                .find(|item| item.is_default)
+                .map(|item| item.id.clone())
+                .or_else(|| visible.first().map(|item| item.id.clone()))
+                .unwrap_or_else(|| thread.model_id.clone())
+        }
+    };
+    let resolved_effort = match reasoning_effort
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => Some(value),
+        None => engine
+            .models
+            .iter()
+            .find(|item| item.id == resolved_model)
+            .map(|item| item.default_reasoning_effort.clone())
+            .filter(|value| !value.is_empty()),
+    };
+    Ok((engine_id.to_string(), resolved_model, resolved_effort))
+}
+
 /// 将聊天完成通知包装成移动端约定的远程事件。
 ///
 /// 事件只携带刚刚完成持久化的单条助手消息，避免按线程扫描或发送流式差异。
@@ -1413,6 +1461,73 @@ impl RemoteTunnelManager {
                                                 .await
                                                 .and_then(|thread| serde_json::to_value(thread).map_err(|error| error.to_string())),
                                                 Err(error) => Err(error),
+                                            }
+                                        }
+                                        "thread.update_runtime" => {
+                                            let thread_id = request.payload.get("thread_id")
+                                                .and_then(Value::as_str)
+                                                .map(str::trim)
+                                                .filter(|value| !value.is_empty())
+                                                .map(str::to_string)
+                                                .ok_or_else(|| "thread_id is required".to_string());
+                                            let engine_id = request.payload.get("engine_id")
+                                                .and_then(Value::as_str)
+                                                .map(str::trim)
+                                                .filter(|value| !value.is_empty())
+                                                .map(str::to_string)
+                                                .ok_or_else(|| "engine_id is required".to_string());
+                                            let model_id = request.payload.get("model_id")
+                                                .and_then(Value::as_str)
+                                                .map(str::trim)
+                                                .filter(|value| !value.is_empty())
+                                                .map(str::to_string);
+                                            let reasoning_effort = request.payload.get("reasoning_effort")
+                                                .and_then(Value::as_str)
+                                                .map(str::trim)
+                                                .filter(|value| !value.is_empty())
+                                                .map(str::to_string);
+                                            match (thread_id, engine_id) {
+                                                (Ok(thread_id), Ok(engine_id)) => {
+                                                    async {
+                                                        let db = state.db.clone();
+                                                        let query_thread_id = thread_id.clone();
+                                                        let thread = tokio::task::spawn_blocking(move || {
+                                                            crate::db::threads::get_thread(&db, &query_thread_id)
+                                                        })
+                                                        .await
+                                                        .map_err(|error| error.to_string())
+                                                        .and_then(|result| result.map_err(|error| error.to_string()))?
+                                                        .ok_or_else(|| "thread not found".to_string())?;
+                                                        let engines = crate::commands::engines::list_local_engine_infos(&state).await?;
+                                                        let (engine_id, model_id, reasoning_effort) =
+                                                            resolve_remote_runtime_update(&thread, &engines, &engine_id, model_id, reasoning_effort)?;
+                                                        let db = state.db.clone();
+                                                        let update_thread_id = thread_id.clone();
+                                                        let updated = tokio::task::spawn_blocking(move || {
+                                                            crate::db::threads::update_thread_runtime_selection(
+                                                                &db,
+                                                                &update_thread_id,
+                                                                &engine_id,
+                                                                &model_id,
+                                                                None,
+                                                                None,
+                                                                reasoning_effort.as_deref(),
+                                                                None,
+                                                            )
+                                                        })
+                                                        .await
+                                                        .map_err(|error| error.to_string())
+                                                        .and_then(|result| result.map_err(|error| error.to_string()))?;
+                                                        // PC 端通过 thread-updated 事件实时刷新会话运行时显示。
+                                                        let _ = app.emit("thread-updated", json!({
+                                                            "threadId": updated.id,
+                                                            "workspaceId": updated.workspace_id,
+                                                            "thread": updated.clone(),
+                                                        }));
+                                                        serde_json::to_value(updated).map_err(|error| error.to_string())
+                                                    }.await
+                                                }
+                                                (Err(error), _) | (_, Err(error)) => Err(error),
                                             }
                                         }
                                         "thread.set_autonomy_preset" => {
@@ -2627,14 +2742,133 @@ mod tests {
     use super::{
         build_completed_message_event, decode_relay_header_value, enforce_message_page_budget,
         mobile_message_value, parse_optional_batch_id, parse_remote_attachment_inputs,
-        relay_attachment_url, remote_batch_key, truncate_mobile_text, RemoteBatchState,
-        RemoteTunnelManager,
+        relay_attachment_url, remote_batch_key, resolve_remote_runtime_update,
+        truncate_mobile_text, RemoteBatchState, RemoteTunnelManager,
     };
     use crate::commands::chat::ChatAttachmentPayload;
     use crate::config::app_config::RemoteAccessConfig;
-    use crate::models::{MessageDto, MessageStatusDto, MessageWindowCursorDto};
+    use crate::models::{
+        EngineCapabilitiesDto, EngineInfoDto, EngineModelDto, MessageDto, MessageStatusDto,
+        MessageWindowCursorDto, ThreadDto, ThreadStatusDto,
+    };
     use serde_json::{json, Value};
     use tokio::fs as tokio_fs;
+
+    fn test_thread(message_count: i64, engine_thread_id: Option<&str>) -> ThreadDto {
+        ThreadDto {
+            id: "thread-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            repo_id: None,
+            engine_id: "codex".to_string(),
+            model_id: "gpt-5.4".to_string(),
+            engine_thread_id: engine_thread_id.map(str::to_string),
+            engine_metadata: None,
+            plan_mode: None,
+            send_method: None,
+            reasoning_effort: Some("high".to_string()),
+            permission_mode: None,
+            title: "新会话".to_string(),
+            status: ThreadStatusDto::Idle,
+            message_count,
+            total_tokens: 0,
+            created_at: "2026-08-27T00:00:00Z".to_string(),
+            last_activity_at: "2026-08-27T00:00:00Z".to_string(),
+        }
+    }
+
+    fn test_engine(id: &str, models: Vec<EngineModelDto>) -> EngineInfoDto {
+        EngineInfoDto {
+            id: id.to_string(),
+            name: id.to_string(),
+            models,
+            capabilities: EngineCapabilitiesDto {
+                permission_modes: vec![],
+                sandbox_modes: vec![],
+                approval_decisions: vec![],
+            },
+        }
+    }
+
+    fn test_model(id: &str, is_default: bool, hidden: bool) -> EngineModelDto {
+        EngineModelDto {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            description: String::new(),
+            hidden,
+            is_default,
+            upgrade: None,
+            availability_nux: None,
+            upgrade_info: None,
+            input_modalities: vec![],
+            attachment_modalities: vec![],
+            limits: None,
+            supports_personality: false,
+            default_reasoning_effort: "medium".to_string(),
+            supported_reasoning_efforts: vec![],
+        }
+    }
+
+    #[test]
+    fn resolve_remote_runtime_update_allows_unstarted_thread_and_defaults_model() {
+        let thread = test_thread(0, None);
+        let engines = vec![test_engine(
+            "claude",
+            vec![
+                test_model("claude-a", false, false),
+                test_model("claude-b", true, false),
+            ],
+        )];
+        let result = resolve_remote_runtime_update(&thread, &engines, "claude", None, None)
+            .expect("unstarted thread must allow engine switch");
+        assert_eq!(result.0, "claude");
+        assert_eq!(result.1, "claude-b");
+        assert_eq!(result.2.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn resolve_remote_runtime_update_rejects_started_thread_with_messages() {
+        let thread = test_thread(1, None);
+        let engines = vec![test_engine(
+            "claude",
+            vec![test_model("claude-b", true, false)],
+        )];
+        let error = resolve_remote_runtime_update(&thread, &engines, "claude", None, None)
+            .expect_err("started thread must reject engine switch");
+        assert!(
+            error.contains("already started"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resolve_remote_runtime_update_rejects_started_thread_with_engine_session() {
+        let thread = test_thread(0, Some("cli-session-1"));
+        let engines = vec![test_engine(
+            "claude",
+            vec![test_model("claude-b", true, false)],
+        )];
+        let error = resolve_remote_runtime_update(&thread, &engines, "claude", None, None)
+            .expect_err("thread with engine session must reject engine switch");
+        assert!(
+            error.contains("already started"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resolve_remote_runtime_update_rejects_unknown_engine() {
+        let thread = test_thread(0, None);
+        let engines = vec![test_engine(
+            "claude",
+            vec![test_model("claude-b", true, false)],
+        )];
+        let error = resolve_remote_runtime_update(&thread, &engines, "unknown", None, None)
+            .expect_err("unknown engine must be rejected");
+        assert!(
+            error.contains("unknown engine_id"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn remote_identity_is_generated_and_rotates() {

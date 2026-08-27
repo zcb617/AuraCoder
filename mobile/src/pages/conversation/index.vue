@@ -25,6 +25,7 @@ const selectedModelId = ref("");
 const selectedReasoningEffort = ref("");
 const selectedAutonomyPreset = ref<AutonomyPreset>("inherit");
 const runtimePickerOpen = ref(false);
+const engineSaving = ref(false);
 const permissionPickerOpen = ref(false);
 const permissionSaving = ref(false);
 const cancelledAttachments = new Set<string>();
@@ -280,6 +281,8 @@ watch(() => conversation.value?.messageRevision || 0, (revision, previousRevisio
 });
 const efforts = computed(() => selectedModel.value?.supportedReasoningEfforts ?? []);
 const activeTurn = computed(() => thread.value?.status === "streaming");
+// 空会话（未开始）才允许切换 CLI，与 PC 端 canChangeUnstartedThreadEngine 同一口径。
+const engineLocked = computed(() => Boolean(thread.value && (thread.value.messageCount > 0 || thread.value.engineThreadId)));
 const attachmentUploading = computed(() => conversation.value?.attachments.some((item) => item.uploading) ?? false);
 const pendingBatch = computed(() => conversation.value?.pendingBatch ?? null);
 const batchSending = computed(() => Boolean(pendingBatch.value && pendingBatch.value.status !== "failed"));
@@ -431,6 +434,29 @@ function chooseModel(modelId: string) {
   selectedReasoningEffort.value = model.supportedReasoningEfforts.find((item) => item.reasoningEffort === model.defaultReasoningEffort)?.reasoningEffort
     ?? model.supportedReasoningEfforts[0]?.reasoningEffort
     ?? "";
+}
+
+function chooseEngine(engineId: string) {
+  const current = thread.value;
+  if (!current || engineLocked.value || engineSaving.value || engineId === current.engineId) return;
+  const engine = engines.value.find((item) => item.id === engineId);
+  if (!engine) return;
+  engineSaving.value = true;
+  void auracoderConnectionManager.request<Thread>(auracoderId.value, "thread.update_runtime", { thread_id: threadId.value, engine_id: engineId }).then((updated) => {
+    projectStore.upsert(auracoderId.value, updated);
+    // 切换 CLI 后模型与思考强度重置为新引擎默认值；模型列表由 currentEngine 随会话自动切换。
+    const models = engine.models.filter((item) => !item.hidden);
+    const model = models.find((item) => item.isDefault) ?? models[0] ?? null;
+    selectedModelId.value = model?.id || "";
+    selectedReasoningEffort.value = model
+      ? model.supportedReasoningEfforts.find((item) => item.reasoningEffort === model.defaultReasoningEffort)?.reasoningEffort
+        ?? model.supportedReasoningEfforts[0]?.reasoningEffort ?? ""
+      : "";
+  }).catch((error) => {
+    uni.showToast({ title: error instanceof Error ? error.message : "无法切换 CLI", icon: "none" });
+  }).finally(() => {
+    engineSaving.value = false;
+  });
 }
 
 function chooseReasoningEffort(reasoningEffort: string) {
@@ -782,6 +808,10 @@ onUnload(() => {
     <view v-if="runtimePickerOpen" class="mobile-picker-backdrop" @tap="runtimePickerOpen = false">
       <view class="mobile-picker" @tap.stop>
         <view class="mobile-picker-header"><text>模型与思考强度</text><button hover-class="none" @tap="runtimePickerOpen = false">完成</button></view>
+        <text class="mobile-picker-section-title">CLI 工具</text>
+        <view v-if="engineLocked" class="mobile-picker-note">会话已开始，不能切换 CLI</view>
+        <button v-for="engine in engines" :key="engine.id" class="mobile-picker-option" :class="{ selected: currentEngine?.id === engine.id }" hover-class="none" :disabled="engineLocked || engineSaving" @tap="chooseEngine(engine.id)"><view><text>{{ engine.name }}</text><text>{{ engine.id }}</text></view><text>{{ currentEngine?.id === engine.id ? '✓' : '' }}</text></button>
+        <view v-if="!engines.length" class="mobile-picker-note">引擎列表未加载</view>
         <text class="mobile-picker-section-title">模型</text>
         <scroll-view class="mobile-picker-list" scroll-y>
           <button v-for="model in visibleModels" :key="model.id" class="mobile-picker-option" :class="{ selected: selectedModelId === model.id }" hover-class="none" @tap="chooseModel(model.id)"><view><text>{{ model.displayName || model.id }}</text><text>{{ model.description }}</text></view><text>{{ selectedModelId === model.id ? '✓' : '' }}</text></button>
@@ -843,4 +873,5 @@ onUnload(() => {
 .message-image-preview-backdrop { position: fixed; z-index: 2000; inset: 0; display: flex; padding: 28px 18px calc(28px + env(safe-area-inset-bottom)); align-items: center; justify-content: center; background: rgba(0, 0, 0, .88); }
 .message-image-preview { width: 100%; height: 100%; }
 .message-image-preview-close { position: absolute; top: calc(14px + env(safe-area-inset-top)); right: 14px; display: flex; width: 38px; height: 38px; padding: 0; align-items: center; justify-content: center; border-radius: 50%; color: #fff; background: rgba(255, 255, 255, .18); font-size: 28px; line-height: 1; }
+.mobile-picker-note { margin: 0 0 8px; color: var(--muted); font-size: 12px; }
 </style>
