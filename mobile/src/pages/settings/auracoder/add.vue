@@ -64,7 +64,7 @@ onLoad((query) => { replacingAuraCoderId.value = String((query || {}).auracoderI
 <template>
   <scroll-view class="full-scroll" scroll-y>
     <view class="pair-page compact-pair-page">
-      <view class="pair-brand"><view class="pair-logo">A</view><text class="pair-name">AuraCoder Mobile</text><text class="pair-title">{{ replacingAuraCoderId ? '重新配对 AuraCoder' : '添加 AuraCoder' }}</text><text class="pair-copy">从桌面 AuraCoder 的远程访问设置中扫描二维码，或粘贴配对内容。</text></view>
+      <view class="pair-brand"><!-- <view class="pair-logo">A</view> --><image class="pair-logo" src="/static/logo.png" mode="aspectFit" /><text class="pair-name">AuraCoder Mobile</text><text class="pair-title">{{ replacingAuraCoderId ? '重新配对 AuraCoder' : '添加 AuraCoder' }}</text><text class="pair-copy">从桌面 AuraCoder 的远程访问设置中扫描二维码，或粘贴配对内容。</text></view>
       <button class="primary-button" @tap="scanPairing">扫码配对</button>
       <view class="divider"><view/><text>或粘贴配对内容</text><view/></view>
       <textarea v-model="pairingText" class="pair-input" placeholder="粘贴 AuraCoder Mobile 配对内容" placeholder-class="placeholder" :maxlength="20000"/>
@@ -76,4 +76,5 @@ onLoad((query) => { replacingAuraCoderId.value = String((query || {}).auracoderI
 
 <style scoped>
 .compact-pair-page { min-height: 100vh; padding-top: calc(20px + env(safe-area-inset-top)); padding-bottom: calc(30px + env(safe-area-inset-bottom)); justify-content: flex-start; }.placeholder { color: #6c7686; }
+.pair-logo { display: block; width: 78px; height: 78px; margin-bottom: 14px; border: 0; background: transparent; box-shadow: none; }
 </style>

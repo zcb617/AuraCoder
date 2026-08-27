@@ -61,6 +61,39 @@
                 "minSdkVersion" : 28,
                 "targetSdkVersion" : 34				
             },
+            "icons" : {
+                "android" : {
+                    "mdpi" : "../logo/android/48x48/logo.png",
+                    "hdpi" : "../logo/android/72x72/logo.png",
+                    "xhdpi" : "../logo/android/96x96/logo.png",
+                    "xxhdpi" : "../logo/android/144x144/logo.png",
+                    "xxxhdpi" : "../logo/android/192x192/logo.png"
+                },
+                "ios" : {
+                    "iphone" : {
+                        "app@2x" : "../logo/ios/120x120/logo.png",
+                        "app@3x" : "../logo/ios/180x180/logo.png",
+                        "spotlight@2x" : "../logo/ios/80x80/logo.png",
+                        "spotlight@3x" : "../logo/ios/120x120/logo.png",
+                        "settings@2x" : "../logo/ios/58x58/logo.png",
+                        "settings@3x" : "../logo/ios/87x87/logo.png",
+                        "notification@2x" : "../logo/ios/40x40/logo.png",
+                        "notification@3x" : "../logo/ios/60x60/logo.png"
+                    },
+                    "ipad" : {
+                        "app" : "../logo/ios/76x76/logo.png",
+                        "app@2x" : "../logo/ios/152x152/logo.png",
+                        "proapp@2x" : "../logo/ios/167x167/logo.png",
+                        "spotlight" : "../logo/ios/40x40/logo.png",
+                        "spotlight@2x" : "../logo/ios/80x80/logo.png",
+                        "settings" : "../logo/ios/29x29/logo.png",
+                        "settings@2x" : "../logo/ios/58x58/logo.png",
+                        "notification" : "../logo/ios/20x20/logo.png",
+                        "notification@2x" : "../logo/ios/40x40/logo.png"
+                    },
+                    "appstore" : "../logo/ios/1024x1024/logo.png"
+                }
+            },
             /* ios打包配置 */
             "ios" : {
                 "UIBackgroundModes" : "location",

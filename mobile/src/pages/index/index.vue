@@ -123,7 +123,8 @@ onUnload(() => {
         </scroll-view>
 
         <view v-if="!allDevices.length" class="empty-state no-device">
-          <text class="empty-logo">A</text>
+          <!-- <text class="empty-logo">A</text> -->
+          <image class="empty-logo" src="/static/logo.png" mode="aspectFit" />
           <text>尚未添加 AuraCoder</text>
           <text>添加桌面 AuraCoder 后，即可查看项目与会话。</text>
           <button class="primary-button compact-button" @tap="openAuraCoderSettings">前往设置</button>
@@ -222,6 +223,7 @@ onUnload(() => {
 .remote-search-input { min-width: 0; height: 44px; flex: 1; padding: 0; color: var(--text); background: transparent; font-size: 14px; }
 .remote-search-input::placeholder { color: var(--muted); }
 .no-device { min-height: 420px; }
-.empty-logo { display: flex; width: 62px; height: 62px; align-items: center; justify-content: center; border: 1px solid var(--accent); border-radius: 18px; color: var(--accent); background: var(--soft); font-size: 25px; font-weight: 800; }
+/* .empty-logo { display: flex; width: 62px; height: 62px; align-items: center; justify-content: center; border: 1px solid var(--accent); border-radius: 18px; color: var(--accent); background: var(--soft); font-size: 25px; font-weight: 800; } */
+.empty-logo { display: block; width: 62px; height: 62px; border: 0; border-radius: 18px; background: transparent; }
 .compact-button { width: 180px; min-height: 42px; margin-top: 12px; }
 </style>
