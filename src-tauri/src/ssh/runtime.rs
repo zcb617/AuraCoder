@@ -1,68 +1,19 @@
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-
 use crate::{
     db::{self, ssh_connections::SshConnectionRecord, Database},
     models::WorkspaceDto,
 };
 
-pub const REMOTE_REPO_PREFIX: &str = "ssh://auracoder/";
+pub const REMOTE_WORKSPACE_PREFIX: &str = "ssh://auracoder/";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteWorktreePath {
-    pub root_path: String,
-    pub relative_path: Option<String>,
+pub fn remote_workspace_marker(workspace_id: &str) -> String {
+    format!("{REMOTE_WORKSPACE_PREFIX}{workspace_id}")
 }
 
-pub fn remote_repo_marker(workspace_id: &str) -> String {
-    format!("{REMOTE_REPO_PREFIX}{workspace_id}")
-}
-
-pub fn workspace_id_from_repo_marker(repo_path: &str) -> Option<&str> {
-    repo_path
-        .strip_prefix(REMOTE_REPO_PREFIX)
+pub fn workspace_id_from_workspace_marker(root_path: &str) -> Option<&str> {
+    root_path
+        .strip_prefix(REMOTE_WORKSPACE_PREFIX)
         .and_then(|value| value.split('/').next())
         .filter(|value| !value.is_empty())
-}
-
-pub fn remote_worktree_marker(workspace_id: &str, absolute_path: &str) -> String {
-    format!(
-        "{}/worktree/{}",
-        remote_repo_marker(workspace_id).trim_end_matches('/'),
-        URL_SAFE_NO_PAD.encode(absolute_path.as_bytes()),
-    )
-}
-
-pub fn worktree_path_from_repo_marker(
-    repo_path: &str,
-) -> anyhow::Result<Option<RemoteWorktreePath>> {
-    let Some(value) = repo_path.strip_prefix(REMOTE_REPO_PREFIX) else {
-        return Ok(None);
-    };
-    let Some((_, suffix)) = value.split_once('/') else {
-        return Ok(None);
-    };
-    let marker = suffix
-        .strip_prefix("worktree/")
-        .ok_or_else(|| anyhow::anyhow!("远端工作树标识无效"))?;
-    let (encoded, relative_path) = match marker.split_once('/') {
-        Some((encoded, relative_path)) => {
-            validate_remote_relative_path(relative_path, false)?;
-            (encoded, Some(relative_path.to_string()))
-        }
-        None => (marker, None),
-    };
-    let bytes = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|_| anyhow::anyhow!("远端工作树标识无效"))?;
-    let path = String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("远端工作树路径无效"))?;
-    anyhow::ensure!(
-        path.starts_with('/') && !path.contains('\0'),
-        "远端工作树路径无效"
-    );
-    Ok(Some(RemoteWorktreePath {
-        root_path: path,
-        relative_path,
-    }))
 }
 
 #[derive(Debug, Clone)]
@@ -162,10 +113,7 @@ pub fn remote_path(root: &str, relative: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        remote_worktree_marker, validate_remote_relative_path, workspace_id_from_repo_marker,
-        worktree_path_from_repo_marker,
-    };
+    use super::{validate_remote_relative_path, workspace_id_from_workspace_marker};
 
     #[test]
     fn wraps_remote_command_with_remote_login_shell() {
@@ -199,22 +147,11 @@ mod tests {
     }
 
     #[test]
-    fn encodes_registered_worktree_path_in_remote_repo_marker() {
-        let marker = remote_worktree_marker("ws-1", "/srv/worktrees/feature");
-        assert_eq!(workspace_id_from_repo_marker(&marker), Some("ws-1"));
+    fn parses_project_root_workspace_marker() {
         assert_eq!(
-            worktree_path_from_repo_marker(&marker).unwrap(),
-            Some(super::RemoteWorktreePath {
-                root_path: "/srv/worktrees/feature".to_string(),
-                relative_path: None,
-            })
+            workspace_id_from_workspace_marker("ssh://auracoder/ws-1"),
+            Some("ws-1")
         );
-        assert_eq!(
-            worktree_path_from_repo_marker(&format!("{marker}/src/main")).unwrap(),
-            Some(super::RemoteWorktreePath {
-                root_path: "/srv/worktrees/feature".to_string(),
-                relative_path: Some("src/main".to_string()),
-            })
-        );
+        assert_eq!(workspace_id_from_workspace_marker("/srv/project"), None);
     }
 }

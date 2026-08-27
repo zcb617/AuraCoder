@@ -5009,8 +5009,7 @@ async fn consume_local_archive_notification_suppression(
 
 fn scope_cwd(scope: &ThreadScope) -> String {
     match scope {
-        ThreadScope::Repo { repo_path } => repo_path.to_string(),
-        ThreadScope::Workspace { root_path, .. } => root_path.to_string(),
+        ThreadScope::Project { root_path, .. } => root_path.to_string(),
     }
 }
 

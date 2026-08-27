@@ -33,7 +33,6 @@ pub struct ScheduledTaskInput {
 struct ScheduledRuntimeConfig {
     engine_id: String,
     model_id: String,
-    repo_id: Option<String>,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
 }
@@ -312,10 +311,6 @@ async fn validate_runtime_config(
             .await?,
         );
     }
-    runtime.repo_id = runtime
-        .repo_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
     runtime.service_tier = match runtime
         .service_tier
         .as_deref()
@@ -335,7 +330,6 @@ fn runtime_config_from_thread(thread: &ThreadDto) -> Value {
     serde_json::json!({
         "engineId": thread.engine_id,
         "modelId": thread.model_id,
-        "repoId": thread.repo_id,
         "reasoningEffort": thread.reasoning_effort,
         "serviceTier": metadata
             .and_then(|value| value.get("serviceTier"))

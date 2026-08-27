@@ -2024,8 +2024,7 @@ impl Engine for ClaudeSidecarEngine {
         }
 
         let cwd = match &thread_config.scope {
-            ThreadScope::Repo { repo_path } => repo_path.clone(),
-            ThreadScope::Workspace { root_path, .. } => root_path.clone(),
+            ThreadScope::Project { root_path, .. } => root_path.clone(),
         };
 
         let TurnInput {

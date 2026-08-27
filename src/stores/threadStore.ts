@@ -13,7 +13,6 @@ import { useOnboardingStore } from "./onboardingStore";
 
 interface EnsureThreadInput {
   workspaceId: string;
-  repoId: string | null;
   engineId?: string;
   modelId?: string;
   reasoningEffort?: string | null;
@@ -23,7 +22,6 @@ interface EnsureThreadInput {
 
 interface CreateThreadInput {
   workspaceId: string;
-  repoId: string | null;
   engineId?: string;
   modelId?: string;
   reasoningEffort?: string | null;
@@ -264,7 +262,6 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
   // 创建会话并更新线程集合；失败时保留错误状态并向公共动作传播原始异常。
   createThread: async ({
     workspaceId,
-    repoId,
     engineId,
     modelId,
     reasoningEffort,
@@ -286,10 +283,9 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     try {
       const created = await ipc.createThread(
         workspaceId,
-        repoId,
         effectiveRuntime.engineId,
         effectiveRuntime.modelId,
-        title ?? (repoId ? "Repo Chat" : "Workspace Chat"),
+        title ?? "Workspace Chat",
         effectiveRuntime.reasoningEffort,
         effectiveRuntime.serviceTier,
       );
@@ -340,7 +336,6 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
   },
   ensureThreadForScope: async ({
     workspaceId,
-    repoId,
     engineId,
     modelId,
     reasoningEffort,
@@ -360,7 +355,6 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       const all = await ipc.listThreads(workspaceId);
       const scoped = all.filter(
         (thread) =>
-          thread.repoId === repoId &&
           thread.engineId === effectiveEngine
       );
       const scopedForModel = scoped
@@ -376,10 +370,9 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       if (!selected) {
         selected = await ipc.createThread(
           workspaceId,
-          repoId,
           effectiveEngine,
           effectiveModel,
-          title ?? (repoId ? "Repo Chat" : "General"),
+          title ?? "General",
           effectiveReasoningEffort,
           effectiveServiceTier,
         );

@@ -348,8 +348,6 @@ describe("keepAwakeStore", () => {
 
     expect(command?.isAvailable?.({
       activeWorkspaceId: null,
-      activeRepoPath: null,
-      repos: [],
       close: () => {},
       openSubFlow: () => {},
     } as never)).toBe(false);
@@ -376,8 +374,6 @@ describe("keepAwakeStore", () => {
 
     expect(command?.isAvailable?.({
       activeWorkspaceId: null,
-      activeRepoPath: null,
-      repos: [],
       close: () => {},
       openSubFlow: () => {},
     } as never)).toBe(true);

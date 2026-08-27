@@ -70,7 +70,6 @@ describe("chatStore send", () => {
     mockIpc.syncThreadFromEngine.mockResolvedValue({
       id: "thread-1",
       workspaceId: "workspace-1",
-      repoId: null,
       engineId: "codex",
       modelId: "gpt-5.3-codex",
       engineThreadId: "engine-thread-1",
@@ -753,7 +752,6 @@ describe("chatStore send", () => {
         {
           id: "thread-1",
           workspaceId: "workspace-1",
-          repoId: null,
           engineId: "claude",
           modelId: "fable",
           engineThreadId: "engine-thread-1",
@@ -2111,7 +2109,6 @@ describe("chatStore send", () => {
       const thread = {
         id: "thread-1",
         workspaceId: "workspace-1",
-        repoId: null,
         engineId: "codex" as const,
         modelId: "gpt-5.3-codex",
         engineThreadId: "engine-thread-1",
@@ -2155,7 +2152,6 @@ describe("chatStore send", () => {
       // 三个测试会话属于同一工作区。
       workspaceId: "workspace-1",
       // 测试会话未绑定具体仓库。
-      repoId: null,
       // 通过 Codex 引擎判断激活时需要同步。
       engineId: "codex",
       // 已附加的远端 Codex 会话标识。
@@ -2183,7 +2179,6 @@ describe("chatStore send", () => {
       // 三个测试会话属于同一工作区。
       workspaceId: "workspace-1",
       // 测试会话未绑定具体仓库。
-      repoId: null,
       // 通过 Codex 引擎判断激活时需要同步。
       engineId: "codex",
       // 已附加的远端 Codex 会话标识。
@@ -2211,7 +2206,6 @@ describe("chatStore send", () => {
       // 三个测试会话属于同一工作区。
       workspaceId: "workspace-1",
       // 测试会话未绑定具体仓库。
-      repoId: null,
       // 通过 Codex 引擎判断激活时需要同步。
       engineId: "codex",
       // 已附加的远端 Codex 会话标识。
@@ -2375,7 +2369,6 @@ describe("chatStore send", () => {
     const thread = {
       id: "thread-1",
       workspaceId: "workspace-1",
-      repoId: null,
       engineId: "codex" as const,
       modelId: "gpt-5.3-codex",
       engineThreadId: "engine-thread-1",
@@ -2411,7 +2404,6 @@ describe("chatStore send", () => {
     const thread = {
       id: "thread-1",
       workspaceId: "workspace-1",
-      repoId: null,
       engineId: "codex" as const,
       modelId: "gpt-5.3-codex",
       engineThreadId: "engine-thread-1",

@@ -98,7 +98,7 @@ describe("gitStore", () => {
     mockIpc.applyGitStash.mockResolvedValue(undefined);
     mockIpc.popGitStash.mockResolvedValue(undefined);
     mockIpc.addGitWorktree.mockResolvedValue({
-      path: "/repo/.auracoder/worktrees/feature",
+      path: "/workspace/main/.auracoder/worktrees/feature",
       headSha: null,
       branch: "feature",
       isMain: false,
@@ -117,9 +117,10 @@ describe("gitStore", () => {
       diff: undefined,
       loading: false,
       error: undefined,
-      activeRepoPath: null,
+      workspaceId: null,
+      gitContext: null,
       remoteSyncAction: null,
-      remoteSyncRepoPath: null,
+      remoteSyncWorkspaceId: null,
       activeView: "changes",
       branchScope: "local",
       branches: [],
@@ -129,7 +130,7 @@ describe("gitStore", () => {
       commitsTotal: 0,
       stashes: [],
       worktrees: [],
-      mainRepoPath: null,
+      remotesWorkspaceId: null,
       selectedCommitHash: undefined,
       commitDiff: undefined,
     });
@@ -141,8 +142,8 @@ describe("gitStore", () => {
     mockIpc.fetchGit.mockReturnValueOnce(fetchDeferred.promise);
     mockIpc.pullGit.mockReturnValueOnce(pullDeferred.promise);
 
-    const fetchPromise = useGitStore.getState().fetchRemote("/repo");
-    const pullPromise = useGitStore.getState().pullRemote("/repo");
+    const fetchPromise = useGitStore.getState().fetchRemote("ws-1");
+    const pullPromise = useGitStore.getState().pullRemote("ws-1");
     await flushPromises();
     expect(useGitStore.getState().loading).toBe(true);
 
@@ -159,32 +160,32 @@ describe("gitStore", () => {
     const pushDeferred = deferred<void>();
     mockIpc.pushGit.mockReturnValueOnce(pushDeferred.promise);
 
-    const pushPromise = useGitStore.getState().pushRemote("/repo");
+    const pushPromise = useGitStore.getState().pushRemote("ws-1");
     await flushPromises();
     expect(useGitStore.getState().remoteSyncAction).toBe("push");
-    expect(useGitStore.getState().remoteSyncRepoPath).toBe("/repo");
+    expect(useGitStore.getState().remoteSyncWorkspaceId).toBe("ws-1");
 
     pushDeferred.resolve(undefined);
     await pushPromise;
     expect(useGitStore.getState().remoteSyncAction).toBeNull();
-    expect(useGitStore.getState().remoteSyncRepoPath).toBeNull();
+    expect(useGitStore.getState().remoteSyncWorkspaceId).toBeNull();
   });
 
-  it("ignores stale refresh responses after repo switch", async () => {
+  it("ignores stale refresh responses after workspace switch", async () => {
     const repoAStatus = deferred<GitStatus>();
-    mockIpc.getGitStatus.mockImplementation((repoPath: string) => {
-      if (repoPath === "/repo-a") {
+    mockIpc.getGitStatus.mockImplementation((workspaceId: string) => {
+      if (workspaceId === "ws-a") {
         return repoAStatus.promise;
       }
       return Promise.resolve(makeStatus("repo-b-branch"));
     });
 
-    useGitStore.getState().setActiveRepoPath("/repo-a");
-    const repoARefresh = useGitStore.getState().refresh("/repo-a");
+    useGitStore.setState({ workspaceId: "ws-a" });
+    const repoARefresh = useGitStore.getState().refresh("ws-a");
     await flushPromises();
 
-    useGitStore.getState().setActiveRepoPath("/repo-b");
-    await useGitStore.getState().refresh("/repo-b");
+    useGitStore.setState({ workspaceId: "ws-b" });
+    await useGitStore.getState().refresh("ws-b");
     expect(useGitStore.getState().status?.branch).toBe("repo-b-branch");
 
     repoAStatus.resolve(makeStatus("repo-a-branch"));
@@ -193,27 +194,27 @@ describe("gitStore", () => {
   });
 
   it("refreshes status after bulk stage mutation", async () => {
-    const repoPath = "/repo-stage";
+    const workspaceId = "ws-stage";
     mockIpc.getGitStatus
       .mockResolvedValueOnce(makeStatus("main", []))
       .mockResolvedValueOnce(makeStatus("main", [{ path: "a.ts", indexStatus: "added" }]));
 
-    useGitStore.getState().setActiveRepoPath(repoPath);
-    await useGitStore.getState().refresh(repoPath);
+    useGitStore.setState({ workspaceId });
+    await useGitStore.getState().refresh(workspaceId);
     expect(useGitStore.getState().status?.files).toHaveLength(0);
 
-    await useGitStore.getState().stageMany(repoPath, ["a.ts"]);
-    expect(mockIpc.stageFiles).toHaveBeenCalledWith(repoPath, ["a.ts"]);
+    await useGitStore.getState().stageMany(workspaceId, ["a.ts"]);
+    expect(mockIpc.stageFiles).toHaveBeenCalledWith(workspaceId, ["a.ts"]);
     expect(useGitStore.getState().status?.files).toHaveLength(1);
     expect(useGitStore.getState().status?.files[0]?.path).toBe("a.ts");
   });
 
-  it("falls back to the main repo after removing the active worktree", async () => {
-    const mainRepoPath = "/repo-main";
-    const worktreePath = "/repo-main/.auracoder/worktrees/feature";
+  it("refreshes the same workspace after removing a worktree", async () => {
+    const workspaceId = "ws-main";
+    const worktreePath = "/workspace/main/.auracoder/worktrees/feature";
     const remainingWorktrees: GitWorktree[] = [
       {
-        path: mainRepoPath,
+        path: "/workspace/main",
         headSha: null,
         branch: "main",
         isMain: true,
@@ -225,25 +226,20 @@ describe("gitStore", () => {
     mockIpc.listGitWorktrees.mockResolvedValue(remainingWorktrees);
     mockIpc.getGitStatus.mockResolvedValue(makeStatus("main"));
 
-    useGitStore.setState({
-      activeRepoPath: worktreePath,
-      mainRepoPath,
-      activeView: "worktrees",
-    });
+    useGitStore.setState({ workspaceId, activeView: "worktrees" });
 
     await useGitStore
       .getState()
-      .removeWorktree(mainRepoPath, worktreePath, false, "feature", false);
+      .removeWorktree(workspaceId, worktreePath, false, "feature", false);
 
     expect(mockIpc.removeGitWorktree).toHaveBeenCalledWith(
-      mainRepoPath,
+      workspaceId,
       worktreePath,
       false,
       "feature",
       false,
     );
-    expect(useGitStore.getState().activeRepoPath).toBe(mainRepoPath);
-    expect(useGitStore.getState().mainRepoPath).toBeNull();
-    expect(mockIpc.getGitStatus).toHaveBeenLastCalledWith(mainRepoPath);
+    expect(useGitStore.getState().workspaceId).toBe(workspaceId);
+    expect(mockIpc.getGitStatus).toHaveBeenLastCalledWith(workspaceId);
   });
 });

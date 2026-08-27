@@ -185,13 +185,6 @@ impl CodexCli {
                 if path_utils::paths_equal(&workspace.root_path, &cwd) {
                     return Ok::<_, anyhow::Error>(Some(workspace));
                 }
-                let repos = db::repos::get_repos(&db, &workspace.id)?;
-                if repos
-                    .iter()
-                    .any(|repo| path_utils::paths_equal(&repo.path, &cwd))
-                {
-                    return Ok(Some(workspace));
-                }
             }
             Ok(None)
         })
@@ -1680,7 +1673,6 @@ mod tests {
         ThreadDto {
             id: "thread".to_string(),
             workspace_id: "workspace".to_string(),
-            repo_id: None,
             engine_id: "codex".to_string(),
             model_id: "model".to_string(),
             engine_thread_id: None,

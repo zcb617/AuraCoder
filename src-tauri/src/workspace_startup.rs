@@ -45,13 +45,6 @@ pub enum WorkspaceStartupApplyWhen {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkspaceStartupRepoMode {
-    ActiveRepo,
-    FixedRepo,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum WorkspaceStartupSplitDirection {
     Horizontal,
     Vertical,
@@ -98,9 +91,6 @@ pub struct WorkspaceStartupGroup {
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceStartupWorktreeConfig {
     pub enabled: bool,
-    pub repo_mode: WorkspaceStartupRepoMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -250,12 +240,7 @@ fn normalize_group(
 
     group.name = normalize_non_empty(&group.name, "terminal.groups[].name")?;
     normalize_worktree(group.worktree.as_mut(), workspace_root)?;
-    group.sessions = normalize_sessions(
-        &group.sessions,
-        all_session_ids,
-        workspace_root,
-        group.worktree.as_ref(),
-    )?;
+    group.sessions = normalize_sessions(&group.sessions, all_session_ids, workspace_root)?;
 
     let session_ids = group
         .sessions
@@ -299,7 +284,6 @@ fn normalize_sessions(
     sessions: &[WorkspaceStartupSession],
     all_session_ids: &mut HashSet<String>,
     workspace_root: &Path,
-    worktree: Option<&WorkspaceStartupWorktreeConfig>,
 ) -> anyhow::Result<Vec<WorkspaceStartupSession>> {
     let mut session_ids = HashSet::new();
     let mut normalized = Vec::with_capacity(sessions.len());
@@ -325,7 +309,6 @@ fn normalize_sessions(
             &next.cwd,
             next.cwd_base.unwrap_or(WorkspacePathBase::Workspace),
             workspace_root,
-            worktree,
         )?;
         next.harness_id = next
             .harness_id
@@ -347,7 +330,6 @@ fn normalize_session_cwd(
     raw_cwd: &str,
     cwd_base: WorkspacePathBase,
     workspace_root: &Path,
-    worktree: Option<&WorkspaceStartupWorktreeConfig>,
 ) -> anyhow::Result<String> {
     const FIELD_NAME: &str = "terminal.groups[].sessions[].cwd";
     let cwd = normalize_non_empty(raw_cwd, FIELD_NAME)?;
@@ -379,25 +361,6 @@ fn normalize_session_cwd(
             );
 
             let normalized = path_to_string(&normalize_path(cwd_path));
-            if let Some(worktree) = worktree.filter(|config| config.enabled) {
-                if worktree.repo_mode == WorkspaceStartupRepoMode::FixedRepo {
-                    let repo_path = worktree.repo_path.as_deref().ok_or_else(|| {
-                        anyhow!("worktree.repoPath is required when repoMode='fixed_repo'")
-                    })?;
-                    let repo_root = workspace_root.join(repo_path);
-                    let resolved = resolve_path_inside_workspace(
-                        &normalized,
-                        &repo_root,
-                        workspace_root,
-                        FIELD_NAME,
-                    )?;
-                    ensure_existing_dir(&resolved, FIELD_NAME)?;
-                    let relative = relative_path_from_base(&normalize_path(&repo_root), &resolved)
-                        .context("failed to normalize startup cwd")?;
-                    return Ok(path_to_string(&relative));
-                }
-            }
-
             Ok(normalized)
         }
     }
@@ -430,59 +393,16 @@ fn normalize_worktree(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
 
-    match worktree.repo_mode {
-        WorkspaceStartupRepoMode::ActiveRepo => {
-            worktree.repo_path = None;
-        }
-        WorkspaceStartupRepoMode::FixedRepo => {
-            let raw_repo_path = worktree.repo_path.as_deref().ok_or_else(|| {
-                anyhow!("worktree.repoPath is required when repoMode='fixed_repo'")
-            })?;
-            worktree.repo_path = Some(normalize_repo_path(raw_repo_path, workspace_root)?);
-        }
-    }
-
     worktree.base_dir = worktree
         .base_dir
         .as_deref()
-        .map(|raw_base_dir| {
-            normalize_base_dir(
-                raw_base_dir,
-                workspace_root,
-                worktree.repo_mode,
-                worktree.repo_path.as_deref(),
-            )
-        })
+        .map(|raw_base_dir| normalize_base_dir(raw_base_dir, workspace_root))
         .transpose()?;
 
     Ok(())
 }
 
-fn normalize_repo_path(raw_path: &str, workspace_root: &Path) -> anyhow::Result<String> {
-    let trimmed = raw_path.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("worktree.repoPath cannot be empty");
-    }
-
-    let resolved = resolve_path_inside_workspace(
-        trimmed,
-        workspace_root,
-        workspace_root,
-        "worktree.repoPath",
-    )?;
-    ensure_existing_dir(&resolved, "worktree.repoPath")?;
-    ensure_git_repository(&resolved, "worktree.repoPath")?;
-    let relative = relative_path_from_base(workspace_root, &resolved)
-        .context("failed to normalize worktree.repoPath")?;
-    Ok(path_to_string(&relative))
-}
-
-fn normalize_base_dir(
-    raw_base_dir: &str,
-    workspace_root: &Path,
-    repo_mode: WorkspaceStartupRepoMode,
-    repo_path: Option<&str>,
-) -> anyhow::Result<String> {
+fn normalize_base_dir(raw_base_dir: &str, workspace_root: &Path) -> anyhow::Result<String> {
     let trimmed = raw_base_dir.trim();
     if trimmed.is_empty() {
         anyhow::bail!("worktree.baseDir cannot be empty");
@@ -499,29 +419,11 @@ fn normalize_base_dir(
         return Ok(path_to_string(&resolved));
     }
 
-    match repo_mode {
-        WorkspaceStartupRepoMode::ActiveRepo => {
-            anyhow::ensure!(
-                !uses_parent_components(base_dir_path),
-                "worktree.baseDir cannot contain parent segments when repoMode='active_repo'"
-            );
-            Ok(path_to_string(&normalize_path(base_dir_path)))
-        }
-        WorkspaceStartupRepoMode::FixedRepo => {
-            let repo_root = workspace_root.join(repo_path.ok_or_else(|| {
-                anyhow!("worktree.repoPath is required when repoMode='fixed_repo'")
-            })?);
-            let resolved = resolve_path_inside_workspace(
-                trimmed,
-                &repo_root,
-                workspace_root,
-                "worktree.baseDir",
-            )?;
-            let relative = relative_path_from_base(&normalize_path(&repo_root), &resolved)
-                .context("failed to normalize worktree.baseDir")?;
-            Ok(path_to_string(&relative))
-        }
-    }
+    anyhow::ensure!(
+        !uses_parent_components(base_dir_path),
+        "worktree.baseDir cannot contain parent segments"
+    );
+    Ok(path_to_string(&normalize_path(base_dir_path)))
 }
 
 fn resolve_path_inside_workspace(
@@ -588,12 +490,6 @@ fn ensure_existing_dir(path: &Path, field_name: &str) -> anyhow::Result<()> {
         path.is_dir(),
         "{field_name} must reference an existing directory"
     );
-    Ok(())
-}
-
-fn ensure_git_repository(path: &Path, field_name: &str) -> anyhow::Result<()> {
-    git2::Repository::open(path)
-        .with_context(|| format!("{field_name} must reference an existing git repository"))?;
     Ok(())
 }
 
@@ -953,88 +849,63 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fixed_repo_path_that_escapes_workspace() {
+    fn accepts_project_root_worktree_configuration() {
         let workspace_root = workspace_root();
         let mut preset = preset();
         preset.terminal.as_mut().unwrap().groups[0].worktree =
             Some(WorkspaceStartupWorktreeConfig {
                 enabled: true,
-                repo_mode: WorkspaceStartupRepoMode::FixedRepo,
-                repo_path: Some("../outside-repo".to_string()),
                 base_branch: None,
                 base_dir: None,
                 branch_prefix: None,
             });
 
-        let error = normalize_workspace_startup_preset(preset, &workspace_root)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("worktree.repoPath must stay inside the workspace root"));
+        normalize_workspace_startup_preset(preset, &workspace_root).expect("project-root worktree");
     }
 
     #[test]
-    fn rejects_parent_escaped_absolute_repo_path() {
+    fn accepts_project_root_worktree_without_nested_path() {
         let workspace_root = workspace_root();
         let mut preset = preset();
         preset.terminal.as_mut().unwrap().groups[0].worktree =
             Some(WorkspaceStartupWorktreeConfig {
                 enabled: true,
-                repo_mode: WorkspaceStartupRepoMode::FixedRepo,
-                repo_path: Some(
-                    workspace_root
-                        .join("../outside-repo")
-                        .to_string_lossy()
-                        .to_string(),
-                ),
                 base_branch: None,
                 base_dir: None,
                 branch_prefix: None,
             });
 
-        let error = normalize_workspace_startup_preset(preset, &workspace_root)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("worktree.repoPath must stay inside the workspace root"));
+        normalize_workspace_startup_preset(preset, &workspace_root).expect("project-root worktree");
     }
 
     #[test]
-    fn rejects_missing_fixed_repo_path() {
+    fn accepts_project_root_worktree_without_nested_repo() {
         let workspace_root = workspace_root();
         let mut preset = preset();
         preset.terminal.as_mut().unwrap().groups[0].worktree =
             Some(WorkspaceStartupWorktreeConfig {
                 enabled: true,
-                repo_mode: WorkspaceStartupRepoMode::FixedRepo,
-                repo_path: Some("apps/missing-repo".to_string()),
                 base_branch: None,
                 base_dir: None,
                 branch_prefix: None,
             });
 
-        let error = normalize_workspace_startup_preset(preset, &workspace_root)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("must reference an existing directory"));
+        normalize_workspace_startup_preset(preset, &workspace_root).expect("project-root worktree");
     }
 
     #[test]
-    fn rejects_fixed_repo_path_that_is_not_a_git_repository() {
+    fn accepts_project_root_worktree_without_git_subdirectory() {
         let workspace_root = workspace_root();
         let mut preset = preset();
         preset.terminal.as_mut().unwrap().groups[0].worktree =
             Some(WorkspaceStartupWorktreeConfig {
                 enabled: true,
-                repo_mode: WorkspaceStartupRepoMode::FixedRepo,
-                repo_path: Some("apps/not-a-repo".to_string()),
                 base_branch: None,
                 base_dir: None,
                 branch_prefix: None,
             });
 
-        let error = normalize_workspace_startup_preset(preset, &workspace_root)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("existing git repository"));
+        normalize_workspace_startup_preset(preset, &workspace_root).expect("project-root worktree");
     }
 
     #[test]
@@ -1044,8 +915,6 @@ mod tests {
         preset.terminal.as_mut().unwrap().groups[0].worktree =
             Some(WorkspaceStartupWorktreeConfig {
                 enabled: true,
-                repo_mode: WorkspaceStartupRepoMode::FixedRepo,
-                repo_path: Some("apps/repo".to_string()),
                 base_branch: None,
                 base_dir: Some("../../../outside-worktrees".to_string()),
                 branch_prefix: None,
@@ -1054,20 +923,18 @@ mod tests {
         let error = normalize_workspace_startup_preset(preset, &workspace_root)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("worktree.baseDir must stay inside the workspace root"));
+        assert!(error.contains("worktree.baseDir cannot contain parent segments"));
     }
 
     #[test]
-    fn keeps_fixed_repo_base_dir_relative_when_it_stays_inside_workspace() {
+    fn keeps_project_root_base_dir_relative() {
         let workspace_root = workspace_root();
         let mut preset = preset();
         preset.terminal.as_mut().unwrap().groups[0].worktree =
             Some(WorkspaceStartupWorktreeConfig {
                 enabled: true,
-                repo_mode: WorkspaceStartupRepoMode::FixedRepo,
-                repo_path: Some("apps/repo".to_string()),
                 base_branch: None,
-                base_dir: Some("../worktrees".to_string()),
+                base_dir: Some("worktrees".to_string()),
                 branch_prefix: None,
             });
 
@@ -1082,7 +949,6 @@ mod tests {
             .worktree
             .unwrap();
 
-        assert_eq!(worktree.repo_path.as_deref(), Some("apps/repo"));
-        assert_eq!(worktree.base_dir.as_deref(), Some("../worktrees"));
+        assert_eq!(worktree.base_dir.as_deref(), Some("worktrees"));
     }
 }

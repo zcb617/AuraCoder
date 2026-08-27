@@ -1046,7 +1046,6 @@ pub fn search_messages(
         "SELECT m.thread_id,
             t.title,
             w.name,
-            t.repo_id,
             m.id,
             COALESCE(m.content, '')
      FROM messages_fts
@@ -1065,9 +1064,8 @@ pub fn search_messages(
             thread_id: row.get(0)?,
             thread_title: row.get(1)?,
             workspace_name: row.get(2)?,
-            repo_id: row.get(3)?,
-            message_id: row.get(4)?,
-            snippet: build_search_result_snippet(&row.get::<_, String>(5)?, query),
+            message_id: row.get(3)?,
+            snippet: build_search_result_snippet(&row.get::<_, String>(4)?, query),
         })
     })?;
 
@@ -1524,16 +1522,14 @@ mod tests {
     fn test_workspace(db: &Database) -> String {
         let root = std::env::temp_dir().join(format!("auracoder-workspace-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("failed to create temp workspace root");
-        let workspace =
-            workspaces::upsert_workspace(db, root.to_string_lossy().as_ref(), Some(1)).unwrap();
+        let workspace = workspaces::upsert_workspace(db, root.to_string_lossy().as_ref()).unwrap();
         workspace.id
     }
 
     fn test_thread(db: &Database) -> String {
         let workspace_id = test_workspace(db);
         let thread =
-            threads::create_thread(db, &workspace_id, None, "codex", "gpt-5.3-codex", "test")
-                .unwrap();
+            threads::create_thread(db, &workspace_id, "codex", "gpt-5.3-codex", "test").unwrap();
         thread.id
     }
 
@@ -1541,8 +1537,8 @@ mod tests {
     fn created_times_use_the_operating_system_offset() {
         let db = test_db();
         let thread_id = test_thread(&db);
-        let message = insert_user_message(&db, &thread_id, "hello", None, None, None, None)
-            .unwrap();
+        let message =
+            insert_user_message(&db, &thread_id, "hello", None, None, None, None).unwrap();
         let thread = threads::get_thread(&db, &thread_id).unwrap().unwrap();
         let expected_offset = chrono::Local::now().offset().local_minus_utc();
 
@@ -1930,8 +1926,7 @@ mod tests {
         let db = test_db();
         let workspace_id = test_workspace(&db);
         let thread =
-            threads::create_thread(&db, &workspace_id, None, "codex", "gpt-5.3-codex", "test")
-                .unwrap();
+            threads::create_thread(&db, &workspace_id, "codex", "gpt-5.3-codex", "test").unwrap();
         insert_user_message(
             &db,
             &thread.id,
@@ -1952,8 +1947,7 @@ mod tests {
         let db = test_db();
         let workspace_id = test_workspace(&db);
         let thread =
-            threads::create_thread(&db, &workspace_id, None, "codex", "gpt-5.3-codex", "test")
-                .unwrap();
+            threads::create_thread(&db, &workspace_id, "codex", "gpt-5.3-codex", "test").unwrap();
         let message = insert_assistant_placeholder(&db, &thread.id, None, None, None).unwrap();
 
         let blocks = json!([
@@ -1980,8 +1974,7 @@ mod tests {
         let db = test_db();
         let workspace_id = test_workspace(&db);
         let thread =
-            threads::create_thread(&db, &workspace_id, None, "codex", "gpt-5.3-codex", "test")
-                .unwrap();
+            threads::create_thread(&db, &workspace_id, "codex", "gpt-5.3-codex", "test").unwrap();
         let message = insert_assistant_placeholder(&db, &thread.id, None, None, None).unwrap();
 
         // Simulate a row written before the fix: blocks_json holds the reply,
@@ -2013,8 +2006,7 @@ mod tests {
         let db = test_db();
         let workspace_id = test_workspace(&db);
         let thread =
-            threads::create_thread(&db, &workspace_id, None, "codex", "gpt-5.3-codex", "test")
-                .unwrap();
+            threads::create_thread(&db, &workspace_id, "codex", "gpt-5.3-codex", "test").unwrap();
         let content = format!(
             "{} Workspace marker {}",
             "opening prelude ".repeat(20),
@@ -2033,8 +2025,7 @@ mod tests {
         let db = test_db();
         let workspace_id = test_workspace(&db);
         let thread =
-            threads::create_thread(&db, &workspace_id, None, "codex", "gpt-5.3-codex", "test")
-                .unwrap();
+            threads::create_thread(&db, &workspace_id, "codex", "gpt-5.3-codex", "test").unwrap();
         insert_user_message(
             &db,
             &thread.id,
@@ -2067,8 +2058,7 @@ mod tests {
         let db = test_db();
         let workspace_id = test_workspace(&db);
         let thread =
-            threads::create_thread(&db, &workspace_id, None, "codex", "gpt-5.3-codex", "test")
-                .unwrap();
+            threads::create_thread(&db, &workspace_id, "codex", "gpt-5.3-codex", "test").unwrap();
         insert_user_message(
             &db,
             &thread.id,
@@ -2092,8 +2082,7 @@ mod tests {
         let db = test_db();
         let workspace_id = test_workspace(&db);
         let thread =
-            threads::create_thread(&db, &workspace_id, None, "codex", "gpt-5.3-codex", "test")
-                .unwrap();
+            threads::create_thread(&db, &workspace_id, "codex", "gpt-5.3-codex", "test").unwrap();
         let content = format!(
             "{} CAFÉ marker {}",
             "opening prelude ".repeat(20),
@@ -2113,17 +2102,10 @@ mod tests {
         let db = test_db();
         let workspace_id = test_workspace(&db);
         let active_thread =
-            threads::create_thread(&db, &workspace_id, None, "codex", "gpt-5.3-codex", "active")
+            threads::create_thread(&db, &workspace_id, "codex", "gpt-5.3-codex", "active").unwrap();
+        let archived_thread =
+            threads::create_thread(&db, &workspace_id, "codex", "gpt-5.3-codex", "archived")
                 .unwrap();
-        let archived_thread = threads::create_thread(
-            &db,
-            &workspace_id,
-            None,
-            "codex",
-            "gpt-5.3-codex",
-            "archived",
-        )
-        .unwrap();
 
         insert_user_message(
             &db,

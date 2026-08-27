@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Repo, TerminalNotification, TerminalSession, Workspace } from "../types";
+import type { TerminalNotification, TerminalSession, Workspace } from "../types";
 
 const mockIpc = vi.hoisted(() => ({
   terminalCreateSession: vi.fn(),
@@ -10,7 +10,7 @@ const mockIpc = vi.hoisted(() => ({
   terminalSetNotificationFocus: vi.fn(),
   addGitWorktree: vi.fn(),
   removeGitWorktree: vi.fn(),
-  getRepos: vi.fn(),
+  getWorkspaceGitContext: vi.fn(),
   launchHarness: vi.fn(),
   getWorkspaceStartupPreset: vi.fn(),
 }));
@@ -59,21 +59,9 @@ function makeWorkspace(id: string, rootPath: string): Workspace {
     id,
     name: id,
     rootPath,
-    scanDepth: 3,
+    trustLevel: "standard",
     createdAt: new Date(0).toISOString(),
     lastOpenedAt: new Date(0).toISOString(),
-  };
-}
-
-function makeRepo(id: string, workspaceId: string, path: string): Repo {
-  return {
-    id,
-    workspaceId,
-    name: id,
-    path,
-    defaultBranch: "main",
-    isActive: true,
-    trustLevel: "trusted",
   };
 }
 
@@ -102,9 +90,6 @@ describe("terminalStore.createMultiSessionGroup", () => {
       workspaces: [],
       archivedWorkspaces: [],
       activeWorkspaceId: null,
-      repos: [],
-      activeRepoId: null,
-      reposLoading: false,
       loading: false,
       error: undefined,
     });
@@ -115,7 +100,7 @@ describe("terminalStore.createMultiSessionGroup", () => {
     mockIpc.terminalSetNotificationFocus.mockResolvedValue(undefined);
     mockIpc.addGitWorktree.mockResolvedValue(undefined);
     mockIpc.removeGitWorktree.mockResolvedValue(undefined);
-    mockIpc.getRepos.mockResolvedValue([]);
+    mockIpc.getWorkspaceGitContext.mockResolvedValue({ kind: "repository", workspaceId: "ws-1", rootPath: "/workspace/ws-1", name: "ws-1", defaultBranch: "main" });
     mockIpc.launchHarness.mockResolvedValue(null);
     mockIpc.getWorkspaceStartupPreset.mockResolvedValue(null);
     mockWriteCommandToNewSession.mockResolvedValue(undefined);
@@ -152,6 +137,15 @@ describe("terminalStore.createMultiSessionGroup", () => {
   });
 
   it("uses unique worktree branch and path names for repeated harnesses", async () => {
+    const workspace = makeWorkspace("ws-1", "/workspace/ws-1");
+    useWorkspaceStore.setState({ workspaces: [workspace], activeWorkspaceId: "ws-1" });
+    mockIpc.getWorkspaceGitContext.mockResolvedValue({
+      kind: "repository",
+      workspaceId: workspace.id,
+      rootPath: workspace.rootPath,
+      name: workspace.name,
+      defaultBranch: "main",
+    });
     mockIpc.terminalCreateSession
       .mockResolvedValueOnce(makeSession("s1"))
       .mockResolvedValueOnce(makeSession("s2"));
@@ -164,10 +158,8 @@ describe("terminalStore.createMultiSessionGroup", () => {
       ],
       {
         enabled: true,
-        repoMode: "fixed_repo",
-        repoPath: "/repo",
         baseBranch: "main",
-        baseDir: "/repo/.auracoder/worktrees",
+        baseDir: ".auracoder/worktrees",
         branchPrefix: "auracoder",
       },
       120,
@@ -182,8 +174,10 @@ describe("terminalStore.createMultiSessionGroup", () => {
     const runId = /^auracoder\/([^/]+)\/codex-1$/.exec(first[2] as string)?.[1];
 
     expect(runId).toBeTruthy();
-    expect(first[1]).toBe(`/repo/.auracoder/worktrees/${runId}/codex-1`);
-    expect(second[1]).toBe(`/repo/.auracoder/worktrees/${runId}/codex-2`);
+    expect(first[0]).toBe("ws-1");
+    expect(second[0]).toBe("ws-1");
+    expect(first[1]).toBe(`/workspace/ws-1/.auracoder/worktrees/${runId}/codex-1`);
+    expect(second[1]).toBe(`/workspace/ws-1/.auracoder/worktrees/${runId}/codex-2`);
     expect(first[2]).toBe(`auracoder/${runId}/codex-1`);
     expect(second[2]).toBe(`auracoder/${runId}/codex-2`);
   });
@@ -196,13 +190,13 @@ describe("terminalStore.createMultiSessionGroup", () => {
     await expect(
       useTerminalStore.getState().removeGroupWorktrees("ws-1", [
         {
-          repoPath: "/repo",
-          worktreePath: "/repo/.auracoder/worktrees/r1/agent-1",
+          workspaceId: "ws-1",
+          worktreePath: "/workspace/ws-1/.auracoder/worktrees/r1/agent-1",
           branch: "auracoder/r1/agent-1",
         },
         {
-          repoPath: "/repo",
-          worktreePath: "/repo/.auracoder/worktrees/r1/agent-2",
+          workspaceId: "ws-1",
+          worktreePath: "/workspace/ws-1/.auracoder/worktrees/r1/agent-2",
           branch: "auracoder/r1/agent-2",
         },
       ]),
@@ -212,16 +206,16 @@ describe("terminalStore.createMultiSessionGroup", () => {
     expect(workspace?.error).toContain("auracoder/r1/agent-2");
     expect(mockIpc.removeGitWorktree).toHaveBeenNthCalledWith(
       1,
-      "/repo",
-      "/repo/.auracoder/worktrees/r1/agent-1",
+      "ws-1",
+      "/workspace/ws-1/.auracoder/worktrees/r1/agent-1",
       true,
       "auracoder/r1/agent-1",
       true,
     );
     expect(mockIpc.removeGitWorktree).toHaveBeenNthCalledWith(
       2,
-      "/repo",
-      "/repo/.auracoder/worktrees/r1/agent-2",
+      "ws-1",
+      "/workspace/ws-1/.auracoder/worktrees/r1/agent-2",
       true,
       "auracoder/r1/agent-2",
       true,
@@ -251,8 +245,8 @@ describe("terminalStore.createMultiSessionGroup", () => {
                   autoDetectedHarness: false,
                   launchHarnessOnCreate: true,
                   worktree: {
-                    repoPath: "/repo",
-                    worktreePath: "/repo/.auracoder/worktrees/r1/agent-1",
+                    workspaceId: "ws-1",
+                    worktreePath: "/workspace/ws-1/.auracoder/worktrees/r1/agent-1",
                     branch: "auracoder/r1/agent-1",
                   },
                 },
@@ -278,6 +272,15 @@ describe("terminalStore.createMultiSessionGroup", () => {
   });
 
   it("reports rollback cleanup failures when group creation fails", async () => {
+    const workspace = makeWorkspace("ws-1", "/workspace/ws-1");
+    useWorkspaceStore.setState({ workspaces: [workspace], activeWorkspaceId: "ws-1" });
+    mockIpc.getWorkspaceGitContext.mockResolvedValue({
+      kind: "repository",
+      workspaceId: workspace.id,
+      rootPath: workspace.rootPath,
+      name: workspace.name,
+      defaultBranch: "main",
+    });
     mockIpc.addGitWorktree
       .mockResolvedValueOnce(undefined)
       .mockResolvedValueOnce(undefined);
@@ -296,10 +299,8 @@ describe("terminalStore.createMultiSessionGroup", () => {
       ],
       {
         enabled: true,
-        repoMode: "fixed_repo",
-        repoPath: "/repo",
         baseBranch: "main",
-        baseDir: "/repo/.auracoder/worktrees",
+        baseDir: ".auracoder/worktrees",
         branchPrefix: "auracoder",
       },
       120,
@@ -307,10 +308,10 @@ describe("terminalStore.createMultiSessionGroup", () => {
     );
 
     expect(result).toBeNull();
-    const workspace = useTerminalStore.getState().workspaces["ws-1"];
-    expect(workspace?.error).toContain("create failed");
-    expect(workspace?.error).toContain("Cleanup failed for 1 worktree(s)");
-    expect(workspace?.error).toContain("auracoder/");
+    const terminalWorkspace = useTerminalStore.getState().workspaces["ws-1"];
+    expect(terminalWorkspace?.error).toContain("create failed");
+    expect(terminalWorkspace?.error).toContain("Cleanup failed for 1 worktree(s)");
+    expect(terminalWorkspace?.error).toContain("auracoder/");
   });
 
   it("syncs a saved startup preset without mutating the live layout", () => {
@@ -658,26 +659,16 @@ describe("terminalStore.createMultiSessionGroup", () => {
     expect(workspace?.pendingStartupPreset).toEqual(preset);
   });
 
-  it("uses the remembered active repo for active_repo startup worktrees", async () => {
-    mockLocalStorage.getItem.mockImplementation((key: string) =>
-      key === "auracoder:lastActiveRepoByWorkspace"
-        ? JSON.stringify({ "ws-1": "repo-2" })
-        : null,
-    );
+  it("uses the workspace root and workspace identity for startup worktrees", async () => {
     mockIpc.terminalCreateSession.mockResolvedValueOnce(makeSession("s1"));
 
     const workspace = makeWorkspace("ws-1", "/workspace/ws-1");
-    const repo1 = makeRepo("repo-1", workspace.id, "/workspace/ws-1/repo-a");
-    const repo2 = makeRepo("repo-2", workspace.id, "/workspace/ws-1/repo-b");
-    mockIpc.getRepos.mockResolvedValue([repo1, repo2]);
+    mockIpc.getWorkspaceGitContext.mockResolvedValue({ kind: "repository", workspaceId: "ws-1", rootPath: workspace.rootPath, name: workspace.name, defaultBranch: "main" });
 
     useWorkspaceStore.setState({
       workspaces: [workspace],
       archivedWorkspaces: [],
       activeWorkspaceId: null,
-      repos: [],
-      activeRepoId: null,
-      reposLoading: false,
       loading: false,
       error: undefined,
     });
@@ -691,11 +682,9 @@ describe("terminalStore.createMultiSessionGroup", () => {
         groups: [
           {
             id: "g1",
-            name: "Repo worktree",
+            name: "Project worktree",
             worktree: {
               enabled: true,
-              repoMode: "active_repo",
-              repoPath: null,
               baseBranch: "main",
               baseDir: ".auracoder/worktrees",
               branchPrefix: "auracoder/preset",
@@ -711,8 +700,8 @@ describe("terminalStore.createMultiSessionGroup", () => {
 
     expect(applied).toBe(true);
     expect(mockIpc.addGitWorktree).toHaveBeenCalledTimes(1);
-    expect(mockIpc.addGitWorktree.mock.calls[0]?.[0]).toBe(repo2.path);
-    expect(mockIpc.addGitWorktree.mock.calls[0]?.[1]).toContain(`${repo2.path}/.auracoder/worktrees/`);
+    expect(mockIpc.addGitWorktree.mock.calls[0]?.[0]).toBe("ws-1");
+    expect(mockIpc.addGitWorktree.mock.calls[0]?.[1]).toContain(`${workspace.rootPath}/.auracoder/worktrees/`);
   });
 
   it("launches saved harness commands even when harness scanning is still in flight", async () => {
@@ -724,9 +713,6 @@ describe("terminalStore.createMultiSessionGroup", () => {
       workspaces: [workspace],
       archivedWorkspaces: [],
       activeWorkspaceId: "ws-1",
-      repos: [],
-      activeRepoId: null,
-      reposLoading: false,
       loading: false,
       error: undefined,
     });
@@ -776,9 +762,6 @@ describe("terminalStore.createMultiSessionGroup", () => {
       workspaces: [workspace],
       archivedWorkspaces: [],
       activeWorkspaceId: "ws-1",
-      repos: [],
-      activeRepoId: null,
-      reposLoading: false,
       loading: false,
       error: undefined,
     });
@@ -842,9 +825,6 @@ describe("terminalStore.createMultiSessionGroup", () => {
       workspaces: [workspace],
       archivedWorkspaces: [],
       activeWorkspaceId: "ws-1",
-      repos: [],
-      activeRepoId: null,
-      reposLoading: false,
       loading: false,
       error: undefined,
     });
@@ -924,9 +904,6 @@ describe("terminalStore.createMultiSessionGroup", () => {
       workspaces: [workspace],
       archivedWorkspaces: [],
       activeWorkspaceId: "ws-1",
-      repos: [],
-      activeRepoId: null,
-      reposLoading: false,
       loading: false,
       error: undefined,
     });
@@ -982,9 +959,6 @@ describe("terminalStore.createMultiSessionGroup", () => {
       workspaces: [workspaceA, workspaceB],
       archivedWorkspaces: [],
       activeWorkspaceId: "ws-2",
-      repos: [],
-      activeRepoId: null,
-      reposLoading: false,
       loading: false,
       error: undefined,
     });

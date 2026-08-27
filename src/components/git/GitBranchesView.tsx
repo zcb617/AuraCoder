@@ -8,10 +8,12 @@ import { getActionMenuPosition } from "./actionMenuPosition";
 import { toast } from "../../stores/toastStore";
 import { useGitStore } from "../../stores/gitStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
-import type { Repo, GitBranchScope } from "../../types";
+import type { GitBranchScope, WorkspaceGitContext } from "../../types";
+
+type GitBranchContext = Extract<WorkspaceGitContext, { kind: "repository" }>;
 
 interface Props {
-  repo: Repo;
+  context: GitBranchContext;
   onError: (error: string | undefined) => void;
 }
 
@@ -26,7 +28,7 @@ interface ActionMenuState {
   left: number;
 }
 
-export function GitBranchesView({ repo, onError }: Props) {
+export function GitBranchesView({ context, onError }: Props) {
   const { t, i18n } = useTranslation("git");
   const {
     branchScope,
@@ -75,18 +77,18 @@ export function GitBranchesView({ repo, onError }: Props) {
   useEffect(() => {
     if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
     setLocalSearch("");
-    void loadBranches(repo.path, branchScope, "");
-  }, [repo.path, branchScope, loadBranches]);
+    void loadBranches(context.workspaceId, branchScope, "");
+  }, [context.workspaceId, branchScope, loadBranches]);
 
   const onSearchChange = useCallback(
     (value: string) => {
       setLocalSearch(value);
       if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
       searchDebounceRef.current = setTimeout(() => {
-        void setBranchSearch(repo.path, value);
+        void setBranchSearch(context.workspaceId, value);
       }, 300);
     },
-    [repo.path, setBranchSearch],
+    [context.workspaceId, setBranchSearch],
   );
 
   useEffect(
@@ -191,7 +193,7 @@ export function GitBranchesView({ repo, onError }: Props) {
     setLoadingKey(`checkout:${branchName}`);
     try {
       onError(undefined);
-      await checkoutBranch(repo.path, branchName, isRemote);
+      await checkoutBranch(context.workspaceId, branchName, isRemote);
       toast.success(t("branches.toasts.switchedTo", { branchName }));
     } catch (e) {
       onError(String(e));
@@ -206,7 +208,7 @@ export function GitBranchesView({ repo, onError }: Props) {
     setLoadingKey("create");
     try {
       onError(undefined);
-      await createBranch(repo.path, name, null);
+      await createBranch(context.workspaceId, name, null);
       if (activeWorkspaceId) pushBranchHistory(activeWorkspaceId, name);
       branchHistCursorRef.current = -1;
       branchLiveDraftRef.current = "";
@@ -229,7 +231,7 @@ export function GitBranchesView({ repo, onError }: Props) {
     setLoadingKey(`rename:${oldName}`);
     try {
       onError(undefined);
-      await renameBranch(repo.path, oldName, newName);
+      await renameBranch(context.workspaceId, oldName, newName);
       setRenamingBranch(null);
       toast.success(t("branches.toasts.renamed"));
     } catch (e) {
@@ -249,11 +251,11 @@ export function GitBranchesView({ repo, onError }: Props) {
     try {
       onError(undefined);
       setConfirmingDelete(null);
-      await deleteBranch(repo.path, branchName, false);
+      await deleteBranch(context.workspaceId, branchName, false);
       toast.success(t("branches.toasts.deleted", { branchName }));
     } catch (e) {
       try {
-        await deleteBranch(repo.path, branchName, true);
+        await deleteBranch(context.workspaceId, branchName, true);
         toast.success(t("branches.toasts.deleted", { branchName }));
       } catch (e2) {
         onError(String(e2));
@@ -611,7 +613,7 @@ export function GitBranchesView({ repo, onError }: Props) {
               onClick={() => {
                 if (loadingMore) return;
                 setLoadingMore(true);
-                void loadMoreBranches(repo.path).finally(() => setLoadingMore(false));
+                void loadMoreBranches(context.workspaceId).finally(() => setLoadingMore(false));
               }}
               disabled={loadingMore}
               style={{ width: "100%", justifyContent: "center", fontSize: 12, opacity: loadingMore ? 0.6 : 1 }}

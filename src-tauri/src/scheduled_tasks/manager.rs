@@ -35,7 +35,6 @@ struct ScheduledTaskEvent {
 struct ScheduledRuntimeConfig {
     engine_id: String,
     model_id: String,
-    repo_id: Option<String>,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
 }
@@ -282,7 +281,6 @@ async fn create_scheduled_thread(
     threads::create_thread_with_defaults(
         state,
         task.workspace_id.clone(),
-        runtime.repo_id.clone(),
         runtime.engine_id.clone(),
         runtime.model_id.clone(),
         title,
@@ -306,7 +304,6 @@ fn runtime_config_for_task(
     Ok(ScheduledRuntimeConfig {
         engine_id: thread.engine_id.clone(),
         model_id: thread.model_id.clone(),
-        repo_id: thread.repo_id.clone(),
         reasoning_effort: thread.reasoning_effort.clone(),
         service_tier: thread.engine_metadata.as_ref()
             .and_then(|value| value.get("serviceTier"))
@@ -358,7 +355,6 @@ mod tests {
         ThreadDto {
             id: "thread-1".to_string(),
             workspace_id: "workspace-1".to_string(),
-            repo_id: Some("repo-1".to_string()),
             engine_id: "codex".to_string(),
             model_id: "gpt-selected".to_string(),
             engine_thread_id: None,
@@ -388,7 +384,6 @@ mod tests {
         assert_eq!(runtime.model_id, "gpt-selected");
         assert_eq!(runtime.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(runtime.service_tier.as_deref(), Some("fast"));
-        assert_eq!(runtime.repo_id.as_deref(), Some("repo-1"));
     }
 
     #[test]

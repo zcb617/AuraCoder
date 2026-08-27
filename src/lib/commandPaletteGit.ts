@@ -1,44 +1,25 @@
-import type { GitStatus, Repo } from "../types";
+import type { GitStatus, WorkspaceGitContext } from "../types";
 
 interface ResolveCommandPaletteGitStatusOptions {
-  repoPath: string | null;
-  activeRepoPath: string | null;
+  workspaceId: string | null;
+  gitContext: WorkspaceGitContext | null;
   activeStatus?: GitStatus;
-  loadStatus: (repoPath: string) => Promise<GitStatus>;
+  loadStatus: (workspaceId: string) => Promise<GitStatus>;
 }
 
-export function isRepoScopedGitCommandAvailable(
-  activeRepoPath: string | null,
-  repos: Repo[],
-): boolean {
-  return Boolean(activeRepoPath) || hasMultipleActiveGitRepos(repos);
+/** 判断当前项目是否具备项目级 Git 操作上下文。 */
+export function isWorkspaceGitCommandAvailable(gitContext: WorkspaceGitContext | null): boolean {
+  return gitContext?.kind === "repository";
 }
 
-export function getActiveGitRepos(repos: Repo[]): Repo[] {
-  return repos.filter((repo) => repo.isActive);
-}
-
-export function hasMultipleActiveGitRepos(repos: Repo[]): boolean {
-  return getActiveGitRepos(repos).length > 1;
-}
-
+/** 读取命令面板所需的当前项目 Git 状态。 */
 export async function resolveCommandPaletteGitStatus({
-  repoPath,
-  activeRepoPath,
+  workspaceId,
+  gitContext,
   activeStatus,
   loadStatus,
 }: ResolveCommandPaletteGitStatusOptions): Promise<GitStatus | undefined> {
-  if (!repoPath) {
-    return undefined;
-  }
-
-  if (repoPath === activeRepoPath && activeStatus) {
-    return activeStatus;
-  }
-
-  return loadStatus(repoPath);
-}
-
-export function shouldPersistPickedRepoSelection(commandId: string): boolean {
-  return commandId === "git-discard-all";
+  if (!workspaceId || gitContext?.kind !== "repository") return undefined;
+  if (activeStatus) return activeStatus;
+  return loadStatus(workspaceId);
 }

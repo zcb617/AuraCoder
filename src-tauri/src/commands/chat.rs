@@ -46,8 +46,8 @@ use crate::{
     },
     models::{
         ActionOutputDto, EngineInfoDto, EngineModelDto, MessageDto, MessageStatusDto,
-        MessageWindowCursorDto, MessageWindowDto, RepoDto, SearchResultDto, SteerReceiptDto,
-        ThreadDto, ThreadStatusDto, ThreadUpdateDto, TrustLevelDto,
+        MessageWindowCursorDto, MessageWindowDto, SearchResultDto, SteerReceiptDto, ThreadDto,
+        ThreadStatusDto, ThreadUpdateDto, TrustLevelDto,
     },
     runtime_env,
     ssh::remote_attachments::{self, RemoteAttachmentBatch},
@@ -734,12 +734,8 @@ pub(crate) async fn send_message_inner(
             thread.engine_id
         ));
     }
-    let referenced_thread = resolve_auracoder_thread_reference(
-        state,
-        &thread,
-        referenced_thread_id.as_deref(),
-    )
-    .await?;
+    let referenced_thread =
+        resolve_auracoder_thread_reference(state, &thread, referenced_thread_id.as_deref()).await?;
     let auracoder_thread_instruction = referenced_thread
         .as_ref()
         .map(build_auracoder_thread_instruction);
@@ -888,7 +884,9 @@ pub(crate) async fn send_message_inner(
                 .ok()
                 .map(|engine| vec![engine])
         } else {
-            crate::commands::engines::list_local_engine_infos(state).await.ok()
+            crate::commands::engines::list_local_engine_infos(state)
+                .await
+                .ok()
         }
     } else {
         None
@@ -928,7 +926,11 @@ pub(crate) async fn send_message_inner(
             .await
             .map_err(err_to_string)?])
     } else {
-        Some(crate::commands::engines::list_local_engine_infos(state).await.map_err(err_to_string)?)
+        Some(
+            crate::commands::engines::list_local_engine_infos(state)
+                .await
+                .map_err(err_to_string)?,
+        )
     };
     validate_attachments_for_engine_model(
         &attachments,
@@ -937,22 +939,15 @@ pub(crate) async fn send_message_inner(
         attachment_catalog.as_deref(),
     )?;
 
-    let (workspace, repos, selected_repo) = run_db(db.clone(), {
+    let workspace = run_db(db.clone(), {
         let workspace_id = thread.workspace_id.clone();
         let thread_id = thread.id.clone();
-        let repo_id = thread.repo_id.clone();
         move |db| {
             let workspace = db::workspaces::list_workspaces(db)?
                 .into_iter()
                 .find(|item| item.id == workspace_id)
                 .ok_or_else(|| anyhow::anyhow!("workspace not found for thread {thread_id}"))?;
-            let repos = db::repos::get_repos(db, &workspace_id)?;
-            let selected_repo = if let Some(repo_id) = repo_id.as_deref() {
-                db::repos::find_repo_by_id(db, repo_id)?
-            } else {
-                None
-            };
-            Ok((workspace, repos, selected_repo))
+            Ok(workspace)
         }
     })
     .await?;
@@ -982,15 +977,25 @@ pub(crate) async fn send_message_inner(
     } else {
         configured_reasoning_effort.clone()
     };
-    let cli_permissions = if let (Some(codex), Some(context)) = (codex_cli.as_ref(), codex_context.as_ref()) {
+    let cli_permissions = if let (Some(codex), Some(context)) =
+        (codex_cli.as_ref(), codex_context.as_ref())
+    {
         let cli: &dyn CliTool = codex.as_ref();
-        cli.runtime_permissions(context, &thread).await.map_err(err_to_string)?
-    } else if let (Some(opencode), Some(context)) = (opencode_cli.as_ref(), opencode_context.as_ref()) {
+        cli.runtime_permissions(context, &thread)
+            .await
+            .map_err(err_to_string)?
+    } else if let (Some(opencode), Some(context)) =
+        (opencode_cli.as_ref(), opencode_context.as_ref())
+    {
         let cli: &dyn CliTool = opencode.as_ref();
-        cli.runtime_permissions(context, &thread).await.map_err(err_to_string)?
+        cli.runtime_permissions(context, &thread)
+            .await
+            .map_err(err_to_string)?
     } else if let (Some(claude), Some(context)) = (claude_cli.as_ref(), claude_context.as_ref()) {
         let cli: &dyn CliTool = claude.as_ref();
-        cli.runtime_permissions(context, &thread).await.map_err(err_to_string)?
+        cli.runtime_permissions(context, &thread)
+            .await
+            .map_err(err_to_string)?
     } else {
         CliRuntimePermissions::default()
     };
@@ -1011,38 +1016,12 @@ pub(crate) async fn send_message_inner(
         }
         None
     };
-    let workspace_writable_roots = if selected_repo.is_some() {
-        None
-    } else {
-        Some(resolve_workspace_writable_roots(
-            repos.iter().map(|repo| repo.path.as_str()),
-            workspace_root.as_str(),
-            thread.engine_metadata.as_ref(),
-        )?)
-    };
-    let scope = if execution_workspace.location_kind == "ssh" {
-        ThreadScope::Workspace {
-            root_path: execution_workspace.root_path.clone(),
-            writable_roots: vec![execution_workspace.root_path.clone()],
-        }
-    } else if let Some(repo) = selected_repo.as_ref() {
-        ThreadScope::Repo {
-            repo_path: repo.path.clone(),
-        }
-    } else {
-        ThreadScope::Workspace {
-            root_path: workspace_root,
-            writable_roots: workspace_writable_roots
-                .as_ref()
-                .map(|resolution| resolution.roots.clone())
-                .unwrap_or_default(),
-        }
+    let scope = ThreadScope::Project {
+        root_path: workspace_root.clone(),
+        writable_roots: vec![workspace_root.clone()],
     };
 
-    let trust_level = selected_repo
-        .as_ref()
-        .map(|repo| repo.trust_level.clone())
-        .unwrap_or_else(|| aggregate_workspace_trust_level(&repos));
+    let trust_level = workspace.trust_level.clone();
     let codex_external_sandbox_active =
         if let (Some(codex), Some(context)) = (codex_cli.as_ref(), codex_context.as_ref()) {
             let cli: &dyn CliTool = codex.as_ref();
@@ -1054,7 +1033,9 @@ pub(crate) async fn send_message_inner(
         };
     let permission_profile = if thread.engine_id == "codex" {
         cli_permissions.permission_profile.clone()
-    } else { None };
+    } else {
+        None
+    };
 
     if permission_profile.is_none() {
         if let Some(sandbox_mode) = sandbox_mode.as_deref() {
@@ -1068,16 +1049,6 @@ pub(crate) async fn send_message_inner(
             }
 
             validate_engine_sandbox_mode(thread.engine_id.as_str(), Some(sandbox_mode))?;
-
-            if workspace_write_confirmation_required(
-                workspace_writable_roots.as_ref(),
-                sandbox_mode,
-                workspace_write_opt_in_enabled(thread.engine_metadata.as_ref()),
-            ) {
-                return Err(
-                "Workspace thread with multiple writable repositories requires explicit confirmation before execution.".to_string(),
-            );
-            }
         }
     }
 
@@ -1088,12 +1059,14 @@ pub(crate) async fn send_message_inner(
             reasoning_effort: reasoning_effort.clone(),
             ..Default::default()
         };
-        thread = run_db(db.clone(), move |db| db::threads::update_thread(db, &update)).await?;
+        thread = run_db(db.clone(), move |db| {
+            db::threads::update_thread(db, &update)
+        })
+        .await?;
     }
 
     let writable_roots = match &scope {
-        ThreadScope::Repo { repo_path } => vec![repo_path.clone()],
-        ThreadScope::Workspace {
+        ThreadScope::Project {
             writable_roots,
             root_path,
         } => {
@@ -1109,7 +1082,8 @@ pub(crate) async fn send_message_inner(
         if thread.engine_id == "codex" && sandbox_mode.as_deref() == Some("danger-full-access") {
             true
         } else {
-            cli_permissions.allow_network
+            cli_permissions
+                .allow_network
                 .unwrap_or_else(|| allow_network_for_trust_level(&trust_level))
         };
     let model_supports_selected_personality = if execution_workspace.location_kind == "ssh" {
@@ -1449,7 +1423,6 @@ pub async fn start_codex_review(
                 let created = db::threads::create_thread(
                     db,
                     &source_thread.workspace_id,
-                    source_thread.repo_id.as_deref(),
                     &source_thread.engine_id,
                     &initial_turn_model_id,
                     &review_title,
@@ -1596,12 +1569,9 @@ pub async fn steer_message(
         .clone()
         .ok_or_else(|| format!("thread `{thread_id}` has no active engine thread id"))?;
     let attachments = normalize_attachments(attachments)?;
-    let referenced_thread = resolve_auracoder_thread_reference(
-        state.inner(),
-        &thread,
-        referenced_thread_id.as_deref(),
-    )
-    .await?;
+    let referenced_thread =
+        resolve_auracoder_thread_reference(state.inner(), &thread, referenced_thread_id.as_deref())
+            .await?;
     // 阶段计划 3 直接拒绝 SSH steer 附件；阶段计划 4 使用同一安全上传前置流程。
     // if workspace.location_kind == "ssh" && !attachments.is_empty() {
     //     return Err("SSH 远端项目附件将在第4阶段剩余工作阶段计划4中接入；当前不能把本机附件路径发送给远端 Codex".to_string());
@@ -2805,9 +2775,7 @@ async fn run_turn(
     }
 
     enum TurnWait {
-        Engine(
-            std::result::Result<anyhow::Result<()>, tokio::task::JoinError>,
-        ),
+        Engine(std::result::Result<anyhow::Result<()>, tokio::task::JoinError>),
         Event(Option<EngineEvent>),
         FlushPending,
         Cancelled,
@@ -3104,9 +3072,7 @@ async fn run_turn(
 
         if failed_completion {
             failed_completion_processed = true;
-            break 'turn_loop TurnOutcome::Failed(anyhow::anyhow!(
-                "当前 CLI 报告本轮对话执行失败"
-            ));
+            break 'turn_loop TurnOutcome::Failed(anyhow::anyhow!("当前 CLI 报告本轮对话执行失败"));
         }
     };
 
@@ -3490,7 +3456,6 @@ async fn run_turn(
                 recoverable: false,
             },
         );
-
     }
 
     if engine_failed && !failed_completion_processed {
@@ -3744,7 +3709,6 @@ async fn run_codex_review_turn(
             let review_thread_status = review_thread_for_started.status.clone();
             let review_thread_title = review_thread_for_started.title.clone();
             let review_thread_workspace_id = review_thread_for_started.workspace_id.clone();
-            let review_thread_repo_id = review_thread_for_started.repo_id.clone();
             move |db| {
                 if review_thread_engine_id.as_deref() == Some(started.review_thread_id.as_str()) {
                     return db::threads::get_thread(db, &review_thread_id)?.ok_or_else(|| {
@@ -3768,7 +3732,7 @@ async fn run_codex_review_turn(
                 )?;
                 db::threads::get_thread(db, &review_thread_id)?.ok_or_else(|| {
                     anyhow::anyhow!(
-                        "review thread not found after runtime snapshot update: {review_thread_workspace_id}:{review_thread_repo_id:?}:{review_thread_model_id}"
+                        "review thread not found after runtime snapshot update: {review_thread_workspace_id}:{review_thread_model_id}"
                     )
                 })
             }
@@ -5876,32 +5840,6 @@ fn truncate_action_result_output(
     }
 }
 
-fn workspace_write_opt_in_enabled(metadata: Option<&Value>) -> bool {
-    metadata
-        .and_then(|value| value.get("workspaceWriteOptIn"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
-fn aggregate_workspace_trust_level(repos: &[RepoDto]) -> TrustLevelDto {
-    if repos
-        .iter()
-        .any(|repo| matches!(repo.trust_level, TrustLevelDto::Restricted))
-    {
-        return TrustLevelDto::Restricted;
-    }
-
-    if !repos.is_empty()
-        && repos
-            .iter()
-            .all(|repo| matches!(repo.trust_level, TrustLevelDto::Trusted))
-    {
-        return TrustLevelDto::Trusted;
-    }
-
-    TrustLevelDto::Standard
-}
-
 fn approval_policy_for_engine_and_trust_level(
     engine_id: &str,
     trust_level: &TrustLevelDto,
@@ -5943,114 +5881,6 @@ fn thread_allow_network_override(_metadata: Option<&Value>) -> Option<bool> {
 fn thread_sandbox_mode(_metadata: Option<&Value>) -> Result<Option<String>, String> {
     // 旧 metadata 适配入口保留；运行代码改由 CliTool::runtime_permissions 提供。
     Ok(None)
-}
-
-fn workspace_writable_roots_from_metadata(
-    metadata: Option<&Value>,
-) -> Result<Option<Vec<String>>, String> {
-    let Some(raw_roots) = metadata.and_then(|value| value.get("workspaceWritableRoots")) else {
-        return Ok(None);
-    };
-
-    let roots = raw_roots.as_array().ok_or_else(|| {
-        "invalid `workspaceWritableRoots` on thread metadata. expected an array of paths"
-            .to_string()
-    })?;
-
-    let mut normalized = Vec::with_capacity(roots.len());
-    for root in roots {
-        let root = root.as_str().map(str::trim).filter(|value| !value.is_empty()).ok_or_else(
-            || {
-                "invalid `workspaceWritableRoots` on thread metadata. expected non-empty string paths"
-                    .to_string()
-            },
-        )?;
-        normalized.push(root.to_string());
-    }
-
-    Ok(Some(normalized))
-}
-
-struct WorkspaceWritableRootsResolution {
-    roots: Vec<String>,
-    requires_confirmation: bool,
-}
-
-fn resolve_workspace_writable_roots<'a>(
-    repo_paths: impl IntoIterator<Item = &'a str>,
-    workspace_root: &str,
-    metadata: Option<&Value>,
-) -> Result<WorkspaceWritableRootsResolution, String> {
-    let available_roots: Vec<String> = repo_paths.into_iter().map(ToOwned::to_owned).collect();
-    let confirmed_roots = workspace_writable_roots_from_metadata(metadata)?;
-
-    if let Some(confirmed_roots) = confirmed_roots {
-        if confirmed_roots.is_empty() {
-            return Ok(WorkspaceWritableRootsResolution {
-                roots: vec![workspace_root.to_string()],
-                requires_confirmation: false,
-            });
-        }
-
-        let available_set: std::collections::HashSet<&str> =
-            available_roots.iter().map(String::as_str).collect();
-        let mut filtered_roots = Vec::with_capacity(confirmed_roots.len());
-        for root in confirmed_roots {
-            if available_set.contains(root.as_str()) {
-                filtered_roots.push(root);
-            }
-        }
-        if !filtered_roots.is_empty() {
-            return Ok(WorkspaceWritableRootsResolution {
-                roots: filtered_roots,
-                requires_confirmation: false,
-            });
-        }
-
-        return Ok(match available_roots.len() {
-            0 => WorkspaceWritableRootsResolution {
-                roots: vec![workspace_root.to_string()],
-                requires_confirmation: false,
-            },
-            1 => WorkspaceWritableRootsResolution {
-                roots: available_roots,
-                requires_confirmation: false,
-            },
-            _ => WorkspaceWritableRootsResolution {
-                roots: available_roots,
-                requires_confirmation: true,
-            },
-        });
-    }
-
-    if available_roots.is_empty() {
-        Ok(WorkspaceWritableRootsResolution {
-            roots: vec![workspace_root.to_string()],
-            requires_confirmation: false,
-        })
-    } else {
-        Ok(WorkspaceWritableRootsResolution {
-            roots: available_roots,
-            requires_confirmation: false,
-        })
-    }
-}
-
-fn sandbox_mode_requires_workspace_opt_in(mode: &str) -> bool {
-    !mode.eq_ignore_ascii_case("read-only")
-}
-
-fn workspace_write_confirmation_required(
-    resolution: Option<&WorkspaceWritableRootsResolution>,
-    sandbox_mode: &str,
-    opt_in_enabled: bool,
-) -> bool {
-    let Some(resolution) = resolution else {
-        return false;
-    };
-
-    sandbox_mode_requires_workspace_opt_in(sandbox_mode)
-        && (resolution.requires_confirmation || (resolution.roots.len() > 1 && !opt_in_enabled))
 }
 
 fn unsupported_thread_sandbox_override_for_external_sandbox(
@@ -6303,21 +6133,11 @@ mod tests {
         let workspace_root =
             std::env::temp_dir().join(format!("auracoder-chat-workspace-{}", Uuid::new_v4()));
         fs::create_dir_all(&workspace_root).expect("failed to create workspace root");
-        let workspace = db::workspaces::upsert_workspace(
-            &state.db,
-            workspace_root.to_string_lossy().as_ref(),
-            Some(1),
-        )
-        .expect("failed to create workspace");
-        db::threads::create_thread(
-            &state.db,
-            &workspace.id,
-            None,
-            engine_id,
-            model_id,
-            "Thread",
-        )
-        .expect("failed to create thread")
+        let workspace =
+            db::workspaces::upsert_workspace(&state.db, workspace_root.to_string_lossy().as_ref())
+                .expect("failed to create workspace");
+        db::threads::create_thread(&state.db, &workspace.id, engine_id, model_id, "Thread")
+            .expect("failed to create thread")
     }
 
     fn attachment_validation_catalog(attachment_modalities: Vec<&str>) -> Vec<EngineInfoDto> {
@@ -6734,80 +6554,6 @@ mod tests {
         ));
         assert!(!unsupported_thread_sandbox_override_for_external_sandbox(
             Some("danger-full-access"),
-            true,
-        ));
-    }
-
-    #[test]
-    fn resolve_workspace_writable_roots_prefers_confirmed_subset() {
-        let roots = resolve_workspace_writable_roots(
-            ["/workspace/repo-a", "/workspace/repo-b"],
-            "/workspace",
-            Some(&serde_json::json!({
-                "workspaceWritableRoots": ["/workspace/repo-b"]
-            })),
-        )
-        .expect("expected confirmed roots to resolve");
-
-        assert_eq!(roots.roots, vec![String::from("/workspace/repo-b")]);
-        assert!(!roots.requires_confirmation);
-    }
-
-    #[test]
-    fn resolve_workspace_writable_roots_drops_stale_confirmed_paths() {
-        let roots = resolve_workspace_writable_roots(
-            ["/workspace/repo-a", "/workspace/repo-b"],
-            "/workspace",
-            Some(&serde_json::json!({
-                "workspaceWritableRoots": ["/workspace/repo-b", "/workspace/repo-c"]
-            })),
-        )
-        .expect("expected stale confirmed roots to be ignored");
-
-        assert_eq!(roots.roots, vec![String::from("/workspace/repo-b")]);
-        assert!(!roots.requires_confirmation);
-    }
-
-    #[test]
-    fn resolve_workspace_writable_roots_requires_reconfirmation_when_all_confirmed_roots_are_stale()
-    {
-        let roots = resolve_workspace_writable_roots(
-            ["/workspace/repo-a", "/workspace/repo-b"],
-            "/workspace",
-            Some(&serde_json::json!({
-                "workspaceWritableRoots": ["/workspace/repo-c"]
-            })),
-        )
-        .expect("expected stale confirmed roots to resolve to current repos");
-
-        assert_eq!(
-            roots.roots,
-            vec![
-                String::from("/workspace/repo-a"),
-                String::from("/workspace/repo-b")
-            ]
-        );
-        assert!(roots.requires_confirmation);
-    }
-
-    #[test]
-    fn read_only_workspace_threads_ignore_stale_confirmation_requirements() {
-        let resolution = WorkspaceWritableRootsResolution {
-            roots: vec![
-                String::from("/workspace/repo-a"),
-                String::from("/workspace/repo-b"),
-            ],
-            requires_confirmation: true,
-        };
-
-        assert!(!workspace_write_confirmation_required(
-            Some(&resolution),
-            "read-only",
-            true,
-        ));
-        assert!(workspace_write_confirmation_required(
-            Some(&resolution),
-            "workspace-write",
             true,
         ));
     }

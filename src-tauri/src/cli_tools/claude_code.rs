@@ -11,8 +11,8 @@ use super::{
         shared_claude_code_session_handles, ClaudeCodeSessionHandleRegistry,
     },
     CliExecutionContext, CliForkedThread, CliLocationKind, CliReviewStarted,
-    CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError,
-    CliSessionSnapshot, CliTool,
+    CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError, CliSessionSnapshot,
+    CliTool,
 };
 use crate::{
     config::app_config::ClaudeCodeSessionMode,
@@ -30,7 +30,8 @@ use crate::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CodexAppDto, CodexPluginDto,
         CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionCatalogRefreshErrorDto, ExtensionItemDto,
-        OpenCodeRuntimeCatalogDto, PermissionComponentJson, ThreadDto, ThreadStatusDto, WorkspaceDto,
+        OpenCodeRuntimeCatalogDto, PermissionComponentJson, ThreadDto, ThreadStatusDto,
+        WorkspaceDto,
     },
     path_utils, remote_project_claude_runtime_service, ssh,
     state::AppState,
@@ -46,37 +47,71 @@ fn default_permission_component() -> PermissionComponentJson {
 }
 
 fn set_permission_array(values: &mut PermissionComponentJson, key: &str, items: &[&str]) {
-    values.insert(key.to_string(), Value::Array(items.iter().map(|item| json!(item)).collect()));
+    values.insert(
+        key.to_string(),
+        Value::Array(items.iter().map(|item| json!(item)).collect()),
+    );
 }
 
 fn set_or_remove(object: &mut serde_json::Map<String, Value>, key: &str, value: Option<Value>) {
-    if let Some(value) = value { object.insert(key.to_string(), value); } else { object.remove(key); }
+    if let Some(value) = value {
+        object.insert(key.to_string(), value);
+    } else {
+        object.remove(key);
+    }
 }
 
-fn permission_choice<'a>(values: &'a PermissionComponentJson, key: &str) -> Result<Option<&'a str>> {
+fn permission_choice<'a>(
+    values: &'a PermissionComponentJson,
+    key: &str,
+) -> Result<Option<&'a str>> {
     let value = values.get(key).context(format!("缺少权限参数: {key}"))?;
-    let array = value.as_array().context(format!("权限参数必须是数组: {key}"))?;
+    let array = value
+        .as_array()
+        .context(format!("权限参数必须是数组: {key}"))?;
     Ok(array.first().and_then(Value::as_str))
 }
 
 fn validate_permission_component(values: &PermissionComponentJson) -> Result<()> {
     let allowed = [
-        ("autonomyPreset", ["automatic", "read-only", "ask", "auto", "full"].as_slice()),
-        ("trust", ["automatic", "trusted", "standard", "restricted"].as_slice()),
-        ("approval", ["automatic", "restricted", "ask", "autonomous"].as_slice()),
-        ("sandbox", ["automatic", "read-only", "workspace-write", "full-access"].as_slice()),
+        (
+            "autonomyPreset",
+            ["automatic", "read-only", "ask", "auto", "full"].as_slice(),
+        ),
+        (
+            "trust",
+            ["automatic", "trusted", "standard", "restricted"].as_slice(),
+        ),
+        (
+            "approval",
+            ["automatic", "restricted", "ask", "autonomous"].as_slice(),
+        ),
+        (
+            "sandbox",
+            ["automatic", "read-only", "workspace-write", "full-access"].as_slice(),
+        ),
         ("network", ["automatic", "enabled", "restricted"].as_slice()),
-        ("defaultForNewThreads", ["automatic", "read-only", "ask", "auto", "full"].as_slice()),
+        (
+            "defaultForNewThreads",
+            ["automatic", "read-only", "ask", "auto", "full"].as_slice(),
+        ),
     ];
     for key in values.keys() {
-        anyhow::ensure!(allowed.iter().any(|(name, _)| name == key), "未知权限参数: {key}");
+        anyhow::ensure!(
+            allowed.iter().any(|(name, _)| name == key),
+            "未知权限参数: {key}"
+        );
     }
     for (key, choices) in allowed {
         let value = values.get(key).context(format!("缺少权限参数: {key}"))?;
-        let array = value.as_array().context(format!("权限参数必须是数组: {key}"))?;
+        let array = value
+            .as_array()
+            .context(format!("权限参数必须是数组: {key}"))?;
         anyhow::ensure!(array.len() <= 1, "权限参数数组最多只能有一个值: {key}");
         for item in array {
-            let item = item.as_str().context(format!("权限参数值必须是字符串: {key}"))?;
+            let item = item
+                .as_str()
+                .context(format!("权限参数值必须是字符串: {key}"))?;
             anyhow::ensure!(choices.contains(&item), "权限参数值不支持: {key}={item}");
         }
     }
@@ -117,12 +152,12 @@ fn permissions_from_thread(thread: &ThreadDto) -> Result<PermissionComponentJson
         .or_else(|| object.get("networkPolicy"))
         .or_else(|| object.get("sandboxAllowNetwork"))
         .and_then(|value| {
-                value.as_bool().or_else(|| match value.as_str() {
-                    Some("enabled") => Some(true),
-                    Some("restricted") => Some(false),
-                    Some("inherit") => None,
-                    _ => None,
-                })
+            value.as_bool().or_else(|| match value.as_str() {
+                Some("enabled") => Some(true),
+                Some("restricted") => Some(false),
+                Some("inherit") => None,
+                _ => None,
+            })
         });
 
     let mut result = default_permission_component();
@@ -220,7 +255,8 @@ fn raw_permissions_value(
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
-    raw.entry("permissionMode".to_string()).or_insert(Value::Null);
+    raw.entry("permissionMode".to_string())
+        .or_insert(Value::Null);
     raw.entry("sandboxMode".to_string()).or_insert(Value::Null);
     raw.entry("allowNetwork".to_string()).or_insert(Value::Null);
     raw.entry("allow".to_string()).or_insert_with(|| json!([]));
@@ -315,13 +351,6 @@ impl ClaudeCodeCli {
             for workspace in workspaces {
                 if path_utils::paths_equal(&workspace.root_path, &cwd) {
                     return Ok::<_, anyhow::Error>(Some(workspace));
-                }
-                let repos = db::repos::get_repos(&db, &workspace.id)?;
-                if repos
-                    .iter()
-                    .any(|repo| path_utils::paths_equal(&repo.path, &cwd))
-                {
-                    return Ok(Some(workspace));
                 }
             }
             Ok(None)
@@ -989,7 +1018,10 @@ impl CliTool for ClaudeCodeCli {
     ) -> Result<PermissionComponentJson> {
         self.load_workspace(context).await?;
         anyhow::ensure!(thread.engine_id == "claude", "当前会话不属于 Claude Code");
-        anyhow::ensure!(thread.workspace_id == context.workspace_id, "当前会话不属于该 workspace");
+        anyhow::ensure!(
+            thread.workspace_id == context.workspace_id,
+            "当前会话不属于该 workspace"
+        );
         permissions_from_thread(thread)
     }
 
@@ -1001,7 +1033,10 @@ impl CliTool for ClaudeCodeCli {
     ) -> Result<PermissionComponentJson> {
         self.load_workspace(context).await?;
         anyhow::ensure!(thread.engine_id == "claude", "当前会话不属于 Claude Code");
-        anyhow::ensure!(thread.workspace_id == context.workspace_id, "当前会话不属于该 workspace");
+        anyhow::ensure!(
+            thread.workspace_id == context.workspace_id,
+            "当前会话不属于该 workspace"
+        );
         validate_permission_component(&values)?;
         let current = <Self as CliTool>::get_permissions(self, context, thread).await?;
         if current.get("autonomyPreset") == values.get("autonomyPreset")
@@ -1010,8 +1045,12 @@ impl CliTool for ClaudeCodeCli {
             && current.get("network") == values.get("network")
         {
             let mut result = current;
-            if let Some(value) = values.get("trust") { result.insert("trust".to_string(), value.clone()); }
-            if let Some(value) = values.get("defaultForNewThreads") { result.insert("defaultForNewThreads".to_string(), value.clone()); }
+            if let Some(value) = values.get("trust") {
+                result.insert("trust".to_string(), value.clone());
+            }
+            if let Some(value) = values.get("defaultForNewThreads") {
+                result.insert("defaultForNewThreads".to_string(), value.clone());
+            }
             return Ok(result);
         }
         let preset = permission_choice(&values, "autonomyPreset")?;
@@ -1022,7 +1061,10 @@ impl CliTool for ClaudeCodeCli {
             .get("autonomyPreset")
             .and_then(Value::as_array)
             .is_some_and(Vec::is_empty);
-        anyhow::ensure!(sandbox != Some("full-access"), "Claude Code 不支持 full-access sandbox");
+        anyhow::ensure!(
+            sandbox != Some("full-access"),
+            "Claude Code 不支持 full-access sandbox"
+        );
         let (mode, sandbox_mode, allow_network) = match preset {
             Some("automatic") => (None, None, None),
             None if autonomy_is_empty || (approval.is_none() && sandbox.is_none() && network.is_none()) => (None, None, None),
@@ -1042,10 +1084,13 @@ impl CliTool for ClaudeCodeCli {
         };
         let raw_value = raw_permissions_value(thread, mode, sandbox_mode, allow_network);
         let raw_string = raw_value.to_string();
-        let saved = db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw_string))?;
+        let saved =
+            db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw_string))?;
         let mut result = self.get_permissions(context, &saved).await?;
         for key in ["trust", "defaultForNewThreads"] {
-            if let Some(value) = values.get(key) { result.insert(key.to_string(), value.clone()); }
+            if let Some(value) = values.get(key) {
+                result.insert(key.to_string(), value.clone());
+            }
         }
         Ok(result)
     }
@@ -1705,7 +1750,8 @@ mod tests {
     use uuid::Uuid;
 
     fn test_app_state() -> AppState {
-        let root = std::env::temp_dir().join(format!("auracoder-claude-archive-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("auracoder-claude-archive-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("failed to create test root");
         let db = crate::db::Database::open(root.join("workspaces.db"))
             .expect("failed to create test database");
@@ -1770,13 +1816,11 @@ mod tests {
             &connection_id,
             "Claude archive test workspace",
             &format!("/tmp/auracoder-claude-archive-{}", Uuid::new_v4()),
-            None,
         )
         .expect("failed to create test SSH workspace");
         let thread = crate::db::threads::create_thread(
             &state.db,
             &workspace.id,
-            None,
             "claude",
             "claude-sonnet-4-6",
             "Claude archive test thread",
@@ -1797,7 +1841,6 @@ mod tests {
         ThreadDto {
             id: "thread".to_string(),
             workspace_id: "workspace".to_string(),
-            repo_id: None,
             engine_id: "claude".to_string(),
             model_id: "model".to_string(),
             engine_thread_id: None,
@@ -1840,7 +1883,9 @@ mod tests {
     #[test]
     fn permissions_read_all_legacy_inherit_values_as_automatic() {
         let values = permissions_from_thread(&permission_thread(
-            Some(r#"{"approvalPolicy":"inherit","sandboxMode":"inherit","networkPolicy":"inherit"}"#),
+            Some(
+                r#"{"approvalPolicy":"inherit","sandboxMode":"inherit","networkPolicy":"inherit"}"#,
+            ),
             None,
         ))
         .unwrap();

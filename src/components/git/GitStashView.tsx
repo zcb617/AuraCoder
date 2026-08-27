@@ -4,14 +4,16 @@ import { useTranslation } from "react-i18next";
 import { formatDateTime } from "../../lib/formatters";
 import { toast } from "../../stores/toastStore";
 import { useGitStore } from "../../stores/gitStore";
-import type { Repo } from "../../types";
+import type { WorkspaceGitContext } from "../../types";
+
+type GitStashContext = Extract<WorkspaceGitContext, { kind: "repository" }>;
 
 interface Props {
-  repo: Repo;
+  context: GitStashContext;
   onError: (error: string | undefined) => void;
 }
 
-export function GitStashView({ repo, onError }: Props) {
+export function GitStashView({ context, onError }: Props) {
   const { t, i18n } = useTranslation("git");
   const { status, stashes, loadStashes, pushStash, applyStash, popStash } = useGitStore();
 
@@ -20,13 +22,13 @@ export function GitStashView({ repo, onError }: Props) {
   const [stashMessage, setStashMessage] = useState("");
 
   useEffect(() => {
-    void loadStashes(repo.path);
-  }, [repo.path, loadStashes]);
+    void loadStashes(context.workspaceId);
+  }, [context.workspaceId, loadStashes]);
 
   useEffect(() => {
     setFilterQuery("");
     setStashMessage("");
-  }, [repo.path]);
+  }, [context.workspaceId]);
 
   const hasChanges = (status?.files.length ?? 0) > 0;
 
@@ -46,7 +48,7 @@ export function GitStashView({ repo, onError }: Props) {
     try {
       onError(undefined);
       const msg = stashMessage.trim() || undefined;
-      await pushStash(repo.path, msg);
+      await pushStash(context.workspaceId, msg);
       setStashMessage("");
       toast.success(t("stash.toasts.saved"));
     } catch (e) {
@@ -61,7 +63,7 @@ export function GitStashView({ repo, onError }: Props) {
     setLoadingKey(`apply:${index}`);
     try {
       onError(undefined);
-      await applyStash(repo.path, index);
+      await applyStash(context.workspaceId, index);
       toast.success(t("stash.toasts.applied"));
     } catch (e) {
       onError(String(e));
@@ -75,7 +77,7 @@ export function GitStashView({ repo, onError }: Props) {
     setLoadingKey(`pop:${index}`);
     try {
       onError(undefined);
-      await popStash(repo.path, index);
+      await popStash(context.workspaceId, index);
       toast.success(t("stash.toasts.applied"));
     } catch (e) {
       onError(String(e));

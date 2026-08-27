@@ -74,7 +74,6 @@ import { getHarnessIcon } from "../shared/HarnessLogos";
 import { showWorkspaceEditorForDirectFileOpen } from "../../lib/workspacePaneNavigation";
 import {
   resolveRelativePathWithinRoot,
-  resolveThreadFileRootPath,
 } from "../../lib/fileRootUtils";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { useGitStore } from "../../stores/gitStore";
@@ -1035,18 +1034,6 @@ function readThreadSandboxModeValue(thread: Thread | null): ThreadSandboxModeVal
   return "inherit";
 }
 */
-
-function readThreadWorkspaceWritableRoots(thread: Thread | null): string[] {
-  const value = thread?.engineMetadata?.workspaceWritableRoots;
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value
-    .filter((item): item is string => typeof item === "string")
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0);
-}
 
 /* 旧 PermissionPicker 的本地策略合并、回写和请求适配已停用，保留完整迁移记录。
 function readThreadExecutionPolicyState(thread: Thread | null): {
@@ -2074,21 +2061,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     [engines, onboardingSelectedChatEngines],
   );
   const {
-    repos,
     activeWorkspaceId,
     activeWorkspace,
-    activeRepo,
-    setRepoTrustLevel,
-    setAllReposTrustLevel,
   } = useWorkspaceStore(
     useShallow((state) => ({
-      repos: state.repos,
       activeWorkspaceId: state.activeWorkspaceId,
       activeWorkspace:
         state.workspaces.find((workspace) => workspace.id === state.activeWorkspaceId) ?? null,
-      activeRepo: state.repos.find((repo) => repo.id === state.activeRepoId) ?? null,
-      setRepoTrustLevel: state.setRepoTrustLevel,
-      setAllReposTrustLevel: state.setAllReposTrustLevel,
     })),
   );
   const {
@@ -2541,30 +2520,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const [textAnnotationComment, setTextAnnotationComment] = useState("");
   const [autoScrollLocked, setAutoScrollLocked] = useState(false);
   const [hasExplicitComposerRuntime, setHasExplicitComposerRuntime] = useState(false);
-  const [workspaceOptInPrompt, setWorkspaceOptInPrompt] = useState<{
-    repoNames: string;
-    workspaceId: string;
-    threadId: string;
-    threadPaths: string[];
-    text: string;
-    draftText: string;
-    attachments: ChatAttachment[];
-    textAnnotations: ChatTextAnnotation[];
-    references: ChatInputReference[];
-    referencedAuraCoderThreadId: string | null;
-    inputItems: ChatInputItem[] | null;
-    planMode: boolean;
-    engineId: string;
-    modelId: string;
-    effort: string | null;
-    personality: CodexPersonalityValue;
-    serviceTier: CodexServiceTierValue;
-    outputSchemaText: string;
-    customApprovalPolicyText: string;
-    openCodeAgent: string;
-    reasoningConfigured: boolean;
-    restorePlanModeOnCancel: boolean;
-  } | null>(null);
+  const [workspaceRootPrompt, setWorkspaceRootPrompt] = useState<any>(null);
   const [planImplementationPrompt, setPlanImplementationPrompt] = useState<{
     threadId: string;
     engineId: string;
@@ -2622,10 +2578,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     () => availableModels.filter((m) => !m.hidden),
     [availableModels],
   );
-  const codexReferenceRoot =
-    activeRepo?.workspaceId === activeWorkspaceId
-      ? activeRepo.path
-      : activeWorkspace?.rootPath ?? null;
+  const codexReferenceRoot = activeWorkspace?.rootPath ?? null;
   const openCodeRuntimeRoot = codexReferenceRoot;
   const extensionProviderId: ExtensionProviderId =
     selectedEngineId === "claude"
@@ -2637,10 +2590,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     () => ({
       providerId: extensionProviderId,
       workspaceId: activeWorkspaceId,
-      repoId: activeRepo?.id ?? null,
       cwd: codexReferenceRoot,
     }),
-    [activeRepo?.id, activeWorkspaceId, codexReferenceRoot, extensionProviderId],
+    [activeWorkspaceId, codexReferenceRoot, extensionProviderId],
   );
   const extensionCacheKey = buildExtensionCacheKey(extensionContext);
   const extensionCatalog = useExtensionStore(
@@ -2745,10 +2697,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       return false;
     }
 
-    const activeScopeRepoId = activeRepo?.id ?? null;
-    const inScope =
-      activeThread.workspaceId === activeWorkspaceId &&
-      activeThread.repoId === activeScopeRepoId;
+    const inScope = activeThread.workspaceId === activeWorkspaceId;
     const engineMatch = activeThread.engineId === selectedEngineId;
     const modelMatch =
       activeThreadHasRemoteSession ||
@@ -2758,7 +2707,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
     return inScope && engineMatch && modelMatch;
   }, [
-    activeRepo?.id,
     activeThread,
     activeThreadHasRemoteSession,
     activeWorkspaceId,
@@ -2798,15 +2746,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       return false;
     }
 
-    const activeScopeRepoId = activeRepo?.id ?? null;
     return (
       activeThread.id === threadId &&
       activeThread.workspaceId === activeWorkspaceId &&
-      activeThread.repoId === activeScopeRepoId &&
       activeThread.engineId === "codex"
     );
   }, [
-    activeRepo?.id,
     activeThread,
     activeWorkspaceId,
     selectedEngineId,
@@ -3100,18 +3045,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const permissionSavePromisesRef = useRef<Record<string, Promise<boolean>>>({});
   const [defaultAutonomyPreset, setDefaultAutonomyPreset] =
     useState<AutonomyPresetId | null>(null);
-  const workspaceTrustLevel: TrustLevel = useMemo(() => {
-    if (!repos.length) {
-      return "standard";
-    }
-    if (repos.some((repo) => repo.trustLevel === "restricted")) {
-      return "restricted";
-    }
-    if (repos.every((repo) => repo.trustLevel === "trusted")) {
-      return "trusted";
-    }
-    return "standard";
-  }, [repos]);
+  const workspaceTrustLevel: TrustLevel = activeWorkspace?.trustLevel ?? "standard";
 
   // 权限组件只依赖 AuraCoder 线程 ID；新建线程在发送前也立即显示统一默认值。
   useEffect(() => {
@@ -3128,7 +3062,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       .getThreadPermissions(threadId)
       .then((values) => {
         if (!disposed && permissionLoadRequestRef.current === requestId) {
-          const repoTrust = activeRepo?.trustLevel ?? (repos.length > 0 ? workspaceTrustLevel : null);
+          const repoTrust = workspaceTrustLevel;
           setPermissionComponent({
             ...values,
             trust: repoTrust ? [repoTrust] : values.trust,
@@ -3146,7 +3080,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     return () => {
       disposed = true;
     };
-  }, [activeThread?.id, activeRepo?.trustLevel, defaultAutonomyPreset, repos.length, workspaceTrustLevel]);
+  }, [activeThread?.id, defaultAutonomyPreset, workspaceTrustLevel]);
 
   function onPermissionComponentChange(next: PermissionComponentJson): Promise<boolean> {
     const thread = activeThread;
@@ -3165,11 +3099,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
           ? next.trust[0] as TrustLevel
           : null;
         if (nextTrust === "trusted" || nextTrust === "standard" || nextTrust === "restricted") {
-          if (activeRepo) {
-            await onRepoTrustLevelChange(nextTrust);
-          } else if (repos.length > 0) {
-            await onWorkspaceTrustLevelChange(nextTrust);
-          }
+          await onWorkspaceTrustLevelChange(nextTrust);
         }
         const nextDefaultValue = Array.isArray(next.defaultForNewThreads)
           && typeof next.defaultForNewThreads[0] === "string"
@@ -3539,9 +3469,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       ),
     [activeThread?.engineId, pendingApprovalBannerRows],
   );
-  const canTrustApprovalScope = activeRepo
-    ? activeRepo.trustLevel !== "trusted"
-    : repos.length > 0 && workspaceTrustLevel !== "trusted";
+  const canTrustApprovalScope = workspaceTrustLevel !== "trusted";
   const showApprovalBannerHeader =
     pendingApprovalBannerRows.length > 1 || canTrustApprovalScope;
 
@@ -5708,10 +5636,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     // const submitPlanMode = submitEngineId === "opencode" ? false : planMode;
     const submitPlanMode = submitEngineId === "opencode" ? false : submittedPlanMode;
 
-    const activeScopeRepoId = activeRepo?.id ?? null;
     const activeThreadInScope = activeThread
-      ? activeThread.workspaceId === activeWorkspaceId &&
-        activeThread.repoId === activeScopeRepoId
+      ? activeThread.workspaceId === activeWorkspaceId
       : false;
     /*
      * 旧逻辑要求当前模型与会话创建时模型相同，才会复用会话：
@@ -5769,7 +5695,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     if (!targetThreadId) {
       const createdThreadId = await createThread({
         workspaceId: activeWorkspaceId,
-        repoId: activeScopeRepoId,
         engineId: submitEngineId,
         modelId: submitModelId,
         reasoningEffort: submitReasoningEffort,
@@ -5777,9 +5702,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
           submitEngineId === "codex" && selectedServiceTier !== "inherit"
             ? selectedServiceTier
             : null,
-        title: activeRepo
-          ? t("panel.repoChatTitle", { name: activeRepo.name })
-          : t("panel.workspaceChatTitle"),
+        title: t("panel.workspaceChatTitle"),
       });
       if (!createdThreadId) {
         return false;
@@ -5880,49 +5803,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
     const inputItems = await resolveCodexInputItems(text, submitEngineId, currentReferences);
 
-    if (
-      currentThread &&
-      currentThread.repoId === null &&
-      repos.length > 1 &&
-      activeThreadSandboxMode !== "read-only"
-    ) {
-      const availableRepoPaths = repos.map((repo) => repo.path);
-      const optIn = Boolean(currentThread.engineMetadata?.workspaceWriteOptIn);
-      const confirmedWritableRoots = readThreadWorkspaceWritableRoots(currentThread);
-      const hasValidConfirmedRoots = confirmedWritableRoots.some((root) =>
-        availableRepoPaths.includes(root),
-      );
-      if (!optIn || !hasValidConfirmedRoots) {
-        const repoNames = repos.map((repo) => repo.name).join(", ");
-        setWorkspaceOptInPrompt({
-          repoNames,
-          workspaceId: activeWorkspaceId,
-          threadId: targetThreadId,
-          threadPaths: availableRepoPaths,
-          text,
-          // draftText: input.trim(),
-          draftText: submittedText.trim(),
-          // attachments: [...attachments],
-          attachments: currentAttachments,
-          textAnnotations: currentTextAnnotations,
-          references: currentReferences,
-          referencedAuraCoderThreadId,
-          inputItems: inputItems ?? null,
-          planMode: submitPlanMode,
-          engineId: submitEngineId,
-          modelId: submitModelId,
-          effort: submitReasoningEffort,
-          personality: selectedPersonality,
-          serviceTier: selectedServiceTier,
-          outputSchemaText,
-          customApprovalPolicyText,
-          openCodeAgent: selectedOpenCodeAgentRef.current,
-          reasoningConfigured: createdThread,
-          restorePlanModeOnCancel: false,
-        });
-        return true;
-      }
-    }
 
     if (!createdThread) {
       await ipc.setThreadReasoningEffort(
@@ -6173,7 +6053,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   }
 
   async function executeWorkspaceOptInSend() {
-    const prompt = workspaceOptInPrompt;
+    const prompt = workspaceRootPrompt;
     if (!prompt) return;
     const promptSessionKey = getChatComposerSessionKey(prompt.workspaceId, prompt.threadId);
     setPendingSubmission(
@@ -6185,10 +6065,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         prompt.planMode,
       ),
     );
-    setWorkspaceOptInPrompt(null);
+    setWorkspaceRootPrompt(null);
 
     try {
-      await ipc.confirmWorkspaceThread(prompt.threadId, prompt.threadPaths);
+      // 项目根目录是唯一写入范围，无需额外确认。
 
       if (!prompt.reasoningConfigured) {
         await ipc.setThreadReasoningEffort(prompt.threadId, prompt.effort, prompt.modelId);
@@ -6282,49 +6162,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       return;
     }
 
-    if (
-      currentThread.repoId === null &&
-      repos.length > 1 &&
-      activeThreadSandboxMode !== "read-only"
-    ) {
-      const availableRepoPaths = repos.map((repo) => repo.path);
-      const optIn = Boolean(currentThread.engineMetadata?.workspaceWriteOptIn);
-      const confirmedWritableRoots = readThreadWorkspaceWritableRoots(currentThread);
-      const hasValidConfirmedRoots = confirmedWritableRoots.some((root) =>
-        availableRepoPaths.includes(root),
-      );
-      if (!optIn || !hasValidConfirmedRoots) {
-        const repoNames = repos.map((repo) => repo.name).join(", ");
-        setPlanImplementationPrompt(null);
-        setPlanMode(false);
-        setWorkspaceOptInPrompt({
-          repoNames,
-          workspaceId: activeWorkspaceId,
-          threadId: currentThread.id,
-          threadPaths: availableRepoPaths,
-          text: implementationMessage,
-          draftText: implementationMessage,
-          attachments: [],
-          textAnnotations: [],
-          references: [],
-          referencedAuraCoderThreadId: null,
-          inputItems: null,
-          planMode: false,
-          engineId: prompt.engineId,
-          modelId: prompt.modelId,
-          effort: prompt.effort,
-          personality: prompt.personality,
-          serviceTier: prompt.serviceTier,
-          outputSchemaText: prompt.outputSchemaText,
-          customApprovalPolicyText: prompt.customApprovalPolicyText,
-          openCodeAgent: prompt.openCodeAgent,
-          reasoningConfigured: false,
-          restorePlanModeOnCancel: true,
-        });
-        return;
-      }
-    }
-
     setPlanImplementationPrompt(null);
     setPlanMode(false);
     try {
@@ -6392,7 +6229,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   }
 
   function dismissWorkspaceOptInPrompt() {
-    const prompt = workspaceOptInPrompt;
+    const prompt = workspaceRootPrompt;
     if (prompt?.restorePlanModeOnCancel) {
       setPlanMode(true);
     }
@@ -6406,7 +6243,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       );
     }
     setPendingSubmission(null);
-    setWorkspaceOptInPrompt(null);
+    setWorkspaceRootPrompt(null);
   }
 
   async function onReasoningEffortChange(nextEffort: string) {
@@ -6429,16 +6266,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     });
   }
 
-  async function onRepoTrustLevelChange(nextTrustLevel: TrustLevel) {
-    if (!activeRepo) {
-      return;
-    }
-
-    await setRepoTrustLevel(activeRepo.id, nextTrustLevel);
-  }
-
   async function onWorkspaceTrustLevelChange(nextTrustLevel: TrustLevel) {
-    await setAllReposTrustLevel(nextTrustLevel);
+    if (activeWorkspaceId) {
+      await useWorkspaceStore.getState().setWorkspaceTrustLevel(activeWorkspaceId, nextTrustLevel);
+    }
   }
 
   /* 旧 PermissionPicker 的 CLI 权限状态合并和保存回调已停用，保留完整迁移记录。
@@ -6806,15 +6637,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const openUsageLimitsModal = useUiStore((s) => s.openUsageLimitsModal);
   const openImageAttachmentPreview = useUiStore((s) => s.openImageAttachmentPreview);
 
-  const diffFileRootPath = useMemo(
-    () =>
-      resolveThreadFileRootPath(
-        activeThread,
-        repos,
-        activeWorkspace?.rootPath ?? null,
-      ),
-    [activeThread, activeWorkspace?.rootPath, repos],
-  );
+  const diffFileRootPath = activeWorkspace?.rootPath ?? null;
   const handleOpenDiffFile = useCallback(
     (filePath: string) => {
       if (!diffFileRootPath || !activeWorkspaceId) {
@@ -7441,10 +7264,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                 {t("panel.startConversation")}
               </p>
               <p style={{ margin: 0, fontSize: 12.5 }}>
-                {activeWorkspaceId && (activeRepo || gitStatus?.branch)
-                  ? activeRepo && gitStatus?.branch
-                    ? t("panel.emptyScopeRepoBranch", { repo: activeRepo.name, branch: gitStatus.branch })
-                    : t("panel.emptyScopeRepo", { repo: activeRepo?.name ?? workspaceName })
+                {activeWorkspaceId && gitStatus?.branch
+                  ? t("panel.emptyScopeRepoBranch", { repo: workspaceName, branch: gitStatus.branch })
                   : t("panel.emptyHint")}
               </p>
             </div>
@@ -7761,17 +7582,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                         )}
                       </>
                     )}
-                  {activeRepo && activeRepo.trustLevel !== "trusted" && (
-                    <button
-                      type="button"
-                      className="approval-trust-btn"
-                      onClick={() => void onRepoTrustLevelChange("trusted")}
-                      title={t("panel.setRepoTrusted")}
-                    >
-                      {t("panel.trustRepo")}
-                    </button>
-                  )}
-                  {!activeRepo && repos.length > 0 && workspaceTrustLevel !== "trusted" && (
+                  {workspaceTrustLevel !== "trusted" && (
                     <button
                       type="button"
                       className="approval-trust-btn"
@@ -8191,9 +8002,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                     busy={commandPanelBusy}
                     error={commandPanelError}
                     defaultBaseBranch={
-                      (activeThread?.repoId
-                        ? repos.find((repo) => repo.id === activeThread.repoId)?.defaultBranch
-                        : activeRepo?.defaultBranch) ?? null
+                      gitStatus?.branch ?? null
                     }
                     currentServiceTier={selectedServiceTier}
                     currentPersonality={selectedPersonality}
@@ -9116,20 +8925,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         </div>
       </div>
 
-      <ConfirmDialog
-        open={workspaceOptInPrompt !== null}
-        title={t("panel.multipleRepoWriteEnable")}
-        message={
-          workspaceOptInPrompt
-            ? t("panel.multipleRepoWriteMessage", {
-              repoNames: workspaceOptInPrompt.repoNames,
-            })
-            : ""
-        }
-        confirmLabel={t("panel.continue")}
-        onConfirm={() => void executeWorkspaceOptInSend()}
-        onCancel={dismissWorkspaceOptInPrompt}
-      />
     </div>
   );
 }

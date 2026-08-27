@@ -23,19 +23,18 @@ pub fn validate_repo_relative_path(path: &str) -> anyhow::Result<&Path> {
     Ok(Path::new(path))
 }
 
-pub fn list_dir(repo_path: &str, dir_path: &str) -> anyhow::Result<Vec<FileTreeEntryDto>> {
-    let repo_root = PathBuf::from(repo_path)
+pub fn list_dir(root_path: &str, dir_path: &str) -> anyhow::Result<Vec<FileTreeEntryDto>> {
+    let root = PathBuf::from(root_path)
         .canonicalize()
-        .context("failed to canonicalize repo path")?;
+        .context("failed to canonicalize root path")?;
     let target = if dir_path.is_empty() {
-        repo_root.clone()
+        root.clone()
     } else {
-        repo_root
-            .join(dir_path)
+        root.join(dir_path)
             .canonicalize()
             .context("directory not found")?
     };
-    anyhow::ensure!(target.starts_with(&repo_root), "path traversal not allowed");
+    anyhow::ensure!(target.starts_with(&root), "path traversal not allowed");
     anyhow::ensure!(target.is_dir(), "path is not a directory");
 
     let mut entries = Vec::new();
@@ -56,7 +55,7 @@ pub fn list_dir(repo_path: &str, dir_path: &str) -> anyhow::Result<Vec<FileTreeE
         // Skip symlinks pointing outside the repo
         if path.is_symlink() {
             if let Ok(canonical) = path.canonicalize() {
-                if !canonical.starts_with(&repo_root) {
+                if !canonical.starts_with(&root) {
                     continue;
                 }
             } else {
@@ -66,7 +65,7 @@ pub fn list_dir(repo_path: &str, dir_path: &str) -> anyhow::Result<Vec<FileTreeE
         }
 
         let relative = path
-            .strip_prefix(&repo_root)
+            .strip_prefix(&root)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| path.to_string_lossy().to_string());
 
@@ -85,18 +84,15 @@ pub fn list_dir(repo_path: &str, dir_path: &str) -> anyhow::Result<Vec<FileTreeE
     Ok(entries)
 }
 
-pub fn read_file(repo_path: &str, file_path: &str) -> anyhow::Result<ReadFileResultDto> {
-    let repo_root = PathBuf::from(repo_path)
+pub fn read_file(root_path: &str, file_path: &str) -> anyhow::Result<ReadFileResultDto> {
+    let root = PathBuf::from(root_path)
         .canonicalize()
-        .context("failed to canonicalize repo path")?;
-    let abs_path = repo_root
+        .context("failed to canonicalize root path")?;
+    let abs_path = root
         .join(file_path)
         .canonicalize()
         .context("file not found or cannot be read")?;
-    anyhow::ensure!(
-        abs_path.starts_with(&repo_root),
-        "path traversal not allowed"
-    );
+    anyhow::ensure!(abs_path.starts_with(&root), "path traversal not allowed");
     let metadata = fs::metadata(&abs_path).context("failed to read file metadata")?;
     let size_bytes = metadata.len();
     anyhow::ensure!(
@@ -118,11 +114,11 @@ pub fn read_file(repo_path: &str, file_path: &str) -> anyhow::Result<ReadFileRes
     })
 }
 
-pub fn create_file(repo_path: &str, file_path: &str) -> anyhow::Result<()> {
-    let repo_root = PathBuf::from(repo_path)
+pub fn create_file(root_path: &str, file_path: &str) -> anyhow::Result<()> {
+    let root = PathBuf::from(root_path)
         .canonicalize()
-        .context("failed to canonicalize repo path")?;
-    let target = repo_root.join(validate_repo_relative_path(file_path)?);
+        .context("failed to canonicalize root path")?;
+    let target = root.join(validate_repo_relative_path(file_path)?);
 
     let parent = target.parent().context("invalid file path")?;
     if parent.exists() {
@@ -130,7 +126,7 @@ pub fn create_file(repo_path: &str, file_path: &str) -> anyhow::Result<()> {
             .canonicalize()
             .context("parent directory not found")?;
         anyhow::ensure!(
-            parent_canonical.starts_with(&repo_root),
+            parent_canonical.starts_with(&root),
             "path traversal not allowed"
         );
     } else {
@@ -143,7 +139,7 @@ pub fn create_file(repo_path: &str, file_path: &str) -> anyhow::Result<()> {
             .canonicalize()
             .context("ancestor directory not found")?;
         anyhow::ensure!(
-            ancestor_canonical.starts_with(&repo_root),
+            ancestor_canonical.starts_with(&root),
             "path traversal not allowed"
         );
         fs::create_dir_all(parent).context("failed to create parent directories")?;
@@ -154,11 +150,11 @@ pub fn create_file(repo_path: &str, file_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn create_dir(repo_path: &str, dir_path: &str) -> anyhow::Result<()> {
-    let repo_root = PathBuf::from(repo_path)
+pub fn create_dir(root_path: &str, dir_path: &str) -> anyhow::Result<()> {
+    let root = PathBuf::from(root_path)
         .canonicalize()
-        .context("failed to canonicalize repo path")?;
-    let target = repo_root.join(validate_repo_relative_path(dir_path)?);
+        .context("failed to canonicalize root path")?;
+    let target = root.join(validate_repo_relative_path(dir_path)?);
 
     let mut ancestor = target.as_path();
     while !ancestor.exists() {
@@ -168,7 +164,7 @@ pub fn create_dir(repo_path: &str, dir_path: &str) -> anyhow::Result<()> {
         .canonicalize()
         .context("ancestor directory not found")?;
     anyhow::ensure!(
-        ancestor_canonical.starts_with(&repo_root),
+        ancestor_canonical.starts_with(&root),
         "path traversal not allowed"
     );
 
@@ -177,12 +173,12 @@ pub fn create_dir(repo_path: &str, dir_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn resolve_existing_repo_entry(
-    repo_root: &Path,
+fn resolve_existing_root_entry(
+    root: &Path,
     relative_path: &str,
     missing_message: &str,
 ) -> anyhow::Result<PathBuf> {
-    let target = repo_root.join(validate_repo_relative_path(relative_path)?);
+    let target = root.join(validate_repo_relative_path(relative_path)?);
     fs::symlink_metadata(&target).with_context(|| missing_message.to_string())?;
 
     let parent = target.parent().context("invalid path")?;
@@ -190,7 +186,7 @@ fn resolve_existing_repo_entry(
         .canonicalize()
         .context("parent directory not found")?;
     anyhow::ensure!(
-        parent_canonical.starts_with(repo_root),
+        parent_canonical.starts_with(root),
         "path traversal not allowed"
     );
 
@@ -237,11 +233,11 @@ fn validate_rename_name(new_name: &str) -> anyhow::Result<&Path> {
     Ok(Path::new(name))
 }
 
-pub fn rename_path(repo_path: &str, old_path: &str, new_name: &str) -> anyhow::Result<()> {
-    let repo_root = PathBuf::from(repo_path)
+pub fn rename_path(root_path: &str, old_path: &str, new_name: &str) -> anyhow::Result<()> {
+    let root = PathBuf::from(root_path)
         .canonicalize()
-        .context("failed to canonicalize repo path")?;
-    let source = resolve_existing_repo_entry(&repo_root, old_path, "source not found")?;
+        .context("failed to canonicalize root path")?;
+    let source = resolve_existing_root_entry(&root, old_path, "source not found")?;
 
     let parent = source.parent().context("invalid path")?;
     let dest = parent.join(validate_rename_name(new_name)?);
@@ -258,35 +254,32 @@ pub fn rename_path(repo_path: &str, old_path: &str, new_name: &str) -> anyhow::R
     Ok(())
 }
 
-pub fn delete_path(repo_path: &str, file_path: &str) -> anyhow::Result<()> {
-    let repo_root = PathBuf::from(repo_path)
+pub fn delete_path(root_path: &str, file_path: &str) -> anyhow::Result<()> {
+    let root = PathBuf::from(root_path)
         .canonicalize()
-        .context("failed to canonicalize repo path")?;
-    let target = resolve_existing_repo_entry(&repo_root, file_path, "path not found")?;
-    anyhow::ensure!(target != repo_root, "cannot delete the repository root");
+        .context("failed to canonicalize root path")?;
+    let target = resolve_existing_root_entry(&root, file_path, "path not found")?;
+    anyhow::ensure!(target != root, "cannot delete the repository root");
     delete_existing_entry(&target)
 }
 
 pub fn write_file(
-    repo_path: &str,
+    root_path: &str,
     file_path: &str,
     content: &str,
     expected_version: Option<&str>,
 ) -> anyhow::Result<WriteFileResultDto> {
-    let repo_root = PathBuf::from(repo_path)
+    let root = PathBuf::from(root_path)
         .canonicalize()
-        .context("failed to canonicalize repo path")?;
-    let target = repo_root.join(file_path);
+        .context("failed to canonicalize root path")?;
+    let target = root.join(file_path);
 
     // If the file already exists, canonicalize and verify the full path
     if target.exists() {
         let canonical = target
             .canonicalize()
             .context("failed to resolve file path")?;
-        anyhow::ensure!(
-            canonical.starts_with(&repo_root),
-            "path traversal not allowed"
-        );
+        anyhow::ensure!(canonical.starts_with(&root), "path traversal not allowed");
         if let Some(expected_version) = expected_version {
             let current = fs::read(&canonical).context("failed to verify file before saving")?;
             anyhow::ensure!(
@@ -305,7 +298,7 @@ pub fn write_file(
             .canonicalize()
             .context("parent directory not found")?;
         anyhow::ensure!(
-            parent_canonical.starts_with(&repo_root),
+            parent_canonical.starts_with(&root),
             "path traversal not allowed"
         );
     }

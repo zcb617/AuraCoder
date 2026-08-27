@@ -8,7 +8,10 @@ use std::{collections::HashMap, sync::Mutex};
 
 use serde_json::{json, Value};
 
-use crate::{db::{messages, threads, Database}, models::ThreadDto};
+use crate::{
+    db::{messages, threads, Database},
+    models::ThreadDto,
+};
 
 /// AuraCoder 会话 MCP 的命名空间。
 pub const PANES_THREAD_NAMESPACE: &str = "auracoder_thread";
@@ -114,7 +117,10 @@ impl AuraCoderThreadMcpService {
                 .lock()
                 .map_err(|_| "AuraCoder 会话工具来源登记不可用".to_string())?;
             bindings
-                .get(&(engine_id.trim().to_string(), engine_thread_id.trim().to_string()))
+                .get(&(
+                    engine_id.trim().to_string(),
+                    engine_thread_id.trim().to_string(),
+                ))
                 .cloned()
                 .ok_or_else(|| "当前引擎线程尚未登记 AuraCoder 项目范围".to_string())?
         };
@@ -150,7 +156,8 @@ impl AuraCoderThreadMcpService {
                 }
                 "get_auracoder_thread_messages_page" => {
                     let page = page.ok_or_else(|| "缺少必填参数 page".to_string())?;
-                    let page_size = page_size.ok_or_else(|| "缺少必填参数 page_size".to_string())?;
+                    let page_size =
+                        page_size.ok_or_else(|| "缺少必填参数 page_size".to_string())?;
                     let records = messages::get_thread_messages_page_desc(
                         &db,
                         &target_thread_id,
@@ -195,10 +202,13 @@ mod tests {
             .into_iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
             .collect::<Vec<_>>();
-        assert_eq!(names, vec![
-            "get_auracoder_thread_message_count",
-            "get_auracoder_thread_messages_page",
-        ]);
+        assert_eq!(
+            names,
+            vec![
+                "get_auracoder_thread_message_count",
+                "get_auracoder_thread_messages_page",
+            ]
+        );
     }
 
     #[test]
@@ -220,23 +230,26 @@ mod tests {
         let workspace_one = crate::db::workspaces::upsert_workspace(
             &db,
             &std::env::temp_dir()
-                .join(format!("auracoder-thread-mcp-workspace-one-{}", uuid::Uuid::new_v4()))
+                .join(format!(
+                    "auracoder-thread-mcp-workspace-one-{}",
+                    uuid::Uuid::new_v4()
+                ))
                 .to_string_lossy(),
-            Some(1),
         )
         .expect("first workspace");
         let workspace_two = crate::db::workspaces::upsert_workspace(
             &db,
             &std::env::temp_dir()
-                .join(format!("auracoder-thread-mcp-workspace-two-{}", uuid::Uuid::new_v4()))
+                .join(format!(
+                    "auracoder-thread-mcp-workspace-two-{}",
+                    uuid::Uuid::new_v4()
+                ))
                 .to_string_lossy(),
-            Some(1),
         )
         .expect("second workspace");
         let target_thread = crate::db::threads::create_thread(
             &db,
             &workspace_one.id,
-            None,
             "claude",
             "model",
             "Referenced thread",
@@ -245,7 +258,6 @@ mod tests {
         let other_thread = crate::db::threads::create_thread(
             &db,
             &workspace_two.id,
-            None,
             "opencode",
             "model",
             "Other thread",
@@ -323,7 +335,9 @@ mod tests {
             )
             .await
             .expect("first page query");
-        let first_messages = first_page["messages"].as_array().expect("first page messages");
+        let first_messages = first_page["messages"]
+            .as_array()
+            .expect("first page messages");
         assert_eq!(first_messages.len(), 2);
         assert_eq!(first_messages[0]["content"], "晚");
         assert_eq!(first_messages[1]["content"], "中");
@@ -355,11 +369,15 @@ mod tests {
             )
             .await
             .expect_err("cross-workspace query must fail");
-        assert_eq!(isolation_error, "AuraCoder 会话工具只允许读取当前项目的会话");
+        assert_eq!(
+            isolation_error,
+            "AuraCoder 会话工具只允许读取当前项目的会话"
+        );
     }
 
     fn test_database() -> Database {
-        let path = std::env::temp_dir().join(format!("auracoder-thread-mcp-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("auracoder-thread-mcp-{}.db", uuid::Uuid::new_v4()));
         Database::open(path).expect("test database")
     }
 }

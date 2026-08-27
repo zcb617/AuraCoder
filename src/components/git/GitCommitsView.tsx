@@ -4,13 +4,15 @@ import { useTranslation } from "react-i18next";
 import { formatDateTime } from "../../lib/formatters";
 import { useGitStore } from "../../stores/gitStore";
 import { DiffPanel } from "./GitChangesView";
-import type { Repo } from "../../types";
+import type { WorkspaceGitContext } from "../../types";
+
+type GitCommitContext = Extract<WorkspaceGitContext, { kind: "repository" }>;
 
 interface Props {
-  repo: Repo;
+  context: GitCommitContext;
 }
 
-export function GitCommitsView({ repo }: Props) {
+export function GitCommitsView({ context }: Props) {
   const { t, i18n } = useTranslation("git");
   const {
     commits,
@@ -28,13 +30,13 @@ export function GitCommitsView({ repo }: Props) {
   const [filterQuery, setFilterQuery] = useState("");
 
   useEffect(() => {
-    void loadCommits(repo.path, false);
+    void loadCommits(context.workspaceId, false);
     clearCommitSelection();
-  }, [repo.path, loadCommits, clearCommitSelection]);
+  }, [context.workspaceId, loadCommits, clearCommitSelection]);
 
   useEffect(() => {
     setFilterQuery("");
-  }, [repo.path]);
+  }, [context.workspaceId]);
 
   const filteredCommits = useMemo(() => {
     const q = filterQuery.toLowerCase().trim();
@@ -51,7 +53,7 @@ export function GitCommitsView({ repo }: Props) {
     if (loadingMore) return;
     setLoadingMore(true);
     try {
-      await loadMoreCommits(repo.path);
+      await loadMoreCommits(context.workspaceId);
     } finally {
       setLoadingMore(false);
     }
@@ -131,7 +133,7 @@ export function GitCommitsView({ repo }: Props) {
                 <div
                   className={`git-commit-row${isSelected ? " git-commit-row-selected" : ""}`}
                   style={{ cursor: "pointer" }}
-                  onClick={() => void selectCommit(repo.path, entry.hash)}
+                  onClick={() => void selectCommit(context.workspaceId, entry.hash)}
                 >
                   <div
                     style={{

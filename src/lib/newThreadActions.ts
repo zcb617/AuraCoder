@@ -36,20 +36,10 @@ export async function createAndActivateWorkspaceThread(
   }
 
   applyWorkspaceLayoutMode(workspaceId, targetLayoutMode);
-  useWorkspaceStore.getState().setActiveRepo(null, { remember: false });
-
-  /*
-  const threadId = await useThreadStore.getState().createThread({
-    workspaceId,
-    repoId: null,
-    title: t("app:sidebar.newThreadTitle"),
-  });
-  */
   let threadId: string | null;
   try {
     threadId = await useThreadStore.getState().createThread({
       workspaceId,
-      repoId: null,
       title: t("app:sidebar.newThreadTitle"),
     });
   } catch {

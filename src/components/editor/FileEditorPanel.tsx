@@ -1,10 +1,7 @@
 import { useEffect } from "react";
 import { ExternalLink, Eye, FileDiff, FileText, Loader2, PanelLeftOpen, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import {
-  resolveOwningRepoForAbsolutePath,
-  resolveRelativePathWithinRoot,
-} from "../../lib/fileRootUtils";
+import { resolveRelativePathWithinRoot } from "../../lib/fileRootUtils";
 import { ipc } from "../../lib/ipc";
 import { isMarkdownPreviewFile } from "../../lib/editorFileTypes";
 import { useFileStore } from "../../stores/fileStore";
@@ -39,32 +36,14 @@ export function FileEditorPanel({ embedded = false }: FileEditorPanelProps = {})
   const showSidebar = useUiStore((s) => s.showSidebar);
   const showExplorer = useUiStore((s) => s.showExplorer);
   const setExplorerOpen = useUiStore((s) => s.setExplorerOpen);
-  const repos = useWorkspaceStore((s) => s.repos);
-  const activeRepoId = useWorkspaceStore((s) => s.activeRepoId);
   const openFile = useFileStore((s) => s.openFile);
   const openGitDiffFile = useFileStore((s) => s.openGitDiffFile);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const isMac = isMacDesktop();
   const useTitlebarSafeInset = !embedded && isMac && focusMode && !showSidebar;
-  const activeTabOwnership = activeTab
-    ? (
-        (activeTab.gitRepoPath && activeTab.gitFilePath)
-          ? {
-              repoPath: activeTab.gitRepoPath,
-              filePath: activeTab.gitFilePath,
-            }
-          : (() => {
-              const ownership = resolveOwningRepoForAbsolutePath(
-                activeTab.absolutePath,
-                repos,
-                activeRepoId,
-              );
-              return ownership
-                ? { repoPath: ownership.repo.path, filePath: ownership.filePath }
-                : null;
-            })()
-      )
+  const activeTabOwnership = activeTab?.workspaceId && activeTab.gitFilePath
+    ? { workspaceId: activeTab.workspaceId, filePath: activeTab.gitFilePath }
     : null;
   const canToggleDiffView = Boolean(
     activeTab
@@ -103,14 +82,14 @@ export function FileEditorPanel({ embedded = false }: FileEditorPanelProps = {})
       return;
     }
 
-    const repoPath = activeTabOwnership.repoPath;
     const gitFilePath = activeTab.gitFilePath
-      ?? resolveRelativePathWithinRoot(activeTab.absolutePath, repoPath);
+      ?? resolveRelativePathWithinRoot(activeTab.absolutePath, activeTab.rootPath);
     if (!gitFilePath) {
       return;
     }
 
-    void openGitDiffFile(repoPath, gitFilePath, { source: "changes" });
+    if (!activeTab.workspaceId) return;
+    void openGitDiffFile(activeTab.workspaceId, gitFilePath, { source: "changes" });
   }
 
   function handleToggleMarkdownPreview() {

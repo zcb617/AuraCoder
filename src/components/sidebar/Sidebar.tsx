@@ -49,21 +49,7 @@ interface ProjectGroup {
 }
 
 const MAX_VISIBLE_THREADS = 8;
-const LEGACY_SCAN_DEPTH_STORAGE_KEY = "auracoder.workspace.scanDepth";
-const LEGACY_SCAN_DEPTH_MIN = 0;
-const LEGACY_SCAN_DEPTH_MAX = 12;
 const PINNED_WORKSPACE_IDS_STORAGE_KEY = "auracoder:sidebar:pinnedWorkspaceIds";
-
-function readLegacyDefaultScanDepth(): number | undefined {
-  const stored = window.localStorage.getItem(LEGACY_SCAN_DEPTH_STORAGE_KEY);
-  if (!stored) return undefined;
-  const parsed = Number.parseInt(stored, 10);
-  if (!Number.isFinite(parsed)) return undefined;
-  if (parsed < LEGACY_SCAN_DEPTH_MIN || parsed > LEGACY_SCAN_DEPTH_MAX) {
-    return undefined;
-  }
-  return parsed;
-}
 
 function readPinnedWorkspaceIds(): string[] {
   try {
@@ -99,7 +85,6 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
     activeWorkspaceId,
     sshSessionSyncingWorkspaceIds,
     setActiveWorkspace,
-    setActiveRepo,
     openWorkspace,
     removeWorkspace,
     restoreWorkspace,
@@ -259,18 +244,13 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   async function onOpenFolder() {
     const selected = await open({ directory: true, multiple: false });
     if (!selected || Array.isArray(selected)) return;
-    await openWorkspace(selected, readLegacyDefaultScanDepth());
+    await openWorkspace(selected);
   }
 
   async function onSelectThread(thread: Thread) {
     if (activeView !== "chat") setActiveView("chat");
     if (thread.workspaceId !== activeWorkspaceId) {
       await setActiveWorkspace(thread.workspaceId);
-    }
-    if (thread.repoId) {
-      setActiveRepo(thread.repoId);
-    } else {
-      setActiveRepo(null, { remember: false });
     }
     setActiveThread(thread.id);
     await bindChatThread(thread.id);

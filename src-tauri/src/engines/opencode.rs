@@ -2775,8 +2775,7 @@ fn model_modalities(model: &OpenCodeProviderModel) -> Vec<String> {
 
 fn scope_cwd(scope: &ThreadScope) -> String {
     match scope {
-        ThreadScope::Repo { repo_path } => repo_path.clone(),
-        ThreadScope::Workspace { root_path, .. } => root_path.clone(),
+        ThreadScope::Project { root_path, .. } => root_path.clone(),
     }
 }
 

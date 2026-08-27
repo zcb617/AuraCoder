@@ -413,7 +413,7 @@ pub fn active_thread_for_task(
     };
     let conn = db.connect()?;
     conn.query_row(
-        "SELECT id, workspace_id, repo_id, engine_id, model_id, engine_thread_id,
+        "SELECT id, workspace_id, engine_id, model_id, engine_thread_id,
                 engine_metadata_json, title, status, message_count, total_tokens,
                 created_at, last_activity_at,
                 plan_mode, send_method, reasoning_effort, permission_mode
@@ -421,25 +421,24 @@ pub fn active_thread_for_task(
          WHERE id = ?1 AND workspace_id = ?2 AND archived_at IS NULL",
         params![thread_id, task.workspace_id],
         |row| {
-            let metadata: Option<String> = row.get(6)?;
+            let metadata: Option<String> = row.get(5)?;
             Ok(ThreadDto {
                 id: row.get(0)?,
                 workspace_id: row.get(1)?,
-                repo_id: row.get(2)?,
-                engine_id: row.get(3)?,
-                model_id: row.get(4)?,
-                engine_thread_id: row.get(5)?,
+                engine_id: row.get(2)?,
+                model_id: row.get(3)?,
+                engine_thread_id: row.get(4)?,
                 engine_metadata: metadata.and_then(|value| serde_json::from_str(&value).ok()),
-                plan_mode: row.get(13)?,
-                send_method: row.get(14)?,
-                reasoning_effort: row.get(15)?,
-                permission_mode: row.get(16)?,
-                title: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                status: ThreadStatusDto::from_str(&row.get::<_, String>(8)?),
-                message_count: row.get(9)?,
-                total_tokens: row.get(10)?,
-                created_at: row.get(11)?,
-                last_activity_at: row.get(12)?,
+                plan_mode: row.get(12)?,
+                send_method: row.get(13)?,
+                reasoning_effort: row.get(14)?,
+                permission_mode: row.get(15)?,
+                title: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                status: ThreadStatusDto::from_str(&row.get::<_, String>(7)?),
+                message_count: row.get(8)?,
+                total_tokens: row.get(9)?,
+                created_at: row.get(10)?,
+                last_activity_at: row.get(11)?,
             })
         },
     )
@@ -557,16 +556,20 @@ mod tests {
     use crate::db;
 
     fn test_db() -> Database {
-        let path =
-            std::env::temp_dir().join(format!("auracoder-scheduled-task-db-{}.sqlite", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!(
+            "auracoder-scheduled-task-db-{}.sqlite",
+            Uuid::new_v4()
+        ));
         Database::open(path).expect("failed to create test database")
     }
 
     fn test_workspace(db: &Database) -> crate::models::WorkspaceDto {
-        let root =
-            std::env::temp_dir().join(format!("auracoder-scheduled-task-workspace-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!(
+            "auracoder-scheduled-task-workspace-{}",
+            Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&root).expect("failed to create test workspace root");
-        db::workspaces::upsert_workspace(db, root.to_string_lossy().as_ref(), None)
+        db::workspaces::upsert_workspace(db, root.to_string_lossy().as_ref())
             .expect("failed to create test workspace")
     }
 

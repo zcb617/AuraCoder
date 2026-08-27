@@ -44,10 +44,7 @@ pub struct ApprovalRequestRoute {
 
 #[derive(Debug, Clone)]
 pub enum ThreadScope {
-    Repo {
-        repo_path: String,
-    },
-    Workspace {
+    Project {
         root_path: String,
         writable_roots: Vec<String>,
     },

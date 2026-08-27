@@ -18,15 +18,14 @@ use crate::{
     config::app_config::AppConfig,
     db, fs_ops,
     models::{
-        FileTreeEntryDto, ReadFileResultDto, ResolvedEditorFileReferenceDto, TrustLevelDto,
-        WriteFileResultDto,
+        FileTreeEntryDto, ReadFileResultDto, ResolvedEditorFileReferenceDto, WriteFileResultDto,
     },
     path_utils,
     ssh::{
-        remote_fs, remote_git,
+        remote_fs,
         runtime::{
-            remote_repo_marker, resolve_workspace_target, workspace_id_from_repo_marker,
-            worktree_path_from_repo_marker, WorkspaceTarget,
+            remote_workspace_marker, resolve_workspace_target, workspace_id_from_workspace_marker,
+            WorkspaceTarget,
         },
     },
     state::AppState,
@@ -35,7 +34,7 @@ use crate::{
 #[tauri::command]
 pub async fn list_dir(
     state: State<'_, AppState>,
-    repo_path: String,
+    root_path: String,
     dir_path: String,
     workspace_id: Option<String>,
 ) -> Result<Vec<FileTreeEntryDto>, String> {
@@ -43,14 +42,14 @@ pub async fn list_dir(
         let target = load_workspace_target(&state.db, workspace_id).await?;
         if target.is_remote() {
             let connection = target.remote_connection().map_err(err_to_string)?;
-            let root = remote_access_root(&target, &repo_path).await?;
+            let root = remote_access_root(&target, &root_path).await?;
             return remote_fs::list_dir(connection, &root, &dir_path)
                 .await
                 .map_err(err_to_string);
         }
     }
     tokio::task::spawn_blocking(move || {
-        fs_ops::list_dir(&repo_path, &dir_path).map_err(err_to_string)
+        fs_ops::list_dir(&root_path, &dir_path).map_err(err_to_string)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -59,7 +58,7 @@ pub async fn list_dir(
 #[tauri::command]
 pub async fn read_file(
     state: State<'_, AppState>,
-    repo_path: String,
+    root_path: String,
     file_path: String,
     workspace_id: Option<String>,
 ) -> Result<ReadFileResultDto, String> {
@@ -67,14 +66,14 @@ pub async fn read_file(
         let target = load_workspace_target(&state.db, workspace_id).await?;
         if target.is_remote() {
             let connection = target.remote_connection().map_err(err_to_string)?;
-            let root = remote_access_root(&target, &repo_path).await?;
+            let root = remote_access_root(&target, &root_path).await?;
             return remote_fs::read_file(connection, &root, &file_path)
                 .await
                 .map_err(err_to_string);
         }
     }
     tokio::task::spawn_blocking(move || {
-        fs_ops::read_file(&repo_path, &file_path).map_err(err_to_string)
+        fs_ops::read_file(&root_path, &file_path).map_err(err_to_string)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -83,7 +82,7 @@ pub async fn read_file(
 #[tauri::command]
 pub async fn get_file_version(
     state: State<'_, AppState>,
-    repo_path: String,
+    root_path: String,
     file_path: String,
     workspace_id: Option<String>,
 ) -> Result<String, String> {
@@ -91,14 +90,14 @@ pub async fn get_file_version(
         let target = load_workspace_target(&state.db, workspace_id).await?;
         if target.is_remote() {
             let connection = target.remote_connection().map_err(err_to_string)?;
-            let root = remote_access_root(&target, &repo_path).await?;
+            let root = remote_access_root(&target, &root_path).await?;
             return remote_fs::file_version(connection, &root, &file_path)
                 .await
                 .map_err(err_to_string);
         }
     }
     tokio::task::spawn_blocking(move || {
-        fs_ops::read_file(&repo_path, &file_path)
+        fs_ops::read_file(&root_path, &file_path)
             .map(|result| result.version)
             .map_err(err_to_string)
     })
@@ -109,7 +108,7 @@ pub async fn get_file_version(
 #[tauri::command]
 pub async fn get_directory_fingerprint(
     state: State<'_, AppState>,
-    repo_path: String,
+    root_path: String,
     dir_path: String,
     workspace_id: Option<String>,
 ) -> Result<String, String> {
@@ -117,13 +116,13 @@ pub async fn get_directory_fingerprint(
         let target = load_workspace_target(&state.db, workspace_id).await?;
         if target.is_remote() {
             let connection = target.remote_connection().map_err(err_to_string)?;
-            let root = remote_access_root(&target, &repo_path).await?;
+            let root = remote_access_root(&target, &root_path).await?;
             return remote_fs::directory_fingerprint(connection, &root, &dir_path)
                 .await
                 .map_err(err_to_string);
         }
     }
-    Err(format!("本地目录使用文件监听，不需要目录指纹：{repo_path}"))
+    Err(format!("本地目录使用文件监听，不需要目录指纹：{root_path}"))
 }
 
 #[tauri::command]
@@ -131,8 +130,6 @@ pub async fn resolve_editor_file_reference(
     state: State<'_, AppState>,
     workspace_id: String,
     raw_reference: String,
-    preferred_repo_path: Option<String>,
-    current_cwd: Option<String>,
 ) -> Result<Option<ResolvedEditorFileReferenceDto>, String> {
     let target = load_workspace_target(&state.db, &workspace_id).await?;
     if target.is_remote() {
@@ -147,7 +144,7 @@ pub async fn resolve_editor_file_reference(
             .await
             .map_err(err_to_string)?;
         return Ok(Some(ResolvedEditorFileReferenceDto {
-            repo_path: crate::ssh::runtime::remote_repo_marker(&target.workspace.id),
+            root_path: target.workspace.root_path.clone(),
             file_path,
             line: parsed.line,
             column: parsed.column,
@@ -158,15 +155,8 @@ pub async fn resolve_editor_file_reference(
         let workspace = db::workspaces::find_workspace_by_id(&db, &workspace_id)
             .map_err(err_to_string)?
             .ok_or_else(|| "workspace not found".to_string())?;
-        let repos = db::repos::get_repos(&db, &workspace_id).map_err(err_to_string)?;
-        resolve_editor_file_reference_impl(
-            &workspace.root_path,
-            &repos,
-            &raw_reference,
-            preferred_repo_path.as_deref(),
-            current_cwd.as_deref(),
-        )
-        .map_err(err_to_string)
+        resolve_editor_file_reference_impl(&workspace.root_path, &raw_reference)
+            .map_err(err_to_string)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -175,7 +165,7 @@ pub async fn resolve_editor_file_reference(
 #[tauri::command]
 pub async fn write_file(
     state: State<'_, AppState>,
-    repo_path: String,
+    root_path: String,
     file_path: String,
     content: String,
     workspace_id: Option<String>,
@@ -185,7 +175,7 @@ pub async fn write_file(
         let target = load_workspace_target(&state.db, workspace_id).await?;
         if target.is_remote() {
             let connection = target.remote_connection().map_err(err_to_string)?;
-            let root = remote_access_root(&target, &repo_path).await?;
+            let root = remote_access_root(&target, &root_path).await?;
             return remote_fs::write_file(
                 connection,
                 &root,
@@ -197,35 +187,16 @@ pub async fn write_file(
             .map_err(err_to_string);
         }
     }
-    let db = state.db.clone();
     let cache = state.file_tree_cache.clone();
     tokio::task::spawn_blocking(move || {
-        let access_root = PathBuf::from(&repo_path)
+        let access_root = PathBuf::from(&root_path)
             .canonicalize()
             .map_err(err_to_string)?;
         let target_for_repo_lookup =
             resolve_target_path_for_repo_lookup(&access_root, &file_path).map_err(err_to_string)?;
 
-        // Trust level check for user-initiated writes from the editor:
-        // - Restricted: blocked — explicit opt-in required (must change trust level first)
-        // - Standard/Trusted: allowed — these are direct user actions, not agent-initiated,
-        //   so they don't require approval flow (approval is for agent operations)
-        if let Some(repo) = db::repos::find_deepest_repo_containing_path(
-            &db,
-            target_for_repo_lookup.to_string_lossy().as_ref(),
-            workspace_id.as_deref(),
-        )
-        .map_err(err_to_string)?
-        {
-            if matches!(repo.trust_level, TrustLevelDto::Restricted) {
-                return Err(
-                    "cannot write to a restricted repository; change the trust level first"
-                        .to_string(),
-                );
-            }
-        }
         let result = fs_ops::write_file(
-            &repo_path,
+            &root_path,
             &file_path,
             &content,
             expected_version.as_deref(),
@@ -241,7 +212,7 @@ pub async fn write_file(
 #[tauri::command]
 pub async fn create_file(
     state: State<'_, AppState>,
-    repo_path: String,
+    root_path: String,
     file_path: String,
     workspace_id: Option<String>,
 ) -> Result<(), String> {
@@ -249,33 +220,21 @@ pub async fn create_file(
         let target = load_workspace_target(&state.db, workspace_id).await?;
         if target.is_remote() {
             let connection = target.remote_connection().map_err(err_to_string)?;
-            let root = remote_access_root(&target, &repo_path).await?;
+            let root = remote_access_root(&target, &root_path).await?;
             return remote_fs::create_file(connection, &root, &file_path)
                 .await
                 .map_err(err_to_string);
         }
     }
-    let db = state.db.clone();
     let cache = state.file_tree_cache.clone();
     tokio::task::spawn_blocking(move || {
-        let access_root = PathBuf::from(&repo_path)
+        let access_root = PathBuf::from(&root_path)
             .canonicalize()
             .map_err(err_to_string)?;
         let target_for_repo_lookup =
             resolve_target_path_for_repo_lookup(&access_root, &file_path).map_err(err_to_string)?;
 
-        if let Some(repo) = db::repos::find_deepest_repo_containing_path(
-            &db,
-            target_for_repo_lookup.to_string_lossy().as_ref(),
-            workspace_id.as_deref(),
-        )
-        .map_err(err_to_string)?
-        {
-            if matches!(repo.trust_level, TrustLevelDto::Restricted) {
-                return Err("cannot modify a restricted repository".to_string());
-            }
-        }
-        fs_ops::create_file(&repo_path, &file_path).map_err(err_to_string)?;
+        fs_ops::create_file(&root_path, &file_path).map_err(err_to_string)?;
         cache.invalidate_containing_path(target_for_repo_lookup.to_string_lossy().as_ref());
         Ok(())
     })
@@ -286,7 +245,7 @@ pub async fn create_file(
 #[tauri::command]
 pub async fn create_dir(
     state: State<'_, AppState>,
-    repo_path: String,
+    root_path: String,
     dir_path: String,
     workspace_id: Option<String>,
 ) -> Result<(), String> {
@@ -294,33 +253,21 @@ pub async fn create_dir(
         let target = load_workspace_target(&state.db, workspace_id).await?;
         if target.is_remote() {
             let connection = target.remote_connection().map_err(err_to_string)?;
-            let root = remote_access_root(&target, &repo_path).await?;
+            let root = remote_access_root(&target, &root_path).await?;
             return remote_fs::create_dir(connection, &root, &dir_path)
                 .await
                 .map_err(err_to_string);
         }
     }
-    let db = state.db.clone();
     let cache = state.file_tree_cache.clone();
     tokio::task::spawn_blocking(move || {
-        let access_root = PathBuf::from(&repo_path)
+        let access_root = PathBuf::from(&root_path)
             .canonicalize()
             .map_err(err_to_string)?;
         let target_for_repo_lookup =
             resolve_target_path_for_repo_lookup(&access_root, &dir_path).map_err(err_to_string)?;
 
-        if let Some(repo) = db::repos::find_deepest_repo_containing_path(
-            &db,
-            target_for_repo_lookup.to_string_lossy().as_ref(),
-            workspace_id.as_deref(),
-        )
-        .map_err(err_to_string)?
-        {
-            if matches!(repo.trust_level, TrustLevelDto::Restricted) {
-                return Err("cannot modify a restricted repository".to_string());
-            }
-        }
-        fs_ops::create_dir(&repo_path, &dir_path).map_err(err_to_string)?;
+        fs_ops::create_dir(&root_path, &dir_path).map_err(err_to_string)?;
         cache.invalidate_containing_path(target_for_repo_lookup.to_string_lossy().as_ref());
         Ok(())
     })
@@ -331,7 +278,7 @@ pub async fn create_dir(
 #[tauri::command]
 pub async fn rename_path(
     state: State<'_, AppState>,
-    repo_path: String,
+    root_path: String,
     old_path: String,
     new_name: String,
     workspace_id: Option<String>,
@@ -340,33 +287,21 @@ pub async fn rename_path(
         let target = load_workspace_target(&state.db, workspace_id).await?;
         if target.is_remote() {
             let connection = target.remote_connection().map_err(err_to_string)?;
-            let root = remote_access_root(&target, &repo_path).await?;
+            let root = remote_access_root(&target, &root_path).await?;
             return remote_fs::rename_path(connection, &root, &old_path, &new_name)
                 .await
                 .map_err(err_to_string);
         }
     }
-    let db = state.db.clone();
     let cache = state.file_tree_cache.clone();
     tokio::task::spawn_blocking(move || {
-        let access_root = PathBuf::from(&repo_path)
+        let access_root = PathBuf::from(&root_path)
             .canonicalize()
             .map_err(err_to_string)?;
         let target_for_repo_lookup =
             resolve_target_path_for_repo_lookup(&access_root, &old_path).map_err(err_to_string)?;
 
-        if let Some(repo) = db::repos::find_deepest_repo_containing_path(
-            &db,
-            target_for_repo_lookup.to_string_lossy().as_ref(),
-            workspace_id.as_deref(),
-        )
-        .map_err(err_to_string)?
-        {
-            if matches!(repo.trust_level, TrustLevelDto::Restricted) {
-                return Err("cannot modify a restricted repository".to_string());
-            }
-        }
-        fs_ops::rename_path(&repo_path, &old_path, &new_name).map_err(err_to_string)?;
+        fs_ops::rename_path(&root_path, &old_path, &new_name).map_err(err_to_string)?;
         cache.invalidate_containing_path(target_for_repo_lookup.to_string_lossy().as_ref());
         Ok(())
     })
@@ -377,7 +312,7 @@ pub async fn rename_path(
 #[tauri::command]
 pub async fn delete_path(
     state: State<'_, AppState>,
-    repo_path: String,
+    root_path: String,
     file_path: String,
     workspace_id: Option<String>,
 ) -> Result<(), String> {
@@ -385,33 +320,21 @@ pub async fn delete_path(
         let target = load_workspace_target(&state.db, workspace_id).await?;
         if target.is_remote() {
             let connection = target.remote_connection().map_err(err_to_string)?;
-            let root = remote_access_root(&target, &repo_path).await?;
+            let root = remote_access_root(&target, &root_path).await?;
             return remote_fs::delete_path(connection, &root, &file_path)
                 .await
                 .map_err(err_to_string);
         }
     }
-    let db = state.db.clone();
     let cache = state.file_tree_cache.clone();
     tokio::task::spawn_blocking(move || {
-        let access_root = PathBuf::from(&repo_path)
+        let access_root = PathBuf::from(&root_path)
             .canonicalize()
             .map_err(err_to_string)?;
         let target_for_repo_lookup =
             resolve_target_path_for_repo_lookup(&access_root, &file_path).map_err(err_to_string)?;
 
-        if let Some(repo) = db::repos::find_deepest_repo_containing_path(
-            &db,
-            target_for_repo_lookup.to_string_lossy().as_ref(),
-            workspace_id.as_deref(),
-        )
-        .map_err(err_to_string)?
-        {
-            if matches!(repo.trust_level, TrustLevelDto::Restricted) {
-                return Err("cannot modify a restricted repository".to_string());
-            }
-        }
-        fs_ops::delete_path(&repo_path, &file_path).map_err(err_to_string)?;
+        fs_ops::delete_path(&root_path, &file_path).map_err(err_to_string)?;
         cache.invalidate_containing_path(target_for_repo_lookup.to_string_lossy().as_ref());
         Ok(())
     })
@@ -1448,10 +1371,7 @@ fn resolve_target_path_for_repo_lookup(
 
 fn resolve_editor_file_reference_impl(
     workspace_root: &str,
-    repos: &[crate::models::RepoDto],
     raw_reference: &str,
-    preferred_repo_path: Option<&str>,
-    current_cwd: Option<&str>,
 ) -> anyhow::Result<Option<ResolvedEditorFileReferenceDto>> {
     let Some(parsed) = parse_editor_file_reference(raw_reference) else {
         return Ok(None);
@@ -1459,33 +1379,26 @@ fn resolve_editor_file_reference_impl(
 
     let workspace_root = path_utils::canonicalize_path(Path::new(workspace_root))
         .context("failed to canonicalize workspace root")?;
-    let ordered_roots =
-        ordered_editor_reference_roots(&workspace_root, repos, preferred_repo_path, current_cwd);
-
-    for root in ordered_roots {
-        let candidate = if parsed.path.is_absolute() {
-            parsed.path.clone()
-        } else {
-            root.join(&parsed.path)
-        };
-        let Ok(resolved) = candidate.canonicalize() else {
-            continue;
-        };
-        if !resolved.is_file() || !resolved.starts_with(&root) {
-            continue;
-        }
-        let Ok(relative) = resolved.strip_prefix(&root) else {
-            continue;
-        };
-        return Ok(Some(ResolvedEditorFileReferenceDto {
-            repo_path: root.to_string_lossy().to_string(),
-            file_path: relative.to_string_lossy().to_string(),
-            line: parsed.line,
-            column: parsed.column,
-        }));
+    let candidate = if parsed.path.is_absolute() {
+        parsed.path
+    } else {
+        workspace_root.join(parsed.path)
+    };
+    let Ok(resolved) = candidate.canonicalize() else {
+        return Ok(None);
+    };
+    if !resolved.is_file() || !resolved.starts_with(&workspace_root) {
+        return Ok(None);
     }
-
-    Ok(None)
+    let relative = resolved
+        .strip_prefix(&workspace_root)
+        .context("failed to resolve editor file path")?;
+    Ok(Some(ResolvedEditorFileReferenceDto {
+        root_path: workspace_root.to_string_lossy().to_string(),
+        file_path: relative.to_string_lossy().to_string(),
+        line: parsed.line,
+        column: parsed.column,
+    }))
 }
 
 #[derive(Debug)]
@@ -1547,42 +1460,6 @@ fn parse_line_column(value: &str, separator: char) -> Option<(Option<u32>, Optio
     Some((Some(line), column))
 }
 
-fn ordered_editor_reference_roots(
-    workspace_root: &Path,
-    repos: &[crate::models::RepoDto],
-    preferred_repo_path: Option<&str>,
-    current_cwd: Option<&str>,
-) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    push_editor_reference_root(&mut roots, current_cwd);
-    push_editor_reference_root(&mut roots, preferred_repo_path);
-
-    for repo in repos.iter().filter(|repo| repo.is_active) {
-        push_editor_reference_root(&mut roots, Some(repo.path.as_str()));
-    }
-    for repo in repos.iter().filter(|repo| !repo.is_active) {
-        push_editor_reference_root(&mut roots, Some(repo.path.as_str()));
-    }
-    push_editor_reference_path_root(&mut roots, workspace_root.to_path_buf());
-    roots
-}
-
-fn push_editor_reference_root(roots: &mut Vec<PathBuf>, path: Option<&str>) {
-    let Some(path) = path else {
-        return;
-    };
-    let Ok(root) = path_utils::canonicalize_path(Path::new(path)) else {
-        return;
-    };
-    push_editor_reference_path_root(roots, root);
-}
-
-fn push_editor_reference_path_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
-    if !roots.iter().any(|existing| existing == &root) {
-        roots.push(root);
-    }
-}
-
 async fn load_workspace_target(
     db: &crate::db::Database,
     workspace_id: &str,
@@ -1595,30 +1472,16 @@ async fn load_workspace_target(
         .map_err(err_to_string)
 }
 
-async fn remote_access_root(target: &WorkspaceTarget, repo_path: &str) -> Result<String, String> {
+async fn remote_access_root(target: &WorkspaceTarget, root_path: &str) -> Result<String, String> {
     let workspace_id = target.workspace.id.as_str();
-    if repo_path == remote_repo_marker(workspace_id) || repo_path == target.workspace.root_path {
+    if root_path == remote_workspace_marker(workspace_id) || root_path == target.workspace.root_path
+    {
         return Ok(target.workspace.root_path.clone());
     }
-    if workspace_id_from_repo_marker(repo_path) != Some(workspace_id) {
-        return Err("远端文件路径不属于当前项目".to_string());
+    if workspace_id_from_workspace_marker(root_path) == Some(workspace_id) {
+        return Ok(target.workspace.root_path.clone());
     }
-    let worktree = worktree_path_from_repo_marker(repo_path)
-        .map_err(err_to_string)?
-        .ok_or_else(|| "远端文件路径不属于当前项目登记的工作树".to_string())?;
-    if worktree.relative_path.is_some() {
-        return Err("文件访问根目录不能指向工作树内的子目录".to_string());
-    }
-    let connection = target.remote_connection().map_err(err_to_string)?;
-    let registered = remote_git::worktrees(connection, &target.workspace.root_path)
-        .await
-        .map_err(err_to_string)?
-        .into_iter()
-        .any(|item| item.path == worktree.root_path);
-    if !registered {
-        return Err("远端工作树没有登记在当前项目中".to_string());
-    }
-    Ok(worktree.root_path)
+    Err("远端文件路径不属于当前项目".to_string())
 }
 
 fn err_to_string(error: impl std::fmt::Display) -> String {

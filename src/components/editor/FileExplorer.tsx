@@ -180,7 +180,6 @@ export function FileExplorer() {
   const activeWorkspace = useWorkspaceStore((s) =>
     s.workspaces.find((w) => w.id === activeWorkspaceId),
   );
-  const workspaceRepos = useWorkspaceStore((s) => s.repos);
   const rootPath = activeWorkspace?.rootPath ?? "";
 
   // -- Directory contents & loading --
@@ -275,7 +274,6 @@ export function FileExplorer() {
       const entries = await ipc.listDir(
         requestSignature.rootPath,
         dirPath,
-        activeWorkspaceId,
       );
         if (!isCurrentExplorerLoad(requestSignature, loadSignatureRef.current)) return;
         setDirContents((prev) => {
@@ -421,31 +419,14 @@ export function FileExplorer() {
   useEffect(() => {
     if (!activeWorkspaceId || !rootPath) return;
 
-    const repoPaths = workspaceRepos
-      .filter((repo) => repo.workspaceId === activeWorkspaceId)
-      .map((repo) => repo.path);
-
-    if (repoPaths.length === 0) {
-      return;
-    }
-
-    const visibleRepoPaths = new Set(repoPaths);
     let disposed = false;
     let unlisten: (() => void) | null = null;
 
     const attach = async () => {
-      await Promise.all(
-        repoPaths.map(async (repoPath) => {
-          try {
-            await ipc.watchGitRepo(repoPath);
-          } catch {
-            // Ignore watch failures for individual repos.
-          }
-        }),
-      );
+      try { await ipc.watchGitRepo(activeWorkspaceId); } catch { /* 非 Git 项目忽略监听失败。 */ }
 
       const stop = await listenGitRepoChanged((event) => {
-        if (!visibleRepoPaths.has(event.repoPath)) {
+        if (event.workspaceId !== activeWorkspaceId) {
           return;
         }
         scheduleRefreshVisibleDirs();
@@ -465,7 +446,7 @@ export function FileExplorer() {
       disposed = true;
       unlisten?.();
     };
-  }, [activeWorkspaceId, rootPath, scheduleRefreshVisibleDirs, workspaceRepos]);
+  }, [activeWorkspaceId, rootPath, scheduleRefreshVisibleDirs]);
 
   useEffect(() => {
     if (!rootPath) return;
@@ -520,7 +501,6 @@ export function FileExplorer() {
           const fingerprint = await ipc.getDirectoryFingerprint(
             rootPath,
             dirPath,
-            activeWorkspaceId,
           );
           const previous = remoteDirectoryFingerprintsRef.current.get(dirPath);
           remoteDirectoryFingerprintsRef.current.set(dirPath, fingerprint);
@@ -1016,7 +996,7 @@ export function FileExplorer() {
       : newName;
 
     try {
-      await ipc.renamePath(rootPath, renamingPath, newName, activeWorkspaceId ?? null);
+      await ipc.renamePath(rootPath, renamingPath, newName);
       retargetTabsAfterRename(rootPath, renamingPath, renamedPath);
       setSelectedPaths((prev) => {
         const next = new Set<string>();
@@ -1089,13 +1069,13 @@ export function FileExplorer() {
     const targetPath = creating.parentDir ? `${creating.parentDir}/${name}` : name;
     try {
       if (creating.type === "file") {
-        await ipc.createFile(rootPath, targetPath, activeWorkspaceId ?? null);
+        await ipc.createFile(rootPath, targetPath);
         await loadDir(creating.parentDir);
         toast.success(t("explorer.toasts.created", { name }));
         void openFile(rootPath, targetPath);
         if (activeWorkspaceId) showWorkspaceSurface(activeWorkspaceId, "editor");
       } else {
-        await ipc.createDir(rootPath, targetPath, activeWorkspaceId ?? null);
+        await ipc.createDir(rootPath, targetPath);
         await loadDir(creating.parentDir);
         toast.success(t("explorer.toasts.created", { name }));
       }
@@ -1141,7 +1121,7 @@ export function FileExplorer() {
     setDeletePending(null);
 
     const results = await Promise.allSettled(
-      deletePaths.map((path) => ipc.deletePath(rootPath, path, activeWorkspaceId ?? null)),
+      deletePaths.map((path) => ipc.deletePath(rootPath, path)),
     );
 
     const successfulPaths = deletePaths.filter((_, index) => results[index]?.status === "fulfilled");

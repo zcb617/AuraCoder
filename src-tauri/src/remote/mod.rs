@@ -1451,7 +1451,6 @@ impl RemoteTunnelManager {
                                                 Ok(workspace_id) => create_thread_with_defaults(
                                                     &state,
                                                     workspace_id,
-                                                    None,
                                                     engine_id,
                                                     model_id,
                                                     "新会话".to_string(),

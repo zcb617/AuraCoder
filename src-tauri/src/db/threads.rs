@@ -16,7 +16,6 @@ pub struct RuntimeRecoveryReport {
 pub fn create_thread(
     db: &Database,
     workspace_id: &str,
-    repo_id: Option<&str>,
     engine_id: &str,
     model_id: &str,
     title: &str,
@@ -26,9 +25,9 @@ pub fn create_thread(
     let conn = db.connect()?;
     conn.execute(
         "INSERT INTO threads (
-            id, workspace_id, repo_id, engine_id, model_id, title, status, created_at, last_activity_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'idle', ?7, ?7)",
-        params![id, workspace_id, repo_id, engine_id, model_id, title, created_at],
+            id, workspace_id, engine_id, model_id, title, status, created_at, last_activity_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'idle', ?6, ?6)",
+        params![id, workspace_id, engine_id, model_id, title, created_at],
     )
     .context("failed to create thread")?;
 
@@ -38,15 +37,15 @@ pub fn create_thread(
 pub fn get_thread(db: &Database, thread_id: &str) -> anyhow::Result<Option<ThreadDto>> {
     let conn = db.connect()?;
     conn.query_row(
-    "SELECT id, workspace_id, repo_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
+        "SELECT id, workspace_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
             COALESCE(title, ''), status, message_count, total_tokens, created_at, last_activity_at,
             plan_mode, send_method, reasoning_effort, permission_mode
      FROM threads WHERE id = ?1",
-    params![thread_id],
-    map_thread_row,
-  )
-  .optional()
-  .context("failed to query thread")
+        params![thread_id],
+        map_thread_row,
+    )
+    .optional()
+    .context("failed to query thread")
 }
 
 pub fn find_thread_by_engine_thread_id(
@@ -56,7 +55,7 @@ pub fn find_thread_by_engine_thread_id(
 ) -> anyhow::Result<Option<ThreadDto>> {
     let conn = db.connect()?;
     conn.query_row(
-        "SELECT id, workspace_id, repo_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
+        "SELECT id, workspace_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
                 COALESCE(title, ''), status, message_count, total_tokens, created_at, last_activity_at,
                 plan_mode, send_method, reasoning_effort, permission_mode
          FROM threads
@@ -82,7 +81,7 @@ pub fn find_thread_by_workspace_engine_thread_id(
 ) -> anyhow::Result<Option<ThreadDto>> {
     let conn = db.connect()?;
     conn.query_row(
-        "SELECT id, workspace_id, repo_id, engine_id, model_id, engine_thread_id,
+        "SELECT id, workspace_id, engine_id, model_id, engine_thread_id,
                 engine_metadata_json, COALESCE(title, ''), status, message_count,
                 total_tokens, created_at, last_activity_at,
                 plan_mode, send_method, reasoning_effort, permission_mode
@@ -134,7 +133,9 @@ pub fn upsert_ssh_remote_thread_snapshot(
         model_id.trim()
     };
     let last_activity = last_activity_at.unwrap_or("");
-    if let Some((thread_id, current_model, current_metadata_raw, current_reasoning_effort)) = existing {
+    if let Some((thread_id, current_model, current_metadata_raw, current_reasoning_effort)) =
+        existing
+    {
         // 只有本地模型仍是 unknown 时，才接受远端提供的具体模型，避免覆盖用户配置。
         let next_model = if normalized_model != "unknown" && current_model == "unknown" {
             normalized_model
@@ -178,7 +179,8 @@ pub fn upsert_ssh_remote_thread_snapshot(
         )
         .context("failed update SSH remote thread snapshot")?;
         // CLI 服务端真实返回的模型与思考强度写入独立字段，其余底部项服务端不提供。
-        let remote_reasoning_effort = current_reasoning_effort.or_else(|| reasoning_effort.map(str::to_owned));
+        let remote_reasoning_effort =
+            current_reasoning_effort.or_else(|| reasoning_effort.map(str::to_owned));
         tx.execute(
             "UPDATE threads
              SET reasoning_effort = ?1
@@ -192,10 +194,10 @@ pub fn upsert_ssh_remote_thread_snapshot(
         let remote_reasoning_effort = reasoning_effort;
         tx.execute(
             "INSERT INTO threads (
-                id, workspace_id, repo_id, engine_id, model_id, engine_thread_id,
+                id, workspace_id, engine_id, model_id, engine_thread_id,
                 engine_metadata_json, title, status, last_activity_at, created_at,
                 reasoning_effort
-             ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8,
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                        CASE WHEN ?9 <> '' THEN ?9 ELSE ?10 END, ?10, ?11)",
             params![
                 thread_id,
@@ -225,7 +227,7 @@ pub fn list_threads_for_workspace(
 ) -> anyhow::Result<Vec<ThreadDto>> {
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
-    "SELECT id, workspace_id, repo_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
+        "SELECT id, workspace_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
             COALESCE(title, ''), status, message_count, total_tokens, created_at, last_activity_at,
             plan_mode, send_method, reasoning_effort, permission_mode
      FROM threads
@@ -239,7 +241,7 @@ pub fn list_threads_for_workspace(
          )
        )
      ORDER BY last_activity_at DESC",
-  )?;
+    )?;
 
     let rows = stmt.query_map(params![workspace_id], map_thread_row)?;
     let mut out = Vec::new();
@@ -255,7 +257,7 @@ pub fn list_archived_threads_for_workspace(
 ) -> anyhow::Result<Vec<ThreadDto>> {
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
-    "SELECT id, workspace_id, repo_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
+        "SELECT id, workspace_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
             COALESCE(title, ''), status, message_count, total_tokens, created_at, last_activity_at,
             plan_mode, send_method, reasoning_effort, permission_mode
      FROM threads
@@ -269,7 +271,7 @@ pub fn list_archived_threads_for_workspace(
          )
        )
      ORDER BY archived_at DESC",
-  )?;
+    )?;
 
     let rows = stmt.query_map(params![workspace_id], map_thread_row)?;
     let mut out = Vec::new();
@@ -426,7 +428,7 @@ pub fn reconfigure_unstarted_thread_runtime(
 
     let updated = tx
         .query_row(
-            "SELECT id, workspace_id, repo_id, engine_id, model_id, engine_thread_id,
+            "SELECT id, workspace_id, engine_id, model_id, engine_thread_id,
                     engine_metadata_json, COALESCE(title, ''), status, message_count,
                     total_tokens, created_at, last_activity_at,
                     plan_mode, send_method, reasoning_effort, permission_mode
@@ -558,27 +560,25 @@ pub fn update_thread(db: &Database, update: &ThreadUpdateDto) -> anyhow::Result<
         .execute(
             "UPDATE threads
              SET workspace_id = COALESCE(?1, workspace_id),
-                 repo_id = COALESCE(?2, repo_id),
-                 engine_id = COALESCE(?3, engine_id),
-                 model_id = COALESCE(?4, model_id),
-                 engine_thread_id = COALESCE(?5, engine_thread_id),
-                 engine_metadata_json = COALESCE(?6, engine_metadata_json),
-                 engine_capabilities_json = COALESCE(?7, engine_capabilities_json),
-                 title = COALESCE(?8, title),
-                 status = COALESCE(?9, status),
-                 archived_at = COALESCE(?10, archived_at),
-                 message_count = COALESCE(?11, message_count),
-                 total_tokens = COALESCE(?12, total_tokens),
-                 created_at = COALESCE(?13, created_at),
-                 last_activity_at = COALESCE(?14, last_activity_at),
-                 plan_mode = COALESCE(?15, plan_mode),
-                 send_method = COALESCE(?16, send_method),
-                 reasoning_effort = COALESCE(?17, reasoning_effort),
-                 permission_mode = COALESCE(?18, permission_mode)
-             WHERE id = ?19",
+                 engine_id = COALESCE(?2, engine_id),
+                 model_id = COALESCE(?3, model_id),
+                 engine_thread_id = COALESCE(?4, engine_thread_id),
+                 engine_metadata_json = COALESCE(?5, engine_metadata_json),
+                 engine_capabilities_json = COALESCE(?6, engine_capabilities_json),
+                 title = COALESCE(?7, title),
+                 status = COALESCE(?8, status),
+                 archived_at = COALESCE(?9, archived_at),
+                 message_count = COALESCE(?10, message_count),
+                 total_tokens = COALESCE(?11, total_tokens),
+                 created_at = COALESCE(?12, created_at),
+                 last_activity_at = COALESCE(?13, last_activity_at),
+                 plan_mode = COALESCE(?14, plan_mode),
+                 send_method = COALESCE(?15, send_method),
+                 reasoning_effort = COALESCE(?16, reasoning_effort),
+                 permission_mode = COALESCE(?17, permission_mode)
+             WHERE id = ?18",
             params![
                 update.workspace_id,
-                update.repo_id,
                 update.engine_id,
                 update.model_id,
                 update.engine_thread_id,
@@ -910,27 +910,26 @@ fn derive_thread_status_for_recovery(
 }
 
 fn map_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadDto> {
-    let metadata_raw: Option<String> = row.get(6)?;
+    let metadata_raw: Option<String> = row.get(5)?;
     let metadata = metadata_raw.and_then(|raw| serde_json::from_str(&raw).ok());
 
     Ok(ThreadDto {
         id: row.get(0)?,
         workspace_id: row.get(1)?,
-        repo_id: row.get(2)?,
-        engine_id: row.get(3)?,
-        model_id: row.get(4)?,
-        engine_thread_id: row.get(5)?,
+        engine_id: row.get(2)?,
+        model_id: row.get(3)?,
+        engine_thread_id: row.get(4)?,
         engine_metadata: metadata,
-        plan_mode: row.get(13)?,
-        send_method: row.get(14)?,
-        reasoning_effort: row.get(15)?,
-        permission_mode: row.get(16)?,
-        title: row.get(7)?,
-        status: ThreadStatusDto::from_str(&row.get::<_, String>(8)?),
-        message_count: row.get(9)?,
-        total_tokens: row.get(10)?,
-        created_at: row.get(11)?,
-        last_activity_at: row.get(12)?,
+        plan_mode: row.get(12)?,
+        send_method: row.get(13)?,
+        reasoning_effort: row.get(14)?,
+        permission_mode: row.get(15)?,
+        title: row.get(6)?,
+        status: ThreadStatusDto::from_str(&row.get::<_, String>(7)?),
+        message_count: row.get(8)?,
+        total_tokens: row.get(9)?,
+        created_at: row.get(10)?,
+        last_activity_at: row.get(11)?,
     })
 }
 
@@ -944,8 +943,8 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use crate::db::{messages, workspaces, ConnectionPool, SQLITE_POOL_MAX_IDLE};
     use super::*;
+    use crate::db::{messages, workspaces, ConnectionPool, SQLITE_POOL_MAX_IDLE};
 
     fn test_db() -> Database {
         let path = std::env::temp_dir().join(format!("auracoder-threads-{}.db", Uuid::new_v4()));
@@ -963,9 +962,8 @@ mod tests {
     fn test_thread(db: &Database, title: &str) -> ThreadDto {
         let root = std::env::temp_dir().join(format!("auracoder-workspace-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("failed to create temp workspace root");
-        let workspace =
-            workspaces::upsert_workspace(db, root.to_string_lossy().as_ref(), Some(1)).unwrap();
-        create_thread(db, &workspace.id, None, "codex", "gpt-5.3-codex", title).unwrap()
+        let workspace = workspaces::upsert_workspace(db, root.to_string_lossy().as_ref()).unwrap();
+        create_thread(db, &workspace.id, "codex", "gpt-5.3-codex", title).unwrap()
     }
 
     #[test]

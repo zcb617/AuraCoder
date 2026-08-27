@@ -200,7 +200,6 @@ export function SettingsPage() {
   const setActiveView = useUiStore((state) => state.setActiveView);
   const workspaces = useWorkspaceStore((state) => state.workspaces);
   const activeWorkspaceId = useWorkspaceStore((state) => state.activeWorkspaceId);
-  const activeRepos = useWorkspaceStore((state) => state.repos);
   const themePreference = useThemeStore((state) => state.preference);
   const setThemePreference = useThemeStore((state) => state.setPreference);
   const displayScale = useDisplayScaleStore((state) => state.displayScale);
@@ -408,7 +407,6 @@ export function SettingsPage() {
       { id: "power" as const, icon: <Zap size={15} />, label: t("app:settingsPage.nav.power") },
       { id: "about" as const, icon: <BadgeInfo size={15} />, label: t("app:settingsPage.nav.about") },
       { id: "workspace-general" as const, icon: <FolderGit2 size={15} />, label: t("workspace:nav.general") },
-      { id: "workspace-repos" as const, icon: <GitBranch size={15} />, label: t("workspace:nav.repositories") },
       { id: "workspace-startup" as const, icon: <Play size={15} />, label: t("workspace:nav.startup") },
     ],
     [t],
@@ -800,9 +798,6 @@ export function SettingsPage() {
                 >
                   {item.icon}
                   <span>{item.label}</span>
-                  {item.id === "workspace-repos" && selectedWorkspace?.id === activeWorkspaceId && activeRepos.length > 0 ? (
-                    <span className="usp-nav-count">{activeRepos.length}</span>
-                  ) : null}
                 </button>
               ))}
             </div>
@@ -944,12 +939,6 @@ export function SettingsPage() {
                     title={selectedWorkspace?.name || t("workspace:general.workspaceFallback")}
                     description={t("app:settingsPage.overview.workspaceGeneralDescription")}
                     onActivate={selectedWorkspace ? () => setSection("workspace-general") : undefined}
-                  />
-                  <SettingsRow
-                    icon={<GitBranch size={17} />}
-                    title={t("workspace:nav.repositories")}
-                    description={t("app:settingsPage.overview.repositoriesDescription")}
-                    onActivate={selectedWorkspace ? () => setSection("workspace-repos") : undefined}
                   />
                   <SettingsRow
                     icon={<Play size={17} />}

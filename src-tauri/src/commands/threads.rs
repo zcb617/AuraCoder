@@ -17,7 +17,7 @@ use crate::{
     engines::ThreadSyncSnapshot,
     models::{
         CodexRemoteThreadDto, CodexRemoteThreadPageDto, MessageStatusDto, OpenCodeRemoteSessionDto,
-        OpenCodeRemoteSessionPageDto, PermissionComponentJson, RepoDto, ThreadDto, ThreadStatusDto,
+        OpenCodeRemoteSessionPageDto, PermissionComponentJson, ThreadDto, ThreadStatusDto,
         ThreadUpdateDto, TrustLevelDto,
     },
     path_utils::paths_equal,
@@ -79,7 +79,10 @@ pub async fn update_thread(
     state: State<'_, AppState>,
     update: ThreadUpdateDto,
 ) -> Result<ThreadDto, String> {
-    run_db(state.db.clone(), move |db| db::threads::update_thread(db, &update)).await
+    run_db(state.db.clone(), move |db| {
+        db::threads::update_thread(db, &update)
+    })
+    .await
 }
 
 /// 持久化会话底部 6 项运行时选择。
@@ -122,13 +125,12 @@ pub async fn list_codex_remote_threads(
     archived: Option<bool>,
 ) -> Result<CodexRemoteThreadPageDto, String> {
     let db = state.db.clone();
-    let (workspace_root, repos) = run_db(db.clone(), {
+    let workspace_root = run_db(db.clone(), {
         let workspace_id = workspace_id.clone();
         move |db| {
             let workspace = db::workspaces::find_workspace_by_id(db, &workspace_id)?
                 .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
-            let repos = db::repos::get_repos(db, &workspace_id)?;
-            Ok((workspace.root_path, repos))
+            Ok(workspace.root_path)
         }
     })
     .await?;
@@ -152,9 +154,7 @@ pub async fn list_codex_remote_threads(
         .await
         .map_err(err_to_string)?
         .into_iter()
-        .filter(|thread| {
-            codex_remote_thread_belongs_to_workspace(&workspace_root, &repos, &thread.cwd)
-        })
+        .filter(|thread| codex_remote_thread_belongs_to_workspace(&workspace_root, &thread.cwd))
         .collect::<Vec<_>>();
 
     let offset = parse_codex_remote_thread_cursor(cursor.as_deref())?;
@@ -201,17 +201,16 @@ pub async fn attach_codex_remote_thread(
     // let normalized_model_id =
     //     validate_model_for_engine(state.inner(), "codex", model_id.trim()).await?;
     let db = state.db.clone();
-    let (workspace_root, repos, existing_local_thread) = run_db(db.clone(), {
+    let existing_local_thread = run_db(db.clone(), {
         let workspace_id = workspace_id.clone();
         let engine_thread_id = engine_thread_id.clone();
         move |db| {
-            let workspace = db::workspaces::find_workspace_by_id(db, &workspace_id)?
+            db::workspaces::find_workspace_by_id(db, &workspace_id)?
                 .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
-            let repos = db::repos::get_repos(db, &workspace_id)?;
             let existing =
                 db::threads::find_thread_by_engine_thread_id(db, "codex", &engine_thread_id)?
                     .filter(|thread| thread.workspace_id == workspace_id);
-            Ok((workspace.root_path, repos, existing))
+            Ok(existing)
         }
     })
     .await?;
@@ -351,7 +350,6 @@ pub async fn attach_codex_remote_thread(
         let operation_thread = existing_local_thread.clone().unwrap_or_else(|| ThreadDto {
             id: engine_thread_id.clone(),
             workspace_id: workspace.id.clone(),
-            repo_id: None,
             engine_id: "codex".to_string(),
             model_id: normalized_model_id.clone(),
             engine_thread_id: Some(engine_thread_id.clone()),
@@ -375,7 +373,6 @@ pub async fn attach_codex_remote_thread(
             .map_err(err_to_string)?;
         remote_thread.archived = false;
     }
-    let repo_id = resolve_codex_remote_thread_repo_id(&workspace_root, &repos, &remote_thread.cwd)?;
     let title = build_codex_remote_thread_title(&remote_thread);
     let metadata = build_codex_remote_thread_metadata(
         &remote_thread,
@@ -446,14 +443,8 @@ pub async fn attach_codex_remote_thread(
     }
 
     run_db(db, move |db| {
-        let created = db::threads::create_thread(
-            db,
-            &workspace_id,
-            repo_id.as_deref(),
-            "codex",
-            &normalized_model_id,
-            &title,
-        )?;
+        let created =
+            db::threads::create_thread(db, &workspace_id, "codex", &normalized_model_id, &title)?;
         db::threads::set_engine_thread_id(db, &created.id, &engine_thread_id)?;
         let updated = db::threads::update_thread_runtime_snapshot(
             db,
@@ -497,18 +488,17 @@ pub async fn list_opencode_remote_sessions(
     archived: Option<bool>,
 ) -> Result<OpenCodeRemoteSessionPageDto, String> {
     let db = state.db.clone();
-    let (workspace, repos) = run_db(db.clone(), {
+    let workspace = run_db(db.clone(), {
         let workspace_id = workspace_id.clone();
         move |db| {
             let workspace = db::workspaces::find_workspace_by_id(db, &workspace_id)?
                 .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
-            let repos = db::repos::get_repos(db, &workspace_id)?;
-            Ok((workspace, repos))
+            Ok(workspace)
         }
     })
     .await?;
 
-    let allowed_roots = collect_remote_thread_roots(&workspace.root_path, &repos);
+    let allowed_roots = collect_remote_thread_roots(&workspace.root_path);
     let normalized_search_term = normalize_remote_thread_search_term(search_term);
     let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
     let opencode = CliToolFactory::new(state.inner().clone())
@@ -585,22 +575,21 @@ pub async fn attach_opencode_remote_session(
     let normalized_model_id =
         validate_model_for_engine(state.inner(), "opencode", model_id.trim()).await?;
     let db = state.db.clone();
-    let (workspace, repos, existing_local_thread) = run_db(db.clone(), {
+    let (workspace, existing_local_thread) = run_db(db.clone(), {
         let workspace_id = workspace_id.clone();
         let engine_thread_id = engine_thread_id.clone();
         move |db| {
             let workspace = db::workspaces::find_workspace_by_id(db, &workspace_id)?
                 .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
-            let repos = db::repos::get_repos(db, &workspace_id)?;
             let existing =
                 db::threads::find_thread_by_engine_thread_id(db, "opencode", &engine_thread_id)?
                     .filter(|thread| thread.workspace_id == workspace_id);
-            Ok((workspace, repos, existing))
+            Ok((workspace, existing))
         }
     })
     .await?;
 
-    let allowed_roots = collect_remote_thread_roots(&workspace.root_path, &repos);
+    let allowed_roots = collect_remote_thread_roots(&workspace.root_path);
     if !allowed_roots.contains(cwd.as_str()) {
         return Err(format!(
             "OpenCode session cwd is outside this workspace: {cwd}"
@@ -641,7 +630,6 @@ pub async fn attach_opencode_remote_session(
         let operation_thread = existing_local_thread.clone().unwrap_or_else(|| ThreadDto {
             id: engine_thread_id.clone(),
             workspace_id: workspace.id.clone(),
-            repo_id: None,
             engine_id: "opencode".to_string(),
             model_id: normalized_model_id.clone(),
             engine_thread_id: Some(engine_thread_id.clone()),
@@ -665,8 +653,6 @@ pub async fn attach_opencode_remote_session(
             .map_err(err_to_string)?;
         remote_session.archived = false;
     }
-    let repo_id =
-        resolve_codex_remote_thread_repo_id(&workspace.root_path, &repos, &remote_session.cwd)?;
     let title = build_opencode_remote_session_title(&remote_session);
     // 只有远端返回并成功解析的更新时间才覆盖本地活动时间，避免写入 Unix epoch。
     let remote_last_activity_at = (remote_session.updated_at > 0)
@@ -718,7 +704,6 @@ pub async fn attach_opencode_remote_session(
         let created = db::threads::create_thread(
             db,
             &workspace_id,
-            repo_id.as_deref(),
             "opencode",
             &normalized_model_id,
             &title,
@@ -837,41 +822,22 @@ fn validate_model_for_engine_from_catalog(
 
 async fn resolve_thread_cwd(state: &AppState, thread: &ThreadDto) -> Result<String, String> {
     let workspace_id = thread.workspace_id.clone();
-    let repo_id = thread.repo_id.clone();
     let thread_id = thread.id.clone();
 
     run_db(state.db.clone(), move |db| {
         let workspace = db::workspaces::find_workspace_by_id(db, &workspace_id)?
             .ok_or_else(|| anyhow::anyhow!("workspace not found for thread {thread_id}"))?;
-        if let Some(repo_id) = repo_id.as_deref() {
-            let repo = db::repos::find_repo_by_id(db, repo_id)?
-                .ok_or_else(|| anyhow::anyhow!("repo not found for thread {thread_id}"))?;
-            return Ok(repo.path);
-        }
-
         Ok(workspace.root_path)
     })
     .await
 }
 
-fn collect_remote_thread_roots(
-    workspace_root: &str,
-    repos: &[RepoDto],
-) -> std::collections::HashSet<String> {
-    let mut roots = std::collections::HashSet::with_capacity(repos.len() + 1);
-    roots.insert(workspace_root.to_string());
-    for repo in repos {
-        roots.insert(repo.path.clone());
-    }
-    roots
+fn collect_remote_thread_roots(workspace_root: &str) -> std::collections::HashSet<String> {
+    std::iter::once(workspace_root.to_string()).collect()
 }
 
-fn codex_remote_thread_belongs_to_workspace(
-    workspace_root: &str,
-    repos: &[RepoDto],
-    cwd: &str,
-) -> bool {
-    paths_equal(cwd, workspace_root) || repos.iter().any(|repo| paths_equal(cwd, &repo.path))
+fn codex_remote_thread_belongs_to_workspace(workspace_root: &str, cwd: &str) -> bool {
+    paths_equal(cwd, workspace_root)
 }
 
 fn normalize_remote_thread_search_term(search_term: Option<String>) -> Option<String> {
@@ -934,24 +900,6 @@ fn codex_remote_thread_timestamp_to_rfc3339(timestamp: i64) -> String {
     DateTime::<Utc>::from_timestamp(seconds, nanos)
         .unwrap_or_else(Utc::now)
         .to_rfc3339()
-}
-
-fn resolve_codex_remote_thread_repo_id(
-    workspace_root: &str,
-    repos: &[RepoDto],
-    cwd: &str,
-) -> Result<Option<String>, String> {
-    if paths_equal(cwd, workspace_root) {
-        return Ok(None);
-    }
-
-    if let Some(repo) = repos.iter().find(|repo| paths_equal(&repo.path, cwd)) {
-        return Ok(Some(repo.id.clone()));
-    }
-
-    Err(format!(
-        "Codex thread cwd `{cwd}` is outside the active workspace and cannot be attached"
-    ))
 }
 
 fn build_codex_remote_thread_title(thread: &CodexRemoteThreadSummary) -> String {
@@ -1197,7 +1145,6 @@ fn autonomy_policy_for_preset(
 pub async fn create_thread(
     state: State<'_, AppState>,
     workspace_id: String,
-    repo_id: Option<String>,
     engine_id: String,
     model_id: String,
     title: String,
@@ -1205,27 +1152,12 @@ pub async fn create_thread(
     service_tier: Option<String>,
 ) -> Result<ThreadDto, String> {
     let log_workspace_id = workspace_id.clone();
-    let log_repo_id = repo_id.clone();
     let log_engine_id = engine_id.clone();
     let log_model_id = model_id.clone();
 
-    /*
-    create_thread_with_defaults(
-        state.inner(),
-        workspace_id,
-        repo_id,
-        engine_id,
-        model_id,
-        title,
-        reasoning_effort,
-        service_tier,
-    )
-    .await
-    */
     match create_thread_with_defaults(
         state.inner(),
         workspace_id,
-        repo_id,
         engine_id,
         model_id,
         title,
@@ -1237,9 +1169,8 @@ pub async fn create_thread(
         Ok(thread) => Ok(thread),
         Err(error) => {
             log::error!(
-                "operation=create_thread workspace_id={} repo_id={:?} engine_id={} model_id={} error={error:#}",
+                "operation=create_thread workspace_id={} engine_id={} model_id={} error={error:#}",
                 log_workspace_id,
-                log_repo_id,
                 log_engine_id,
                 log_model_id,
             );
@@ -1252,7 +1183,6 @@ pub async fn create_thread(
 pub(crate) async fn create_thread_with_defaults(
     state: &AppState,
     workspace_id: String,
-    repo_id: Option<String>,
     engine_id: String,
     model_id: String,
     title: String,
@@ -1270,7 +1200,6 @@ pub(crate) async fn create_thread_with_defaults(
     create_thread_inner(
         state,
         workspace_id,
-        repo_id,
         engine_id,
         model_id,
         title,
@@ -1284,7 +1213,6 @@ pub(crate) async fn create_thread_with_defaults(
 async fn create_thread_inner(
     state: &AppState,
     workspace_id: String,
-    repo_id: Option<String>,
     engine_id: String,
     model_id: String,
     title: String,
@@ -1406,14 +1334,8 @@ async fn create_thread_inner(
     let metadata = (!metadata.is_empty()).then_some(Value::Object(metadata));
 
     let mut created = run_db(state.db.clone(), move |db| {
-        let created = db::threads::create_thread(
-            db,
-            &workspace_id,
-            repo_id.as_deref(),
-            &engine_id,
-            &effective_model_id,
-            &title,
-        )?;
+        let created =
+            db::threads::create_thread(db, &workspace_id, &engine_id, &effective_model_id, &title)?;
         if let Some(metadata) = metadata.as_ref() {
             db::threads::update_engine_metadata(db, &created.id, metadata)?;
         }
@@ -1436,8 +1358,8 @@ async fn create_thread_inner(
         let cli = CliToolFactory::new(state.clone())
             .create(created.engine_id.as_str())
             .map_err(err_to_string)?;
-        let context = CliExecutionContext::from_workspace(&target_workspace)
-            .map_err(err_to_string)?;
+        let context =
+            CliExecutionContext::from_workspace(&target_workspace).map_err(err_to_string)?;
         let mut permissions = cli
             .get_permissions(&context, &created)
             .await
@@ -1453,7 +1375,9 @@ async fn create_thread_inner(
             move |db| db::threads::get_thread(db, &thread_id)
         })
         .await?
-        .ok_or_else(|| format!("thread not found after initial autonomy preset update: {created_id}"))?;
+        .ok_or_else(|| {
+            format!("thread not found after initial autonomy preset update: {created_id}")
+        })?;
     }
 
     Ok(created)
@@ -1662,61 +1586,6 @@ pub async fn reconfigure_unstarted_thread_runtime(
         .ok_or_else(|| format!("thread not found after initial autonomy preset update: {created_id}"))?;
     }
     */
-}
-
-#[tauri::command]
-pub async fn confirm_workspace_thread(
-    state: State<'_, AppState>,
-    thread_id: String,
-    writable_roots: Vec<String>,
-) -> Result<(), String> {
-    let db = state.db.clone();
-    let (thread, workspace_root, repo_paths) = run_db(db.clone(), {
-        let thread_id = thread_id.clone();
-        move |db| {
-            let thread = db::threads::get_thread(db, &thread_id)?
-                .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
-            let workspace = db::workspaces::list_workspaces(db)?
-                .into_iter()
-                .find(|item| item.id == thread.workspace_id)
-                .ok_or_else(|| anyhow::anyhow!("workspace not found for thread {thread_id}"))?;
-            let repo_paths = db::repos::get_repos(db, &thread.workspace_id)?
-                .into_iter()
-                .map(|repo| repo.path)
-                .collect::<Vec<_>>();
-            Ok((thread, workspace.root_path, repo_paths))
-        }
-    })
-    .await?;
-
-    if thread.repo_id.is_some() {
-        return Err("confirmation only applies to workspace threads".to_string());
-    }
-
-    let normalized_writable_roots =
-        normalize_workspace_confirmation_roots(&writable_roots, &workspace_root, &repo_paths)?;
-
-    let mut metadata = thread.engine_metadata.unwrap_or_else(|| json!({}));
-    if !metadata.is_object() {
-        metadata = json!({});
-    }
-
-    if let Some(object) = metadata.as_object_mut() {
-        object.insert("workspaceWriteOptIn".to_string(), json!(true));
-        object.insert(
-            "workspaceWritableRoots".to_string(),
-            json!(normalized_writable_roots),
-        );
-        object.insert(
-            "workspaceWriteConfirmedAt".to_string(),
-            json!(Utc::now().to_rfc3339()),
-        );
-    }
-
-    run_db(db, move |db| {
-        db::threads::update_engine_metadata(db, &thread_id, &metadata)
-    })
-    .await
 }
 
 #[tauri::command]
@@ -2887,20 +2756,22 @@ async fn set_thread_execution_policy_inner(
             .sync_thread_execution_policy(&context, &updated_thread, &policy)
             .await
         {
-            let rollback_permission_mode = if original_permission_mode.is_none()
-                && thread.engine_id == "opencode"
-            {
-                Some("[]".to_string())
-            } else {
-                original_permission_mode.clone()
-            };
+            let rollback_permission_mode =
+                if original_permission_mode.is_none() && thread.engine_id == "opencode" {
+                    Some("[]".to_string())
+                } else {
+                    original_permission_mode.clone()
+                };
             let rollback_result = run_db(db.clone(), {
                 let thread_id = thread_id.clone();
-                move |db| db::threads::update_thread_permissions(
-                    db,
-                    &thread_id,
-                    rollback_permission_mode.as_deref(),
-                ).map(|_| ())
+                move |db| {
+                    db::threads::update_thread_permissions(
+                        db,
+                        &thread_id,
+                        rollback_permission_mode.as_deref(),
+                    )
+                    .map(|_| ())
+                }
             })
             .await;
             if let Err(rollback_error) = rollback_result {
@@ -2908,9 +2779,10 @@ async fn set_thread_execution_policy_inner(
                     "同步 OpenCode session 执行权限失败: {sync_error:#}; 回滚线程权限配置也失败: {rollback_error}"
                 ));
             }
-            return Err(format!("同步 OpenCode session 执行权限失败: {sync_error:#}"));
+            return Err(format!(
+                "同步 OpenCode session 执行权限失败: {sync_error:#}"
+            ));
         }
-
     }
 
     run_db(db, {
@@ -3373,22 +3245,15 @@ async fn build_codex_branch_context(
     thread: &ThreadDto,
 ) -> Result<(String, String, SandboxPolicy), String> {
     let db = state.db.clone();
-    let (workspace, repos, selected_repo) = run_db(db, {
+    let workspace = run_db(db, {
         let workspace_id = thread.workspace_id.clone();
         let thread_id = thread.id.clone();
-        let repo_id = thread.repo_id.clone();
         move |db| {
             let workspace = db::workspaces::list_workspaces(db)?
                 .into_iter()
                 .find(|item| item.id == workspace_id)
                 .ok_or_else(|| anyhow::anyhow!("workspace not found for thread {thread_id}"))?;
-            let repos = db::repos::get_repos(db, &workspace_id)?;
-            let selected_repo = if let Some(repo_id) = repo_id.as_deref() {
-                db::repos::find_repo_by_id(db, repo_id)?
-            } else {
-                None
-            };
-            Ok((workspace, repos, selected_repo))
+            Ok(workspace)
         }
     })
     .await?;
@@ -3406,19 +3271,7 @@ async fn build_codex_branch_context(
     let sandbox_mode = sandbox_mode_override
         .clone()
         .unwrap_or_else(|| "workspace-write".to_string());
-    let workspace_writable_roots = if selected_repo.is_some() {
-        None
-    } else {
-        Some(resolve_workspace_writable_roots(
-            repos.iter().map(|repo| repo.path.as_str()),
-            workspace_root.as_str(),
-            thread.engine_metadata.as_ref(),
-        )?)
-    };
-    let trust_level = selected_repo
-        .as_ref()
-        .map(|repo| repo.trust_level.clone())
-        .unwrap_or_else(|| aggregate_workspace_trust_level(&repos));
+    let trust_level = workspace.trust_level.clone();
     let codex_external_sandbox_active =
         codex_external_sandbox_for_workspace(state, &workspace).await?;
     let permission_profile = runtime_permissions.permission_profile.clone();
@@ -3434,25 +3287,9 @@ async fn build_codex_branch_context(
         }
 
         validate_engine_sandbox_mode(thread.engine_id.as_str(), Some(sandbox_mode.as_str()))?;
-
-        if workspace_write_confirmation_required(
-            workspace_writable_roots.as_ref(),
-            sandbox_mode.as_str(),
-            workspace_write_opt_in_enabled(thread.engine_metadata.as_ref()),
-        ) {
-            return Err(
-                "Workspace thread with multiple writable repositories requires explicit confirmation before execution.".to_string(),
-            );
-        }
     }
 
-    let writable_roots = match selected_repo.as_ref() {
-        Some(repo) => vec![repo.path.clone()],
-        None => workspace_writable_roots
-            .as_ref()
-            .map(|resolution| resolution.roots.clone())
-            .unwrap_or_else(|| vec![workspace_root.clone()]),
-    };
+    let writable_roots = vec![workspace_root.clone()];
     let allow_network = if sandbox_mode.eq_ignore_ascii_case("danger-full-access") {
         true
     } else {
@@ -3463,10 +3300,7 @@ async fn build_codex_branch_context(
     let approval_policy_override = runtime_permissions.approval_policy.clone();
 
     Ok((
-        selected_repo
-            .as_ref()
-            .map(|repo| repo.path.clone())
-            .unwrap_or(workspace_root),
+        workspace_root,
         thread.model_id.clone(),
         SandboxPolicy {
             writable_roots,
@@ -3524,7 +3358,6 @@ async fn create_codex_branch_thread(
             let created = db::threads::create_thread(
                 db,
                 &source_thread.workspace_id,
-                source_thread.repo_id.as_deref(),
                 &source_thread.engine_id,
                 &model_id,
                 title.as_deref().unwrap_or(&source_thread.title),
@@ -3612,32 +3445,6 @@ fn codex_transcript_imported(metadata: Option<&Value>) -> bool {
         .and_then(|value| value.get("codexTranscriptImported"))
         .and_then(Value::as_bool)
         .unwrap_or(true)
-}
-
-fn workspace_write_opt_in_enabled(metadata: Option<&Value>) -> bool {
-    metadata
-        .and_then(|value| value.get("workspaceWriteOptIn"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
-fn aggregate_workspace_trust_level(repos: &[RepoDto]) -> TrustLevelDto {
-    if repos
-        .iter()
-        .any(|repo| matches!(repo.trust_level, TrustLevelDto::Restricted))
-    {
-        return TrustLevelDto::Restricted;
-    }
-
-    if !repos.is_empty()
-        && repos
-            .iter()
-            .all(|repo| matches!(repo.trust_level, TrustLevelDto::Trusted))
-    {
-        return TrustLevelDto::Trusted;
-    }
-
-    TrustLevelDto::Standard
 }
 
 fn approval_policy_for_engine_and_trust_level(
@@ -3760,116 +3567,6 @@ fn thread_allow_network_override(_metadata: Option<&Value>) -> Option<bool> {
 
 fn thread_sandbox_mode(_metadata: Option<&Value>) -> Result<Option<String>, String> {
     Ok(None)
-}
-
-fn workspace_writable_roots_from_metadata(
-    metadata: Option<&Value>,
-) -> Result<Option<Vec<String>>, String> {
-    let Some(raw_roots) = metadata.and_then(|value| value.get("workspaceWritableRoots")) else {
-        return Ok(None);
-    };
-
-    let roots = raw_roots.as_array().ok_or_else(|| {
-        "invalid `workspaceWritableRoots` on thread metadata. expected an array of paths"
-            .to_string()
-    })?;
-
-    let mut normalized = Vec::with_capacity(roots.len());
-    for root in roots {
-        let root = root
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                "invalid `workspaceWritableRoots` on thread metadata. expected non-empty string paths"
-                    .to_string()
-            })?;
-        normalized.push(root.to_string());
-    }
-
-    Ok(Some(normalized))
-}
-
-struct WorkspaceWritableRootsResolution {
-    roots: Vec<String>,
-    requires_confirmation: bool,
-}
-
-fn resolve_workspace_writable_roots<'a>(
-    repo_paths: impl IntoIterator<Item = &'a str>,
-    workspace_root: &str,
-    metadata: Option<&Value>,
-) -> Result<WorkspaceWritableRootsResolution, String> {
-    let available_roots: Vec<String> = repo_paths.into_iter().map(ToOwned::to_owned).collect();
-    let confirmed_roots = workspace_writable_roots_from_metadata(metadata)?;
-
-    if let Some(confirmed_roots) = confirmed_roots {
-        if confirmed_roots.is_empty() {
-            return Ok(WorkspaceWritableRootsResolution {
-                roots: vec![workspace_root.to_string()],
-                requires_confirmation: false,
-            });
-        }
-
-        let available_set: std::collections::HashSet<&str> =
-            available_roots.iter().map(String::as_str).collect();
-        let mut filtered_roots = Vec::with_capacity(confirmed_roots.len());
-        for root in confirmed_roots {
-            if available_set.contains(root.as_str()) {
-                filtered_roots.push(root);
-            }
-        }
-        if !filtered_roots.is_empty() {
-            return Ok(WorkspaceWritableRootsResolution {
-                roots: filtered_roots,
-                requires_confirmation: false,
-            });
-        }
-
-        return Ok(match available_roots.len() {
-            0 => WorkspaceWritableRootsResolution {
-                roots: vec![workspace_root.to_string()],
-                requires_confirmation: false,
-            },
-            1 => WorkspaceWritableRootsResolution {
-                roots: available_roots,
-                requires_confirmation: false,
-            },
-            _ => WorkspaceWritableRootsResolution {
-                roots: available_roots,
-                requires_confirmation: true,
-            },
-        });
-    }
-
-    if available_roots.is_empty() {
-        Ok(WorkspaceWritableRootsResolution {
-            roots: vec![workspace_root.to_string()],
-            requires_confirmation: false,
-        })
-    } else {
-        Ok(WorkspaceWritableRootsResolution {
-            roots: available_roots,
-            requires_confirmation: false,
-        })
-    }
-}
-
-fn sandbox_mode_requires_workspace_opt_in(mode: &str) -> bool {
-    !mode.eq_ignore_ascii_case("read-only")
-}
-
-fn workspace_write_confirmation_required(
-    resolution: Option<&WorkspaceWritableRootsResolution>,
-    sandbox_mode: &str,
-    opt_in_enabled: bool,
-) -> bool {
-    let Some(resolution) = resolution else {
-        return false;
-    };
-
-    sandbox_mode_requires_workspace_opt_in(sandbox_mode)
-        && (resolution.requires_confirmation || (resolution.roots.len() > 1 && !opt_in_enabled))
 }
 
 fn unsupported_thread_sandbox_override_for_external_sandbox(
@@ -4372,38 +4069,6 @@ fn normalize_thread_title(raw: &str) -> Result<String, String> {
     Ok(title)
 }
 
-fn normalize_workspace_confirmation_roots(
-    writable_roots: &[String],
-    _workspace_root: &str,
-    repo_paths: &[String],
-) -> Result<Vec<String>, String> {
-    if writable_roots.is_empty() {
-        return Err(
-            "workspace writable roots must include at least one active repository".to_string(),
-        );
-    }
-
-    let allowed_roots: std::collections::HashSet<&str> =
-        repo_paths.iter().map(String::as_str).collect();
-    let mut normalized = Vec::with_capacity(writable_roots.len());
-    for root in writable_roots {
-        let root = root.trim();
-        if root.is_empty() {
-            return Err("workspace writable roots must be non-empty paths".to_string());
-        }
-        if !allowed_roots.contains(root) {
-            return Err(format!(
-                "workspace writable root `{root}` is not an active repository in this workspace"
-            ));
-        }
-        if !normalized.iter().any(|value: &String| value == root) {
-            normalized.push(root.to_string());
-        }
-    }
-
-    Ok(normalized)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, sync::Arc};
@@ -4458,22 +4123,14 @@ mod tests {
         crate::db::workspaces::upsert_workspace(
             &state.db,
             workspace_root.to_string_lossy().as_ref(),
-            Some(1),
         )
         .expect("failed to create workspace")
     }
 
     fn test_thread(state: &AppState, engine_id: &str, model_id: &str) -> ThreadDto {
         let workspace = test_workspace(state);
-        crate::db::threads::create_thread(
-            &state.db,
-            &workspace.id,
-            None,
-            engine_id,
-            model_id,
-            "Thread",
-        )
-        .expect("failed to create thread")
+        crate::db::threads::create_thread(&state.db, &workspace.id, engine_id, model_id, "Thread")
+            .expect("failed to create thread")
     }
 
     #[test]
@@ -4606,7 +4263,10 @@ mod tests {
             "sandboxAllowNetwork": false,
         });
 
-        assert_eq!(migrate_legacy_codex_on_failure_metadata(Some(&metadata), false), None);
+        assert_eq!(
+            migrate_legacy_codex_on_failure_metadata(Some(&metadata), false),
+            None
+        );
         /*
         // 旧 metadata 迁移已停用：
         assert_eq!(
@@ -4627,7 +4287,10 @@ mod tests {
             "sandboxMode": "workspace-write",
         });
 
-        assert_eq!(migrate_legacy_codex_on_failure_metadata(Some(&metadata), true), None);
+        assert_eq!(
+            migrate_legacy_codex_on_failure_metadata(Some(&metadata), true),
+            None
+        );
         /*
         // 旧 metadata 迁移已停用：
         let migrated = migrate_legacy_codex_on_failure_metadata(Some(&metadata), true)
@@ -4709,61 +4372,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_workspace_confirmation_roots_rejects_unknown_paths() {
-        let error = normalize_workspace_confirmation_roots(
-            &[String::from("/workspace/unknown")],
-            "/workspace",
-            &[
-                String::from("/workspace/repo-a"),
-                String::from("/workspace/repo-b"),
-            ],
-        )
-        .expect_err("expected unknown path to be rejected");
-
-        assert!(error.contains("is not an active repository"));
-    }
-
-    #[test]
-    fn normalize_workspace_confirmation_roots_rejects_empty_lists() {
-        let error = normalize_workspace_confirmation_roots(
-            &[],
-            "/workspace",
-            &[
-                String::from("/workspace/repo-a"),
-                String::from("/workspace/repo-b"),
-            ],
-        )
-        .expect_err("expected empty roots to be rejected");
-
-        assert!(error.contains("must include at least one active repository"));
-    }
-
-    #[test]
-    fn normalize_workspace_confirmation_roots_deduplicates_confirmed_paths() {
-        let roots = normalize_workspace_confirmation_roots(
-            &[
-                String::from("/workspace/repo-a"),
-                String::from("/workspace/repo-a"),
-                String::from("/workspace/repo-b"),
-            ],
-            "/workspace",
-            &[
-                String::from("/workspace/repo-a"),
-                String::from("/workspace/repo-b"),
-            ],
-        )
-        .expect("expected roots to normalize");
-
-        assert_eq!(
-            roots,
-            vec![
-                String::from("/workspace/repo-a"),
-                String::from("/workspace/repo-b")
-            ]
-        );
-    }
-
-    #[test]
     fn merge_codex_runtime_metadata_sets_runtime_fields() {
         let metadata = merge_codex_runtime_metadata(
             Some(json!({
@@ -4808,62 +4416,6 @@ mod tests {
         );
         assert_eq!(
             map_codex_thread_status_to_local(Some("active"), &[], true),
-            None
-        );
-    }
-
-    #[test]
-    fn resolve_codex_remote_thread_repo_id_accepts_workspace_root_and_repo_roots() {
-        let repos = vec![RepoDto {
-            id: "repo-1".to_string(),
-            workspace_id: "workspace-1".to_string(),
-            name: "repo".to_string(),
-            path: "/workspace/repo".to_string(),
-            default_branch: "main".to_string(),
-            is_active: true,
-            trust_level: TrustLevelDto::Standard,
-        }];
-
-        assert_eq!(
-            resolve_codex_remote_thread_repo_id("/workspace", &repos, "/workspace").unwrap(),
-            None
-        );
-        assert_eq!(
-            resolve_codex_remote_thread_repo_id("/workspace", &repos, "/workspace/repo").unwrap(),
-            Some("repo-1".to_string())
-        );
-        assert!(resolve_codex_remote_thread_repo_id("/workspace", &repos, "/elsewhere").is_err());
-    }
-
-    #[test]
-    fn codex_remote_thread_matching_normalizes_windows_workspace_paths() {
-        let repos = vec![RepoDto {
-            id: "repo-1".to_string(),
-            workspace_id: "workspace-1".to_string(),
-            name: "repo".to_string(),
-            path: r"D:\zhangcb\my_wiki\repo".to_string(),
-            default_branch: "main".to_string(),
-            is_active: true,
-            trust_level: TrustLevelDto::Standard,
-        }];
-
-        assert!(codex_remote_thread_belongs_to_workspace(
-            r"D:\zhangcb\my_wiki",
-            &repos,
-            r"d:/zhangcb/my_wiki",
-        ));
-        assert!(codex_remote_thread_belongs_to_workspace(
-            r"D:\zhangcb\my_wiki",
-            &repos,
-            r"d:\zhangcb\my_wiki\repo",
-        ));
-        assert_eq!(
-            resolve_codex_remote_thread_repo_id(
-                r"D:\zhangcb\my_wiki",
-                &repos,
-                r"d:\zhangcb\my_wiki",
-            )
-            .unwrap(),
             None
         );
     }
@@ -5051,7 +4603,6 @@ mod tests {
         let mut thread = ThreadDto {
             id: "thread-1".to_string(),
             workspace_id: "workspace-1".to_string(),
-            repo_id: None,
             engine_id: "codex".to_string(),
             model_id: "gpt-5.4".to_string(),
             engine_thread_id: Some("engine-thread-1".to_string()),
@@ -5156,7 +4707,6 @@ mod tests {
         let created = create_thread_inner(
             &state,
             workspace.id.clone(),
-            None,
             "codex".to_string(),
             "gpt-5.4".to_string(),
             "Thread".to_string(),
@@ -5188,7 +4738,6 @@ mod tests {
         let created = create_thread_inner(
             &state,
             workspace.id.clone(),
-            None,
             "claude".to_string(),
             "claude-sonnet-4-6".to_string(),
             "Thread".to_string(),
@@ -5226,7 +4775,6 @@ mod tests {
         let error = create_thread_inner(
             &state,
             workspace.id,
-            None,
             "codex".to_string(),
             "gpt-5.4".to_string(),
             "Thread".to_string(),
@@ -5248,7 +4796,6 @@ mod tests {
         let error = create_thread_inner(
             &state,
             workspace.id,
-            None,
             "claude".to_string(),
             "claude-sonnet-4-6".to_string(),
             "Thread".to_string(),
@@ -5338,16 +4885,17 @@ mod tests {
         .await
         .expect("expected read-only update to succeed");
 
-        let workspace = crate::db::workspaces::find_workspace_by_id(&state.db, &thread.workspace_id)
-            .unwrap()
-            .expect("expected workspace");
+        let workspace =
+            crate::db::workspaces::find_workspace_by_id(&state.db, &thread.workspace_id)
+                .unwrap()
+                .expect("expected workspace");
         let context = CliExecutionContext::from_workspace(&workspace).unwrap();
         let claude = CliToolFactory::new(state.clone()).create("claude").unwrap();
-        let permissions = claude.runtime_permissions(&context, &updated).await.unwrap();
-        assert_eq!(
-            permissions.sandbox_mode.as_deref(),
-            Some("read-only")
-        );
+        let permissions = claude
+            .runtime_permissions(&context, &updated)
+            .await
+            .unwrap();
+        assert_eq!(permissions.sandbox_mode.as_deref(), Some("read-only"));
         assert!(updated
             .engine_metadata
             .as_ref()
@@ -5376,16 +4924,17 @@ mod tests {
         .await
         .expect("expected workspace-write update to succeed");
 
-        let workspace = crate::db::workspaces::find_workspace_by_id(&state.db, &thread.workspace_id)
-            .unwrap()
-            .expect("expected workspace");
+        let workspace =
+            crate::db::workspaces::find_workspace_by_id(&state.db, &thread.workspace_id)
+                .unwrap()
+                .expect("expected workspace");
         let context = CliExecutionContext::from_workspace(&workspace).unwrap();
         let claude = CliToolFactory::new(state.clone()).create("claude").unwrap();
-        let permissions = claude.runtime_permissions(&context, &updated).await.unwrap();
-        assert_eq!(
-            permissions.sandbox_mode.as_deref(),
-            Some("workspace-write")
-        );
+        let permissions = claude
+            .runtime_permissions(&context, &updated)
+            .await
+            .unwrap();
+        assert_eq!(permissions.sandbox_mode.as_deref(), Some("workspace-write"));
         assert!(updated
             .engine_metadata
             .as_ref()
@@ -5447,9 +4996,10 @@ mod tests {
         )
         .await
         .expect("expected permission profile update to succeed");
-        let workspace = crate::db::workspaces::find_workspace_by_id(&state.db, &thread.workspace_id)
-            .unwrap()
-            .expect("expected workspace");
+        let workspace =
+            crate::db::workspaces::find_workspace_by_id(&state.db, &thread.workspace_id)
+                .unwrap()
+                .expect("expected workspace");
         let context = CliExecutionContext::from_workspace(&workspace).unwrap();
         let codex = CliToolFactory::new(state.clone()).create("codex").unwrap();
         let permissions = codex.runtime_permissions(&context, &updated).await.unwrap();
@@ -5473,7 +5023,10 @@ mod tests {
         .expect("expected sandbox update to succeed");
         let permissions = codex.runtime_permissions(&context, &updated).await.unwrap();
         assert_eq!(permissions.permission_profile, None);
-        assert_eq!(permissions.sandbox_mode.as_deref(), Some("danger-full-access"));
+        assert_eq!(
+            permissions.sandbox_mode.as_deref(),
+            Some("danger-full-access")
+        );
     }
 
     #[test]

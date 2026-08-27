@@ -83,7 +83,6 @@ function buildThread(overrides?: Partial<Thread>): Thread {
   return {
     id: "thread-1",
     workspaceId: "ws-1",
-    repoId: null,
     engineId: "codex",
     modelId: "gpt-5.3-codex",
     engineThreadId: null,

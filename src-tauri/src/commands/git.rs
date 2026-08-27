@@ -1,3 +1,4 @@
+use git2::Repository;
 use serde::Serialize;
 use tauri::Emitter;
 use tauri::State;
@@ -7,15 +8,11 @@ use crate::{
     models::{
         FileTreeEntryDto, FileTreePageDto, GitBranchPageDto, GitBranchScopeDto, GitCommitPageDto,
         GitCompareSourceDto, GitDiffPreviewDto, GitFileCompareDto, GitInitRepoStatusDto,
-        GitRemoteDto, GitStashDto, GitStatusDto, GitWorktreeDto,
+        GitRemoteDto, GitStashDto, GitStatusDto, GitWorktreeDto, WorkspaceGitContextDto,
     },
     ssh::{
         remote_git,
-        runtime::{
-            remote_repo_marker, remote_worktree_marker, resolve_workspace_target,
-            validate_remote_relative_path, workspace_id_from_repo_marker,
-            worktree_path_from_repo_marker, WorkspaceTarget, REMOTE_REPO_PREFIX,
-        },
+        runtime::{resolve_workspace_target, validate_remote_relative_path, WorkspaceTarget},
     },
     state::AppState,
 };
@@ -25,13 +22,141 @@ struct RemoteGitTarget {
     root: String,
 }
 
+enum WorkspaceGitTarget {
+    Local { root_path: String },
+    Remote { target: RemoteGitTarget },
+}
+
+/// 按工作区主键解析唯一项目 Git 目标，并按要求校验基础仓库。
+async fn resolve_workspace_git_target(
+    state: &AppState,
+    workspace_id: &str,
+    require_repository: bool,
+) -> Result<WorkspaceGitTarget, String> {
+    let db = state.db.clone();
+    let id = workspace_id.to_string();
+    let workspace =
+        tokio::task::spawn_blocking(move || crate::db::workspaces::find_workspace_by_id(&db, &id))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(err_to_string)?
+            .ok_or_else(|| format!("workspace not found: {workspace_id}"))?;
+    if workspace.location_kind == "local" {
+        if require_repository
+            && (!std::path::Path::new(&workspace.root_path)
+                .join(".git")
+                .exists()
+                || git2::Repository::open(&workspace.root_path).is_err())
+        {
+            return Err("workspace root is not a Git repository".to_string());
+        }
+        return Ok(WorkspaceGitTarget::Local {
+            root_path: workspace.root_path,
+        });
+    }
+    let db = state.db.clone();
+    let workspace_id = workspace.id.clone();
+    let target = tokio::task::spawn_blocking(move || resolve_workspace_target(&db, &workspace_id))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(err_to_string)?;
+    if !target.is_remote() {
+        return Err("SSH workspace target is unavailable".to_string());
+    }
+    let target = RemoteGitTarget {
+        root: target.workspace.root_path.clone(),
+        target,
+    };
+    if require_repository {
+        let connection = target.target.remote_connection().map_err(err_to_string)?;
+        if remote_git::discover(connection, &target.root)
+            .await
+            .map_err(err_to_string)?
+            .is_none()
+        {
+            return Err("workspace root is not a Git repository".to_string());
+        }
+    }
+    Ok(WorkspaceGitTarget::Remote { target })
+}
+
+/// 读取工作区根目录自身的 Git 上下文，不递归检查子目录仓库。
+#[tauri::command]
+pub async fn get_workspace_git_context(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> Result<WorkspaceGitContextDto, String> {
+    let db = state.db.clone();
+    let workspace_id_for_db = workspace_id.clone();
+    let workspace = tokio::task::spawn_blocking(move || {
+        crate::db::workspaces::find_workspace_by_id(&db, &workspace_id_for_db)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(err_to_string)?
+    .ok_or_else(|| format!("workspace not found: {workspace_id}"))?;
+    if workspace.location_kind == "ssh" {
+        let target = resolve_workspace_target(&state.db, &workspace_id).map_err(err_to_string)?;
+        let connection = target.remote_connection().map_err(err_to_string)?;
+        let Some(info) = remote_git::discover(connection, &workspace.root_path)
+            .await
+            .map_err(err_to_string)?
+        else {
+            return Ok(WorkspaceGitContextDto::NotRepository { workspace_id });
+        };
+        return Ok(WorkspaceGitContextDto::Repository {
+            workspace_id,
+            root_path: workspace.root_path,
+            name: info.name,
+            default_branch: Some(info.default_branch),
+        });
+    }
+    Ok(local_workspace_git_context(
+        &workspace_id,
+        &workspace.name,
+        &workspace.root_path,
+    ))
+}
+
+/// 读取本地工作区根目录的 Git 上下文，只识别根目录自身的仓库状态。
+fn local_workspace_git_context(
+    workspace_id: &str,
+    workspace_name: &str,
+    root_path: &str,
+) -> WorkspaceGitContextDto {
+    let root = std::path::Path::new(root_path);
+    let Ok(repository) = (if root.join(".git").exists() {
+        Repository::open(root)
+    } else {
+        Err(git2::Error::from_str(
+            "workspace root is not a Git repository",
+        ))
+    }) else {
+        return WorkspaceGitContextDto::NotRepository {
+            workspace_id: workspace_id.to_string(),
+        };
+    };
+
+    let name = root
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| workspace_name.to_string());
+    let default_branch = repository
+        .head()
+        .ok()
+        .and_then(|head| head.shorthand().map(str::to_string));
+    WorkspaceGitContextDto::Repository {
+        workspace_id: workspace_id.to_string(),
+        root_path: root_path.to_string(),
+        name,
+        default_branch,
+    }
+}
+
 async fn remote_target(
     state: &AppState,
-    repo_path: &str,
+    workspace_id: &str,
 ) -> Result<Option<RemoteGitTarget>, String> {
-    let Some(workspace_id) = workspace_id_from_repo_marker(repo_path) else {
-        return Ok(None);
-    };
     let db = state.db.clone();
     let workspace_id = workspace_id.to_string();
     let target = tokio::task::spawn_blocking(move || resolve_workspace_target(&db, &workspace_id))
@@ -39,28 +164,36 @@ async fn remote_target(
         .map_err(|error| error.to_string())?
         .map_err(err_to_string)?;
     if !target.is_remote() {
-        return Err("远端仓库标识未绑定远端工作区".to_string());
+        return Ok(None);
     }
-    let root = if let Some(worktree_path) =
-        worktree_path_from_repo_marker(repo_path).map_err(err_to_string)?
-    {
-        if worktree_path.relative_path.is_some() {
-            return Err("Git 仓库路径不能指向工作树内的子目录".to_string());
-        }
-        let connection = target.remote_connection().map_err(err_to_string)?;
-        let registered = remote_git::worktrees(connection, &target.workspace.root_path)
-            .await
-            .map_err(err_to_string)?
-            .into_iter()
-            .any(|worktree| worktree.path == worktree_path.root_path);
-        if !registered {
-            return Err("远端工作树没有登记在当前项目中".to_string());
-        }
-        worktree_path.root_path
-    } else {
-        target.workspace.root_path.clone()
-    };
+    let root = target.workspace.root_path.clone();
     Ok(Some(RemoteGitTarget { target, root }))
+}
+
+/// 根据工作区主键解析项目根目录，禁止调用方直接指定基础仓库路径。
+async fn resolve_workspace_root(state: &AppState, workspace_id: &str) -> Result<String, String> {
+    match resolve_workspace_git_target(state, workspace_id, true).await? {
+        WorkspaceGitTarget::Local { root_path } => Ok(root_path),
+        WorkspaceGitTarget::Remote { target } => Ok(target.root),
+    }
+}
+
+/// 解析允许执行初始化的工作区根目录，初始化前允许根目录尚未存在 Git 仓库。
+async fn resolve_workspace_root_unchecked(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<String, String> {
+    let db = state.db.clone();
+    let workspace_id = workspace_id.to_string();
+    let workspace_id_for_db = workspace_id.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::db::workspaces::find_workspace_by_id(&db, &workspace_id_for_db)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(err_to_string)?
+    .map(|workspace| workspace.root_path)
+    .ok_or_else(|| format!("workspace not found: {workspace_id}"))
 }
 
 fn remote_parts(
@@ -75,9 +208,10 @@ fn remote_parts(
 #[tauri::command]
 pub async fn get_git_status(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
 ) -> Result<GitStatusDto, String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::status(connection, root)
             .await
@@ -91,11 +225,12 @@ pub async fn get_git_status(
 #[tauri::command]
 pub async fn get_file_diff(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     file_path: String,
     staged: bool,
 ) -> Result<GitDiffPreviewDto, String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::diff(connection, root, Some(&file_path), staged)
             .await
@@ -111,12 +246,13 @@ pub async fn get_file_diff(
 #[tauri::command]
 pub async fn get_git_file_compare(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     file_path: String,
     source: String,
 ) -> Result<GitFileCompareDto, String> {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
     let compare_source = GitCompareSourceDto::from_str(&source);
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         let preview = remote_git::diff(
             connection,
@@ -150,10 +286,11 @@ pub async fn get_git_file_compare(
 #[tauri::command]
 pub async fn stage_files(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     files: Vec<String>,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::stage(connection, root, &files)
             .await
@@ -169,10 +306,11 @@ pub async fn stage_files(
 #[tauri::command]
 pub async fn unstage_files(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     files: Vec<String>,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::unstage(connection, root, &files)
             .await
@@ -188,10 +326,11 @@ pub async fn unstage_files(
 #[tauri::command]
 pub async fn discard_files(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     files: Vec<String>,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::discard(connection, root, &files)
             .await
@@ -207,10 +346,11 @@ pub async fn discard_files(
 #[tauri::command]
 pub async fn commit(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     message: String,
 ) -> Result<String, String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::commit(connection, root, &message)
             .await
@@ -224,9 +364,10 @@ pub async fn commit(
 #[tauri::command]
 pub async fn soft_reset_last_commit(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::soft_reset_last_commit(connection, root)
             .await
@@ -240,8 +381,9 @@ pub async fn soft_reset_last_commit(
 }
 
 #[tauri::command]
-pub async fn fetch_git(state: State<'_, AppState>, repo_path: String) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+pub async fn fetch_git(state: State<'_, AppState>, workspace_id: String) -> Result<(), String> {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::fetch(connection, root)
             .await
@@ -253,8 +395,9 @@ pub async fn fetch_git(state: State<'_, AppState>, repo_path: String) -> Result<
 }
 
 #[tauri::command]
-pub async fn pull_git(state: State<'_, AppState>, repo_path: String) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+pub async fn pull_git(state: State<'_, AppState>, workspace_id: String) -> Result<(), String> {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::pull(connection, root)
             .await
@@ -266,8 +409,9 @@ pub async fn pull_git(state: State<'_, AppState>, repo_path: String) -> Result<(
 }
 
 #[tauri::command]
-pub async fn push_git(state: State<'_, AppState>, repo_path: String) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+pub async fn push_git(state: State<'_, AppState>, workspace_id: String) -> Result<(), String> {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::push(connection, root)
             .await
@@ -281,17 +425,18 @@ pub async fn push_git(state: State<'_, AppState>, repo_path: String) -> Result<(
 #[tauri::command]
 pub async fn list_git_branches(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     scope: String,
     offset: Option<usize>,
     limit: Option<usize>,
     search: Option<String>,
 ) -> Result<GitBranchPageDto, String> {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(200);
     let scope = GitBranchScopeDto::from_str(&scope);
 
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::branches(connection, root, scope, offset, limit, search.as_deref())
             .await
@@ -308,11 +453,12 @@ pub async fn list_git_branches(
 #[tauri::command]
 pub async fn checkout_git_branch(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     branch_name: String,
     is_remote: bool,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::checkout_branch(connection, root, &branch_name, is_remote)
             .await
@@ -328,11 +474,12 @@ pub async fn checkout_git_branch(
 #[tauri::command]
 pub async fn create_git_branch(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     branch_name: String,
     from_ref: Option<String>,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::create_branch(connection, root, &branch_name, from_ref.as_deref())
             .await
@@ -349,11 +496,12 @@ pub async fn create_git_branch(
 #[tauri::command]
 pub async fn rename_git_branch(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     old_name: String,
     new_name: String,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::rename_branch(connection, root, &old_name, &new_name)
             .await
@@ -369,11 +517,12 @@ pub async fn rename_git_branch(
 #[tauri::command]
 pub async fn delete_git_branch(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     branch_name: String,
     force: bool,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::delete_branch(connection, root, &branch_name, force)
             .await
@@ -389,14 +538,15 @@ pub async fn delete_git_branch(
 #[tauri::command]
 pub async fn list_git_commits(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<GitCommitPageDto, String> {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(100);
 
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::commits(connection, root, offset, limit)
             .await
@@ -412,9 +562,10 @@ pub async fn list_git_commits(
 #[tauri::command]
 pub async fn list_git_stashes(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
 ) -> Result<Vec<GitStashDto>, String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::stashes(connection, root)
             .await
@@ -428,10 +579,11 @@ pub async fn list_git_stashes(
 #[tauri::command]
 pub async fn push_git_stash(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     message: Option<String>,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::stash_push(connection, root, message.as_deref())
             .await
@@ -447,10 +599,11 @@ pub async fn push_git_stash(
 #[tauri::command]
 pub async fn apply_git_stash(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     stash_index: usize,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::stash_apply(connection, root, stash_index, false)
             .await
@@ -466,10 +619,11 @@ pub async fn apply_git_stash(
 #[tauri::command]
 pub async fn pop_git_stash(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     stash_index: usize,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::stash_apply(connection, root, stash_index, true)
             .await
@@ -485,10 +639,11 @@ pub async fn pop_git_stash(
 #[tauri::command]
 pub async fn get_commit_diff(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     commit_hash: String,
 ) -> Result<GitDiffPreviewDto, String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::commit_diff(connection, root, &commit_hash)
             .await
@@ -504,9 +659,10 @@ pub async fn get_commit_diff(
 #[tauri::command]
 pub async fn get_file_tree(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
 ) -> Result<Vec<FileTreeEntryDto>, String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return Ok(remote_git::file_tree(connection, root, 0, 10_000)
             .await
@@ -524,13 +680,14 @@ pub async fn get_file_tree(
 #[tauri::command]
 pub async fn get_file_tree_page(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<FileTreePageDto, String> {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(2000);
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::file_tree(connection, root, offset, limit)
             .await
@@ -547,23 +704,22 @@ pub async fn get_file_tree_page(
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GitRepoChangedEvent {
-    repo_path: String,
+    workspace_id: String,
 }
 
 #[tauri::command]
 pub async fn watch_git_repo(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
 ) -> Result<(), String> {
-    if workspace_id_from_repo_marker(&repo_path).is_some() {
-        return Ok(());
-    }
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
     let cache = state.file_tree_cache.clone();
+    let workspace_id_for_event = workspace_id.clone();
     let callback = std::sync::Arc::new(move |changed_repo_path: String| {
         cache.invalidate_containing_path(&changed_repo_path);
         let payload = GitRepoChangedEvent {
-            repo_path: changed_repo_path,
+            workspace_id: workspace_id_for_event.clone(),
         };
         let _ = app.emit("git-repo-changed", payload);
     });
@@ -580,11 +736,12 @@ pub async fn watch_git_repo(
 #[tauri::command]
 pub async fn add_git_worktree(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     worktree_path: String,
     branch_name: String,
     base_ref: Option<String>,
 ) -> Result<GitWorktreeDto, String> {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
     // Validate branch name
     if branch_name.contains("..")
         || branch_name.starts_with('/')
@@ -594,10 +751,9 @@ pub async fn add_git_worktree(
     {
         return Err(format!("invalid branch name: {branch_name}"));
     }
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
-        let workspace_id = target.target.workspace.id.as_str();
-        let remote_path = remote_worktree_path(workspace_id, root, &worktree_path)?;
+        let remote_path = remote_worktree_path(root, &worktree_path)?;
         let created = remote_git::add_worktree(
             connection,
             root,
@@ -608,7 +764,7 @@ pub async fn add_git_worktree(
         .await
         .map_err(err_to_string)?;
         return Ok(GitWorktreeDto {
-            path: remote_worktree_marker(workspace_id, &created.path),
+            path: created.path.clone(),
             display_path: Some(created.path.clone()),
             ..created
         });
@@ -646,11 +802,12 @@ pub async fn add_git_worktree(
 #[tauri::command]
 pub async fn list_git_worktrees(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
 ) -> Result<Vec<GitWorktreeDto>, String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
-        let workspace_id = target.target.workspace.id.as_str();
+        let workspace_root = target.target.workspace.root_path.clone();
         return remote_git::worktrees(connection, root)
             .await
             .map_err(err_to_string)?
@@ -658,7 +815,7 @@ pub async fn list_git_worktrees(
             .map(|worktree| {
                 if worktree.is_main {
                     return Ok(GitWorktreeDto {
-                        path: remote_repo_marker(workspace_id),
+                        path: workspace_root.clone(),
                         display_path: Some(worktree.path.clone()),
                         ..worktree
                     });
@@ -667,7 +824,7 @@ pub async fn list_git_worktrees(
                     return Err("远端工作树路径无效".to_string());
                 }
                 Ok(GitWorktreeDto {
-                    path: remote_worktree_marker(workspace_id, &worktree.path),
+                    path: worktree.path.clone(),
                     display_path: Some(worktree.path.clone()),
                     ..worktree
                 })
@@ -682,34 +839,27 @@ pub async fn list_git_worktrees(
 #[tauri::command]
 pub async fn remove_git_worktree(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     worktree_path: String,
     force: bool,
     branch_name: Option<String>,
     delete_branch: bool,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
-        if workspace_id_from_repo_marker(&worktree_path)
-            != Some(target.target.workspace.id.as_str())
-        {
-            return Err("远端工作树不属于当前项目".to_string());
-        }
-        let remote_path = worktree_path_from_repo_marker(&worktree_path)
-            .map_err(err_to_string)?
-            .ok_or_else(|| "远端工作树必须使用程序登记的路径".to_string())?;
-        if remote_path.relative_path.is_some() {
-            return Err("移除工作树时不能指定工作树内的子目录".to_string());
+        if !worktree_path.starts_with('/') || worktree_path.contains('\0') {
+            return Err("远端工作树路径必须是绝对路径".to_string());
         }
         let registered = remote_git::worktrees(connection, root)
             .await
             .map_err(err_to_string)?
             .into_iter()
-            .any(|worktree| worktree.path == remote_path.root_path);
+            .any(|worktree| worktree.path == worktree_path);
         if !registered {
             return Err("远端工作树没有登记在当前项目中".to_string());
         }
-        let result = remote_git::remove_worktree(connection, root, &remote_path.root_path, force)
+        let result = remote_git::remove_worktree(connection, root, &worktree_path, force)
             .await
             .map_err(err_to_string);
         if result.is_ok() && delete_branch {
@@ -738,9 +888,10 @@ pub async fn remove_git_worktree(
 #[tauri::command]
 pub async fn prune_git_worktrees(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::prune_worktrees(connection, root)
             .await
@@ -781,13 +932,14 @@ fn ensure_gitignore_entry(repo_path: &str, pattern: &str) -> Result<(), String> 
 #[tauri::command]
 pub async fn init_git_repo(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     validate_only: Option<bool>,
 ) -> Result<GitInitRepoStatusDto, String> {
+    let repo_path = resolve_workspace_root_unchecked(state.inner(), &workspace_id).await?;
     if repo_path.is_empty() {
-        return Err("repo_path is required".to_string());
+        return Err("workspace root is required".to_string());
     }
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         if validate_only.unwrap_or(false) {
             let can_initialize = remote_git::discover(
                 target.target.remote_connection().map_err(err_to_string)?,
@@ -798,7 +950,7 @@ pub async fn init_git_repo(
             .is_none();
             return Ok(GitInitRepoStatusDto {
                 can_initialize,
-                blocking_repo_path: None,
+                blocking_root_path: None,
             });
         }
         remote_git::init(
@@ -809,7 +961,7 @@ pub async fn init_git_repo(
         .map_err(err_to_string)?;
         return Ok(GitInitRepoStatusDto {
             can_initialize: false,
-            blocking_repo_path: None,
+            blocking_root_path: None,
         });
     }
     if !std::path::Path::new(&repo_path).is_dir() {
@@ -828,9 +980,10 @@ pub async fn init_git_repo(
 #[tauri::command]
 pub async fn list_git_remotes(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
 ) -> Result<Vec<GitRemoteDto>, String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::remotes(connection, root)
             .await
@@ -844,17 +997,18 @@ pub async fn list_git_remotes(
 #[tauri::command]
 pub async fn add_git_remote(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     name: String,
     url: String,
 ) -> Result<(), String> {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
     if name.is_empty() || name.contains(char::is_whitespace) {
         return Err(format!("invalid remote name: {name}"));
     }
     if url.is_empty() {
         return Err("url is required".to_string());
     }
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::add_remote(connection, root, &name, &url)
             .await
@@ -870,10 +1024,11 @@ pub async fn add_git_remote(
 #[tauri::command]
 pub async fn remove_git_remote(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     name: String,
 ) -> Result<(), String> {
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::remove_remote(connection, root, &name)
             .await
@@ -892,14 +1047,15 @@ pub async fn remove_git_remote(
 #[tauri::command]
 pub async fn rename_git_remote(
     state: State<'_, AppState>,
-    repo_path: String,
+    workspace_id: String,
     old_name: String,
     new_name: String,
 ) -> Result<(), String> {
+    let repo_path = resolve_workspace_root(state.inner(), &workspace_id).await?;
     if new_name.is_empty() || new_name.contains(char::is_whitespace) {
         return Err(format!("invalid remote name: {new_name}"));
     }
-    if let Some(target) = remote_target(state.inner(), &repo_path).await? {
+    if let Some(target) = remote_target(state.inner(), &workspace_id).await? {
         let (connection, root) = remote_parts(&target)?;
         return remote_git::rename_remote(connection, root, &old_name, &new_name)
             .await
@@ -912,32 +1068,12 @@ pub async fn rename_git_remote(
     .map_err(|error| error.to_string())?
 }
 
-fn remote_worktree_path(workspace_id: &str, root: &str, path: &str) -> Result<String, String> {
+fn remote_worktree_path(root: &str, path: &str) -> Result<String, String> {
     if path.contains('\0') {
         return Err("远端工作树路径无效".to_string());
     }
     if path.starts_with('/') {
         return Ok(path.to_string());
-    }
-    if path.starts_with(REMOTE_REPO_PREFIX) {
-        let marker = remote_repo_marker(workspace_id);
-        if path.starts_with(&format!("{marker}/worktree/")) {
-            let worktree = worktree_path_from_repo_marker(path)
-                .map_err(err_to_string)?
-                .ok_or_else(|| "远端工作树创建路径无效".to_string())?;
-            if worktree.root_path != root {
-                return Err("远端工作树创建路径不属于当前仓库".to_string());
-            }
-            let relative = worktree
-                .relative_path
-                .ok_or_else(|| "远端工作树创建路径不能为空".to_string())?;
-            return Ok(format!("{}/{}", root.trim_end_matches('/'), relative));
-        }
-        let relative = path
-            .strip_prefix(&format!("{marker}/"))
-            .ok_or_else(|| "远端工作树路径不属于当前项目".to_string())?;
-        validate_remote_relative_path(relative, false).map_err(err_to_string)?;
-        return Ok(format!("{}/{}", root.trim_end_matches('/'), relative));
     }
     validate_remote_relative_path(path, false).map_err(err_to_string)?;
     Ok(format!("{}/{}", root.trim_end_matches('/'), path))
@@ -945,12 +1081,14 @@ fn remote_worktree_path(workspace_id: &str, root: &str, path: &str) -> Result<St
 
 #[cfg(test)]
 mod tests {
+    use super::local_workspace_git_context;
     use super::remote_worktree_path;
+    use std::fs;
 
     #[test]
     fn remote_worktree_path_accepts_external_creation_path() {
         assert_eq!(
-            remote_worktree_path("ws-1", "/srv/repo", "/tmp/feature").unwrap(),
+            remote_worktree_path("/srv/repo", "/tmp/feature").unwrap(),
             "/tmp/feature"
         );
     }
@@ -958,42 +1096,42 @@ mod tests {
     #[test]
     fn remote_worktree_path_accepts_project_relative_creation_path() {
         assert_eq!(
-            remote_worktree_path("ws-1", "/srv/repo", ".auracoder/worktrees/feature").unwrap(),
+            remote_worktree_path("/srv/repo", ".auracoder/worktrees/feature").unwrap(),
             "/srv/repo/.auracoder/worktrees/feature"
         );
         assert_eq!(
-            remote_worktree_path("ws-1", "/srv/repo", "custom/feature").unwrap(),
+            remote_worktree_path("/srv/repo", "custom/feature").unwrap(),
             "/srv/repo/custom/feature"
         );
-        assert_eq!(
-            remote_worktree_path(
-                "ws-1",
-                "/srv/repo",
-                "ssh://auracoder/ws-1/.auracoder/worktrees/feature"
-            )
-            .unwrap(),
-            "/srv/repo/.auracoder/worktrees/feature"
-        );
-        assert!(remote_worktree_path(
-            "ws-1",
-            "/srv/repo",
-            "ssh://auracoder/ws-2/.auracoder/worktrees/feature"
-        )
-        .is_err());
     }
 
+    /// 验证仅根目录的 Git 状态决定工作区 Git 上下文，且空仓库没有默认分支。
     #[test]
-    fn remote_worktree_path_accepts_relative_path_under_registered_worktree_marker() {
-        let marker = crate::ssh::runtime::remote_worktree_marker("ws-1", "/srv/worktree-a");
-        assert_eq!(
-            remote_worktree_path(
-                "ws-1",
-                "/srv/worktree-a",
-                &format!("{marker}/.auracoder/worktrees/feature")
-            )
-            .unwrap(),
-            "/srv/worktree-a/.auracoder/worktrees/feature"
-        );
+    fn local_workspace_git_context_uses_only_workspace_root_repository() {
+        let root =
+            std::env::temp_dir().join(format!("auracoder-git-context-{}", uuid::Uuid::new_v4()));
+        let child = root.join("child");
+        fs::create_dir_all(&child).expect("failed to create workspace test directories");
+        git2::Repository::init(&child).expect("failed to initialize child repository");
+
+        let context =
+            local_workspace_git_context("workspace-1", "Workspace", &root.to_string_lossy());
+        assert!(matches!(
+            context,
+            crate::models::WorkspaceGitContextDto::NotRepository { .. }
+        ));
+
+        git2::Repository::init(&root).expect("failed to initialize workspace repository");
+        let context =
+            local_workspace_git_context("workspace-1", "Workspace", &root.to_string_lossy());
+        match context {
+            crate::models::WorkspaceGitContextDto::Repository { default_branch, .. } => {
+                assert!(default_branch.is_none())
+            }
+            crate::models::WorkspaceGitContextDto::NotRepository { .. } => {
+                panic!("workspace root repository should be detected")
+            }
+        }
     }
 }
 

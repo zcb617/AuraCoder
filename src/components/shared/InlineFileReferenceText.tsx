@@ -14,8 +14,6 @@ interface InlineFileReferenceTextProps extends EditorFileReferenceContext {
 export function InlineFileReferenceText({
   text,
   workspaceId,
-  preferredRepoPath,
-  currentCwd,
 }: InlineFileReferenceTextProps) {
   const { t } = useTranslation("common");
   const matches = useMemo(() => findFileReferenceMatches(text), [text]);
@@ -28,8 +26,6 @@ export function InlineFileReferenceText({
   const hint = t(linkOpenGesture === "click" ? "fileReferences.clickHint" : "fileReferences.shiftClickHint");
   const context = {
     workspaceId,
-    preferredRepoPath,
-    currentCwd,
   };
 
   const nodes: ReactNode[] = [];

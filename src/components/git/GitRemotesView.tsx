@@ -5,18 +5,20 @@ import { Link, Pencil, Plus, Trash2, X } from "lucide-react";
 import { useGitStore } from "../../stores/gitStore";
 import { toast } from "../../stores/toastStore";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
-import type { Repo } from "../../types";
+import type { WorkspaceGitContext } from "../../types";
+
+type GitRemoteContext = Extract<WorkspaceGitContext, { kind: "repository" }>;
 
 interface Props {
-  repo: Repo;
+  context: GitRemoteContext;
   onClose: () => void;
 }
 
-export function GitRemotesView({ repo, onClose }: Props) {
+export function GitRemotesView({ context, onClose }: Props) {
   const { t } = useTranslation("git");
   const {
     remotes,
-    remotesRepoPath,
+    remotesWorkspaceId,
     remotesLoading,
     remotesError,
     loadRemotes,
@@ -37,8 +39,8 @@ export function GitRemotesView({ repo, onClose }: Props) {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
 
   useEffect(() => {
-    void loadRemotes(repo.path);
-  }, [repo.path, loadRemotes]);
+    void loadRemotes(context.workspaceId);
+  }, [context.workspaceId, loadRemotes]);
 
   const cancelRename = useCallback(() => {
     if (renameInFlightRef.current) {
@@ -55,7 +57,7 @@ export function GitRemotesView({ repo, onClose }: Props) {
     setRenamingRemote(null);
     setRenameValue("");
     setConfirmDelete(null);
-  }, [repo.path]);
+  }, [context.workspaceId]);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -80,7 +82,7 @@ export function GitRemotesView({ repo, onClose }: Props) {
     if (!trimmedName || !trimmedUrl) return;
     setAddLoading(true);
     try {
-      await addRemote(repo.path, trimmedName, trimmedUrl);
+      await addRemote(context.workspaceId, trimmedName, trimmedUrl);
       toast.success(t("remotes.toasts.added", { name: trimmedName }));
       setShowAdd(false);
       setAddName("origin");
@@ -90,19 +92,19 @@ export function GitRemotesView({ repo, onClose }: Props) {
     } finally {
       setAddLoading(false);
     }
-  }, [addName, addUrl, addRemote, repo.path]);
+  }, [addName, addUrl, addRemote, context.workspaceId]);
 
   const handleDelete = useCallback(
     async (name: string) => {
       setConfirmDelete(null);
       try {
-        await removeRemote(repo.path, name);
+        await removeRemote(context.workspaceId, name);
         toast.success(t("remotes.toasts.removed", { name }));
       } catch (e) {
         toast.error(String(e));
       }
     },
-    [removeRemote, repo.path],
+    [removeRemote, context.workspaceId],
   );
 
   const handleRename = useCallback(
@@ -115,7 +117,7 @@ export function GitRemotesView({ repo, onClose }: Props) {
       if (renameInFlightRef.current) return;
       renameInFlightRef.current = true;
       try {
-        await renameRemote(repo.path, oldName, newName);
+        await renameRemote(context.workspaceId, oldName, newName);
         toast.success(t("remotes.toasts.renamed", { name: newName }));
         setRenamingRemote(null);
       } catch (e) {
@@ -124,10 +126,10 @@ export function GitRemotesView({ repo, onClose }: Props) {
         renameInFlightRef.current = false;
       }
     },
-    [renameValue, renameRemote, repo.path],
+    [renameValue, renameRemote, context.workspaceId],
   );
 
-  const visibleRemotes = remotesLoading || remotesRepoPath !== repo.path ? [] : remotes;
+  const visibleRemotes = remotesLoading || remotesWorkspaceId !== context.workspaceId ? [] : remotes;
 
   return (
     <div className="confirm-dialog-backdrop" onMouseDown={onClose}>
@@ -148,7 +150,7 @@ export function GitRemotesView({ repo, onClose }: Props) {
             <p className="git-remotes-empty">{t("remotes.loading")}</p>
           )}
 
-          {!remotesLoading && remotesRepoPath === repo.path && remotesError && (
+          {!remotesLoading && remotesWorkspaceId === context.workspaceId && remotesError && (
             <p className="git-remotes-error">{remotesError}</p>
           )}
 

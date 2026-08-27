@@ -1,32 +1,26 @@
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  root_path TEXT NOT NULL UNIQUE,
-  scan_depth INTEGER NOT NULL DEFAULT 3,
+  root_path TEXT NOT NULL,
+  location_kind TEXT NOT NULL DEFAULT 'local'
+    CHECK (location_kind IN ('local', 'ssh')),
+  ssh_connection_id TEXT REFERENCES ssh_connections(id) ON DELETE RESTRICT,
+  trust_level TEXT NOT NULL DEFAULT 'standard'
+    CHECK (trust_level IN ('trusted', 'standard', 'restricted')),
   startup_preset_json TEXT,
   startup_preset_updated_at TEXT,
   archived_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   last_opened_at TEXT NOT NULL DEFAULT (datetime('now')),
-  git_repo_selection_configured INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS repos (
-  id TEXT PRIMARY KEY,
-  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-  name TEXT NOT NULL,
-  path TEXT NOT NULL,
-  default_branch TEXT NOT NULL DEFAULT 'main',
-  is_active INTEGER NOT NULL DEFAULT 1,
-  is_discovered INTEGER NOT NULL DEFAULT 1,
-  trust_level TEXT NOT NULL DEFAULT 'standard',
-  UNIQUE(workspace_id, path)
+  CHECK (
+    (location_kind = 'local' AND ssh_connection_id IS NULL)
+    OR (location_kind = 'ssh' AND ssh_connection_id IS NOT NULL)
+  )
 );
 
 CREATE TABLE IF NOT EXISTS threads (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-  repo_id TEXT REFERENCES repos(id) ON DELETE SET NULL,
   engine_id TEXT NOT NULL,
   model_id TEXT NOT NULL,
   engine_thread_id TEXT,
@@ -95,9 +89,7 @@ CREATE TABLE IF NOT EXISTS engine_event_logs (
   event_json TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_repos_workspace ON repos(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_threads_workspace ON threads(workspace_id);
-CREATE INDEX IF NOT EXISTS idx_threads_repo ON threads(repo_id);
 CREATE INDEX IF NOT EXISTS idx_threads_activity ON threads(workspace_id, last_activity_at DESC);
 CREATE INDEX IF NOT EXISTS idx_threads_workspace_status_activity
   ON threads(workspace_id, status, last_activity_at DESC);

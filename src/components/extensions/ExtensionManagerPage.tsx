@@ -150,7 +150,7 @@ function ExtensionCard({
 export function ExtensionManagerPage() {
   const { t, i18n } = useTranslation(["extensions", "workspace", "common"]);
   const setActiveView = useUiStore((state) => state.setActiveView);
-  const { workspaces, activeWorkspaceId, repos, activeRepoId } = useWorkspaceStore();
+  const { workspaces, activeWorkspaceId } = useWorkspaceStore();
   const { threads, activeThreadId } = useThreadStore();
   const entries = useExtensionStore((state) => state.entries);
   const selectedProviderByWorkspace = useExtensionStore(
@@ -162,7 +162,6 @@ export function ExtensionManagerPage() {
   const performAction = useExtensionStore((state) => state.performAction);
 
   const workspace = workspaces.find((candidate) => candidate.id === activeWorkspaceId) ?? null;
-  const repo = repos.find((candidate) => candidate.id === activeRepoId) ?? null;
   const activeThread = threads.find((candidate) => candidate.id === activeThreadId) ?? null;
   const workspaceKey = activeWorkspaceId ?? "global";
   const preferredProvider = resolveExtensionProvider(
@@ -174,10 +173,10 @@ export function ExtensionManagerPage() {
   const [providerId, setProviderId] = useState<ExtensionProviderId>(preferredProvider);
   const previousWorkspaceRef = useRef(workspaceKey);
   const detailsCloseRef = useRef<HTMLButtonElement>(null);
-  const cwd = repo?.path ?? workspace?.rootPath ?? null;
+  const cwd = workspace?.rootPath ?? null;
   const context = useMemo(
-    () => ({ providerId, workspaceId: activeWorkspaceId, repoId: activeRepoId, cwd }),
-    [activeRepoId, activeWorkspaceId, cwd, providerId],
+    () => ({ providerId, workspaceId: activeWorkspaceId, cwd }),
+    [activeWorkspaceId, cwd, providerId],
   );
   const cacheKey = buildExtensionCacheKey(context);
   const entry = entries[cacheKey];
@@ -432,7 +431,7 @@ export function ExtensionManagerPage() {
                 </select>
               </label>
               <span className="em-workspace-context" title={cwd ?? undefined}>
-                {workspace ? repo?.name ?? workspace.name : t("extensions:workspace.none")}
+                {workspace ? workspace.name : t("extensions:workspace.none")}
               </span>
               <button
                 type="button"

@@ -17,7 +17,6 @@ export type ExtensionCatalogPhase = "idle" | "loading" | "ready" | "error";
 export interface ExtensionCatalogContext {
   providerId: ExtensionProviderId;
   workspaceId?: string | null;
-  repoId?: string | null;
   cwd?: string | null;
 }
 
@@ -116,7 +115,6 @@ export function buildExtensionCacheKey(context: ExtensionCatalogContext): string
   return [
     context.providerId,
     context.workspaceId ?? "global",
-    context.repoId ?? "workspace",
     normalizeCwd(context.cwd),
   ].join("::");
 }

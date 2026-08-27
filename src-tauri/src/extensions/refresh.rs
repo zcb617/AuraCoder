@@ -570,7 +570,8 @@ mod tests {
             .join(".tmp")
             .join(format!("auracoder-extension-cache-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("failed to create test root");
-        let db = Database::open(root.join("workspaces.db")).expect("failed to create test database");
+        let db =
+            Database::open(root.join("workspaces.db")).expect("failed to create test database");
         AppState {
             db: db.clone(),
             config: Arc::new(AppConfig::default()),
@@ -717,9 +718,8 @@ mod tests {
                 Uuid::new_v4()
             ));
         fs::create_dir_all(&root).expect("failed to create active workspace root");
-        let workspace =
-            crate::db::workspaces::upsert_workspace(&state.db, &root.to_string_lossy(), None)
-                .expect("failed to create active workspace");
+        let workspace = crate::db::workspaces::upsert_workspace(&state.db, &root.to_string_lossy())
+            .expect("failed to create active workspace");
 
         schedule_workspace_catalog_refresh(&state, &workspace.id)
             .await

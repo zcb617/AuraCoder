@@ -8,6 +8,7 @@ import type {
   GitStash,
   GitStatus,
   GitWorktree,
+  WorkspaceGitContext,
 } from "../types";
 import { ipc } from "../lib/ipc";
 import { recordPerfMetric } from "../lib/perfTelemetry";
@@ -91,17 +92,17 @@ interface GitDiffCacheEntry {
   updatedAt: number;
 }
 
-const repoRevisionByPath = new Map<string, number>();
-const statusCacheByRepo = new Map<string, GitStatusCacheEntry>();
-const statusInFlightByRepo = new Map<string, Promise<GitStatus>>();
+const repoRevisionByWorkspace = new Map<string, number>();
+const statusCacheByWorkspace = new Map<string, GitStatusCacheEntry>();
+const statusInFlightByWorkspace = new Map<string, Promise<GitStatus>>();
 const diffCacheByKey = new Map<string, GitDiffCacheEntry>();
 const diffInFlightByKey = new Map<string, Promise<GitDiffPreview>>();
 const activeViewRefreshedAtByKey = new Map<string, number>();
 let statusCacheBytes = 0;
 let diffCacheBytes = 0;
 
-function estimateStatusCacheEntryBytes(repoPath: string, entry: GitStatusCacheEntry): number {
-  let bytes = repoPath.length * 2 + entry.status.branch.length * 2 + 96;
+function estimateStatusCacheEntryBytes(workspaceId: string, entry: GitStatusCacheEntry): number {
+  let bytes = workspaceId.length * 2 + entry.status.branch.length * 2 + 96;
   for (const file of entry.status.files) {
     bytes += file.path.length * 2;
     bytes += (file.indexStatus?.length ?? 0) * 2;
@@ -115,16 +116,16 @@ function estimateDiffCacheEntryBytes(key: string, entry: GitDiffCacheEntry): num
   return (key.length + entry.diff.content.length) * 2 + 128;
 }
 
-function removeStatusCacheEntry(repoPath: string) {
-  const existing = statusCacheByRepo.get(repoPath);
+function removeStatusCacheEntry(workspaceId: string) {
+  const existing = statusCacheByWorkspace.get(workspaceId);
   if (!existing) {
     return;
   }
   statusCacheBytes = Math.max(
     0,
-    statusCacheBytes - estimateStatusCacheEntryBytes(repoPath, existing),
+    statusCacheBytes - estimateStatusCacheEntryBytes(workspaceId, existing),
   );
-  statusCacheByRepo.delete(repoPath);
+  statusCacheByWorkspace.delete(workspaceId);
 }
 
 function removeDiffCacheEntry(key: string) {
@@ -138,13 +139,13 @@ function removeDiffCacheEntry(key: string) {
 
 function trimStatusCacheToLimits() {
   while (
-    statusCacheByRepo.size > GIT_STATUS_CACHE_MAX_ENTRIES ||
+    statusCacheByWorkspace.size > GIT_STATUS_CACHE_MAX_ENTRIES ||
     statusCacheBytes > GIT_STATUS_CACHE_MAX_BYTES
   ) {
     let oldestKey: string | null = null;
     let oldestUpdatedAt = Number.POSITIVE_INFINITY;
 
-    for (const [key, entry] of statusCacheByRepo.entries()) {
+    for (const [key, entry] of statusCacheByWorkspace.entries()) {
       if (entry.updatedAt < oldestUpdatedAt) {
         oldestUpdatedAt = entry.updatedAt;
         oldestKey = key;
@@ -180,10 +181,10 @@ function trimDiffCacheToLimits() {
   }
 }
 
-function setStatusCacheEntry(repoPath: string, entry: GitStatusCacheEntry) {
-  removeStatusCacheEntry(repoPath);
-  statusCacheByRepo.set(repoPath, entry);
-  statusCacheBytes += estimateStatusCacheEntryBytes(repoPath, entry);
+function setStatusCacheEntry(workspaceId: string, entry: GitStatusCacheEntry) {
+  removeStatusCacheEntry(workspaceId);
+  statusCacheByWorkspace.set(workspaceId, entry);
+  statusCacheBytes += estimateStatusCacheEntryBytes(workspaceId, entry);
   trimStatusCacheToLimits();
 }
 
@@ -194,43 +195,43 @@ function setDiffCacheEntry(key: string, entry: GitDiffCacheEntry) {
   trimDiffCacheToLimits();
 }
 
-function getRepoRevision(repoPath: string): number {
-  return repoRevisionByPath.get(repoPath) ?? 0;
+function getWorkspaceRevision(workspaceId: string): number {
+  return repoRevisionByWorkspace.get(workspaceId) ?? 0;
 }
 
-function incrementRepoRevision(repoPath: string): number {
-  const next = getRepoRevision(repoPath) + 1;
-  repoRevisionByPath.set(repoPath, next);
+function incrementWorkspaceRevision(workspaceId: string): number {
+  const next = getWorkspaceRevision(workspaceId) + 1;
+  repoRevisionByWorkspace.set(workspaceId, next);
   return next;
 }
 
-function buildDiffCacheKey(repoPath: string, filePath: string, staged: boolean): string {
-  return `${repoPath}::${staged ? "staged" : "worktree"}::${filePath}`;
+function buildDiffCacheKey(workspaceId: string, filePath: string, staged: boolean): string {
+  return `${workspaceId}::${staged ? "staged" : "worktree"}::${filePath}`;
 }
 
-function invalidateRepoCaches(repoPath: string) {
-  incrementRepoRevision(repoPath);
-  removeStatusCacheEntry(repoPath);
-  statusInFlightByRepo.delete(repoPath);
+function invalidateWorkspaceCaches(workspaceId: string) {
+  incrementWorkspaceRevision(workspaceId);
+  removeStatusCacheEntry(workspaceId);
+  statusInFlightByWorkspace.delete(workspaceId);
   for (const key of [...diffCacheByKey.keys()]) {
-    if (key.startsWith(`${repoPath}::`)) {
+    if (key.startsWith(`${workspaceId}::`)) {
       removeDiffCacheEntry(key);
     }
   }
   for (const key of diffInFlightByKey.keys()) {
-    if (key.startsWith(`${repoPath}::`)) {
+    if (key.startsWith(`${workspaceId}::`)) {
       diffInFlightByKey.delete(key);
     }
   }
   for (const key of activeViewRefreshedAtByKey.keys()) {
-    if (key.startsWith(`${repoPath}::`)) {
+    if (key.startsWith(`${workspaceId}::`)) {
       activeViewRefreshedAtByKey.delete(key);
     }
   }
 }
 
 function shouldRefreshActiveView(
-  repoPath: string,
+  workspaceId: string,
   view: GitPanelView,
   force: boolean,
 ): boolean {
@@ -240,7 +241,7 @@ function shouldRefreshActiveView(
   if (force) {
     return true;
   }
-  const key = `${repoPath}::${view}`;
+  const key = `${workspaceId}::${view}`;
   const now = performance.now();
   const last = activeViewRefreshedAtByKey.get(key);
   if (last !== undefined && now - last < GIT_ACTIVE_VIEW_REFRESH_MIN_INTERVAL_MS) {
@@ -249,41 +250,41 @@ function shouldRefreshActiveView(
   return true;
 }
 
-function markActiveViewRefreshed(repoPath: string, view: GitPanelView) {
+function markActiveViewRefreshed(workspaceId: string, view: GitPanelView) {
   if (view === "changes") {
     return;
   }
-  activeViewRefreshedAtByKey.set(`${repoPath}::${view}`, performance.now());
+  activeViewRefreshedAtByKey.set(`${workspaceId}::${view}`, performance.now());
 }
 
-async function getGitStatusCached(repoPath: string, force = false): Promise<GitStatus> {
-  const revision = getRepoRevision(repoPath);
+async function getGitStatusCached(workspaceId: string, force = false): Promise<GitStatus> {
+  const revision = getWorkspaceRevision(workspaceId);
   const now = performance.now();
-  const cached = statusCacheByRepo.get(repoPath);
+  const cached = statusCacheByWorkspace.get(workspaceId);
   if (
     !force &&
     cached &&
     cached.revision === revision &&
     now - cached.updatedAt <= GIT_STATUS_CACHE_TTL_MS
   ) {
-    setStatusCacheEntry(repoPath, {
+    setStatusCacheEntry(workspaceId, {
       ...cached,
       updatedAt: now,
     });
     return cached.status;
   }
 
-  const inFlight = statusInFlightByRepo.get(repoPath);
+  const inFlight = statusInFlightByWorkspace.get(workspaceId);
   if (inFlight) {
     return inFlight;
   }
 
   const requestRevision = revision;
   const requestPromise = ipc
-    .getGitStatus(repoPath)
+    .getGitStatus(workspaceId)
     .then((status) => {
-      if (getRepoRevision(repoPath) === requestRevision) {
-        setStatusCacheEntry(repoPath, {
+      if (getWorkspaceRevision(workspaceId) === requestRevision) {
+        setStatusCacheEntry(workspaceId, {
           status,
           revision: requestRevision,
           updatedAt: performance.now(),
@@ -292,21 +293,21 @@ async function getGitStatusCached(repoPath: string, force = false): Promise<GitS
       return status;
     })
     .finally(() => {
-      statusInFlightByRepo.delete(repoPath);
+      statusInFlightByWorkspace.delete(workspaceId);
     });
 
-  statusInFlightByRepo.set(repoPath, requestPromise);
+  statusInFlightByWorkspace.set(workspaceId, requestPromise);
   return requestPromise;
 }
 
 async function getGitDiffCached(
-  repoPath: string,
+  workspaceId: string,
   filePath: string,
   staged: boolean,
   force = false,
 ): Promise<GitDiffPreview> {
-  const key = buildDiffCacheKey(repoPath, filePath, staged);
-  const revision = getRepoRevision(repoPath);
+  const key = buildDiffCacheKey(workspaceId, filePath, staged);
+  const revision = getWorkspaceRevision(workspaceId);
   const now = performance.now();
   const cached = diffCacheByKey.get(key);
   if (
@@ -329,9 +330,9 @@ async function getGitDiffCached(
 
   const requestRevision = revision;
   const requestPromise = ipc
-    .getFileDiff(repoPath, filePath, staged)
+    .getFileDiff(workspaceId, filePath, staged)
     .then((diff) => {
-      if (getRepoRevision(repoPath) === requestRevision) {
+      if (getWorkspaceRevision(workspaceId) === requestRevision) {
         setDiffCacheEntry(key, {
           diff,
           revision: requestRevision,
@@ -349,15 +350,18 @@ async function getGitDiffCached(
 }
 
 interface GitState {
+  /** 当前项目根目录的 Git 上下文。 */
+  workspaceId: string | null;
+  /** 当前项目是否为 Git 仓库及其根目录信息。 */
+  gitContext: WorkspaceGitContext | null;
   status?: GitStatus;
   selectedFile?: string;
   selectedFileStaged?: boolean;
   diff?: GitDiffPreview;
   loading: boolean;
   error?: string;
-  activeRepoPath: string | null;
   remoteSyncAction: GitRemoteSyncAction | null;
-  remoteSyncRepoPath: string | null;
+  remoteSyncWorkspaceId: string | null;
   activeView: GitPanelView;
   branchScope: GitBranchScope;
   branches: GitBranch[];
@@ -372,53 +376,50 @@ interface GitState {
   stashes: GitStash[];
   worktrees: GitWorktree[];
   remotes: GitRemote[];
-  remotesRepoPath: string | null;
+  remotesWorkspaceId: string | null;
   remotesLoading: boolean;
   remotesError?: string;
-  mainRepoPath: string | null;
   selectedCommitHash?: string;
   commitDiff?: GitDiffPreview;
-  setActiveRepoPath: (repoPath: string | null) => void;
-  refresh: (repoPath: string, options?: { force?: boolean }) => Promise<void>;
-  invalidateRepoCache: (repoPath: string) => void;
+  refresh: (workspaceId: string, options?: { force?: boolean }) => Promise<void>;
+  invalidateWorkspaceCache: (workspaceId: string) => void;
   setActiveView: (view: GitPanelView) => void;
   setBranchScope: (scope: GitBranchScope) => void;
-  selectFile: (repoPath: string, filePath: string, staged?: boolean) => Promise<void>;
-  stage: (repoPath: string, filePath: string) => Promise<void>;
-  stageMany: (repoPath: string, files: string[]) => Promise<void>;
-  unstage: (repoPath: string, filePath: string) => Promise<void>;
-  unstageMany: (repoPath: string, files: string[]) => Promise<void>;
-  discardFiles: (repoPath: string, files: string[]) => Promise<void>;
-  commit: (repoPath: string, message: string) => Promise<string>;
-  softResetLastCommit: (repoPath: string) => Promise<void>;
-  fetchRemote: (repoPath: string) => Promise<void>;
-  pullRemote: (repoPath: string) => Promise<void>;
-  pushRemote: (repoPath: string) => Promise<void>;
-  loadBranches: (repoPath: string, scope?: GitBranchScope, search?: string) => Promise<void>;
-  loadMoreBranches: (repoPath: string) => Promise<void>;
-  setBranchSearch: (repoPath: string, query: string) => Promise<void>;
-  checkoutBranch: (repoPath: string, branchName: string, isRemote: boolean) => Promise<void>;
-  createBranch: (repoPath: string, branchName: string, fromRef?: string | null) => Promise<void>;
-  renameBranch: (repoPath: string, oldName: string, newName: string) => Promise<void>;
-  deleteBranch: (repoPath: string, branchName: string, force: boolean) => Promise<void>;
-  loadCommits: (repoPath: string, append?: boolean) => Promise<void>;
-  loadMoreCommits: (repoPath: string) => Promise<void>;
-  setMainRepoPath: (path: string | null) => void;
-  loadWorktrees: (repoPath: string) => Promise<void>;
-  addWorktree: (repoPath: string, worktreePath: string, branchName: string, baseRef?: string | null) => Promise<GitWorktree>;
-  removeWorktree: (repoPath: string, worktreePath: string, force: boolean, branchName?: string | null, deleteBranch?: boolean) => Promise<void>;
-  pruneWorktrees: (repoPath: string) => Promise<void>;
-  loadStashes: (repoPath: string) => Promise<void>;
-  pushStash: (repoPath: string, message?: string) => Promise<void>;
-  applyStash: (repoPath: string, stashIndex: number) => Promise<void>;
-  popStash: (repoPath: string, stashIndex: number) => Promise<void>;
-  selectCommit: (repoPath: string, commitHash: string) => Promise<void>;
+  selectFile: (workspaceId: string, filePath: string, staged?: boolean) => Promise<void>;
+  stage: (workspaceId: string, filePath: string) => Promise<void>;
+  stageMany: (workspaceId: string, files: string[]) => Promise<void>;
+  unstage: (workspaceId: string, filePath: string) => Promise<void>;
+  unstageMany: (workspaceId: string, files: string[]) => Promise<void>;
+  discardFiles: (workspaceId: string, files: string[]) => Promise<void>;
+  commit: (workspaceId: string, message: string) => Promise<string>;
+  softResetLastCommit: (workspaceId: string) => Promise<void>;
+  fetchRemote: (workspaceId: string) => Promise<void>;
+  pullRemote: (workspaceId: string) => Promise<void>;
+  pushRemote: (workspaceId: string) => Promise<void>;
+  loadBranches: (workspaceId: string, scope?: GitBranchScope, search?: string) => Promise<void>;
+  loadMoreBranches: (workspaceId: string) => Promise<void>;
+  setBranchSearch: (workspaceId: string, query: string) => Promise<void>;
+  checkoutBranch: (workspaceId: string, branchName: string, isRemote: boolean) => Promise<void>;
+  createBranch: (workspaceId: string, branchName: string, fromRef?: string | null) => Promise<void>;
+  renameBranch: (workspaceId: string, oldName: string, newName: string) => Promise<void>;
+  deleteBranch: (workspaceId: string, branchName: string, force: boolean) => Promise<void>;
+  loadCommits: (workspaceId: string, append?: boolean) => Promise<void>;
+  loadMoreCommits: (workspaceId: string) => Promise<void>;
+  loadWorktrees: (workspaceId: string) => Promise<void>;
+  addWorktree: (workspaceId: string, worktreePath: string, branchName: string, baseRef?: string | null) => Promise<GitWorktree>;
+  removeWorktree: (workspaceId: string, worktreePath: string, force: boolean, branchName?: string | null, deleteBranch?: boolean) => Promise<void>;
+  pruneWorktrees: (workspaceId: string) => Promise<void>;
+  loadStashes: (workspaceId: string) => Promise<void>;
+  pushStash: (workspaceId: string, message?: string) => Promise<void>;
+  applyStash: (workspaceId: string, stashIndex: number) => Promise<void>;
+  popStash: (workspaceId: string, stashIndex: number) => Promise<void>;
+  selectCommit: (workspaceId: string, commitHash: string) => Promise<void>;
   clearCommitSelection: () => void;
-  loadRemotes: (repoPath: string) => Promise<void>;
-  addRemote: (repoPath: string, name: string, url: string) => Promise<void>;
-  removeRemote: (repoPath: string, name: string) => Promise<void>;
-  renameRemote: (repoPath: string, oldName: string, newName: string) => Promise<void>;
-  getStatusForRepo: (repoPath: string) => Promise<GitStatus>;
+  loadRemotes: (workspaceId: string) => Promise<void>;
+  addRemote: (workspaceId: string, name: string, url: string) => Promise<void>;
+  removeRemote: (workspaceId: string, name: string) => Promise<void>;
+  renameRemote: (workspaceId: string, oldName: string, newName: string) => Promise<void>;
+  getStatusForWorkspace: (workspaceId: string) => Promise<GitStatus>;
   clearError: () => void;
   drafts: GitDraftsPayload;
   loadDraftsForWorkspace: (workspaceId: string) => void;
@@ -427,12 +428,14 @@ interface GitState {
   pushCommitHistory: (workspaceId: string, message: string) => void;
   pushBranchHistory: (workspaceId: string, name: string) => void;
   flushDrafts: (workspaceId: string) => void;
+  /** 加载项目根目录 Git 上下文并清理旧项目视图。 */
+  loadWorkspaceContext: (workspaceId: string) => Promise<void>;
 }
 
-async function refreshActiveView(repoPath: string, state: Pick<GitState, "activeView" | "branchScope" | "branchSearch">) {
+async function refreshActiveView(workspaceId: string, state: Pick<GitState, "activeView" | "branchScope" | "branchSearch">) {
   if (state.activeView === "branches") {
     const branchesPage = await ipc.listGitBranches(
-      repoPath,
+      workspaceId,
       state.branchScope,
       0,
       BRANCH_PAGE_SIZE,
@@ -447,7 +450,7 @@ async function refreshActiveView(repoPath: string, state: Pick<GitState, "active
   }
 
   if (state.activeView === "commits") {
-    const commitsPage = await ipc.listGitCommits(repoPath, 0, COMMIT_PAGE_SIZE);
+    const commitsPage = await ipc.listGitCommits(workspaceId, 0, COMMIT_PAGE_SIZE);
     return {
       commits: commitsPage.entries,
       commitsOffset: commitsPage.offset + commitsPage.entries.length,
@@ -457,14 +460,14 @@ async function refreshActiveView(repoPath: string, state: Pick<GitState, "active
   }
 
   if (state.activeView === "stash") {
-    const stashes = await ipc.listGitStashes(repoPath);
+    const stashes = await ipc.listGitStashes(workspaceId);
     return {
       stashes,
     } satisfies Partial<GitState>;
   }
 
   if (state.activeView === "worktrees") {
-    const worktrees = await ipc.listGitWorktrees(repoPath);
+    const worktrees = await ipc.listGitWorktrees(workspaceId);
     return {
       worktrees,
     } satisfies Partial<GitState>;
@@ -484,27 +487,6 @@ export const useGitStore = create<GitState>((set, get) => {
   let commitDiffSeq = 0;
   let remotesSeq = 0;
 
-  const isRepoActive = (repoPath: string): boolean => {
-    const activeRepoPath = get().activeRepoPath;
-    return activeRepoPath === null || activeRepoPath === repoPath;
-  };
-
-  const isRepoInWorktreeContext = (repoPath: string): boolean => {
-    const { activeRepoPath, mainRepoPath } = get();
-    if (activeRepoPath === null) {
-      return true;
-    }
-    return activeRepoPath === repoPath || mainRepoPath === repoPath;
-  };
-
-  const resolveRefreshRepoPathForWorktreeMutation = (repoPath: string): string => {
-    const { activeRepoPath, mainRepoPath } = get();
-    if (mainRepoPath && mainRepoPath === repoPath && activeRepoPath) {
-      return activeRepoPath;
-    }
-    return repoPath;
-  };
-
   const beginLoading = () => {
     loadingOps += 1;
     if (loadingOps === 1) {
@@ -519,12 +501,15 @@ export const useGitStore = create<GitState>((set, get) => {
     }
   };
 
-  const runRefresh = async (repoPath: string, options?: { force?: boolean }) => {
+  /** 判断异步 Git 结果是否仍属于当前项目，避免切换项目后覆盖新状态。 */
+  const isWorkspaceActive = (workspaceId: string): boolean => get().workspaceId === workspaceId;
+
+  const runRefresh = async (workspaceId: string, options?: { force?: boolean }) => {
     const requestSeq = ++refreshSeq;
     const startedAt = performance.now();
 
     try {
-      const status = await getGitStatusCached(repoPath, options?.force ?? false);
+      const status = await getGitStatusCached(workspaceId, options?.force ?? false);
       const currentState = get();
       const selectedFile = currentState.selectedFile;
       const selectedFileStaged = currentState.selectedFileStaged ?? false;
@@ -550,7 +535,7 @@ export const useGitStore = create<GitState>((set, get) => {
         } else if (shouldRefreshSelectedDiff) {
           if (sameStateExists) {
             try {
-              selectedDiff = await getGitDiffCached(repoPath, selectedFile, selectedFileStaged);
+              selectedDiff = await getGitDiffCached(workspaceId, selectedFile, selectedFileStaged);
               selectedDiffRefreshed = true;
             } catch {
               selectedDiff = undefined;
@@ -559,7 +544,7 @@ export const useGitStore = create<GitState>((set, get) => {
             const flippedStaged = !selectedFileStaged;
             nextSelectedFileStaged = flippedStaged;
             try {
-              selectedDiff = await getGitDiffCached(repoPath, selectedFile, flippedStaged);
+              selectedDiff = await getGitDiffCached(workspaceId, selectedFile, flippedStaged);
               selectedDiffRefreshed = true;
             } catch {
               selectedDiff = undefined;
@@ -575,19 +560,19 @@ export const useGitStore = create<GitState>((set, get) => {
 
       const forceRefresh = options?.force ?? false;
       const refreshView = shouldRefreshActiveView(
-        repoPath,
+        workspaceId,
         currentState.activeView,
         forceRefresh,
       );
       const viewState = refreshView
-        ? await refreshActiveView(repoPath, {
+        ? await refreshActiveView(workspaceId, {
             activeView: currentState.activeView,
             branchScope: currentState.branchScope,
             branchSearch: currentState.branchSearch,
           })
         : {};
 
-      if (requestSeq === refreshSeq && isRepoActive(repoPath)) {
+      if (requestSeq === refreshSeq && isWorkspaceActive(workspaceId)) {
         set({
           ...viewState,
           status,
@@ -597,30 +582,30 @@ export const useGitStore = create<GitState>((set, get) => {
           error: undefined,
         });
         if (refreshView) {
-          markActiveViewRefreshed(repoPath, currentState.activeView);
+          markActiveViewRefreshed(workspaceId, currentState.activeView);
         }
       }
 
       recordPerfMetric("git.refresh.ms", performance.now() - startedAt, {
-        repoPath,
+        workspaceId,
         fileCount: status.files.length,
         cached: !forceRefresh,
         viewRefreshed: refreshView,
         selectedDiffRefreshed,
       });
     } catch (error) {
-      if (requestSeq === refreshSeq && isRepoActive(repoPath)) {
+      if (requestSeq === refreshSeq && isWorkspaceActive(workspaceId)) {
         set({ error: String(error) });
       }
       recordPerfMetric("git.refresh.ms", performance.now() - startedAt, {
-        repoPath,
+        workspaceId,
         failed: true,
       });
     }
   };
 
-  const runRepoMutationWithRefresh = async <T>(
-    repoPath: string,
+  const runWorkspaceMutationWithRefresh = async <T>(
+    workspaceId: string,
     mutation: () => Promise<T>,
     options?: { remoteSyncAction?: GitRemoteSyncAction },
   ): Promise<T> => {
@@ -628,16 +613,16 @@ export const useGitStore = create<GitState>((set, get) => {
     set({ error: undefined });
 
     if (options?.remoteSyncAction) {
-      set({ remoteSyncAction: options.remoteSyncAction, remoteSyncRepoPath: repoPath });
+      set({ remoteSyncAction: options.remoteSyncAction, remoteSyncWorkspaceId: workspaceId });
     }
 
     try {
       const result = await mutation();
-      get().invalidateRepoCache(repoPath);
-      await runRefresh(repoPath, { force: true });
+      get().invalidateWorkspaceCache(workspaceId);
+      await runRefresh(workspaceId, { force: true });
       return result;
     } catch (error) {
-      if (isRepoActive(repoPath)) {
+      if (isWorkspaceActive(workspaceId)) {
         set({ error: String(error) });
       }
       throw error;
@@ -645,9 +630,9 @@ export const useGitStore = create<GitState>((set, get) => {
       if (
         options?.remoteSyncAction &&
         get().remoteSyncAction === options.remoteSyncAction &&
-        get().remoteSyncRepoPath === repoPath
+        get().remoteSyncWorkspaceId === workspaceId
       ) {
-        set({ remoteSyncAction: null, remoteSyncRepoPath: null });
+        set({ remoteSyncAction: null, remoteSyncWorkspaceId: null });
       }
       endLoading();
     }
@@ -655,9 +640,10 @@ export const useGitStore = create<GitState>((set, get) => {
 
   return {
     loading: false,
-    activeRepoPath: null,
+    workspaceId: null,
+    gitContext: null,
     remoteSyncAction: null,
-    remoteSyncRepoPath: null,
+    remoteSyncWorkspaceId: null,
     activeView: "changes",
     branchScope: "local",
     branches: [],
@@ -672,49 +658,16 @@ export const useGitStore = create<GitState>((set, get) => {
     stashes: [],
     worktrees: [],
     remotes: [],
-    remotesRepoPath: null,
+    remotesWorkspaceId: null,
     remotesLoading: false,
     remotesError: undefined,
-    mainRepoPath: null,
-    setActiveRepoPath: (repoPath) => {
-      if (get().activeRepoPath === repoPath) {
-        return;
-      }
-
-      set({
-        activeRepoPath: repoPath,
-        mainRepoPath: null,
-        status: undefined,
-        selectedFile: undefined,
-        selectedFileStaged: undefined,
-        diff: undefined,
-        branches: [],
-        branchesTotal: 0,
-        branchesHasMore: false,
-        branchesOffset: 0,
-        branchSearch: "",
-        commits: [],
-        commitsOffset: 0,
-        commitsHasMore: false,
-        commitsTotal: 0,
-        stashes: [],
-        worktrees: [],
-        remotes: [],
-        remotesRepoPath: null,
-        remotesLoading: false,
-        remotesError: undefined,
-        selectedCommitHash: undefined,
-        commitDiff: undefined,
-        error: undefined,
-      });
-    },
-    refresh: async (repoPath, options) => {
+    refresh: async (workspaceId, options) => {
       beginLoading();
-      await runRefresh(repoPath, options);
+      await runRefresh(workspaceId, options);
       endLoading();
     },
-    invalidateRepoCache: (repoPath) => {
-      invalidateRepoCaches(repoPath);
+    invalidateWorkspaceCache: (workspaceId) => {
+      invalidateWorkspaceCaches(workspaceId);
     },
     setActiveView: (view) => {
       set({ activeView: view, error: undefined });
@@ -722,16 +675,16 @@ export const useGitStore = create<GitState>((set, get) => {
     setBranchScope: (scope) => {
       set({ branchScope: scope, error: undefined });
     },
-    selectFile: async (repoPath, filePath, staged = false) => {
+    selectFile: async (workspaceId, filePath, staged = false) => {
       const requestSeq = ++selectFileSeq;
       const startedAt = performance.now();
       try {
-        const diff = await getGitDiffCached(repoPath, filePath, staged);
-        if (requestSeq === selectFileSeq && isRepoActive(repoPath)) {
+        const diff = await getGitDiffCached(workspaceId, filePath, staged);
+        if (requestSeq === selectFileSeq && isWorkspaceActive(workspaceId)) {
           set({ selectedFile: filePath, selectedFileStaged: staged, diff, error: undefined });
         }
         recordPerfMetric("git.file_diff.ms", performance.now() - startedAt, {
-          repoPath,
+          workspaceId,
           filePath,
           staged,
           truncated: diff.truncated,
@@ -739,60 +692,60 @@ export const useGitStore = create<GitState>((set, get) => {
           originalBytes: diff.originalBytes,
         });
       } catch (error) {
-        if (requestSeq === selectFileSeq && isRepoActive(repoPath)) {
+        if (requestSeq === selectFileSeq && isWorkspaceActive(workspaceId)) {
           set({ error: String(error) });
         }
         recordPerfMetric("git.file_diff.ms", performance.now() - startedAt, {
-          repoPath,
+          workspaceId,
           filePath,
           staged,
           failed: true,
         });
       }
     },
-    stage: async (repoPath, filePath) => {
-      await runRepoMutationWithRefresh(repoPath, () => ipc.stageFiles(repoPath, [filePath]));
+    stage: async (workspaceId, filePath) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.stageFiles(workspaceId, [filePath]));
     },
-    stageMany: async (repoPath, files) => {
+    stageMany: async (workspaceId, files) => {
       if (files.length === 0) {
         return;
       }
-      await runRepoMutationWithRefresh(repoPath, () => ipc.stageFiles(repoPath, files));
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.stageFiles(workspaceId, files));
     },
-    unstage: async (repoPath, filePath) => {
-      await runRepoMutationWithRefresh(repoPath, () => ipc.unstageFiles(repoPath, [filePath]));
+    unstage: async (workspaceId, filePath) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.unstageFiles(workspaceId, [filePath]));
     },
-    unstageMany: async (repoPath, files) => {
+    unstageMany: async (workspaceId, files) => {
       if (files.length === 0) {
         return;
       }
-      await runRepoMutationWithRefresh(repoPath, () => ipc.unstageFiles(repoPath, files));
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.unstageFiles(workspaceId, files));
     },
-    discardFiles: async (repoPath, files) => {
-      await runRepoMutationWithRefresh(repoPath, () => ipc.discardFiles(repoPath, files));
+    discardFiles: async (workspaceId, files) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.discardFiles(workspaceId, files));
     },
-    commit: async (repoPath, message) => {
-      return runRepoMutationWithRefresh(repoPath, () => ipc.commit(repoPath, message));
+    commit: async (workspaceId, message) => {
+      return runWorkspaceMutationWithRefresh(workspaceId, () => ipc.commit(workspaceId, message));
     },
-    softResetLastCommit: async (repoPath) => {
-      await runRepoMutationWithRefresh(repoPath, () => ipc.softResetLastCommit(repoPath));
+    softResetLastCommit: async (workspaceId) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.softResetLastCommit(workspaceId));
     },
-    fetchRemote: async (repoPath) => {
-      await runRepoMutationWithRefresh(repoPath, () => ipc.fetchGit(repoPath), {
+    fetchRemote: async (workspaceId) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.fetchGit(workspaceId), {
         remoteSyncAction: "fetch",
       });
     },
-    pullRemote: async (repoPath) => {
-      await runRepoMutationWithRefresh(repoPath, () => ipc.pullGit(repoPath), {
+    pullRemote: async (workspaceId) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.pullGit(workspaceId), {
         remoteSyncAction: "pull",
       });
     },
-    pushRemote: async (repoPath) => {
-      await runRepoMutationWithRefresh(repoPath, () => ipc.pushGit(repoPath), {
+    pushRemote: async (workspaceId) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.pushGit(workspaceId), {
         remoteSyncAction: "push",
       });
     },
-    loadBranches: async (repoPath, scope, search) => {
+    loadBranches: async (workspaceId, scope, search) => {
       const requestSeq = ++branchesSeq;
       const nextScope = scope ?? get().branchScope;
       const searchQuery = search !== undefined ? search : get().branchSearch;
@@ -800,8 +753,8 @@ export const useGitStore = create<GitState>((set, get) => {
       set({ error: undefined, branchScope: nextScope, branchSearch: searchQuery });
 
       try {
-        const page = await ipc.listGitBranches(repoPath, nextScope, 0, BRANCH_PAGE_SIZE, searchQuery || undefined);
-        if (requestSeq === branchesSeq && isRepoActive(repoPath)) {
+        const page = await ipc.listGitBranches(workspaceId, nextScope, 0, BRANCH_PAGE_SIZE, searchQuery || undefined);
+        if (requestSeq === branchesSeq && isWorkspaceActive(workspaceId)) {
           set({
             branches: page.entries,
             branchesTotal: page.total,
@@ -810,14 +763,14 @@ export const useGitStore = create<GitState>((set, get) => {
           });
         }
       } catch (error) {
-        if (requestSeq === branchesSeq && isRepoActive(repoPath)) {
+        if (requestSeq === branchesSeq && isWorkspaceActive(workspaceId)) {
           set({ error: String(error) });
         }
       } finally {
         endLoading();
       }
     },
-    loadMoreBranches: async (repoPath) => {
+    loadMoreBranches: async (workspaceId) => {
       if (!get().branchesHasMore) return;
       const requestSeq = ++branchesSeq;
       const { branchScope, branchSearch, branchesOffset, branches } = get();
@@ -827,13 +780,13 @@ export const useGitStore = create<GitState>((set, get) => {
 
       try {
         const page = await ipc.listGitBranches(
-          repoPath,
+          workspaceId,
           branchScope,
           branchesOffset,
           BRANCH_PAGE_SIZE,
           branchSearch || undefined,
         );
-        if (requestSeq === branchesSeq && isRepoActive(repoPath)) {
+        if (requestSeq === branchesSeq && isWorkspaceActive(workspaceId)) {
           set({
             branches: [...branches, ...page.entries],
             branchesTotal: page.total,
@@ -842,31 +795,31 @@ export const useGitStore = create<GitState>((set, get) => {
           });
         }
       } catch (error) {
-        if (requestSeq === branchesSeq && isRepoActive(repoPath)) {
+        if (requestSeq === branchesSeq && isWorkspaceActive(workspaceId)) {
           set({ error: String(error) });
         }
       } finally {
         endLoading();
       }
     },
-    setBranchSearch: async (repoPath, query) => {
-      await get().loadBranches(repoPath, undefined, query);
+    setBranchSearch: async (workspaceId, query) => {
+      await get().loadBranches(workspaceId, undefined, query);
     },
-    checkoutBranch: async (repoPath, branchName, isRemote) => {
-      await runRepoMutationWithRefresh(repoPath, () => ipc.checkoutGitBranch(repoPath, branchName, isRemote));
+    checkoutBranch: async (workspaceId, branchName, isRemote) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.checkoutGitBranch(workspaceId, branchName, isRemote));
     },
-    createBranch: async (repoPath, branchName, fromRef) => {
-      await runRepoMutationWithRefresh(repoPath, () =>
-        ipc.createGitBranch(repoPath, branchName, fromRef ?? null),
+    createBranch: async (workspaceId, branchName, fromRef) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () =>
+        ipc.createGitBranch(workspaceId, branchName, fromRef ?? null),
       );
     },
-    renameBranch: async (repoPath, oldName, newName) => {
-      await runRepoMutationWithRefresh(repoPath, () => ipc.renameGitBranch(repoPath, oldName, newName));
+    renameBranch: async (workspaceId, oldName, newName) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.renameGitBranch(workspaceId, oldName, newName));
     },
-    deleteBranch: async (repoPath, branchName, force) => {
-      await runRepoMutationWithRefresh(repoPath, () => ipc.deleteGitBranch(repoPath, branchName, force));
+    deleteBranch: async (workspaceId, branchName, force) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.deleteGitBranch(workspaceId, branchName, force));
     },
-    loadCommits: async (repoPath, append = false) => {
+    loadCommits: async (workspaceId, append = false) => {
       const requestSeq = ++commitsSeq;
       const offset = append ? get().commitsOffset : 0;
       const previousEntries = append ? get().commits : [];
@@ -875,8 +828,8 @@ export const useGitStore = create<GitState>((set, get) => {
       set({ error: undefined });
 
       try {
-        const page = await ipc.listGitCommits(repoPath, offset, COMMIT_PAGE_SIZE);
-        if (requestSeq !== commitsSeq || !isRepoActive(repoPath)) {
+        const page = await ipc.listGitCommits(workspaceId, offset, COMMIT_PAGE_SIZE);
+        if (requestSeq !== commitsSeq || !isWorkspaceActive(workspaceId)) {
           return;
         }
 
@@ -888,108 +841,76 @@ export const useGitStore = create<GitState>((set, get) => {
           commitsTotal: page.total,
         });
       } catch (error) {
-        if (requestSeq === commitsSeq && isRepoActive(repoPath)) {
+        if (requestSeq === commitsSeq && isWorkspaceActive(workspaceId)) {
           set({ error: String(error) });
         }
       } finally {
         endLoading();
       }
     },
-    loadMoreCommits: async (repoPath) => {
+    loadMoreCommits: async (workspaceId) => {
       if (!get().commitsHasMore) {
         return;
       }
-      await get().loadCommits(repoPath, true);
+      await get().loadCommits(workspaceId, true);
     },
-    setMainRepoPath: (path) => {
-      set({ mainRepoPath: path });
-    },
-    loadWorktrees: async (repoPath) => {
+    loadWorktrees: async (workspaceId) => {
       const requestSeq = ++worktreesSeq;
       beginLoading();
       set({ error: undefined });
       try {
-        const worktrees = await ipc.listGitWorktrees(repoPath);
-        if (requestSeq === worktreesSeq && isRepoInWorktreeContext(repoPath)) {
+        const worktrees = await ipc.listGitWorktrees(workspaceId);
+      if (requestSeq === worktreesSeq && isWorkspaceActive(workspaceId)) {
           set({ worktrees });
         }
       } catch (error) {
-        if (requestSeq === worktreesSeq && isRepoInWorktreeContext(repoPath)) {
+      if (requestSeq === worktreesSeq && isWorkspaceActive(workspaceId)) {
           set({ error: String(error) });
         }
       } finally {
         endLoading();
       }
     },
-    addWorktree: async (repoPath, worktreePath, branchName, baseRef) => {
-      const refreshRepoPath = resolveRefreshRepoPathForWorktreeMutation(repoPath);
-      return runRepoMutationWithRefresh(refreshRepoPath, () =>
-        ipc.addGitWorktree(repoPath, worktreePath, branchName, baseRef),
+    addWorktree: async (workspaceId, worktreePath, branchName, baseRef) => {
+      return runWorkspaceMutationWithRefresh(workspaceId, () =>
+        ipc.addGitWorktree(workspaceId, worktreePath, branchName, baseRef),
       );
     },
-    removeWorktree: async (repoPath, worktreePath, force, branchName, deleteBranch) => {
-      const { activeRepoPath, mainRepoPath } = get();
-      const removingActiveWorktree =
-        activeRepoPath !== null &&
-        activeRepoPath === worktreePath &&
-        mainRepoPath === repoPath;
-
-      if (removingActiveWorktree) {
-        beginLoading();
-        set({ error: undefined });
-        try {
-          await ipc.removeGitWorktree(repoPath, worktreePath, force, branchName, deleteBranch);
-          get().setActiveRepoPath(repoPath);
-          set({ mainRepoPath: null });
-          get().invalidateRepoCache(repoPath);
-          await runRefresh(repoPath, { force: true });
-        } catch (error) {
-          if (isRepoInWorktreeContext(repoPath)) {
-            set({ error: String(error) });
-          }
-          throw error;
-        } finally {
-          endLoading();
-        }
-        return;
-      }
-
-      const refreshRepoPath = resolveRefreshRepoPathForWorktreeMutation(repoPath);
-      await runRepoMutationWithRefresh(refreshRepoPath, () =>
-        ipc.removeGitWorktree(repoPath, worktreePath, force, branchName, deleteBranch),
+    removeWorktree: async (workspaceId, worktreePath, force, branchName, deleteBranch) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () =>
+        ipc.removeGitWorktree(workspaceId, worktreePath, force, branchName, deleteBranch),
       );
     },
-    pruneWorktrees: async (repoPath) => {
-      const refreshRepoPath = resolveRefreshRepoPathForWorktreeMutation(repoPath);
-      await runRepoMutationWithRefresh(refreshRepoPath, () => ipc.pruneGitWorktrees(repoPath));
+    pruneWorktrees: async (workspaceId) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.pruneGitWorktrees(workspaceId));
     },
-    loadStashes: async (repoPath) => {
+    loadStashes: async (workspaceId) => {
       const requestSeq = ++stashesSeq;
       beginLoading();
       set({ error: undefined });
       try {
-        const stashes = await ipc.listGitStashes(repoPath);
-        if (requestSeq === stashesSeq && isRepoActive(repoPath)) {
+        const stashes = await ipc.listGitStashes(workspaceId);
+        if (requestSeq === stashesSeq && isWorkspaceActive(workspaceId)) {
           set({ stashes });
         }
       } catch (error) {
-        if (requestSeq === stashesSeq && isRepoActive(repoPath)) {
+        if (requestSeq === stashesSeq && isWorkspaceActive(workspaceId)) {
           set({ error: String(error) });
         }
       } finally {
         endLoading();
       }
     },
-    pushStash: async (repoPath, message) => {
-      await runRepoMutationWithRefresh(repoPath, () => ipc.pushGitStash(repoPath, message));
+    pushStash: async (workspaceId, message) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.pushGitStash(workspaceId, message));
     },
-    applyStash: async (repoPath, stashIndex) => {
-      await runRepoMutationWithRefresh(repoPath, () => ipc.applyGitStash(repoPath, stashIndex));
+    applyStash: async (workspaceId, stashIndex) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.applyGitStash(workspaceId, stashIndex));
     },
-    popStash: async (repoPath, stashIndex) => {
-      await runRepoMutationWithRefresh(repoPath, () => ipc.popGitStash(repoPath, stashIndex));
+    popStash: async (workspaceId, stashIndex) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, () => ipc.popGitStash(workspaceId, stashIndex));
     },
-    selectCommit: async (repoPath, commitHash) => {
+    selectCommit: async (workspaceId, commitHash) => {
       const current = get().selectedCommitHash;
       if (current === commitHash) {
         set({ selectedCommitHash: undefined, commitDiff: undefined });
@@ -1000,16 +921,16 @@ export const useGitStore = create<GitState>((set, get) => {
       const startedAt = performance.now();
       set({ selectedCommitHash: commitHash, commitDiff: undefined });
       try {
-        const diff = await ipc.getCommitDiff(repoPath, commitHash);
+        const diff = await ipc.getCommitDiff(workspaceId, commitHash);
         if (
           requestSeq === commitDiffSeq &&
-          isRepoActive(repoPath) &&
+          isWorkspaceActive(workspaceId) &&
           get().selectedCommitHash === commitHash
         ) {
           set({ commitDiff: diff });
         }
         recordPerfMetric("git.file_diff.ms", performance.now() - startedAt, {
-          repoPath,
+          workspaceId,
           commitHash,
           truncated: diff.truncated,
           returnedBytes: diff.returnedBytes,
@@ -1018,13 +939,13 @@ export const useGitStore = create<GitState>((set, get) => {
       } catch (error) {
         if (
           requestSeq === commitDiffSeq &&
-          isRepoActive(repoPath) &&
+          isWorkspaceActive(workspaceId) &&
           get().selectedCommitHash === commitHash
         ) {
           set({ error: String(error), selectedCommitHash: undefined, commitDiff: undefined });
         }
         recordPerfMetric("git.file_diff.ms", performance.now() - startedAt, {
-          repoPath,
+          workspaceId,
           commitHash,
           failed: true,
         });
@@ -1033,25 +954,25 @@ export const useGitStore = create<GitState>((set, get) => {
     clearCommitSelection: () => {
       set({ selectedCommitHash: undefined, commitDiff: undefined });
     },
-    loadRemotes: async (repoPath) => {
+    loadRemotes: async (workspaceId) => {
       const requestSeq = ++remotesSeq;
-      const { remotes, remotesRepoPath } = get();
-      const shouldClearRemotes = remotesRepoPath !== repoPath;
+      const { remotes, remotesWorkspaceId } = get();
+      const shouldClearRemotes = remotesWorkspaceId !== workspaceId;
 
       set({
         remotes: shouldClearRemotes ? [] : remotes,
-        remotesRepoPath: repoPath,
+        remotesWorkspaceId: workspaceId,
         remotesLoading: true,
         remotesError: undefined,
         error: undefined,
       });
       try {
-        const remotes = await ipc.listGitRemotes(repoPath);
-        if (requestSeq === remotesSeq && isRepoActive(repoPath)) {
-          set({ remotes, remotesRepoPath: repoPath, remotesError: undefined });
+        const remotes = await ipc.listGitRemotes(workspaceId);
+        if (requestSeq === remotesSeq && isWorkspaceActive(workspaceId)) {
+          set({ remotes, remotesWorkspaceId: workspaceId, remotesError: undefined });
         }
       } catch (error) {
-        if (requestSeq === remotesSeq && isRepoActive(repoPath)) {
+        if (requestSeq === remotesSeq && isWorkspaceActive(workspaceId)) {
           set({ error: String(error), remotesError: String(error) });
         }
       } finally {
@@ -1060,19 +981,19 @@ export const useGitStore = create<GitState>((set, get) => {
         }
       }
     },
-    addRemote: async (repoPath, name, url) => {
-      await runRepoMutationWithRefresh(repoPath, async () => {
-        await ipc.addGitRemote(repoPath, name, url);
+    addRemote: async (workspaceId, name, url) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, async () => {
+        await ipc.addGitRemote(workspaceId, name, url);
       });
-      await get().loadRemotes(repoPath);
+      await get().loadRemotes(workspaceId);
       // Auto-fetch from the new remote and refresh cached git state so new refs
       // appear immediately. Swallow network/empty-remote failures.
       try {
-        await ipc.fetchGit(repoPath);
-        get().invalidateRepoCache(repoPath);
+        await ipc.fetchGit(workspaceId);
+        get().invalidateWorkspaceCache(workspaceId);
         beginLoading();
         try {
-          await runRefresh(repoPath, { force: true });
+          await runRefresh(workspaceId, { force: true });
         } finally {
           endLoading();
         }
@@ -1080,19 +1001,19 @@ export const useGitStore = create<GitState>((set, get) => {
         // Swallow: remote may be unreachable or empty
       }
     },
-    removeRemote: async (repoPath, name) => {
-      await runRepoMutationWithRefresh(repoPath, async () => {
-        await ipc.removeGitRemote(repoPath, name);
+    removeRemote: async (workspaceId, name) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, async () => {
+        await ipc.removeGitRemote(workspaceId, name);
       });
-      await get().loadRemotes(repoPath);
+      await get().loadRemotes(workspaceId);
     },
-    renameRemote: async (repoPath, oldName, newName) => {
-      await runRepoMutationWithRefresh(repoPath, async () => {
-        await ipc.renameGitRemote(repoPath, oldName, newName);
+    renameRemote: async (workspaceId, oldName, newName) => {
+      await runWorkspaceMutationWithRefresh(workspaceId, async () => {
+        await ipc.renameGitRemote(workspaceId, oldName, newName);
       });
-      await get().loadRemotes(repoPath);
+      await get().loadRemotes(workspaceId);
     },
-    getStatusForRepo: (repoPath) => getGitStatusCached(repoPath),
+    getStatusForWorkspace: (workspaceId) => getGitStatusCached(workspaceId),
     clearError: () => set({ error: undefined }),
     drafts: { ...EMPTY_DRAFTS },
     loadDraftsForWorkspace: (workspaceId) => {
@@ -1126,6 +1047,41 @@ export const useGitStore = create<GitState>((set, get) => {
     },
     flushDrafts: (workspaceId) => {
       saveDraftsToStorage(workspaceId, get().drafts);
+    },
+    loadWorkspaceContext: async (workspaceId) => {
+      set({
+        workspaceId,
+        gitContext: null,
+        status: undefined,
+        selectedFile: undefined,
+        selectedFileStaged: undefined,
+        diff: undefined,
+        branches: [],
+        branchesTotal: 0,
+        branchesHasMore: false,
+        branchesOffset: 0,
+        commits: [],
+        commitsOffset: 0,
+        commitsHasMore: false,
+        commitsTotal: 0,
+        stashes: [],
+        worktrees: [],
+        remotes: [],
+        remotesWorkspaceId: null,
+        remotesError: undefined,
+        selectedCommitHash: undefined,
+        commitDiff: undefined,
+        error: undefined,
+      });
+      try {
+        const gitContext = await ipc.getWorkspaceGitContext(workspaceId);
+        if (get().workspaceId !== workspaceId) return;
+        set({ workspaceId, gitContext });
+        if (gitContext.kind !== "repository") return;
+        await get().refresh(workspaceId, { force: true });
+      } catch (error) {
+        set({ error: String(error) });
+      }
     },
   };
 });

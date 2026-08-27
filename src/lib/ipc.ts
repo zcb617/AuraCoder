@@ -72,7 +72,6 @@ import type {
   ReadFileResult,
   WriteFileResult,
   ResolvedEditorFileReference,
-  Repo,
   SearchResult,
   SteerReceipt,
   StreamEvent,
@@ -91,7 +90,7 @@ import type {
   Thread,
   PermissionComponentJson,
   TrustLevel,
-  WorkspaceGitSelectionStatus,
+  WorkspaceGitContext,
   Workspace,
   UpdateProcessState,
   UpdateInstallResult,
@@ -204,30 +203,19 @@ export const ipc = {
     connectionId: string,
     name: string,
     rootPath: string,
-    scanDepth?: number,
   ) => invoke<Workspace>("create_ssh_workspace", {
     connectionId,
     name,
     rootPath,
-    scanDepth: scanDepth ?? null,
   }),
-  openWorkspace: (path: string, scanDepth?: number) =>
-    invoke<Workspace>("open_workspace", {
-      path,
-      scanDepth: scanDepth ?? null,
-    }),
+  openWorkspace: (path: string) => invoke<Workspace>("open_workspace", { path }),
   archiveWorkspace: (workspaceId: string) => invoke<void>("archive_workspace", { workspaceId }),
   restoreWorkspace: (workspaceId: string) => invoke<Workspace>("restore_workspace", { workspaceId }),
   deleteWorkspace: (workspaceId: string) => invoke<void>("delete_workspace", { workspaceId }),
-  getRepos: (workspaceId: string) => invoke<Repo[]>("get_repos", { workspaceId }),
-  setRepoTrustLevel: (repoId: string, trustLevel: TrustLevel) =>
-    invoke<void>("set_repo_trust_level", { repoId, trustLevel }),
-  setRepoGitActive: (repoId: string, isActive: boolean) =>
-    invoke<void>("set_repo_git_active", { repoId, isActive }),
-  setWorkspaceGitActiveRepos: (workspaceId: string, repoIds: string[]) =>
-    invoke<void>("set_workspace_git_active_repos", { workspaceId, repoIds }),
-  hasWorkspaceGitSelection: (workspaceId: string) =>
-    invoke<WorkspaceGitSelectionStatus>("has_workspace_git_selection", { workspaceId }),
+  getWorkspaceGitContext: (workspaceId: string) =>
+    invoke<WorkspaceGitContext>("get_workspace_git_context", { workspaceId }),
+  setWorkspaceTrustLevel: (workspaceId: string, trustLevel: TrustLevel) =>
+    invoke<void>("set_workspace_trust_level", { workspaceId, trustLevel }),
   getWorkspaceStartupPreset: (workspaceId: string) =>
     invoke<WorkspaceStartupPreset | null>("get_workspace_startup_preset", { workspaceId }),
   normalizeWorkspaceStartupPreset: (workspaceId: string, preset: WorkspaceStartupPreset) =>
@@ -384,7 +372,6 @@ export const ipc = {
     }),
   createThread: (
     workspaceId: string,
-    repoId: string | null,
     engineId: string,
     modelId: string,
     title: string,
@@ -393,7 +380,6 @@ export const ipc = {
   ) =>
     invoke<Thread>("create_thread", {
       workspaceId,
-      repoId,
       engineId,
       modelId,
       title,
@@ -419,8 +405,6 @@ export const ipc = {
       threadId,
       title,
     }),
-  confirmWorkspaceThread: (threadId: string, writableRoots: string[]) =>
-    invoke<void>("confirm_workspace_thread", { threadId, writableRoots }),
   setThreadReasoningEffort: (
     threadId: string,
     reasoningEffort: string | null,
@@ -719,43 +703,41 @@ export const ipc = {
       workspaceId,
       query
     }),
-  getGitStatus: (repoPath: string) => invoke<GitStatus>("get_git_status", { repoPath }),
-  getFileDiff: (repoPath: string, filePath: string, staged: boolean) =>
-    invoke<GitDiffPreview>("get_file_diff", { repoPath, filePath, staged }),
+  getGitStatus: (workspaceId: string) => invoke<GitStatus>("get_git_status", { workspaceId }),
+  getFileDiff: (workspaceId: string, filePath: string, staged: boolean) =>
+    invoke<GitDiffPreview>("get_file_diff", { workspaceId, filePath, staged }),
   getGitFileCompare: (
-    repoPath: string,
+    workspaceId: string,
     filePath: string,
     source: GitCompareSource,
   ) =>
     invoke<GitFileCompare>("get_git_file_compare", {
-      repoPath,
+      workspaceId,
       filePath,
       source,
     }),
-  getFileTree: (repoPath: string) => invoke<FileTreeEntry[]>("get_file_tree", { repoPath }),
-  getFileTreePage: (repoPath: string, offset?: number, limit?: number) =>
-    invoke<FileTreePage>("get_file_tree_page", { repoPath, offset: offset ?? null, limit: limit ?? null }),
+  getFileTree: (workspaceId: string) => invoke<FileTreeEntry[]>("get_file_tree", { workspaceId }),
+  getFileTreePage: (workspaceId: string, offset?: number, limit?: number) =>
+    invoke<FileTreePage>("get_file_tree_page", { workspaceId, offset: offset ?? null, limit: limit ?? null }),
   listDir: (
-    repoPath: string,
+    rootPath: string,
     dirPath: string,
-    workspaceId?: string | null,
   ) =>
     invoke<FileTreeEntry[]>("list_dir", {
-      repoPath,
+      rootPath,
       dirPath,
-      workspaceId: workspaceId ?? null,
     }),
-  createFile: (repoPath: string, filePath: string, workspaceId?: string | null) =>
-    invoke<void>("create_file", { repoPath, filePath, workspaceId: workspaceId ?? null }),
-  createDir: (repoPath: string, dirPath: string, workspaceId?: string | null) =>
-    invoke<void>("create_dir", { repoPath, dirPath, workspaceId: workspaceId ?? null }),
-  renamePath: (repoPath: string, oldPath: string, newName: string, workspaceId?: string | null) =>
-    invoke<void>("rename_path", { repoPath, oldPath, newName, workspaceId: workspaceId ?? null }),
-  deletePath: (repoPath: string, filePath: string, workspaceId?: string | null) =>
-    invoke<void>("delete_path", { repoPath, filePath, workspaceId: workspaceId ?? null }),
-  stageFiles: (repoPath: string, files: string[]) => invoke<void>("stage_files", { repoPath, files }),
-  unstageFiles: (repoPath: string, files: string[]) =>
-    invoke<void>("unstage_files", { repoPath, files }),
+  createFile: (rootPath: string, filePath: string) =>
+    invoke<void>("create_file", { rootPath, filePath }),
+  createDir: (rootPath: string, dirPath: string) =>
+    invoke<void>("create_dir", { rootPath, dirPath }),
+  renamePath: (rootPath: string, oldPath: string, newName: string) =>
+    invoke<void>("rename_path", { rootPath, oldPath, newName }),
+  deletePath: (rootPath: string, filePath: string) =>
+    invoke<void>("delete_path", { rootPath, filePath }),
+  stageFiles: (workspaceId: string, files: string[]) => invoke<void>("stage_files", { workspaceId, files }),
+  unstageFiles: (workspaceId: string, files: string[]) =>
+    invoke<void>("unstage_files", { workspaceId, files }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   openContainingDirectory: (path: string) =>
     invoke<void>("open_containing_directory", { path }),
@@ -771,133 +753,121 @@ export const ipc = {
     invoke<DefaultFileOpenTarget>("get_default_file_open_target"),
   setDefaultFileOpenTarget: (editorId: string | null) =>
     invoke<string | null>("set_default_file_open_target", { editorId }),
-  discardFiles: (repoPath: string, files: string[]) =>
-    invoke<void>("discard_files", { repoPath, files }),
-  commit: (repoPath: string, message: string) => invoke<string>("commit", { repoPath, message }),
-  softResetLastCommit: (repoPath: string) =>
-    invoke<void>("soft_reset_last_commit", { repoPath }),
-  fetchGit: (repoPath: string) => invoke<void>("fetch_git", { repoPath }),
-  pullGit: (repoPath: string) => invoke<void>("pull_git", { repoPath }),
-  pushGit: (repoPath: string) => invoke<void>("push_git", { repoPath }),
-  listGitBranches: (repoPath: string, scope: GitBranchScope, offset?: number, limit?: number, search?: string) =>
+  discardFiles: (workspaceId: string, files: string[]) =>
+    invoke<void>("discard_files", { workspaceId, files }),
+  commit: (workspaceId: string, message: string) => invoke<string>("commit", { workspaceId, message }),
+  softResetLastCommit: (workspaceId: string) =>
+    invoke<void>("soft_reset_last_commit", { workspaceId }),
+  fetchGit: (workspaceId: string) => invoke<void>("fetch_git", { workspaceId }),
+  pullGit: (workspaceId: string) => invoke<void>("pull_git", { workspaceId }),
+  pushGit: (workspaceId: string) => invoke<void>("push_git", { workspaceId }),
+  listGitBranches: (workspaceId: string, scope: GitBranchScope, offset?: number, limit?: number, search?: string) =>
     invoke<GitBranchPage>("list_git_branches", {
-      repoPath,
+      workspaceId,
       scope,
       offset: offset ?? null,
       limit: limit ?? null,
       search: search ?? null,
     }),
-  checkoutGitBranch: (repoPath: string, branchName: string, isRemote: boolean) =>
-    invoke<void>("checkout_git_branch", { repoPath, branchName, isRemote }),
-  createGitBranch: (repoPath: string, branchName: string, fromRef?: string | null) =>
-    invoke<void>("create_git_branch", { repoPath, branchName, fromRef: fromRef ?? null }),
-  renameGitBranch: (repoPath: string, oldName: string, newName: string) =>
-    invoke<void>("rename_git_branch", { repoPath, oldName, newName }),
-  deleteGitBranch: (repoPath: string, branchName: string, force: boolean) =>
-    invoke<void>("delete_git_branch", { repoPath, branchName, force }),
-  listGitCommits: (repoPath: string, offset?: number, limit?: number) =>
+  checkoutGitBranch: (workspaceId: string, branchName: string, isRemote: boolean) =>
+    invoke<void>("checkout_git_branch", { workspaceId, branchName, isRemote }),
+  createGitBranch: (workspaceId: string, branchName: string, fromRef?: string | null) =>
+    invoke<void>("create_git_branch", { workspaceId, branchName, fromRef: fromRef ?? null }),
+  renameGitBranch: (workspaceId: string, oldName: string, newName: string) =>
+    invoke<void>("rename_git_branch", { workspaceId, oldName, newName }),
+  deleteGitBranch: (workspaceId: string, branchName: string, force: boolean) =>
+    invoke<void>("delete_git_branch", { workspaceId, branchName, force }),
+  listGitCommits: (workspaceId: string, offset?: number, limit?: number) =>
     invoke<GitCommitPage>("list_git_commits", {
-      repoPath,
+      workspaceId,
       offset: offset ?? null,
       limit: limit ?? null,
     }),
-  getCommitDiff: (repoPath: string, commitHash: string) =>
-    invoke<GitDiffPreview>("get_commit_diff", { repoPath, commitHash }),
-  listGitStashes: (repoPath: string) =>
-    invoke<GitStash[]>("list_git_stashes", { repoPath }),
-  pushGitStash: (repoPath: string, message?: string) =>
-    invoke<void>("push_git_stash", { repoPath, message: message ?? null }),
-  applyGitStash: (repoPath: string, stashIndex: number) =>
-    invoke<void>("apply_git_stash", { repoPath, stashIndex }),
-  popGitStash: (repoPath: string, stashIndex: number) =>
-    invoke<void>("pop_git_stash", { repoPath, stashIndex }),
+  getCommitDiff: (workspaceId: string, commitHash: string) =>
+    invoke<GitDiffPreview>("get_commit_diff", { workspaceId, commitHash }),
+  listGitStashes: (workspaceId: string) =>
+    invoke<GitStash[]>("list_git_stashes", { workspaceId }),
+  pushGitStash: (workspaceId: string, message?: string) =>
+    invoke<void>("push_git_stash", { workspaceId, message: message ?? null }),
+  applyGitStash: (workspaceId: string, stashIndex: number) =>
+    invoke<void>("apply_git_stash", { workspaceId, stashIndex }),
+  popGitStash: (workspaceId: string, stashIndex: number) =>
+    invoke<void>("pop_git_stash", { workspaceId, stashIndex }),
   readFile: (
-    repoPath: string,
+    rootPath: string,
     filePath: string,
-    workspaceId?: string | null,
   ) =>
     invoke<ReadFileResult>("read_file", {
-      repoPath,
+      rootPath,
       filePath,
-      workspaceId: workspaceId ?? null,
     }),
   getFileVersion: (
-    repoPath: string,
+    rootPath: string,
     filePath: string,
-    workspaceId?: string | null,
   ) => invoke<string>("get_file_version", {
-    repoPath,
+    rootPath,
     filePath,
-    workspaceId: workspaceId ?? null,
   }),
   getDirectoryFingerprint: (
-    repoPath: string,
+    rootPath: string,
     dirPath: string,
-    workspaceId?: string | null,
   ) => invoke<string>("get_directory_fingerprint", {
-    repoPath,
+    rootPath,
     dirPath,
-    workspaceId: workspaceId ?? null,
   }),
   resolveEditorFileReference: (
     workspaceId: string,
     rawReference: string,
-    preferredRepoPath?: string | null,
-    currentCwd?: string | null,
   ) =>
     invoke<ResolvedEditorFileReference | null>("resolve_editor_file_reference", {
       workspaceId,
       rawReference,
-      preferredRepoPath: preferredRepoPath ?? null,
-      currentCwd: currentCwd ?? null,
     }),
   writeFile: (
-    repoPath: string,
+    rootPath: string,
     filePath: string,
     content: string,
-    workspaceId?: string | null,
     expectedVersion?: string | null,
   ) => invoke<WriteFileResult>("write_file", {
-    repoPath,
+    rootPath,
     filePath,
     content,
-    workspaceId: workspaceId ?? null,
     expectedVersion: expectedVersion ?? null,
   }),
-  watchGitRepo: (repoPath: string) => invoke<void>("watch_git_repo", { repoPath }),
-  addGitWorktree: (repoPath: string, worktreePath: string, branchName: string, baseRef?: string | null) =>
-    invoke<GitWorktree>("add_git_worktree", { repoPath, worktreePath, branchName, baseRef: baseRef ?? null }),
-  listGitWorktrees: (repoPath: string) =>
-    invoke<GitWorktree[]>("list_git_worktrees", { repoPath }),
+  watchGitRepo: (workspaceId: string) => invoke<void>("watch_git_repo", { workspaceId }),
+  addGitWorktree: (workspaceId: string, worktreePath: string, branchName: string, baseRef?: string | null) =>
+    invoke<GitWorktree>("add_git_worktree", { workspaceId, worktreePath, branchName, baseRef: baseRef ?? null }),
+  listGitWorktrees: (workspaceId: string) =>
+    invoke<GitWorktree[]>("list_git_worktrees", { workspaceId }),
   removeGitWorktree: (
-    repoPath: string,
+    workspaceId: string,
     worktreePath: string,
     force: boolean,
     branchName?: string | null,
     deleteBranch?: boolean,
   ) =>
     invoke<void>("remove_git_worktree", {
-      repoPath,
+      workspaceId,
       worktreePath,
       force,
       branchName: branchName ?? null,
       deleteBranch: deleteBranch ?? false,
     }),
-  pruneGitWorktrees: (repoPath: string) =>
-    invoke<void>("prune_git_worktrees", { repoPath }),
-  initGitRepo: (repoPath: string, validateOnly?: boolean) =>
+  pruneGitWorktrees: (workspaceId: string) =>
+    invoke<void>("prune_git_worktrees", { workspaceId }),
+  initGitRepo: (workspaceId: string, validateOnly?: boolean) =>
     invoke<GitInitRepoStatus>("init_git_repo", {
-      repoPath,
+      workspaceId,
       validateOnly: validateOnly ?? null,
     }),
-  listGitRemotes: (repoPath: string) =>
-    invoke<GitRemote[]>("list_git_remotes", { repoPath }),
-  addGitRemote: (repoPath: string, name: string, url: string) =>
-    invoke<void>("add_git_remote", { repoPath, name, url }),
-  removeGitRemote: (repoPath: string, name: string) =>
-    invoke<void>("remove_git_remote", { repoPath, name }),
-  renameGitRemote: (repoPath: string, oldName: string, newName: string) =>
-    invoke<void>("rename_git_remote", { repoPath, oldName, newName }),
+  listGitRemotes: (workspaceId: string) =>
+    invoke<GitRemote[]>("list_git_remotes", { workspaceId }),
+  addGitRemote: (workspaceId: string, name: string, url: string) =>
+    invoke<void>("add_git_remote", { workspaceId, name, url }),
+  removeGitRemote: (workspaceId: string, name: string) =>
+    invoke<void>("remove_git_remote", { workspaceId, name }),
+  renameGitRemote: (workspaceId: string, oldName: string, newName: string) =>
+    invoke<void>("rename_git_remote", { workspaceId, oldName, newName }),
   terminalCreateSession: (workspaceId: string, cols: number, rows: number, cwd?: string | null) =>
     invoke<TerminalSession>("terminal_create_session", { workspaceId, cols, rows, cwd: cwd ?? null }),
   terminalWrite: (workspaceId: string, sessionId: string, data: string) =>
@@ -1020,7 +990,7 @@ export async function listenCliServiceRestartRequired(
 }
 
 export interface GitRepoChangedEvent {
-  repoPath: string;
+  workspaceId: string;
 }
 
 export async function listenGitRepoChanged(

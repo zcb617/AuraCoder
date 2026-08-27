@@ -2734,7 +2734,6 @@ interface NewTabDropdownProps {
   menuRef: React.RefObject<HTMLDivElement | null>;
   anchorRect: DOMRect;
   harnesses: { id: string; name: string }[];
-  repos: Array<{ path: string; name: string; defaultBranch: string }>;
   onNewTerminal: () => void;
   onLaunchHarness: (id: string) => void;
   onMultiLaunch: (ids: string[], broadcast: boolean, worktreeRepoPath?: string | null) => void;
@@ -2744,7 +2743,6 @@ function NewTabDropdown({
   menuRef,
   anchorRect,
   harnesses,
-  repos,
   onNewTerminal,
   onLaunchHarness,
   onMultiLaunch,
@@ -2754,16 +2752,6 @@ function NewTabDropdown({
   const [quantities, setQuantities] = useState<Map<string, number>>(() => new Map());
   const [withBroadcast, setWithBroadcast] = useState(true);
   const [useWorktrees, setUseWorktrees] = useState(false);
-  const [selectedRepoPath, setSelectedRepoPath] = useState<string | null>(repos[0]?.path ?? null);
-
-  useEffect(() => {
-    setSelectedRepoPath((current) => {
-      if (current && repos.some((repo) => repo.path === current)) {
-        return current;
-      }
-      return repos[0]?.path ?? null;
-    });
-  }, [repos]);
 
   const totalCount = useMemo(() => {
     let sum = 0;
@@ -2779,13 +2767,7 @@ function NewTabDropdown({
     return ids;
   }, [quantities]);
 
-  const selectedWorktreeRepoPath = useMemo(() => {
-    if (!useWorktrees) return null;
-    if (selectedRepoPath && repos.some((repo) => repo.path === selectedRepoPath)) {
-      return selectedRepoPath;
-    }
-    return repos[0]?.path ?? null;
-  }, [useWorktrees, selectedRepoPath, repos]);
+  const selectedWorktreeRepoPath = useWorktrees ? null : null;
 
   const setQty = (id: string, qty: number) => {
     setQuantities((prev) => {
@@ -2906,8 +2888,7 @@ function NewTabDropdown({
                     </div>
                   </button>
 
-                  {repos.length > 0 && (
-                    <div>
+                  <div>
                       <button
                         type="button"
                         className={`tnd-option-card${useWorktrees ? " tnd-option-card-active" : ""}`}
@@ -2924,19 +2905,7 @@ function NewTabDropdown({
                           <div className="tnd-option-toggle-dot" />
                         </div>
                       </button>
-                      {useWorktrees && repos.length > 1 && (
-                        <select
-                          className="tnd-worktree-repo-select"
-                          value={selectedWorktreeRepoPath ?? ""}
-                          onChange={(e) => setSelectedRepoPath(e.target.value || null)}
-                        >
-                          {repos.map((r) => (
-                            <option key={r.path} value={r.path}>{r.name}</option>
-                          ))}
-                        </select>
-                      )}
                     </div>
-                  )}
                 </div>
 
                 <button
@@ -3003,7 +2972,6 @@ export function TerminalPanel({ workspaceId, embedded = false }: TerminalPanelPr
   const createMultiSessionGroup = useTerminalStore((state) => state.createMultiSessionGroup);
   const getGroupWorktrees = useTerminalStore((state) => state.getGroupWorktrees);
   const removeGroupWorktrees = useTerminalStore((state) => state.removeGroupWorktrees);
-  const repos = useWorkspaceStore((state) => state.repos);
 
   const [worktreeCloseGroupId, setWorktreeCloseGroupId] = useState<string | null>(null);
   const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
@@ -3900,12 +3868,6 @@ export function TerminalPanel({ workspaceId, embedded = false }: TerminalPanelPr
 
   const allHarnesses = useHarnessStore((s) => s.harnesses);
   const installedHarnesses = useMemo(() => allHarnesses.filter((h) => h.found), [allHarnesses]);
-  const activeRepos = useMemo(
-    () => repos
-      .filter((repo) => repo.isActive)
-      .map((repo) => ({ path: repo.path, name: repo.name, defaultBranch: repo.defaultBranch })),
-    [repos],
-  );
   const harnessLaunch = useHarnessStore((s) => s.launch);
   const [newTabMenuOpen, setNewTabMenuOpen] = useState(false);
   const newTabBtnRef = useRef<HTMLButtonElement>(null);
@@ -3974,20 +3936,10 @@ export function TerminalPanel({ workspaceId, embedded = false }: TerminalPanelPr
     }
     if (harnessMeta.length === 0) return;
 
-    // Build worktree config if a repo was selected
+    // Worktree configuration always belongs to the current project root。
     let worktreeConfig: WorkspaceStartupWorktreeConfig | null = null;
     if (worktreeRepoPath) {
-      const repo = repos.find((r) => r.path === worktreeRepoPath);
-      if (repo) {
-        worktreeConfig = {
-          enabled: true,
-          repoMode: "fixed_repo",
-          repoPath: repo.path,
-          baseBranch: repo.defaultBranch,
-          baseDir: ".auracoder/worktrees",
-          branchPrefix: "auracoder/preset",
-        };
-      }
+      worktreeConfig = { enabled: true, baseBranch: null, baseDir: ".auracoder/worktrees", branchPrefix: "auracoder/preset" };
     }
 
     // Create all sessions with correct grid layout in one shot
@@ -4021,7 +3973,6 @@ export function TerminalPanel({ workspaceId, embedded = false }: TerminalPanelPr
     focusedSessionId,
     createMultiSessionGroup,
     workspaceId,
-    repos,
     harnessLaunch,
     installedHarnesses,
     setTerminalSessionFocus,
@@ -4450,7 +4401,6 @@ export function TerminalPanel({ workspaceId, embedded = false }: TerminalPanelPr
           menuRef={newTabMenuRef}
           anchorRect={newTabBtnRef.current.getBoundingClientRect()}
           harnesses={installedHarnesses}
-          repos={activeRepos}
           onNewTerminal={() => { setNewTabMenuOpen(false); spawnNewSession(); }}
           onLaunchHarness={(id) => { setNewTabMenuOpen(false); void spawnHarnessSession(id); }}
           onMultiLaunch={(ids, broadcast, worktreeRepoPath) => { setNewTabMenuOpen(false); void spawnMultiHarnessGroup(ids, broadcast, worktreeRepoPath); }}

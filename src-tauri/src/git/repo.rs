@@ -1626,24 +1626,24 @@ pub fn inspect_init_repo(path: &str) -> anyhow::Result<GitInitRepoStatusDto> {
         Err(error) if error.code() == ErrorCode::NotFound => {
             return Ok(GitInitRepoStatusDto {
                 can_initialize: true,
-                blocking_repo_path: None,
+                blocking_root_path: None,
             });
         }
         Err(error) => return Err(error).context("failed to inspect ancestor repositories"),
     };
 
-    let blocking_repo_path = discovered_repo
+    let blocking_root_path = discovered_repo
         .workdir()
         .map(PathBuf::from)
         .unwrap_or_else(|| discovered_repo.path().to_path_buf());
-    let blocking_repo_path = fs::canonicalize(&blocking_repo_path)
-        .unwrap_or(blocking_repo_path)
+    let blocking_root_path = fs::canonicalize(&blocking_root_path)
+        .unwrap_or(blocking_root_path)
         .to_string_lossy()
         .to_string();
 
     Ok(GitInitRepoStatusDto {
         can_initialize: false,
-        blocking_repo_path: Some(blocking_repo_path),
+        blocking_root_path: Some(blocking_root_path),
     })
 }
 
@@ -1654,7 +1654,7 @@ pub fn init_repo(path: &str, validate_only: bool) -> anyhow::Result<GitInitRepoS
     }
 
     if !status.can_initialize {
-        let blocking_path = status.blocking_repo_path.as_deref().unwrap_or(path);
+        let blocking_path = status.blocking_root_path.as_deref().unwrap_or(path);
         anyhow::bail!(
             "cannot initialize a repository inside an existing git repository: {blocking_path}"
         );
@@ -2072,7 +2072,8 @@ mod tests {
 
     #[test]
     fn workspace_file_tree_page_includes_workspace_files_and_skips_git_dir() {
-        let root = std::env::temp_dir().join(format!("auracoder-workspace-tree-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("auracoder-workspace-tree-{}", Uuid::new_v4()));
         let app_dir = root.join("apps/app/src");
         let nested_repo_dir = root.join("apps/app/packages/web/src");
         let git_dir = root.join(".git");
@@ -2138,8 +2139,10 @@ mod tests {
 
     #[test]
     fn workspace_file_search_matches_plain_queries_against_file_names() {
-        let root =
-            std::env::temp_dir().join(format!("auracoder-workspace-title-search-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!(
+            "auracoder-workspace-title-search-{}",
+            Uuid::new_v4()
+        ));
         let docs_dir = root.join("agents_docs");
 
         fs::create_dir_all(&docs_dir).expect("agents docs dir should exist");
@@ -2192,7 +2195,8 @@ mod tests {
 
     #[test]
     fn workspace_file_search_returns_bounded_ranked_file_matches() {
-        let root = std::env::temp_dir().join(format!("auracoder-workspace-search-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("auracoder-workspace-search-{}", Uuid::new_v4()));
         let app_dir = root.join("apps/app/src");
         let docs_dir = root.join("docs");
 

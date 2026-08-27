@@ -59,21 +59,19 @@ function deferred<T>() {
 }
 
 describe("extensionStore helpers", () => {
-  it("uses provider, workspace, repository and normalized cwd in cache keys", () => {
+  it("uses provider, workspace and normalized cwd in cache keys", () => {
     expect(
       buildExtensionCacheKey({
         providerId: "claude",
         workspaceId: "workspace",
-        repoId: "repo",
         cwd: "D:\\Work\\Project\\",
       }),
-    ).toBe("claude::workspace::repo::d:/work/project");
+    ).toBe("claude::workspace::d:/work/project");
   });
 
   it("does not reuse the same path across different SSH workspaces", () => {
     const baseContext = {
       providerId: "claude" as const,
-      repoId: "repo",
       cwd: "/srv/project",
     };
     expect(
@@ -132,7 +130,6 @@ describe("extensionStore helpers", () => {
     const context = {
       providerId: "codex" as const,
       workspaceId: "workspace",
-      repoId: "repo",
       cwd: "D:/work/project",
     };
 
@@ -152,7 +149,6 @@ describe("extensionStore helpers", () => {
     const context = {
       providerId: "codex" as const,
       workspaceId: "workspace",
-      repoId: "repo",
       cwd: "D:/work/project",
     };
     const cached = catalog("cached");

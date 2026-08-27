@@ -1,35 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { resolveThreadFileRootPath } from "./fileRootUtils";
+import { isWithinRoot, normalizeAbsolutePath, resolveAbsoluteFilePath, resolveRelativePathWithinRoot } from "./fileRootUtils";
 
-const repos = [
-  { id: "repo-a", path: "/workspace/repo-a" },
-  { id: "repo-b", path: "/workspace/repo-b" },
-];
-
-describe("resolveThreadFileRootPath", () => {
-  it("uses the thread repository instead of an independently selected repo", () => {
-    expect(
-      resolveThreadFileRootPath(
-        { repoId: "repo-a" },
-        repos,
-        "/workspace",
-      ),
-    ).toBe("/workspace/repo-a");
+describe("file root utilities", () => {
+  it("normalizes separators and drive letters", () => expect(normalizeAbsolutePath("/c:\\Work\\App\\")).toBe("C:/Work/App"));
+  it("checks root boundaries", () => {
+    expect(isWithinRoot("/workspace/app/file.ts", "/workspace/app")).toBe(true);
+    expect(isWithinRoot("/workspace/app2/file.ts", "/workspace/app")).toBe(false);
   });
-
-  it("uses the workspace root for workspace-scoped threads", () => {
-    expect(
-      resolveThreadFileRootPath({ repoId: null }, repos, "/workspace"),
-    ).toBe("/workspace");
-  });
-
-  it("does not fall back to another root when the thread repository is missing", () => {
-    expect(
-      resolveThreadFileRootPath(
-        { repoId: "missing" },
-        repos,
-        "/workspace",
-      ),
-    ).toBeNull();
+  it("resolves project-relative paths", () => {
+    expect(resolveAbsoluteFilePath("/workspace/app", "src/main.ts")).toBe("/workspace/app/src/main.ts");
+    expect(resolveRelativePathWithinRoot("/workspace/app/src/main.ts", "/workspace/app")).toBe("src/main.ts");
+    expect(resolveRelativePathWithinRoot("/outside/main.ts", "/workspace/app")).toBeNull();
   });
 });

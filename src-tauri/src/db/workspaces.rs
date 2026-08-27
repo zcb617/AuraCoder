@@ -9,13 +9,7 @@ use crate::path_utils;
 
 use super::Database;
 
-const DEFAULT_SCAN_DEPTH: i64 = 3;
-
-pub fn upsert_workspace(
-    db: &Database,
-    root_path: &str,
-    scan_depth: Option<i64>,
-) -> anyhow::Result<WorkspaceDto> {
+pub fn upsert_workspace(db: &Database, root_path: &str) -> anyhow::Result<WorkspaceDto> {
     let conn = db.connect()?;
     let canonical_path = path_utils::canonicalize_path(Path::new(root_path))
         .unwrap_or_else(|_| path_utils::normalize_windows_path(Path::new(root_path).to_path_buf()));
@@ -36,21 +30,19 @@ pub fn upsert_workspace(
             "UPDATE workspaces
        SET root_path = ?2,
            last_opened_at = datetime('now'),
-           scan_depth = COALESCE(?3, scan_depth),
            archived_at = NULL
        WHERE id = ?1",
-            params![id, canonical, scan_depth],
+            params![id, canonical],
         )
         .context("failed to update workspace last_opened_at")?;
     } else {
         let id = Uuid::new_v4().to_string();
         let name = workspace_name_from_path(&canonical);
-        let scan_depth = scan_depth.unwrap_or(DEFAULT_SCAN_DEPTH);
         conn.execute(
             "INSERT INTO workspaces (
-                id, name, root_path, location_kind, ssh_connection_id, scan_depth
-             ) VALUES (?1, ?2, ?3, 'local', NULL, ?4)",
-            params![id, name, canonical, scan_depth],
+                id, name, root_path, location_kind, ssh_connection_id
+             ) VALUES (?1, ?2, ?3, 'local', NULL)",
+            params![id, name, canonical],
         )
         .context("failed to insert workspace")?;
     }
@@ -63,7 +55,6 @@ pub fn create_ssh_workspace(
     connection_id: &str,
     name: &str,
     root_path: &str,
-    scan_depth: Option<i64>,
 ) -> anyhow::Result<WorkspaceDto> {
     let root_path = root_path.trim();
     if !root_path.starts_with('/') || root_path.contains('\0') {
@@ -100,7 +91,6 @@ pub fn create_ssh_workspace(
         anyhow::bail!("SSH 连接尚未连接成功，无法创建远端项目");
     }
 
-    let scan_depth = scan_depth.unwrap_or(DEFAULT_SCAN_DEPTH);
     let existing = conn
         .query_row(
             "SELECT id, archived_at
@@ -121,11 +111,10 @@ pub fn create_ssh_workspace(
         conn.execute(
             "UPDATE workspaces
              SET name = ?1,
-                 scan_depth = ?2,
                  archived_at = NULL,
                  last_opened_at = datetime('now')
-             WHERE id = ?3",
-            params![name, scan_depth, workspace_id],
+             WHERE id = ?2",
+            params![name, workspace_id],
         )
         .context("failed to restore remote workspace")?;
         workspace_id
@@ -133,9 +122,9 @@ pub fn create_ssh_workspace(
         let workspace_id = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO workspaces (
-               id, name, root_path, location_kind, ssh_connection_id, scan_depth
-             ) VALUES (?1, ?2, ?3, 'ssh', ?4, ?5)",
-            params![workspace_id, name, root_path, connection_id, scan_depth],
+               id, name, root_path, location_kind, ssh_connection_id
+             ) VALUES (?1, ?2, ?3, 'ssh', ?4)",
+            params![workspace_id, name, root_path, connection_id],
         )
         .context("failed to insert remote workspace")?;
         workspace_id
@@ -147,7 +136,7 @@ pub fn create_ssh_workspace(
 pub fn list_workspaces(db: &Database) -> anyhow::Result<Vec<WorkspaceDto>> {
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
-        "SELECT w.id, w.name, w.root_path, w.scan_depth, w.created_at, w.last_opened_at,
+        "SELECT w.id, w.name, w.root_path, w.trust_level, w.created_at, w.last_opened_at,
                 w.location_kind, w.ssh_connection_id, s.display_name, s.enabled, s.deleted_at,
                 s.connection_status
          FROM workspaces w
@@ -170,7 +159,7 @@ pub fn list_workspaces(db: &Database) -> anyhow::Result<Vec<WorkspaceDto>> {
 pub fn list_archived_workspaces(db: &Database) -> anyhow::Result<Vec<WorkspaceDto>> {
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
-        "SELECT w.id, w.name, w.root_path, w.scan_depth, w.created_at, w.last_opened_at,
+        "SELECT w.id, w.name, w.root_path, w.trust_level, w.created_at, w.last_opened_at,
                 w.location_kind, w.ssh_connection_id, s.display_name, s.enabled, s.deleted_at,
                 s.connection_status
          FROM workspaces w
@@ -318,34 +307,18 @@ pub fn set_workspace_startup_preset_json(
     Ok(())
 }
 
-pub fn is_git_repo_selection_configured(db: &Database, workspace_id: &str) -> anyhow::Result<bool> {
-    let conn = db.connect()?;
-    let configured = conn
-        .query_row(
-            "SELECT git_repo_selection_configured
-         FROM workspaces
-         WHERE id = ?1",
-            params![workspace_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .context("failed to load workspace git selection state")?;
-
-    Ok(configured.unwrap_or(0) > 0)
-}
-
-pub fn set_git_repo_selection_configured(
+pub fn set_workspace_trust_level(
     db: &Database,
     workspace_id: &str,
-    configured: bool,
+    trust_level: &crate::models::TrustLevelDto,
 ) -> anyhow::Result<()> {
     let conn = db.connect()?;
     let affected = conn
         .execute(
             "UPDATE workspaces
-         SET git_repo_selection_configured = ?1
+         SET trust_level = ?1
          WHERE id = ?2",
-            params![if configured { 1 } else { 0 }, workspace_id],
+            params![trust_level.as_str(), workspace_id],
         )
         .context("failed to update workspace git selection state")?;
 
@@ -361,7 +334,7 @@ fn get_workspace_by_root(
     root_path: &str,
 ) -> anyhow::Result<WorkspaceDto> {
     conn.query_row(
-        "SELECT w.id, w.name, w.root_path, w.scan_depth, w.created_at, w.last_opened_at,
+        "SELECT w.id, w.name, w.root_path, w.trust_level, w.created_at, w.last_opened_at,
                 w.location_kind, w.ssh_connection_id, s.display_name, s.enabled, s.deleted_at,
                 s.connection_status
          FROM workspaces w
@@ -400,7 +373,7 @@ fn get_workspace_by_id_optional(
     workspace_id: &str,
 ) -> anyhow::Result<Option<WorkspaceDto>> {
     conn.query_row(
-        "SELECT w.id, w.name, w.root_path, w.scan_depth, w.created_at, w.last_opened_at,
+        "SELECT w.id, w.name, w.root_path, w.trust_level, w.created_at, w.last_opened_at,
                 w.location_kind, w.ssh_connection_id, s.display_name, s.enabled, s.deleted_at,
                 s.connection_status
          FROM workspaces w
@@ -442,7 +415,7 @@ fn map_workspace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceDto> 
         connection_enabled,
         connection_deleted: ssh_connection_id.map(|_| connection_deleted_at.is_some()),
         connection_status: row.get(11)?,
-        scan_depth: row.get(3)?,
+        trust_level: crate::models::TrustLevelDto::from_str(&row.get::<_, String>(3)?),
         created_at: row.get(4)?,
         last_opened_at: row.get(5)?,
     })
@@ -450,10 +423,7 @@ fn map_workspace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceDto> 
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        sync::{Arc, Mutex},
-    };
+    use std::sync::{Arc, Mutex};
 
     use uuid::Uuid;
 
@@ -492,23 +462,22 @@ mod tests {
         insert_test_connection(&db, "ssh-a", "Remote A");
         insert_test_connection(&db, "ssh-b", "Remote B");
 
-        let first = create_ssh_workspace(&db, "ssh-a", "Repo", "/home/tester/Repo", Some(4))
+        let first = create_ssh_workspace(&db, "ssh-a", "Repo", "/home/tester/Repo")
             .expect("failed to create remote workspace");
         assert_eq!(first.location_kind, "ssh");
         assert_eq!(first.ssh_connection_id.as_deref(), Some("ssh-a"));
         assert_eq!(first.root_path, "/home/tester/Repo");
 
-        let duplicate = create_ssh_workspace(&db, "ssh-a", "Repo 2", "/home/tester/Repo", None)
+        let duplicate = create_ssh_workspace(&db, "ssh-a", "Repo 2", "/home/tester/Repo")
             .expect("an existing remote workspace should be reused");
         assert_eq!(duplicate.id, first.id);
 
-        let same_path_other_host =
-            create_ssh_workspace(&db, "ssh-b", "Repo", "/home/tester/Repo", None)
-                .expect("same path on another host should be allowed");
+        let same_path_other_host = create_ssh_workspace(&db, "ssh-b", "Repo", "/home/tester/Repo")
+            .expect("same path on another host should be allowed");
         assert_ne!(first.id, same_path_other_host.id);
 
         archive_workspace(&db, &first.id).expect("failed to archive remote workspace");
-        let restored = create_ssh_workspace(&db, "ssh-a", "Renamed", "/home/tester/Repo", None)
+        let restored = create_ssh_workspace(&db, "ssh-a", "Renamed", "/home/tester/Repo")
             .expect("failed to restore archived remote workspace");
         assert_eq!(restored.id, first.id);
         assert_eq!(restored.name, "Renamed");
@@ -542,11 +511,11 @@ mod tests {
         insert_test_connection(&db, "ssh-a", "Remote A");
         insert_test_connection(&db, "ssh-b", "Remote B");
 
-        let first = create_ssh_workspace(&db, "ssh-a", "Repo A", "/srv/repo-a", None)
+        let first = create_ssh_workspace(&db, "ssh-a", "Repo A", "/srv/repo-a")
             .expect("failed to create first remote workspace");
-        let second = create_ssh_workspace(&db, "ssh-a", "Repo B", "/srv/repo-b", None)
+        let second = create_ssh_workspace(&db, "ssh-a", "Repo B", "/srv/repo-b")
             .expect("failed to create second remote workspace");
-        create_ssh_workspace(&db, "ssh-b", "Repo C", "/srv/repo-c", None)
+        create_ssh_workspace(&db, "ssh-b", "Repo C", "/srv/repo-c")
             .expect("failed to create unrelated remote workspace");
 
         let mut workspace_ids = workspace_ids_for_ssh_connection(&db, "ssh-a")
@@ -558,17 +527,15 @@ mod tests {
     }
 
     #[test]
-    fn upsert_workspace_preserves_existing_scan_depth_when_none_is_provided() {
+    fn upsert_workspace_preserves_identity_and_uses_standard_trust_by_default() {
         let db = test_db();
         let root = std::env::temp_dir().join(format!("auracoder-workspace-{}", Uuid::new_v4()));
-        fs::create_dir_all(&root).expect("failed to create temp workspace root");
         let root = root.to_string_lossy().to_string();
 
-        let created = upsert_workspace(&db, &root, Some(7)).expect("failed to create workspace");
-        let reopened =
-            upsert_workspace(&db, &root, None).expect("failed to reopen workspace without depth");
+        let created = upsert_workspace(&db, &root).expect("failed to create workspace");
+        let reopened = upsert_workspace(&db, &root).expect("failed to reopen workspace");
 
         assert_eq!(created.id, reopened.id);
-        assert_eq!(reopened.scan_depth, 7);
+        assert_eq!(reopened.trust_level, crate::models::TrustLevelDto::Standard);
     }
 }

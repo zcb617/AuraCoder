@@ -30,7 +30,6 @@ function makeThread(id: string, lastActivityAt = new Date(0).toISOString()): Thr
   return {
     id,
     workspaceId: "workspace-1",
-    repoId: null,
     engineId: "codex",
     modelId: "gpt-5.6",
     engineThreadId: `engine-${id}`,
@@ -101,7 +100,6 @@ describe("threadStore remote Codex discovery", () => {
     await expect(
       useThreadStore.getState().createThread({
         workspaceId: "workspace-1",
-        repoId: null,
         title: "New thread",
       }),
     ).rejects.toBe(error);

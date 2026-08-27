@@ -10,8 +10,6 @@ import { useChatComposerStore } from "../stores/chatComposerStore";
 import { shouldOpenLink } from "./linkOpenSettings";
 export interface EditorFileReferenceContext {
   workspaceId: string | null;
-  preferredRepoPath?: string | null;
-  currentCwd?: string | null;
 }
 
 export async function openEditorFileReference(
@@ -25,15 +23,13 @@ export async function openEditorFileReference(
   const resolved = await ipc.resolveEditorFileReference(
     context.workspaceId,
     rawReference,
-    context.preferredRepoPath,
-    context.currentCwd,
   );
   if (!resolved) {
     toast.warning(t("common:fileReferences.resolveFailed", { reference: rawReference }));
     return false;
   }
 
-  await useFileStore.getState().openFile(resolved.repoPath, resolved.filePath);
+  await useFileStore.getState().openFile(resolved.rootPath, resolved.filePath);
   useUiStore.getState().setExplorerOpen(false);
   await useTerminalStore.getState().setLayoutMode(context.workspaceId, "editor");
   return true;

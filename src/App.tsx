@@ -604,12 +604,6 @@ export function App() {
               if (useWorkspaceStore.getState().activeWorkspaceId !== event.workspaceId) {
                 await useWorkspaceStore.getState().setActiveWorkspace(event.workspaceId);
               }
-              const thread = useThreadStore
-                .getState()
-                .threads.find((candidate) => candidate.id === event.threadId);
-              useWorkspaceStore
-                .getState()
-                .setActiveRepo(thread?.repoId ?? null, { remember: false });
               useThreadStore.getState().setActiveThread(event.threadId);
               await useChatStore.getState().setActiveThread(event.threadId);
             })();

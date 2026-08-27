@@ -341,11 +341,11 @@ async fn persist_sessions(
                 engine_metadata_json, reasoning_effort, last_activity_at, created_at
             ) AS (VALUES {value_groups})
             INSERT INTO threads (
-                id, workspace_id, repo_id, engine_id, model_id, engine_thread_id,
+                id, workspace_id, engine_id, model_id, engine_thread_id,
                 engine_metadata_json, title, status, reasoning_effort, last_activity_at, created_at
             )
             SELECT
-                remote.id, ?, NULL, 'claude', remote.model_id, remote.engine_thread_id,
+                remote.id, ?, 'claude', remote.model_id, remote.engine_thread_id,
                 remote.engine_metadata_json, remote.title, remote.status, remote.reasoning_effort,
                 CASE
                     WHEN remote.last_activity_at <> '' THEN remote.last_activity_at
@@ -772,7 +772,7 @@ mod tests {
             connection_enabled: Some(true),
             connection_deleted: Some(false),
             connection_status: Some("ok".to_string()),
-            scan_depth: 3,
+            trust_level: crate::models::TrustLevelDto::Standard,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             last_opened_at: "2026-01-01T00:00:00Z".to_string(),
         };

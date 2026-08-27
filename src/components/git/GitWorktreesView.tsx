@@ -16,20 +16,18 @@ import { closeGitFlyoutIfFocusLeft, GitFlyoutContext } from "../../lib/gitFlyout
 import { getActionMenuPosition } from "./actionMenuPosition";
 import { toast } from "../../stores/toastStore";
 import { useGitStore } from "../../stores/gitStore";
-import type { Repo, GitWorktree } from "../../types";
+import type { WorkspaceGitContext, GitWorktree } from "../../types";
+
+type GitWorktreeContext = Extract<WorkspaceGitContext, { kind: "repository" }>;
 
 interface Props {
-  repo: Repo;
+  context: GitWorktreeContext;
   onError: (error: string | undefined) => void;
 }
 
-function abbreviatePath(fullPath: string, repoPath: string): string {
-  const remotePrefix = `${repoPath.replace(/\/+$/, "")}/`;
-  if (repoPath.startsWith("ssh://auracoder/") && fullPath.startsWith(remotePrefix)) {
-    return `./${fullPath.slice(remotePrefix.length)}`;
-  }
-  if (fullPath.startsWith(repoPath)) {
-    const rel = fullPath.slice(repoPath.length);
+function abbreviatePath(fullPath: string, rootPath: string): string {
+  if (fullPath.startsWith(rootPath)) {
+    const rel = fullPath.slice(rootPath.length);
     return rel.startsWith("/") ? `.${rel}` : `./${rel}`;
   }
   return fullPath;
@@ -51,7 +49,7 @@ interface ActionMenuState {
   left: number;
 }
 
-export function GitWorktreesView({ repo, onError }: Props) {
+export function GitWorktreesView({ context, onError }: Props) {
   const { t } = useTranslation("git");
   const {
     worktrees,
@@ -59,8 +57,6 @@ export function GitWorktreesView({ repo, onError }: Props) {
     addWorktree,
     removeWorktree,
     pruneWorktrees,
-    setActiveRepoPath,
-    setMainRepoPath,
   } = useGitStore();
 
   const [loadingKey, setLoadingKey] = useState<string | null>(null);
@@ -77,15 +73,15 @@ export function GitWorktreesView({ repo, onError }: Props) {
   const gitFlyoutContext = useContext(GitFlyoutContext);
 
   useEffect(() => {
-    void loadWorktrees(repo.path);
-  }, [repo.path, loadWorktrees]);
+    void loadWorktrees(context.workspaceId);
+  }, [context.workspaceId, loadWorktrees]);
 
   useEffect(() => {
     setFilterQuery("");
     setShowCreate(false);
     setCreateBranch("");
     setCreateBaseRef("");
-  }, [repo.path]);
+  }, [context.workspaceId]);
 
   useEffect(() => {
     if (showCreate) createBranchInputRef.current?.focus();
@@ -156,7 +152,7 @@ export function GitWorktreesView({ repo, onError }: Props) {
   }, [worktrees, filterQuery]);
 
   const autoWorktreePath = createBranch.trim()
-    ? `${repo.path.replace(/\/+$/, "")}/.auracoder/worktrees/${createBranch.trim().replace(/[/\\]/g, "-")}`
+    ? `${context.rootPath.replace(/\/+$/, "")}/.auracoder/worktrees/${createBranch.trim().replace(/[/\\]/g, "-")}`
     : "";
 
   function openActionMenu(worktree: GitWorktree, e: React.MouseEvent<HTMLButtonElement>) {
@@ -196,7 +192,7 @@ export function GitWorktreesView({ repo, onError }: Props) {
     try {
       onError(undefined);
       const baseRef = createBaseRef.trim() || undefined;
-      await addWorktree(repo.path, autoWorktreePath, branch, baseRef);
+      await addWorktree(context.workspaceId, autoWorktreePath, branch, baseRef);
       setCreateBranch("");
       setCreateBaseRef("");
       setShowCreate(false);
@@ -213,7 +209,7 @@ export function GitWorktreesView({ repo, onError }: Props) {
     setLoadingKey("prune");
     try {
       onError(undefined);
-      await pruneWorktrees(repo.path);
+      await pruneWorktrees(context.workspaceId);
       toast.success(t("worktrees.toasts.pruned"));
     } catch (e) {
       onError(String(e));
@@ -225,8 +221,6 @@ export function GitWorktreesView({ repo, onError }: Props) {
   function onOpenInPanel(wt: GitWorktree) {
     closeMenu();
     if (wt.isMain) return;
-    setActiveRepoPath(wt.path);
-    setMainRepoPath(repo.path);
   }
 
   async function onRemoveWorktree(wtPath: string, branch: string | null, deleteBranch: boolean) {
@@ -244,7 +238,7 @@ export function GitWorktreesView({ repo, onError }: Props) {
       setConfirmingRemove(null);
       setConfirmingRemoveWithBranch(null);
       closeMenu();
-      await removeWorktree(repo.path, wtPath, false, branch, deleteBranch);
+      await removeWorktree(context.workspaceId, wtPath, false, branch, deleteBranch);
       toast.success(t("worktrees.toasts.removed"));
     } catch (e) {
       onError(String(e));
@@ -417,7 +411,7 @@ export function GitWorktreesView({ repo, onError }: Props) {
           </div>
           {autoWorktreePath && (
             <span className="git-worktree-path" title={autoWorktreePath}>
-              {abbreviatePath(autoWorktreePath, repo.path)}
+              {abbreviatePath(autoWorktreePath, context.rootPath)}
             </span>
           )}
         </div>
@@ -523,7 +517,7 @@ export function GitWorktreesView({ repo, onError }: Props) {
                       className="git-worktree-path"
                       title={wt.displayPath ?? wt.path}
                     >
-                      {abbreviatePath(wt.displayPath ?? wt.path, repo.path)}
+                      {abbreviatePath(wt.displayPath ?? wt.path, context.rootPath)}
                     </span>
                     {wt.headSha && (
                       <span

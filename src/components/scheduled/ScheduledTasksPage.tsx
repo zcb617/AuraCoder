@@ -83,7 +83,6 @@ function runtimeFromThread(thread: Thread | undefined): ScheduledRuntimeConfig |
   return {
     engineId: thread.engineId,
     modelId: thread.modelId,
-    repoId: thread.repoId,
     reasoningEffort: thread.reasoningEffort,
     serviceTier: typeof metadata.serviceTier === "string" ? metadata.serviceTier : null,
   };
@@ -208,11 +207,8 @@ function ScheduledTaskModal({
     ?? (initialTargetType === "existing_thread" ? runtimeFromThread(initialThread) : null)
     ?? runtimeByWorkspace[initialWorkspaceId]
     ?? runtimeFromThread(initialThread)
-    ?? { ...NEW_THREAD_FALLBACK_RUNTIME, repoId: null };
-  const initialRuntime: ScheduledRuntimeConfig = {
-    ...initialRuntimeSource,
-    repoId: "repoId" in initialRuntimeSource ? initialRuntimeSource.repoId : null,
-  };
+    ?? NEW_THREAD_FALLBACK_RUNTIME;
+  const initialRuntime: ScheduledRuntimeConfig = initialRuntimeSource;
 
   const [description, setDescription] = useState(task?.description ?? "");
   const [enabled] = useState(task?.enabled ?? true);
@@ -226,7 +222,6 @@ function ScheduledTaskModal({
   const [reasoningEffort, setReasoningEffort] = useState<string | null>(
     initialRuntime.reasoningEffort ?? null,
   );
-  const [runtimeRepoId, setRuntimeRepoId] = useState(initialRuntime.repoId ?? null);
   const [serviceTier, setServiceTier] = useState(initialRuntime.serviceTier ?? null);
   const [scheduleType, setScheduleType] = useState<ScheduledTaskScheduleType>(
     task?.scheduleType ?? "daily",
@@ -277,7 +272,6 @@ function ScheduledTaskModal({
     setEngineId(nextEngine.id);
     setModelId(nextModel?.id ?? "");
     setReasoningEffort(resolveReasoningEffortForModel(nextModel, null));
-    setRuntimeRepoId(null);
     setServiceTier(null);
   }, [availableEngines, engineId]);
 
@@ -305,7 +299,6 @@ function ScheduledTaskModal({
     setEngineId(nextEngine.id);
     setModelId(nextModel?.id ?? "");
     setReasoningEffort(resolveReasoningEffortForModel(nextModel, null));
-    setRuntimeRepoId(null);
     setServiceTier(null);
   };
 
@@ -361,7 +354,6 @@ function ScheduledTaskModal({
     const runtimeConfig: ScheduledRuntimeConfig = {
       engineId: selectedEngine.id,
       modelId: selectedModel.id,
-      repoId: targetType === "existing_thread" ? selectedThread?.repoId ?? null : runtimeRepoId,
       reasoningEffort,
       serviceTier: selectedEngine.id === "codex" ? serviceTier : null,
     };
@@ -473,7 +465,6 @@ function ScheduledTaskModal({
               <label>{t("workspace")}</label>
               <select value={workspaceId} onChange={(event) => {
                 setWorkspaceId(event.target.value);
-                setRuntimeRepoId(null);
               }}>
                 <option value="">{t("selectWorkspace")}</option>
                 {workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}
@@ -592,7 +583,6 @@ export function ScheduledTasksPage() {
     await useWorkspaceStore.getState().setActiveWorkspace(task.workspaceId);
     await useThreadStore.getState().refreshThreads(task.workspaceId);
     const thread = useThreadStore.getState().threads.find((candidate) => candidate.id === threadId);
-    useWorkspaceStore.getState().setActiveRepo(thread?.repoId ?? null, { remember: false });
     useThreadStore.getState().setActiveThread(threadId);
     await useChatStore.getState().setActiveThread(threadId);
   };

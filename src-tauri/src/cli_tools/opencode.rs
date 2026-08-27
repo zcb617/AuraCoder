@@ -1,4 +1,7 @@
-use std::{collections::{HashMap, HashSet}, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -8,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     CliExecutionContext, CliForkedThread, CliLocationKind, CliReviewStarted,
-    CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError,
-    CliSessionSnapshot, CliTool,
+    CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError, CliSessionSnapshot,
+    CliTool,
 };
 use crate::{
     db,
@@ -25,8 +28,7 @@ use crate::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CodexAppDto, CodexPluginDto,
         CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
-        PermissionComponentJson, ThreadDto,
-        ThreadStatusDto, WorkspaceDto,
+        PermissionComponentJson, ThreadDto, ThreadStatusDto, WorkspaceDto,
     },
     path_utils, remote_project_opencode_runtime_service, ssh,
     state::AppState,
@@ -42,33 +44,63 @@ fn default_permission_component() -> PermissionComponentJson {
 }
 
 fn set_permission_array(values: &mut PermissionComponentJson, key: &str, items: &[&str]) {
-    values.insert(key.to_string(), Value::Array(items.iter().map(|item| json!(item)).collect()));
+    values.insert(
+        key.to_string(),
+        Value::Array(items.iter().map(|item| json!(item)).collect()),
+    );
 }
 
-fn permission_choice<'a>(values: &'a PermissionComponentJson, key: &str) -> Result<Option<&'a str>> {
+fn permission_choice<'a>(
+    values: &'a PermissionComponentJson,
+    key: &str,
+) -> Result<Option<&'a str>> {
     let value = values.get(key).context(format!("缺少权限参数: {key}"))?;
-    let array = value.as_array().context(format!("权限参数必须是数组: {key}"))?;
+    let array = value
+        .as_array()
+        .context(format!("权限参数必须是数组: {key}"))?;
     Ok(array.first().and_then(Value::as_str))
 }
 
 fn validate_permission_component(values: &PermissionComponentJson) -> Result<()> {
     let allowed = [
-        ("autonomyPreset", ["automatic", "read-only", "ask", "auto", "full"].as_slice()),
-        ("trust", ["automatic", "trusted", "standard", "restricted"].as_slice()),
-        ("approval", ["automatic", "restricted", "ask", "autonomous"].as_slice()),
-        ("sandbox", ["automatic", "read-only", "workspace-write", "full-access"].as_slice()),
+        (
+            "autonomyPreset",
+            ["automatic", "read-only", "ask", "auto", "full"].as_slice(),
+        ),
+        (
+            "trust",
+            ["automatic", "trusted", "standard", "restricted"].as_slice(),
+        ),
+        (
+            "approval",
+            ["automatic", "restricted", "ask", "autonomous"].as_slice(),
+        ),
+        (
+            "sandbox",
+            ["automatic", "read-only", "workspace-write", "full-access"].as_slice(),
+        ),
         ("network", ["automatic", "enabled", "restricted"].as_slice()),
-        ("defaultForNewThreads", ["automatic", "read-only", "ask", "auto", "full"].as_slice()),
+        (
+            "defaultForNewThreads",
+            ["automatic", "read-only", "ask", "auto", "full"].as_slice(),
+        ),
     ];
     for key in values.keys() {
-        anyhow::ensure!(allowed.iter().any(|(name, _)| name == key), "未知权限参数: {key}");
+        anyhow::ensure!(
+            allowed.iter().any(|(name, _)| name == key),
+            "未知权限参数: {key}"
+        );
     }
     for (key, choices) in allowed {
         let value = values.get(key).context(format!("缺少权限参数: {key}"))?;
-        let array = value.as_array().context(format!("权限参数必须是数组: {key}"))?;
+        let array = value
+            .as_array()
+            .context(format!("权限参数必须是数组: {key}"))?;
         anyhow::ensure!(array.len() <= 1, "权限参数数组最多只能有一个值: {key}");
         for item in array {
-            let item = item.as_str().context(format!("权限参数值必须是字符串: {key}"))?;
+            let item = item
+                .as_str()
+                .context(format!("权限参数值必须是字符串: {key}"))?;
             anyhow::ensure!(choices.contains(&item), "权限参数值不支持: {key}={item}");
         }
     }
@@ -77,9 +109,13 @@ fn validate_permission_component(values: &PermissionComponentJson) -> Result<()>
 
 fn raw_rules_from_thread(thread: &ThreadDto) -> Result<Value> {
     let raw = thread.permission_mode.as_deref().unwrap_or("").trim();
-    if raw.is_empty() { return Ok(json!([])); }
+    if raw.is_empty() {
+        return Ok(json!([]));
+    }
     let parsed: Value = serde_json::from_str(raw).context("OpenCode 权限 JSON 格式错误")?;
-    if parsed.is_null() || parsed == json!({}) || parsed == json!([]) { return Ok(json!([])); }
+    if parsed.is_null() || parsed == json!({}) || parsed == json!([]) {
+        return Ok(json!([]));
+    }
     if let Some(rules) = parsed.get("permission") {
         anyhow::ensure!(rules.is_array(), "OpenCode permission 必须是数组");
         return Ok(rules.clone());
@@ -185,13 +221,6 @@ impl OpenCodeCli {
                 if path_utils::paths_equal(&workspace.root_path, &cwd) {
                     return Ok::<_, anyhow::Error>(Some(workspace));
                 }
-                let repos = db::repos::get_repos(&db, &workspace.id)?;
-                if repos
-                    .iter()
-                    .any(|repo| path_utils::paths_equal(&repo.path, &cwd))
-                {
-                    return Ok(Some(workspace));
-                }
             }
             Ok(None)
         })
@@ -241,21 +270,7 @@ impl OpenCodeCli {
     }
 
     async fn workspace_roots(&self, workspace: &WorkspaceDto) -> Result<Vec<String>> {
-        let db = self.state.db.clone();
-        let workspace_id = workspace.id.clone();
-        let repos = tokio::task::spawn_blocking(move || db::repos::get_repos(&db, &workspace_id))
-            .await
-            .context("读取 OpenCode workspace 仓库任务失败")??;
-        let mut roots = vec![workspace.root_path.clone()];
-        for repo in repos {
-            if !roots
-                .iter()
-                .any(|root| path_utils::paths_equal(root, &repo.path))
-            {
-                roots.push(repo.path);
-            }
-        }
-        Ok(roots)
+        Ok(vec![workspace.root_path.clone()])
     }
 
     async fn resolve_workspace_cwd(
@@ -275,33 +290,8 @@ impl OpenCodeCli {
     }
 
     async fn thread_cwd(&self, workspace: &WorkspaceDto, thread: &ThreadDto) -> Result<String> {
-        let Some(repo_id) = thread.repo_id.as_deref() else {
-            if let Some(remote_cwd) = thread
-                .engine_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("opencodeRemoteCwd"))
-                .and_then(Value::as_str)
-            {
-                return self
-                    .resolve_workspace_cwd(workspace, Some(remote_cwd))
-                    .await;
-            }
-            return Ok(workspace.root_path.clone());
-        };
-        let db = self.state.db.clone();
-        let repo_id = repo_id.to_string();
-        let lookup_repo_id = repo_id.clone();
-        let repo =
-            tokio::task::spawn_blocking(move || db::repos::find_repo_by_id(&db, &lookup_repo_id))
-                .await
-                .context("读取 OpenCode 会话仓库任务失败")??
-                .ok_or_else(|| anyhow::anyhow!("OpenCode 会话仓库不存在: {repo_id}"))?;
-        anyhow::ensure!(
-            repo.workspace_id == workspace.id,
-            "OpenCode 会话仓库不属于当前 workspace"
-        );
-        self.resolve_workspace_cwd(workspace, Some(repo.path.as_str()))
-            .await
+        let _ = thread;
+        Ok(workspace.root_path.clone())
     }
 
     async fn list_workspace_sessions(
@@ -744,7 +734,10 @@ impl CliTool for OpenCodeCli {
     ) -> Result<PermissionComponentJson> {
         self.load_workspace(context).await?;
         Self::validate_thread(context, thread)?;
-        anyhow::ensure!(thread.workspace_id == context.workspace_id, "当前会话不属于该 workspace");
+        anyhow::ensure!(
+            thread.workspace_id == context.workspace_id,
+            "当前会话不属于该 workspace"
+        );
         let mut rules = raw_rules_from_thread(thread)?;
         /*
         // 旧实现曾用该标记判断是否回退到 engine_metadata_json 权限镜像；
@@ -758,11 +751,14 @@ impl CliTool for OpenCodeCli {
         */
         // 权限为空时保持 CLI 默认行为，不再回退读取 engine_metadata_json。
         let mut result = default_permission_component();
-        let action = rules.as_array().and_then(|rules| rules.iter().rev().find_map(|rule| {
-            (rule.get("permission").and_then(Value::as_str) == Some("*")
-                && rule.get("pattern").and_then(Value::as_str) == Some("*"))
-                .then(|| rule.get("action").and_then(Value::as_str)).flatten()
-        }));
+        let action = rules.as_array().and_then(|rules| {
+            rules.iter().rev().find_map(|rule| {
+                (rule.get("permission").and_then(Value::as_str) == Some("*")
+                    && rule.get("pattern").and_then(Value::as_str) == Some("*"))
+                .then(|| rule.get("action").and_then(Value::as_str))
+                .flatten()
+            })
+        });
         match action {
             Some("allow") => {
                 set_permission_array(&mut result, "autonomyPreset", &["full"]);
@@ -793,7 +789,10 @@ impl CliTool for OpenCodeCli {
     ) -> Result<PermissionComponentJson> {
         let workspace = self.load_workspace(context).await?;
         Self::validate_thread(context, thread)?;
-        anyhow::ensure!(thread.workspace_id == context.workspace_id, "当前会话不属于该 workspace");
+        anyhow::ensure!(
+            thread.workspace_id == context.workspace_id,
+            "当前会话不属于该 workspace"
+        );
         validate_permission_component(&values)?;
         let current = <Self as CliTool>::get_permissions(self, context, thread).await?;
         if current.get("autonomyPreset") == values.get("autonomyPreset")
@@ -802,8 +801,12 @@ impl CliTool for OpenCodeCli {
             && current.get("network") == values.get("network")
         {
             let mut result = current;
-            if let Some(value) = values.get("trust") { result.insert("trust".to_string(), value.clone()); }
-            if let Some(value) = values.get("defaultForNewThreads") { result.insert("defaultForNewThreads".to_string(), value.clone()); }
+            if let Some(value) = values.get("trust") {
+                result.insert("trust".to_string(), value.clone());
+            }
+            if let Some(value) = values.get("defaultForNewThreads") {
+                result.insert("defaultForNewThreads".to_string(), value.clone());
+            }
             return Ok(result);
         }
         let preset = permission_choice(&values, "autonomyPreset")?;
@@ -812,8 +815,14 @@ impl CliTool for OpenCodeCli {
             .get("autonomyPreset")
             .and_then(Value::as_array)
             .is_some_and(Vec::is_empty);
-        anyhow::ensure!(permission_choice(&values, "sandbox")?.map_or(true, |v| v == "automatic"), "OpenCode 不支持 sandbox 覆盖");
-        anyhow::ensure!(permission_choice(&values, "network")?.map_or(true, |v| v == "automatic"), "OpenCode 不支持 network 覆盖");
+        anyhow::ensure!(
+            permission_choice(&values, "sandbox")?.map_or(true, |v| v == "automatic"),
+            "OpenCode 不支持 sandbox 覆盖"
+        );
+        anyhow::ensure!(
+            permission_choice(&values, "network")?.map_or(true, |v| v == "automatic"),
+            "OpenCode 不支持 network 覆盖"
+        );
         let rules = match preset {
             Some("automatic") => json!([]),
             None if autonomy_is_empty || approval == Some("automatic") => json!([]),
@@ -822,14 +831,20 @@ impl CliTool for OpenCodeCli {
                 { "permission": "*", "pattern": "*", "action": "ask" },
                 { "permission": "question", "pattern": "*", "action": "allow" }
             ]),
-            Some("auto") | Some("full") => json!([{ "permission": "*", "pattern": "*", "action": "allow" }]),
+            Some("auto") | Some("full") => {
+                json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
+            }
             _ => match approval {
-                Some("restricted") => json!([{ "permission": "*", "pattern": "*", "action": "deny" }]),
+                Some("restricted") => {
+                    json!([{ "permission": "*", "pattern": "*", "action": "deny" }])
+                }
                 Some("ask") => json!([
                     { "permission": "*", "pattern": "*", "action": "ask" },
                     { "permission": "question", "pattern": "*", "action": "allow" }
                 ]),
-                Some("autonomous") => json!([{ "permission": "*", "pattern": "*", "action": "allow" }]),
+                Some("autonomous") => {
+                    json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
+                }
                 _ => raw_rules_from_thread(thread)?,
             },
         };
@@ -846,17 +861,19 @@ impl CliTool for OpenCodeCli {
             raw_permission_value(thread, &rules).to_string()
         };
         let engine_thread_id = thread.engine_thread_id.clone();
-        let saved = db::threads::update_thread_permissions(
-            &self.state.db,
-            &thread.id,
-            Some(&raw),
-        )?;
+        let saved = db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw))?;
         if let Some(engine_thread_id) = engine_thread_id.as_deref() {
             let cwd = self.thread_cwd(&workspace, thread).await?;
             let result = if context.location_kind == CliLocationKind::Ssh {
-                remote_project_opencode_runtime_service::runtime(&workspace).await?.set_session_permission_rules(&cwd, engine_thread_id, &rules).await
+                remote_project_opencode_runtime_service::runtime(&workspace)
+                    .await?
+                    .set_session_permission_rules(&cwd, engine_thread_id, &rules)
+                    .await
             } else {
-                self.local_engine().await?.set_session_permission_rules(&cwd, engine_thread_id, &rules).await
+                self.local_engine()
+                    .await?
+                    .set_session_permission_rules(&cwd, engine_thread_id, &rules)
+                    .await
             };
             if let Err(error) = result {
                 let rollback_value = thread
@@ -877,7 +894,9 @@ impl CliTool for OpenCodeCli {
         }
         let mut result = self.get_permissions(context, &saved).await?;
         for key in ["trust", "defaultForNewThreads"] {
-            if let Some(value) = values.get(key) { result.insert(key.to_string(), value.clone()); }
+            if let Some(value) = values.get(key) {
+                result.insert(key.to_string(), value.clone());
+            }
         }
         Ok(result)
     }
@@ -893,8 +912,8 @@ impl CliTool for OpenCodeCli {
             items.iter().rev().find_map(|rule| {
                 (rule.get("permission").and_then(Value::as_str) == Some("*")
                     && rule.get("pattern").and_then(Value::as_str) == Some("*"))
-                    .then(|| rule.get("action").cloned())
-                    .flatten()
+                .then(|| rule.get("action").cloned())
+                .flatten()
             })
         });
         Ok(CliRuntimePermissions {
@@ -1024,8 +1043,7 @@ impl CliTool for OpenCodeCli {
         let workspace = self.load_workspace(context).await?;
         Self::validate_thread(context, thread)?;
         let scope_cwd = match &scope {
-            ThreadScope::Repo { repo_path } => repo_path.as_str(),
-            ThreadScope::Workspace { root_path, .. } => root_path.as_str(),
+            ThreadScope::Project { root_path, .. } => root_path.as_str(),
         };
         self.resolve_workspace_cwd(&workspace, Some(scope_cwd))
             .await?;
@@ -1305,7 +1323,8 @@ impl CliTool for OpenCodeCli {
         } else {
             let engine = self.local_engine().await?;
             engine.set_computer_control_service(self.state.computer_control_service.clone());
-            engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
+            engine
+                .set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
             engine.runtime_catalog(&cwd).await
         }
     }
@@ -1623,7 +1642,6 @@ mod tests {
         ThreadDto {
             id: "thread".to_string(),
             workspace_id: "workspace".to_string(),
-            repo_id: None,
             engine_id: "opencode".to_string(),
             model_id: "model".to_string(),
             engine_thread_id: None,
@@ -1643,12 +1661,12 @@ mod tests {
 
     #[test]
     fn permissions_read_empty_and_legacy_modes() {
-        assert_eq!(raw_rules_from_thread(&thread(None, None)).unwrap(), json!([]));
-        let rules = raw_rules_from_thread(&thread(
-            Some(r#"{"approvalPolicy":"ask"}"#),
-            None,
-        ))
-        .unwrap();
+        assert_eq!(
+            raw_rules_from_thread(&thread(None, None)).unwrap(),
+            json!([])
+        );
+        let rules =
+            raw_rules_from_thread(&thread(Some(r#"{"approvalPolicy":"ask"}"#), None)).unwrap();
         assert_eq!(rules.as_array().map(Vec::len), Some(2));
         assert_eq!(rules[0]["action"], json!("ask"));
     }
@@ -1662,8 +1680,8 @@ mod tests {
         let action = rules.as_array().unwrap().iter().rev().find_map(|rule| {
             (rule.get("permission").and_then(Value::as_str) == Some("*")
                 && rule.get("pattern").and_then(Value::as_str) == Some("*"))
-                .then(|| rule.get("action").and_then(Value::as_str))
-                .flatten()
+            .then(|| rule.get("action").and_then(Value::as_str))
+            .flatten()
         });
         assert_eq!(action, Some("ask"));
     }

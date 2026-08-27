@@ -17,7 +17,8 @@ pub struct WorkspaceDto {
     pub connection_enabled: Option<bool>,
     pub connection_deleted: Option<bool>,
     pub connection_status: Option<String>,
-    pub scan_depth: i64,
+    /// 项目级信任等级，决定项目内引擎的权限策略。
+    pub trust_level: TrustLevelDto,
     pub created_at: String,
     pub last_opened_at: String,
 }
@@ -98,22 +99,31 @@ pub struct SshConnectionTestDto {
     pub error: Option<String>,
 }
 
+/// 工作区根目录自身的 Git 上下文。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RepoDto {
-    pub id: String,
-    pub workspace_id: String,
-    pub name: String,
-    pub path: String,
-    pub default_branch: String,
-    pub is_active: bool,
-    pub trust_level: TrustLevelDto,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceGitSelectionStatusDto {
-    pub configured: bool,
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum WorkspaceGitContextDto {
+    /// 工作区根目录不是 Git 仓库。
+    #[serde(rename = "not-repository")]
+    NotRepository {
+        /// 工作区主键。
+        workspace_id: String,
+    },
+    /// 工作区根目录是 Git 仓库。
+    Repository {
+        /// 工作区主键。
+        workspace_id: String,
+        /// Git 仓库根目录。
+        root_path: String,
+        /// 仓库显示名称。
+        name: String,
+        /// 默认分支名称。
+        default_branch: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,7 +157,6 @@ impl TrustLevelDto {
 pub struct ThreadDto {
     pub id: String,
     pub workspace_id: String,
-    pub repo_id: Option<String>,
     pub engine_id: String,
     pub model_id: String,
     pub engine_thread_id: Option<String>,
@@ -172,8 +181,6 @@ pub struct ThreadUpdateDto {
     pub id: String,
     /// 工作区主键。
     pub workspace_id: Option<String>,
-    /// 仓库主键；Some("") 按原值写入规则处理。
-    pub repo_id: Option<String>,
     /// CLI 工具标识。
     pub engine_id: Option<String>,
     /// 模型标识。
@@ -423,7 +430,6 @@ pub struct SearchResultDto {
     pub thread_id: String,
     pub thread_title: String,
     pub workspace_name: String,
-    pub repo_id: Option<String>,
     pub message_id: String,
     pub snippet: String,
 }
@@ -1181,7 +1187,7 @@ pub struct WriteFileResultDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedEditorFileReferenceDto {
-    pub repo_path: String,
+    pub root_path: String,
     pub file_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
@@ -1323,7 +1329,7 @@ pub struct GitRemoteDto {
 #[serde(rename_all = "camelCase")]
 pub struct GitInitRepoStatusDto {
     pub can_initialize: bool,
-    pub blocking_repo_path: Option<String>,
+    pub blocking_root_path: Option<String>,
 }
 
 // ── Setup / Onboarding ──────────────────────────────────────────────

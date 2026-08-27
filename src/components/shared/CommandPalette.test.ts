@@ -130,8 +130,7 @@ describe("CommandPalette view-files command", () => {
 
     await command?.action({
       activeWorkspaceId: "ws-1",
-      activeRepoPath: null,
-      repos: [],
+      gitContext: null,
       close,
       openSubFlow: vi.fn(),
     });
@@ -153,8 +152,7 @@ describe("CommandPalette view-files command", () => {
 
     await command?.action({
       activeWorkspaceId: "ws-1",
-      activeRepoPath: null,
-      repos: [],
+      gitContext: null,
       close,
       openSubFlow: vi.fn(),
     });

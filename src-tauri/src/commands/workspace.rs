@@ -2,14 +2,14 @@ use tauri::State;
 
 use crate::{
     db, fs_ops,
-    git::{multi_repo, repo},
+    git::repo,
     models::{
-        FileTreeEntryDto, FileTreePageDto, RepoDto, SshConnectionTestDto, SshRemoteDirectoryDto,
-        TrustLevelDto, WorkspaceDto, WorkspaceGitSelectionStatusDto,
+        FileTreeEntryDto, FileTreePageDto, SshConnectionTestDto, SshRemoteDirectoryDto,
+        TrustLevelDto, WorkspaceDto,
     },
     ssh::{
-        gateway, remote_fs, remote_git,
-        runtime::{remote_repo_marker, resolve_workspace_target},
+        gateway, remote_fs,
+        runtime::resolve_workspace_target,
     },
     state::AppState,
     workspace_startup::{
@@ -19,9 +19,6 @@ use crate::{
         WorkspaceStartupPreset, WorkspaceStartupPresetFormat,
     },
 };
-
-const MIN_SCAN_DEPTH: i64 = 0;
-const MAX_SCAN_DEPTH: i64 = 12;
 
 async fn run_db<T, F>(db: crate::db::Database, operation: F) -> Result<T, String>
 where
@@ -38,33 +35,9 @@ where
 pub async fn open_workspace(
     state: State<'_, AppState>,
     path: String,
-    scan_depth: Option<i64>,
 ) -> Result<WorkspaceDto, String> {
-    let scan_depth = normalize_scan_depth(scan_depth);
     run_db(state.db.clone(), move |db| {
-        let workspace = db::workspaces::upsert_workspace(db, &path, scan_depth)?;
-        let repos =
-            multi_repo::scan_git_repositories(&workspace.root_path, workspace.scan_depth as usize)?;
-        let repo_paths = repos
-            .iter()
-            .map(|repo| repo.path.clone())
-            .collect::<Vec<_>>();
-        db::repos::reconcile_workspace_repos(db, &workspace.id, &repo_paths)?;
-        let selection_configured =
-            db::workspaces::is_git_repo_selection_configured(db, &workspace.id)?;
-
-        for repo in repos {
-            let _ = db::repos::upsert_repo(
-                db,
-                &workspace.id,
-                &repo.name,
-                &repo.path,
-                &repo.default_branch,
-                !selection_configured,
-            );
-        }
-
-        Ok(workspace)
+        db::workspaces::upsert_workspace(db, &path)
     })
     .await
 }
@@ -166,7 +139,6 @@ pub async fn create_ssh_workspace(
     connection_id: String,
     name: String,
     root_path: String,
-    scan_depth: Option<i64>,
 ) -> Result<WorkspaceDto, String> {
     let root_path = root_path.trim().to_string();
     validate_remote_path(&root_path)?;
@@ -189,7 +161,6 @@ pub async fn create_ssh_workspace(
             &connection_id,
             &name,
             &root_path,
-            normalize_scan_depth(scan_depth),
         )
     })
     .await?;
@@ -217,115 +188,15 @@ pub async fn create_ssh_workspace(
 }
 
 #[tauri::command]
-pub async fn get_repos(
+pub async fn set_workspace_trust_level(
     state: State<'_, AppState>,
     workspace_id: String,
-) -> Result<Vec<RepoDto>, String> {
-    let target = run_db(state.db.clone(), {
-        let workspace_id = workspace_id.clone();
-        move |db| resolve_workspace_target(db, &workspace_id)
-    })
-    .await?;
-    if target.is_remote() {
-        let connection = target.remote_connection().map_err(err_to_string)?;
-        let Some(info) = remote_git::discover(connection, &target.workspace.root_path)
-            .await
-            .map_err(err_to_string)?
-        else {
-            return Ok(Vec::new());
-        };
-        return Ok(vec![RepoDto {
-            id: format!("remote-repo-{}", target.workspace.id),
-            workspace_id: target.workspace.id.clone(),
-            name: info.name,
-            path: remote_repo_marker(&target.workspace.id),
-            default_branch: info.default_branch,
-            is_active: true,
-            trust_level: TrustLevelDto::Standard,
-        }]);
-    }
-    run_db(state.db.clone(), move |db| {
-        db::repos::get_repos(db, &workspace_id)
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn set_repo_trust_level(
-    state: State<'_, AppState>,
-    repo_id: String,
     trust_level: TrustLevelDto,
 ) -> Result<(), String> {
-    if repo_id.starts_with("remote-repo-") {
-        return Ok(());
-    }
     run_db(state.db.clone(), move |db| {
-        db::repos::set_repo_trust_level(db, &repo_id, trust_level)
+        db::workspaces::set_workspace_trust_level(db, &workspace_id, &trust_level)
     })
     .await
-}
-
-#[tauri::command]
-pub async fn set_repo_git_active(
-    state: State<'_, AppState>,
-    repo_id: String,
-    is_active: bool,
-) -> Result<(), String> {
-    if repo_id.starts_with("remote-repo-") {
-        return Ok(());
-    }
-    run_db(state.db.clone(), move |db| {
-        db::repos::set_repo_active(db, &repo_id, is_active)?;
-
-        if let Some(repo) = db::repos::find_repo_by_id(db, &repo_id)? {
-            db::workspaces::set_git_repo_selection_configured(db, &repo.workspace_id, true)?;
-        }
-
-        Ok(())
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn set_workspace_git_active_repos(
-    state: State<'_, AppState>,
-    workspace_id: String,
-    repo_ids: Vec<String>,
-) -> Result<(), String> {
-    let target = run_db(state.db.clone(), {
-        let workspace_id = workspace_id.clone();
-        move |db| resolve_workspace_target(db, &workspace_id)
-    })
-    .await?;
-    if target.is_remote() {
-        return Ok(());
-    }
-    run_db(state.db.clone(), move |db| {
-        db::repos::set_workspace_active_repos(db, &workspace_id, &repo_ids)?;
-        db::workspaces::set_git_repo_selection_configured(db, &workspace_id, true)?;
-        Ok(())
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn has_workspace_git_selection(
-    state: State<'_, AppState>,
-    workspace_id: String,
-) -> Result<WorkspaceGitSelectionStatusDto, String> {
-    let target = run_db(state.db.clone(), {
-        let workspace_id = workspace_id.clone();
-        move |db| resolve_workspace_target(db, &workspace_id)
-    })
-    .await?;
-    if target.is_remote() {
-        return Ok(WorkspaceGitSelectionStatusDto { configured: true });
-    }
-    let configured = run_db(state.db.clone(), move |db| {
-        db::workspaces::is_git_repo_selection_configured(db, &workspace_id)
-    })
-    .await?;
-    Ok(WorkspaceGitSelectionStatusDto { configured })
 }
 
 #[tauri::command]
@@ -647,10 +518,6 @@ fn normalize_preset_for_workspace(
     }
     let workspace_root = resolve_workspace_path(&workspace.root_path)?;
     normalize_preset(preset, &workspace_root)
-}
-
-fn normalize_scan_depth(value: Option<i64>) -> Option<i64> {
-    value.map(|depth| depth.clamp(MIN_SCAN_DEPTH, MAX_SCAN_DEPTH))
 }
 
 async fn load_usable_ssh_connection(

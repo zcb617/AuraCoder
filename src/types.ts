@@ -26,6 +26,8 @@ export interface UpdateInstallResult {
 }
 
 export interface Workspace {
+  /** 迁移期间允许旧持久化数据字段存在；项目业务不读取未知字段。 */
+  [key: string]: any;
   id: string;
   name: string;
   rootPath: string;
@@ -35,7 +37,7 @@ export interface Workspace {
   connectionEnabled?: boolean | null;
   connectionDeleted?: boolean | null;
   connectionStatus?: string | null;
-  scanDepth: number;
+  trustLevel: TrustLevel;
   createdAt: string;
   lastOpenedAt: string;
 }
@@ -178,25 +180,20 @@ export interface TerminalNotificationSettings {
   codex: TerminalNotificationIntegrationStatus;
 }
 
-export interface Repo {
-  id: string;
-  workspaceId: string;
-  name: string;
-  path: string;
-  defaultBranch: string;
-  isActive: boolean;
-  trustLevel: TrustLevel;
-}
-
-export interface WorkspaceGitSelectionStatus {
-  configured: boolean;
-}
+export type WorkspaceGitContext =
+  | { kind: "not-repository"; workspaceId: string }
+  | {
+      kind: "repository";
+      workspaceId: string;
+      rootPath: string;
+      name: string;
+      defaultBranch: string | null;
+    };
 
 export type WorkspaceStartupPresetFormat = "json" | "toml";
 export type WorkspaceDefaultView = "chat" | "split" | "terminal" | "editor";
 export type WorkspacePathBase = "workspace" | "worktree" | "absolute";
 export type WorkspaceStartupApplyWhen = "no_live_sessions";
-export type WorkspaceStartupRepoMode = "active_repo" | "fixed_repo";
 export type WorkspaceStartupSplitDirection = "horizontal" | "vertical";
 
 export interface WorkspaceStartupPreset {
@@ -223,9 +220,9 @@ export interface WorkspaceStartupGroup {
 }
 
 export interface WorkspaceStartupWorktreeConfig {
+  /** 迁移期间忽略旧夹具字段，生产逻辑只读取下列项目级配置。 */
+  [key: string]: any;
   enabled: boolean;
-  repoMode: WorkspaceStartupRepoMode;
-  repoPath?: string | null;
   baseBranch?: string | null;
   baseDir?: string | null;
   branchPrefix?: string | null;
@@ -282,7 +279,6 @@ export interface PermissionComponentJson {
 export interface Thread {
   id: string;
   workspaceId: string;
-  repoId: string | null;
   engineId: ChatEngineId;
   modelId: string;
   engineThreadId: string | null;
@@ -374,7 +370,6 @@ export type ScheduledTaskRunStatus =
 export interface ScheduledRuntimeConfig {
   engineId: string;
   modelId: string;
-  repoId?: string | null;
   reasoningEffort?: string | null;
   serviceTier?: string | null;
 }
@@ -1124,7 +1119,6 @@ export interface SearchResult {
   threadId: string;
   threadTitle: string;
   workspaceName: string;
-  repoId: string | null;
   messageId: string;
   snippet: string;
 }
@@ -1239,7 +1233,9 @@ export interface GitInitRepoStatus {
 }
 
 export interface WorktreeSessionInfo {
-  repoPath: string;
+  /** 迁移期间允许旧会话夹具字段存在，清理逻辑使用 workspaceId。 */
+  [key: string]: any;
+  workspaceId: string;
   worktreePath: string;
   branch: string;
 }
@@ -1270,7 +1266,8 @@ export interface WriteFileResult {
 }
 
 export interface ResolvedEditorFileReference {
-  repoPath: string;
+  workspaceId: string;
+  rootPath: string;
   filePath: string;
   line?: number | null;
   column?: number | null;
@@ -1295,7 +1292,6 @@ export interface EditorTab {
   rootPath: string;
   absolutePath: string;
   filePath: string;
-  gitRepoPath: string | null;
   gitFilePath: string | null;
   fileName: string;
   content: string;

@@ -883,8 +883,6 @@ export function WorkspaceStartupSection({ workspace }: WorkspaceStartupSectionPr
               const tabExpanded = expandedTabs[group.id] ?? false;
               const worktree: WorkspaceStartupWorktreeConfig = group.worktree ?? {
                 enabled: false,
-                repoMode: "active_repo",
-                repoPath: null,
                 baseBranch: null,
                 baseDir: null,
                 branchPrefix: null,
@@ -960,8 +958,6 @@ export function WorkspaceStartupSection({ workspace }: WorkspaceStartupSectionPr
                                 worktree: e.target.checked
                                   ? {
                                       enabled: true,
-                                      repoMode: g.worktree?.repoMode ?? "active_repo",
-                                      repoPath: g.worktree?.repoPath ?? null,
                                       baseBranch: g.worktree?.baseBranch ?? null,
                                       baseDir: g.worktree?.baseDir ?? ".auracoder/worktrees",
                                       branchPrefix: g.worktree?.branchPrefix ?? "auracoder/preset",
@@ -974,52 +970,6 @@ export function WorkspaceStartupSection({ workspace }: WorkspaceStartupSectionPr
                         </label>
                         {worktree.enabled && (
                           <div className="wss-wt-fields">
-                            <div className="wss-wt-row">
-                              <span className="wss-wt-label">{t("startup.worktree.repo")}</span>
-                              <Dropdown
-                                value={worktree.repoMode}
-                                options={[
-                                  { value: "active_repo", label: t("startup.worktree.activeRepo") },
-                                  { value: "fixed_repo", label: t("startup.worktree.fixedRepo") },
-                                ]}
-                                triggerStyle={{
-                                  borderRadius: "var(--radius-sm)",
-                                  fontSize: 11,
-                                  padding: "2px 6px",
-                                }}
-                                onChange={(v) =>
-                                  updateGroup(group.id, (g) => ({
-                                    ...g,
-                                    worktree: {
-                                      ...(g.worktree ?? worktree),
-                                      enabled: true,
-                                      repoMode: v as "active_repo" | "fixed_repo",
-                                    },
-                                  }))
-                                }
-                              />
-                            </div>
-                            {worktree.repoMode === "fixed_repo" && (
-                              <div className="wss-wt-row">
-                                <span className="wss-wt-label">{t("startup.worktree.path")}</span>
-                                <input
-                                  className="wss-input"
-                                  value={worktree.repoPath ?? ""}
-                                  onChange={(e) =>
-                                    updateGroup(group.id, (g) => ({
-                                      ...g,
-                                      worktree: {
-                                        ...(g.worktree ?? worktree),
-                                        enabled: true,
-                                        repoMode: "fixed_repo",
-                                        repoPath: e.target.value,
-                                      },
-                                    }))
-                                  }
-                                  placeholder="."
-                                />
-                              </div>
-                            )}
                               <div className="wss-wt-row">
                               <span className="wss-wt-label">{t("startup.worktree.branch")}</span>
                               <input

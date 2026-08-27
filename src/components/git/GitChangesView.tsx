@@ -27,10 +27,12 @@ import {
   getStatusClass,
 } from "./gitChangesUtils";
 import type { ChangeSection, TreeRow } from "./gitChangesUtils";
-import type { GitDiffPreview, Repo, GitFileStatus } from "../../types";
+import type { GitDiffPreview, GitFileStatus, WorkspaceGitContext } from "../../types";
+
+type GitDiffContext = Extract<WorkspaceGitContext, { kind: "repository" }>;
 
 interface Props {
-  repo: Repo;
+  context: GitDiffContext;
   showDiff: boolean;
   onError: (error: string | undefined) => void;
 }
@@ -102,7 +104,7 @@ export function DiffPanel({
   );
 }
 
-export function GitChangesView({ repo, showDiff, onError }: Props) {
+export function GitChangesView({ context, showDiff, onError }: Props) {
   const { t } = useTranslation("git");
   const {
     status,
@@ -125,12 +127,12 @@ export function GitChangesView({ repo, showDiff, onError }: Props) {
 
   const handleOpenInEditor = useCallback(
     (filePath: string, source: ChangeSection) => {
-      void openGitDiffFile(repo.path, filePath, { source });
+      void openGitDiffFile(context.workspaceId, filePath, { source });
       if (activeWorkspaceId) {
         showWorkspaceEditorForDirectFileOpen(activeWorkspaceId);
       }
     },
-    [repo.path, openGitDiffFile, activeWorkspaceId],
+    [context.workspaceId, openGitDiffFile, activeWorkspaceId],
   );
 
   const commitMessage = drafts.commitMessage;
@@ -203,7 +205,7 @@ export function GitChangesView({ repo, showDiff, onError }: Props) {
     setLoadingKey("commit");
     try {
       onError(undefined);
-      await commit(repo.path, msg);
+      await commit(context.workspaceId, msg);
       if (activeWorkspaceId) pushCommitHistory(activeWorkspaceId, msg);
       toast.success(
         t("changes.toasts.committed", { message: msg.split("\n")[0] }),
@@ -223,7 +225,7 @@ export function GitChangesView({ repo, showDiff, onError }: Props) {
     try {
       onError(undefined);
       await stageMany(
-        repo.path,
+        context.workspaceId,
         unstagedFiles.map((f) => f.path),
       );
     } catch (e) {
@@ -239,7 +241,7 @@ export function GitChangesView({ repo, showDiff, onError }: Props) {
     try {
       onError(undefined);
       await unstageMany(
-        repo.path,
+        context.workspaceId,
         stagedFiles.map((f) => f.path),
       );
     } catch (e) {
@@ -260,9 +262,9 @@ export function GitChangesView({ repo, showDiff, onError }: Props) {
     try {
       onError(undefined);
       if (staged) {
-        await unstageMany(repo.path, directoryFiles);
+        await unstageMany(context.workspaceId, directoryFiles);
       } else {
-        await stageMany(repo.path, directoryFiles);
+        await stageMany(context.workspaceId, directoryFiles);
       }
     } catch (e) {
       onError(String(e));
@@ -276,7 +278,7 @@ export function GitChangesView({ repo, showDiff, onError }: Props) {
     setLoadingKey(`file:${filePath}`);
     try {
       onError(undefined);
-      await stage(repo.path, filePath);
+      await stage(context.workspaceId, filePath);
     } catch (e) {
       onError(String(e));
     } finally {
@@ -289,7 +291,7 @@ export function GitChangesView({ repo, showDiff, onError }: Props) {
     setLoadingKey(`file:${filePath}`);
     try {
       onError(undefined);
-      await unstage(repo.path, filePath);
+      await unstage(context.workspaceId, filePath);
     } catch (e) {
       onError(String(e));
     } finally {
@@ -337,7 +339,7 @@ export function GitChangesView({ repo, showDiff, onError }: Props) {
     setLoadingKey("discard");
     try {
       onError(undefined);
-      await discardFiles(repo.path, files);
+      await discardFiles(context.workspaceId, files);
     } catch (e) {
       onError(String(e));
     } finally {
@@ -444,7 +446,7 @@ export function GitChangesView({ repo, showDiff, onError }: Props) {
           if (isSelected) {
             useGitStore.setState({ selectedFile: undefined, selectedFileStaged: undefined, diff: undefined });
           } else {
-            void selectFile(repo.path, row.file.path, staged);
+            void selectFile(context.workspaceId, row.file.path, staged);
           }
         }}
       >

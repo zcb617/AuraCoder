@@ -4,7 +4,6 @@ import { isMarkdownPreviewFile } from "../lib/editorFileTypes";
 import {
   isWithinRoot,
   resolveAbsoluteFilePath,
-  resolveOwningRepoForAbsolutePath,
   resolveRelativePathWithinRoot,
 } from "../lib/fileRootUtils";
 import { t } from "../i18n";
@@ -23,7 +22,6 @@ import type {
 
 interface ResolvedFileContext {
   absolutePath: string;
-  gitRepoPath: string | null;
   gitFilePath: string | null;
 }
 
@@ -46,34 +44,9 @@ function remapAbsolutePathForRename(
 
 function resolveFileContext(rootPath: string, filePath: string): ResolvedFileContext {
   const absolutePath = resolveAbsoluteFilePath(rootPath, filePath);
-  const workspaceState = useWorkspaceStore.getState();
-  const activeWorkspace = workspaceState.workspaces.find(
-    (workspace) => workspace.id === workspaceState.activeWorkspaceId,
-  );
-  if (activeWorkspace?.locationKind === "ssh") {
-    const remoteRepo = workspaceState.repos.find(
-      (repo) =>
-        repo.workspaceId === activeWorkspace.id &&
-        repo.isActive,
-    );
-    if (remoteRepo) {
-      return {
-        absolutePath,
-        gitRepoPath: remoteRepo.path,
-        gitFilePath: filePath,
-      };
-    }
-  }
-  const ownership = resolveOwningRepoForAbsolutePath(
-    absolutePath,
-    workspaceState.repos,
-    workspaceState.activeRepoId,
-  );
-
   return {
     absolutePath,
-    gitRepoPath: ownership?.repo.path ?? null,
-    gitFilePath: ownership?.filePath ?? null,
+    gitFilePath: filePath,
   };
 }
 
@@ -90,7 +63,6 @@ function createPlainTab(
     rootPath,
     absolutePath: resolved.absolutePath,
     filePath,
-    gitRepoPath: resolved.gitRepoPath,
     gitFilePath: resolved.gitFilePath,
     fileName: filePath.split("/").pop() ?? filePath,
     content: "",
@@ -195,7 +167,7 @@ interface FileStoreState {
     reveal?: EditorRevealLocation | null,
   ) => Promise<void>;
   openGitDiffFile: (
-    repoPath: string,
+    workspaceId: string,
     filePath: string,
     options: { source: GitCompareSource },
   ) => Promise<void>;
@@ -247,7 +219,6 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
                 workspaceId,
                 rootPath,
                 filePath,
-                gitRepoPath: resolved.gitRepoPath ?? tab.gitRepoPath,
                 gitFilePath: resolved.gitFilePath ?? tab.gitFilePath,
               }
             : tab,
@@ -265,7 +236,7 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
     }));
 
     try {
-    const result = await ipc.readFile(rootPath, filePath, workspaceId);
+    const result = await ipc.readFile(rootPath, filePath);
       set((state) => ({
         tabs: state.tabs.map((t) =>
           t.id === id
@@ -296,11 +267,12 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
     }
   },
 
-  openGitDiffFile: async (repoPath, filePath, options) => {
-    const workspaceId = useWorkspaceStore.getState().activeWorkspaceId;
+  openGitDiffFile: async (workspaceId, filePath, options) => {
+    const workspace = useWorkspaceStore.getState().workspaces.find((item) => item.id === workspaceId);
+    if (!workspace) return;
+    const rootPath = workspace.rootPath;
     const resolved = {
-      absolutePath: resolveAbsoluteFilePath(repoPath, filePath),
-      gitRepoPath: repoPath,
+      absolutePath: resolveAbsoluteFilePath(rootPath, filePath),
       gitFilePath: filePath,
     };
     const existing = get().tabs.find((tab) => tab.absolutePath === resolved.absolutePath);
@@ -315,7 +287,6 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
             ? {
                 ...tab,
                 workspaceId,
-                gitRepoPath: repoPath,
                 gitFilePath: filePath,
                 isLoading: true,
                 renderMode: "git-diff-editor",
@@ -327,7 +298,7 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
       }));
     } else {
       const tab = {
-        ...createPlainTab(tabId, workspaceId, repoPath, filePath, resolved),
+        ...createPlainTab(tabId, workspaceId, rootPath, filePath, resolved),
         renderMode: "git-diff-editor" as const,
       };
       set((state) => ({
@@ -344,11 +315,11 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
     if (!tab) return;
 
     const compareSource = source ?? tab.gitContext?.source;
-    if (!compareSource || !tab.gitRepoPath || !tab.gitFilePath) return;
+    if (!compareSource || !tab.workspaceId || !tab.gitFilePath) return;
 
     try {
       const compare = await ipc.getGitFileCompare(
-        tab.gitRepoPath,
+        tab.workspaceId,
         tab.gitFilePath,
         compareSource,
       );
@@ -465,8 +436,6 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
   retargetTabsAfterRename: (rootPath, oldPath, newPath) => {
     const oldAbsolutePath = resolveAbsoluteFilePath(rootPath, oldPath);
     const newAbsolutePath = resolveAbsoluteFilePath(rootPath, newPath);
-    const workspaceState = useWorkspaceStore.getState();
-
     set((state) => ({
       tabs: state.tabs.map((tab) => {
         const nextAbsolutePath = remapAbsolutePathForRename(
@@ -481,10 +450,6 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
         const nextRootPath =
           remapAbsolutePathForRename(tab.rootPath, oldAbsolutePath, newAbsolutePath) ??
           tab.rootPath;
-        const nextGitRepoPath = tab.gitRepoPath
-          ? remapAbsolutePathForRename(tab.gitRepoPath, oldAbsolutePath, newAbsolutePath) ??
-            tab.gitRepoPath
-          : null;
         const nextFilePath = resolveRelativePathWithinRoot(
           nextAbsolutePath,
           nextRootPath,
@@ -493,18 +458,7 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
           return tab;
         }
 
-        const ownership =
-          !nextGitRepoPath || nextGitRepoPath === tab.gitRepoPath
-            ? resolveOwningRepoForAbsolutePath(
-                nextAbsolutePath,
-                workspaceState.repos,
-                workspaceState.activeRepoId,
-              )
-            : null;
-        const resolvedGitRepoPath = nextGitRepoPath ?? ownership?.repo.path ?? null;
-        const resolvedGitFilePath = resolvedGitRepoPath
-          ? resolveRelativePathWithinRoot(nextAbsolutePath, resolvedGitRepoPath)
-          : ownership?.filePath ?? null;
+        const resolvedGitFilePath = resolveRelativePathWithinRoot(nextAbsolutePath, nextRootPath);
 
         return {
           ...tab,
@@ -512,7 +466,6 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
           absolutePath: nextAbsolutePath,
           filePath: nextFilePath,
           fileName: nextFilePath.split("/").pop() ?? nextFilePath,
-          gitRepoPath: resolvedGitRepoPath,
           gitFilePath:
             resolvedGitFilePath && resolvedGitFilePath.length > 0
               ? resolvedGitFilePath
@@ -532,7 +485,6 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
         tab.rootPath,
         tab.filePath,
         contentToSave,
-        tab.workspaceId,
         tab.version || null,
       );
       set((state) => ({
@@ -549,11 +501,11 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
         ),
       }));
 
-      if (tab.gitContext && tab.gitRepoPath) {
+      if (tab.gitContext && tab.workspaceId) {
         const gitStore = useGitStore.getState();
         try {
-          gitStore.invalidateRepoCache(tab.gitRepoPath);
-          await gitStore.refresh(tab.gitRepoPath, { force: true });
+          gitStore.invalidateWorkspaceCache(tab.workspaceId);
+          await gitStore.refresh(tab.workspaceId, { force: true });
           await get().refreshGitContext(tabId, tab.gitContext.source);
         } catch {
           // Saving already succeeded; leave the editor usable even if the git refresh fails.
@@ -582,7 +534,6 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
           const version = await ipc.getFileVersion(
             tab.rootPath,
             tab.filePath,
-            workspaceId,
           );
           const current = get().tabs.find((item) => item.id === tab.id);
           if (!current || current.version === version || current.externalVersion === version) {
@@ -600,7 +551,6 @@ export const useFileStore = create<FileStoreState>((set, get) => ({
           const result = await ipc.readFile(
             current.rootPath,
             current.filePath,
-            workspaceId,
           );
           set((state) => ({
             tabs: state.tabs.map((item) =>

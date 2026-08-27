@@ -1,6 +1,5 @@
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import {
-  compareRepoRoots,
   isWithinRoot,
   normalizeAbsolutePath,
 } from "./fileRootUtils";
@@ -19,15 +18,12 @@ import { useChatComposerStore } from "../stores/chatComposerStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { showWorkspaceEditorForFileLink } from "./workspacePaneNavigation";
 import { shouldOpenLink } from "./linkOpenSettings";
-import type { Repo } from "../types";
 
 const EXTERNAL_PROTOCOLS = new Set(["http:", "https:", "mailto:", "tel:"]);
-type LinkRepoRoot = Pick<Repo, "id" | "path"> & Partial<Pick<Repo, "isActive">>;
-
 export interface LinkResolutionContext {
   workspaceRoot: string | null;
-  repos: LinkRepoRoot[];
-  activeRepoId?: string | null;
+  /** 兼容旧测试输入；项目解析逻辑不会读取该字段。 */
+  [key: string]: unknown;
 }
 
 export interface ResolvedLocalFileLink {
@@ -94,27 +90,7 @@ export function extractTextLinkMatches(text: string): TextLinkMatch[] {
 }
 
 function getOrderedRelativeRoots(context: LinkResolutionContext): string[] {
-  const repos = context.repos.slice();
-  const activeRepo = context.activeRepoId
-    ? repos.find((repo) => repo.id === context.activeRepoId) ?? null
-    : null;
-  const activeRepos = repos
-    .filter((repo) => repo.id !== activeRepo?.id && repo.isActive)
-    .sort((left, right) => compareRepoRoots(left, right, null));
-  const remainingRepos = repos
-    .filter((repo) => repo.id !== activeRepo?.id && !repo.isActive)
-    .sort((left, right) => compareRepoRoots(left, right, null));
-  const roots = [
-    ...(activeRepo ? [activeRepo] : []),
-    ...activeRepos,
-    ...remainingRepos,
-  ].map((repo) => normalizeAbsolutePath(repo.path));
-
-  if (context.workspaceRoot) {
-    roots.push(normalizeAbsolutePath(context.workspaceRoot));
-  }
-
-  return [...new Set(roots)];
+  return context.workspaceRoot ? [normalizeAbsolutePath(context.workspaceRoot)] : [];
 }
 
 export function resolveLocalFileLinkTarget(
@@ -125,14 +101,7 @@ export function resolveLocalFileLinkTarget(
 
   const workspaceRoot = context.workspaceRoot ? normalizeAbsolutePath(context.workspaceRoot) : null;
   if (absoluteTarget) {
-    const candidateRoots = context.repos
-      .slice()
-      .sort((left, right) => compareRepoRoots(left, right, context.activeRepoId))
-      .map((repo) => normalizeAbsolutePath(repo.path));
-
-    if (workspaceRoot) {
-      candidateRoots.push(workspaceRoot);
-    }
+    const candidateRoots = workspaceRoot ? [workspaceRoot] : [];
 
     const absolutePath = normalizeAbsolutePath(absoluteTarget.path);
     const matchedRoot = candidateRoots.find((root) => isWithinRoot(absolutePath, root));
@@ -200,14 +169,8 @@ export function resolveActiveWorkspaceLocalFileLinkTarget(
   const activeWorkspace = activeWorkspaceId
     ? workspaceState.workspaces.find((workspace) => workspace.id === activeWorkspaceId) ?? null
     : null;
-  const repos = activeWorkspaceId
-    ? workspaceState.repos.filter((repo) => repo.workspaceId === activeWorkspaceId)
-    : workspaceState.repos;
-
   return resolveLocalFileLinkTarget(rawTarget, {
     workspaceRoot: activeWorkspace?.rootPath ?? null,
-    repos,
-    activeRepoId: workspaceState.activeRepoId,
   });
 }
 

@@ -372,8 +372,7 @@ impl ClaudeRemoteEngine {
             .cloned()
             .context("SSH 远端 Claude 会话配置不存在；必须先恢复或创建会话")?;
         let cwd = match &thread_config.scope {
-            ThreadScope::Repo { repo_path } => repo_path.clone(),
-            ThreadScope::Workspace { root_path, .. } => root_path.clone(),
+            ThreadScope::Project { root_path, .. } => root_path.clone(),
         };
         let TurnInput {
             message,
@@ -859,8 +858,7 @@ impl Engine for ClaudeRemoteEngine {
                 .and_then(|config| config.agent_session_id.clone());
             if cached.is_none() {
                 let cwd = match &scope {
-                    ThreadScope::Repo { repo_path } => repo_path,
-                    ThreadScope::Workspace { root_path, .. } => root_path,
+                    ThreadScope::Project { root_path, .. } => root_path,
                 };
                 self.validate_remote_session(cwd, resume_id).await?;
             }
@@ -905,8 +903,7 @@ impl Engine for ClaudeRemoteEngine {
             config.active_request_id = Some(request_id.clone());
         }
         let cwd = match &thread_config.scope {
-            ThreadScope::Repo { repo_path } => repo_path.clone(),
-            ThreadScope::Workspace { root_path, .. } => root_path.clone(),
+            ThreadScope::Project { root_path, .. } => root_path.clone(),
         };
         let TurnInput {
             message,

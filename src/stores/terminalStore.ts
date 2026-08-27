@@ -3,7 +3,7 @@ import { ipc, writeCommandToNewSession } from "../lib/ipc";
 import { t } from "../i18n";
 import { toast } from "./toastStore";
 import { useHarnessStore } from "./harnessStore";
-import { resolveActiveRepoId, useWorkspaceStore } from "./workspaceStore";
+import { useWorkspaceStore } from "./workspaceStore";
 import type {
   SplitDirection,
   SplitNode,
@@ -620,11 +620,11 @@ function joinPath(basePath: string, childPath: string): string {
   return `${basePath.replace(/\/+$/, "")}/${normalizedChild}`;
 }
 
-function resolveWorktreeBaseDir(repoPath: string, baseDir?: string | null): string {
+function resolveWorktreeBaseDir(workspaceRoot: string, baseDir?: string | null): string {
   if (!baseDir || baseDir.trim() === "") {
-    return `${repoPath.replace(/\/+$/, "")}/.auracoder/worktrees`;
+    return `${workspaceRoot.replace(/\/+$/, "")}/.auracoder/worktrees`;
   }
-  return isAbsolutePath(baseDir) ? baseDir : joinPath(repoPath, baseDir);
+  return isAbsolutePath(baseDir) ? baseDir : joinPath(workspaceRoot, baseDir);
 }
 
 function summarizeWarnings(warnings: string[]): string | null {
@@ -648,11 +648,11 @@ function inferWorktreeConfig(group: TerminalGroup): WorkspaceStartupWorktreeConf
     return null;
   }
 
-  const repoPrefix = `${first.repoPath.replace(/\/+$/, "")}/`;
-  const runSegment = first.worktreePath.slice(repoPrefix.length).split("/").slice(0, -2).join("/");
+  const workspacePrefix = `${first.workspaceId.replace(/\/+$/, "")}/`;
+  const runSegment = first.worktreePath.slice(workspacePrefix.length).split("/").slice(0, -2).join("/");
   const baseDir = runSegment
     ? first.worktreePath
-        .slice(repoPrefix.length)
+        .slice(workspacePrefix.length)
         .split("/")
         .slice(0, -2)
         .join("/")
@@ -660,8 +660,6 @@ function inferWorktreeConfig(group: TerminalGroup): WorkspaceStartupWorktreeConf
 
   return {
     enabled: true,
-    repoMode: "fixed_repo",
-    repoPath: first.repoPath,
     baseDir,
     branchPrefix: first.branch.split("/").slice(0, -2).join("/") || "auracoder/preset",
   };
@@ -672,7 +670,7 @@ async function removeWorktreesSequential(worktrees: WorktreeSessionInfo[]): Prom
   for (const worktree of worktrees) {
     try {
       await ipc.removeGitWorktree(
-        worktree.repoPath,
+        worktree.workspaceId,
         worktree.worktreePath,
         true,
         worktree.branch,
@@ -738,13 +736,13 @@ function buildStartupWorktreeBranch(
 }
 
 function buildStartupWorktreePath(
-  repoPath: string,
+  workspaceRoot: string,
   baseDir: string | null | undefined,
   runId: string,
   logicalSessionId: string,
   index: number,
 ): string {
-  const basePath = resolveWorktreeBaseDir(repoPath, baseDir);
+  const basePath = resolveWorktreeBaseDir(workspaceRoot, baseDir);
   return `${basePath.replace(/\/+$/, "")}/${runId}/${slugifySegment(logicalSessionId || `session-${index + 1}`)}`;
 }
 
@@ -988,17 +986,6 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
     const warnings: string[] = [];
     const launchRequests: Array<{ sessionId: string; harnessId: string; groupName: string }> = [];
-    const workspaceStore = useWorkspaceStore.getState();
-    const currentActiveRepoId =
-      workspaceStore.activeWorkspaceId === workspaceId
-        ? workspaceStore.activeRepoId
-        : null;
-    const repoList =
-      workspaceStore.activeWorkspaceId === workspaceId && workspaceStore.repos.length > 0
-        ? workspaceStore.repos
-        : await ipc.getRepos(workspaceId);
-    const activeRepoId = resolveActiveRepoId(workspaceId, repoList, currentActiveRepoId);
-    const activeRepo = repoList.find((repo) => repo.id === activeRepoId) ?? null;
     const knownHarnesses = new Map(
       useHarnessStore
         .getState()
@@ -1013,29 +1000,25 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     for (const group of terminalPreset.groups) {
       const groupWorktreeConfig = group.worktree?.enabled ? group.worktree : null;
       let resolvedWorktreeConfig: WorkspaceStartupWorktreeConfig | null = groupWorktreeConfig;
-      let worktreeRepoPath: string | null = null;
+      let worktreeBasePath: string | null = null;
 
       if (groupWorktreeConfig) {
-        if (groupWorktreeConfig.repoMode === "fixed_repo") {
-          worktreeRepoPath = workspaceRecord?.locationKind === "ssh"
-            ? activeRepo?.path ?? null
-            : groupWorktreeConfig.repoPath
-              ? (isAbsolutePath(groupWorktreeConfig.repoPath)
-                  ? groupWorktreeConfig.repoPath
-                  : joinPath(workspaceRoot, groupWorktreeConfig.repoPath))
-              : null;
-        } else {
-          worktreeRepoPath = activeRepo?.path ?? null;
+        try {
+          const gitContext = await ipc.getWorkspaceGitContext(workspaceId);
+          if (gitContext.kind === "repository") {
+            worktreeBasePath = workspaceRoot;
+          }
+        } catch {
+          worktreeBasePath = null;
         }
-
-        if (!worktreeRepoPath) {
-          warnings.push(`"${group.name}" opened without worktrees because no repo was available.`);
+        if (!worktreeBasePath) {
+          warnings.push(t("workspace.startup.worktreeUnavailable", { name: group.name }));
           resolvedWorktreeConfig = null;
         }
       }
 
       const worktreesByLogicalSessionId: Record<string, WorktreeSessionInfo | null> = {};
-      if (resolvedWorktreeConfig && worktreeRepoPath) {
+      if (resolvedWorktreeConfig && worktreeBasePath) {
         const runId = crypto.randomUUID().slice(0, 8);
         const branchPrefix = resolvedWorktreeConfig.branchPrefix?.trim() || "auracoder/preset";
         const createdWorktrees: WorktreeSessionInfo[] = [];
@@ -1045,7 +1028,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
           const session = group.sessions[index];
           const branch = buildStartupWorktreeBranch(branchPrefix, runId, session.id, index);
           const worktreePath = buildStartupWorktreePath(
-            worktreeRepoPath,
+            worktreeBasePath,
             resolvedWorktreeConfig.baseDir,
             runId,
             session.id,
@@ -1054,13 +1037,13 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
           try {
             const createdWorktree = await ipc.addGitWorktree(
-              worktreeRepoPath,
+              workspaceId,
               worktreePath,
               branch,
               resolvedWorktreeConfig.baseBranch ?? null,
             );
             const info = {
-              repoPath: worktreeRepoPath,
+              workspaceId,
               worktreePath: createdWorktree?.path ?? worktreePath,
               branch,
             };
@@ -1904,16 +1887,33 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
     // Track created worktrees for cleanup on failure
     const createdWorktrees: WorktreeSessionInfo[] = [];
-    const effectiveWorktreeConfig =
-      worktreeConfig?.enabled && worktreeConfig.repoPath
-        ? worktreeConfig
-        : null;
-    const worktreeRepoPath = effectiveWorktreeConfig?.repoPath ?? null;
+    let effectiveWorktreeConfig = worktreeConfig?.enabled ? worktreeConfig : null;
+    const worktreeBasePath = effectiveWorktreeConfig
+      ? useWorkspaceStore.getState().workspaces.find((w) => w.id === workspaceId)?.rootPath ?? null
+      : null;
 
     try {
+      if (effectiveWorktreeConfig) {
+        let isRepository = false;
+        try {
+          isRepository = (await ipc.getWorkspaceGitContext(workspaceId)).kind === "repository";
+        } catch {
+          isRepository = false;
+        }
+        if (!isRepository || !worktreeBasePath) {
+          effectiveWorktreeConfig = null;
+          if (worktreeConfig?.enabled) {
+            set((state) => ({
+              workspaces: mergeWorkspaceState(state.workspaces, workspaceId, {
+                error: t("workspace.startup.worktreeUnavailable", { name: "terminal group" }),
+              }),
+            }));
+          }
+        }
+      }
       // Phase 1: Create worktrees sequentially if configured (git locks prevent parallelism)
-      const worktreeRunId = effectiveWorktreeConfig && worktreeRepoPath ? crypto.randomUUID().slice(0, 8) : null;
-      if (effectiveWorktreeConfig && worktreeRepoPath && worktreeRunId) {
+      const worktreeRunId = effectiveWorktreeConfig && worktreeBasePath ? crypto.randomUUID().slice(0, 8) : null;
+      if (effectiveWorktreeConfig && worktreeBasePath && worktreeRunId) {
         const branchPrefix = effectiveWorktreeConfig.branchPrefix?.trim() || "auracoder/preset";
         for (let i = 0; i < harnesses.length; i++) {
           const logicalSessionId = harnesses[i]?.harnessId
@@ -1926,20 +1926,20 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
             i,
           );
           const worktreePath = buildStartupWorktreePath(
-            worktreeRepoPath,
+            worktreeBasePath,
             effectiveWorktreeConfig.baseDir,
             worktreeRunId,
             logicalSessionId,
             i,
           );
           const createdWorktree = await ipc.addGitWorktree(
-            worktreeRepoPath,
+            workspaceId,
             worktreePath,
             branch,
             effectiveWorktreeConfig.baseBranch ?? null,
           );
           createdWorktrees.push({
-            repoPath: worktreeRepoPath,
+            workspaceId,
             worktreePath: createdWorktree?.path ?? worktreePath,
             branch,
           });

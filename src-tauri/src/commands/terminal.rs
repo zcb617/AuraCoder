@@ -9,11 +9,11 @@ use crate::{
     },
     path_utils,
     ssh::{
-        gateway, remote_git,
+        gateway,
         runtime::{
-            quote_posix, remote_repo_marker, resolve_workspace_target,
-            validate_remote_relative_path, workspace_id_from_repo_marker,
-            worktree_path_from_repo_marker,
+            quote_posix, remote_workspace_marker, resolve_workspace_target,
+            validate_remote_relative_path, workspace_id_from_workspace_marker,
+            REMOTE_WORKSPACE_PREFIX,
         },
     },
     state::AppState,
@@ -98,32 +98,16 @@ async fn resolve_remote_cwd(
     if requested.is_empty() || requested.contains('\0') {
         return Err("远端终端目录无效".to_string());
     }
-    let (requested, allowed_root) = if let Some(worktree) =
-        worktree_path_from_repo_marker(requested).map_err(err_to_string)?
-    {
-        if workspace_id_from_repo_marker(requested) != Some(workspace_id) {
+    let (requested, allowed_root) =
+        if requested == remote_workspace_marker(workspace_id) || requested == root {
+            (root.to_string(), root.to_string())
+        } else if requested.starts_with(REMOTE_WORKSPACE_PREFIX)
+            || workspace_id_from_workspace_marker(requested).is_some()
+        {
             return Err("远端终端目录不属于当前项目".to_string());
-        }
-        let registered = remote_git::worktrees(connection, root)
-            .await
-            .map_err(err_to_string)?
-            .into_iter()
-            .any(|item| item.path == worktree.root_path);
-        if !registered {
-            return Err("远端终端目录不属于当前项目登记的工作树".to_string());
-        }
-        let requested = match worktree.relative_path {
-            Some(relative) => format!("{}/{}", worktree.root_path.trim_end_matches('/'), relative),
-            None => worktree.root_path.clone(),
+        } else {
+            (requested.to_string(), root.to_string())
         };
-        (requested, worktree.root_path)
-    } else if requested == remote_repo_marker(workspace_id) {
-        (root.to_string(), root.to_string())
-    } else if requested.starts_with(crate::ssh::runtime::REMOTE_REPO_PREFIX) {
-        return Err("远端终端目录不属于当前项目".to_string());
-    } else {
-        (requested.to_string(), root.to_string())
-    };
     let candidate = if requested.starts_with('/') {
         quote_posix(&requested)
     } else {

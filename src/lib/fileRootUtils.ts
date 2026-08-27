@@ -1,142 +1,36 @@
-import type { Repo, Thread } from "../types";
-
-type RepoRoot = Pick<Repo, "id" | "path">;
-
-export interface RepoOwnership {
-  repo: RepoRoot;
-  filePath: string;
-}
-
-export function resolveThreadFileRootPath(
-  thread: Pick<Thread, "repoId"> | null,
-  repos: RepoRoot[],
-  workspaceRootPath: string | null,
-): string | null {
-  if (!thread) {
-    return null;
-  }
-  if (!thread.repoId) {
-    return workspaceRootPath;
-  }
-  return repos.find((repo) => repo.id === thread.repoId)?.path ?? null;
-}
-
-function isWindowsDrivePath(path: string): boolean {
-  return /^[A-Za-z]:[\\/]/.test(path);
-}
-
-function isUncPath(path: string): boolean {
-  return /^\\\\/.test(path) || path.startsWith("//");
-}
-
-function shouldCompareCaseInsensitive(path: string): boolean {
-  const normalized = normalizeAbsolutePath(path);
-  return isWindowsDrivePath(normalized) || isUncPath(normalized);
-}
-
-function normalizeForComparison(path: string): string {
-  const normalized = normalizeAbsolutePath(path);
-  return shouldCompareCaseInsensitive(normalized) ? normalized.toLowerCase() : normalized;
-}
-
+/** 规范化跨平台绝对路径，统一分隔符和盘符大小写。 */
 export function normalizeAbsolutePath(path: string): string {
   let normalized = path.replace(/\\/g, "/");
-  if (/^\/[A-Za-z]:\//.test(normalized)) {
-    normalized = normalized.slice(1);
-  }
-  if (/^[A-Za-z]:\//.test(normalized)) {
-    normalized = `${normalized[0].toUpperCase()}${normalized.slice(1)}`;
-  }
-
+  if (/^\/[A-Za-z]:\//.test(normalized)) normalized = normalized.slice(1);
+  if (/^[A-Za-z]:\//.test(normalized)) normalized = `${normalized[0].toUpperCase()}${normalized.slice(1)}`;
   const isUnc = normalized.startsWith("//");
   normalized = normalized.replace(/\/+/g, "/");
-  if (isUnc) {
-    normalized = `/${normalized}`;
-    normalized = normalized.replace(/^\/+/, "//");
-  }
-
-  if (normalized.length > 1 && /\/$/.test(normalized) && !/^[A-Za-z]:\/$/.test(normalized)) {
-    normalized = normalized.replace(/\/+$/, "");
-  }
+  if (isUnc) normalized = `//${normalized.replace(/^\/+/, "")}`;
+  if (normalized.length > 1 && /\/$/.test(normalized) && !/^[A-Za-z]:\/$/.test(normalized)) normalized = normalized.replace(/\/+$/, "");
   return normalized;
 }
 
+/** 判断文件绝对路径是否位于项目根目录内。 */
 export function isWithinRoot(absolutePath: string, rootPath: string): boolean {
-  const normalizedPath = normalizeForComparison(absolutePath);
-  const normalizedRoot = normalizeForComparison(rootPath);
-  if (normalizedPath === normalizedRoot) {
-    return true;
-  }
-  return normalizedPath.startsWith(`${normalizedRoot}/`);
+  const normalizedPath = normalizeAbsolutePath(absolutePath);
+  const normalizedRoot = normalizeAbsolutePath(rootPath);
+  const comparisonPath = /^[A-Za-z]:\//.test(normalizedPath) || normalizedPath.startsWith("//") ? normalizedPath.toLowerCase() : normalizedPath;
+  const comparisonRoot = /^[A-Za-z]:\//.test(normalizedRoot) || normalizedRoot.startsWith("//") ? normalizedRoot.toLowerCase() : normalizedRoot;
+  return comparisonPath === comparisonRoot || comparisonPath.startsWith(`${comparisonRoot}/`);
 }
 
-export function compareRepoRoots(
-  left: RepoRoot,
-  right: RepoRoot,
-  activeRepoId: string | null | undefined,
-): number {
-  const leftPath = normalizeAbsolutePath(left.path);
-  const rightPath = normalizeAbsolutePath(right.path);
-  if (leftPath.length !== rightPath.length) {
-    return rightPath.length - leftPath.length;
-  }
-  if (activeRepoId) {
-    if (left.id === activeRepoId && right.id !== activeRepoId) {
-      return -1;
-    }
-    if (right.id === activeRepoId && left.id !== activeRepoId) {
-      return 1;
-    }
-  }
-  return leftPath.localeCompare(rightPath);
-}
-
+/** 将项目内文件路径解析为绝对路径。 */
 export function resolveAbsoluteFilePath(rootPath: string, filePath: string): string {
   const normalizedRoot = normalizeAbsolutePath(rootPath);
   const normalizedFilePath = filePath.replace(/\\/g, "/").replace(/^\/+/, "");
-  return normalizeAbsolutePath(
-    normalizedFilePath ? `${normalizedRoot}/${normalizedFilePath}` : normalizedRoot,
-  );
+  return normalizeAbsolutePath(normalizedFilePath ? `${normalizedRoot}/${normalizedFilePath}` : normalizedRoot);
 }
 
-export function resolveRelativePathWithinRoot(
-  absolutePath: string,
-  rootPath: string,
-): string | null {
-  if (!isWithinRoot(absolutePath, rootPath)) {
-    return null;
-  }
-
+/** 将项目内绝对路径转换为相对项目根的文件路径。 */
+export function resolveRelativePathWithinRoot(absolutePath: string, rootPath: string): string | null {
+  if (!isWithinRoot(absolutePath, rootPath)) return null;
   const normalizedAbsolutePath = normalizeAbsolutePath(absolutePath);
   const normalizedRootPath = normalizeAbsolutePath(rootPath);
-  if (normalizeForComparison(normalizedAbsolutePath) === normalizeForComparison(normalizedRootPath)) {
-    return "";
-  }
-
+  if (normalizedAbsolutePath.toLowerCase() === normalizedRootPath.toLowerCase()) return "";
   return normalizedAbsolutePath.slice(normalizedRootPath.length).replace(/^\/+/, "");
-}
-
-export function resolveOwningRepoForAbsolutePath(
-  absolutePath: string,
-  repos: RepoRoot[],
-  activeRepoId?: string | null,
-): RepoOwnership | null {
-  const owningRepo = repos
-    .slice()
-    .sort((left, right) => compareRepoRoots(left, right, activeRepoId))
-    .find((repo) => isWithinRoot(absolutePath, repo.path));
-
-  if (!owningRepo) {
-    return null;
-  }
-
-  const filePath = resolveRelativePathWithinRoot(absolutePath, owningRepo.path);
-  if (filePath === null || filePath.length === 0) {
-    return null;
-  }
-
-  return {
-    repo: owningRepo,
-    filePath,
-  };
 }

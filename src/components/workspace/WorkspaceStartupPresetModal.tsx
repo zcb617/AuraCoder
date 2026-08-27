@@ -1258,8 +1258,6 @@ export function WorkspaceStartupPresetModal({
                       const groupSessionIds = group.sessions.map((session) => session.id);
                       const worktree = group.worktree ?? {
                         enabled: false,
-                        repoMode: "active_repo",
-                        repoPath: null,
                         baseBranch: null,
                         baseDir: null,
                         branchPrefix: null,
@@ -1346,8 +1344,6 @@ export function WorkspaceStartupPresetModal({
                                       worktree: event.target.checked
                                         ? {
                                             enabled: true,
-                                            repoMode: currentGroup.worktree?.repoMode ?? "active_repo",
-                                            repoPath: currentGroup.worktree?.repoPath ?? null,
                                             baseBranch: currentGroup.worktree?.baseBranch ?? null,
                                             baseDir: currentGroup.worktree?.baseDir ?? ".auracoder/worktrees",
                                             branchPrefix: currentGroup.worktree?.branchPrefix ?? "auracoder/preset",
@@ -1360,48 +1356,6 @@ export function WorkspaceStartupPresetModal({
                               </label>
                               {worktree.enabled && (
                                 <>
-                                  <label className="workspace-preset-field">
-                                    <span>{t("startup.worktree.repo")}</span>
-                                    <Dropdown
-                                      value={worktree.repoMode}
-                                      options={[
-                                        { value: "active_repo", label: t("startup.worktree.activeRepo") },
-                                        { value: "fixed_repo", label: t("startup.worktree.fixedRepo") },
-                                      ]}
-                                      triggerStyle={{ borderRadius: "var(--radius-sm)" }}
-                                      onChange={(v) =>
-                                        updateGroup(group.id, (currentGroup) => ({
-                                          ...currentGroup,
-                                          worktree: {
-                                            ...(currentGroup.worktree ?? worktree),
-                                            enabled: true,
-                                            repoMode: v as "active_repo" | "fixed_repo",
-                                          },
-                                        }))
-                                      }
-                                    />
-                                  </label>
-                                  {worktree.repoMode === "fixed_repo" && (
-                                    <label className="workspace-preset-field">
-                                      <span>{t("startup.worktree.path")}</span>
-                                      <input
-                                        className="git-inline-input"
-                                        value={worktree.repoPath ?? ""}
-                                        onChange={(event) =>
-                                          updateGroup(group.id, (currentGroup) => ({
-                                            ...currentGroup,
-                                            worktree: {
-                                              ...(currentGroup.worktree ?? worktree),
-                                              enabled: true,
-                                              repoMode: "fixed_repo",
-                                              repoPath: event.target.value,
-                                            },
-                                          }))
-                                        }
-                                        placeholder="."
-                                      />
-                                    </label>
-                                  )}
                                   <label className="workspace-preset-field">
                                     <span>{t("startup.worktree.branch")}</span>
                                     <input
