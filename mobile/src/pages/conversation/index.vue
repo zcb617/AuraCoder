@@ -775,19 +775,20 @@ onUnload(() => {
   </view>
   </view>
   <view class="conversation-page">
-    <view class="conversation-floating-header">
-      <button class="conversation-header-back" hover-class="none" aria-label="返回" @tap="uni.navigateBack()"><view class="conversation-header-back-arrow-top"></view><view class="conversation-header-back-arrow-bottom"></view></button>
-      <view class="conversation-header-summary">
-        <text class="conversation-header-summary-title">{{ thread?.title || '新会话' }}</text>
-        <view class="conversation-header-meta"><view class="conversation-header-folder-icon"></view><text class="conversation-header-meta-text">{{ workspace?.name || '未命名工作区' }}</text><text class="conversation-header-meta-separator">·</text><view class="conversation-header-status-dot" :class="{ online: auracoderConnectionManager.getState(auracoderId).peerOnline }"></view><text class="conversation-header-meta-text">{{ desktopDeviceName }}</text></view>
-      </view>
-      <view class="conversation-header-actions"><view class="conversation-header-desktop-icon"><view class="conversation-header-desktop-screen"></view><view class="conversation-header-desktop-stand"></view></view><view class="conversation-header-more-icon"><view></view><view></view><view></view></view></view>
-    </view>
-    <view v-if="!auracoderConnectionManager.getState(auracoderId).peerOnline" class="offline-banner">桌面 AuraCoder 当前离线，消息与草稿已保留。</view>
-    <view v-if="!conversation && !auracoderConnectionManager.getState(auracoderId).peerOnline" class="empty-state conversation-waiting"><view class="loader"></view><text>正在等待桌面 AuraCoder 连接…</text></view>
     <scroll-view class="chat-scroll" scroll-y :scroll-top="scrollTop" :scroll-with-animation="false" :scroll-into-view="scrollIntoViewId" @scroll="handleChatScroll" @scrolltolower="handleScrollToLower">
       <view class="chat-content">
-        <!-- 存在更早历史时显示分页入口。 -->
+        <view class="conversation-floating-header">
+          <button class="conversation-header-back" hover-class="none" aria-label="返回" @tap="uni.navigateBack()"><view class="conversation-header-back-arrow-top"></view><view class="conversation-header-back-arrow-bottom"></view></button>
+          <view class="conversation-header-summary">
+            <text class="conversation-header-summary-title">{{ thread?.title || '新会话' }}</text>
+            <view class="conversation-header-meta"><view class="conversation-header-folder-icon"></view><text class="conversation-header-meta-text">{{ workspace?.name || '未命名工作区' }}</text><text class="conversation-header-meta-separator">·</text><view class="conversation-header-status-dot" :class="{ online: auracoderConnectionManager.getState(auracoderId).peerOnline }"></view><text class="conversation-header-meta-text">{{ desktopDeviceName }}</text></view>
+          </view>
+          <view class="conversation-header-actions"><view class="conversation-header-desktop-icon"><view class="conversation-header-desktop-screen"></view><view class="conversation-header-desktop-stand"></view></view><view class="conversation-header-more-icon"><view></view><view></view><view></view></view></view>
+        </view>
+        <view class="conversation-message-content">
+          <view v-if="!auracoderConnectionManager.getState(auracoderId).peerOnline" class="offline-banner">桌面 AuraCoder 当前离线，消息与草稿已保留。</view>
+          <view v-if="!conversation && !auracoderConnectionManager.getState(auracoderId).peerOnline" class="empty-state conversation-waiting"><view class="loader"></view><text>正在等待桌面 AuraCoder 连接…</text></view>
+          <!-- 存在更早历史时显示分页入口。 -->
         <button v-if="conversation?.nextCursor" class="load-older" :disabled="conversation.loadingOlder" @tap="loadOlder">{{ conversation.loadingOlder ? '正在加载…' : '加载更早消息' }}</button>
         <view v-if="conversation?.loading && !conversation.messages.length" class="empty-state"><view class="loader"></view><text>正在加载消息…</text></view>
         <view v-for="message in conversation?.messages || []" :key="message.id" :id="'msg-' + message.id" class="message" :class="message.role">
@@ -812,6 +813,7 @@ onUnload(() => {
             <view class="markdown"><MessageContent :message="message"/></view>
           </view>
           <text v-if="message.status === 'streaming'" class="streaming">正在生成</text>
+        </view>
         </view>
       </view>
     </scroll-view>
@@ -865,14 +867,30 @@ onUnload(() => {
 	/* .conversation-device { display: flex; min-width: 0; align-items: center; } */
 	/* .conversation-status-dot { width: 6px; height: 6px; flex-shrink: 0; margin-right: 5px; border-radius: 50%; background: #667080; } */
 	/* .conversation-status-dot.online { background: var(--accent); box-shadow: 0 0 0 3px rgba(70, 211, 154, .12); } */
-	.conversation-floating-header { position: fixed; z-index: 50; top: calc(env(safe-area-inset-top) + 10px); left: 16px; right: 16px; display: grid; grid-template-columns: 52px minmax(0, 1fr) 104px; gap: 10px; align-items: stretch; }
+	/* display: grid; */
+	/* grid-template-columns: 52px minmax(0, 1fr) 104px; */
+	/* align-items: stretch; */
+		.conversation-floating-header {
+			/* position: fixed; */
+			position: sticky;
+			z-index: 50;
+			/* top: calc(env(safe-area-inset-top) + 10px); */
+			top: 0;
+			/* left: 16px; */
+			/* right: 16px; */
+			display: flex;
+			padding: calc(env(safe-area-inset-top) + 10px) 16px 10px;
+			gap: 10px;
+			align-items: stretch;
+			background: var(--bg);
+		}
 	.conversation-header-back, .conversation-header-summary, .conversation-header-actions { height: 64px; box-sizing: border-box; border: 1px solid rgba(255,255,255,.10); border-radius: 28px; background: #252525; }
-	.conversation-header-back { position: relative; display: flex; width: 52px; margin: 0; padding: 0; align-items: center; justify-content: center; border-radius: 50%; color: var(--text); }
+	.conversation-header-back { position: relative; display: flex; width: 52px; flex: 0 0 52px; flex-shrink: 0; margin: 0; padding: 0; align-items: center; justify-content: center; border-radius: 50%; color: var(--text); }
 	.conversation-header-back::after { border: 0; }
 	.conversation-header-back-arrow-top, .conversation-header-back-arrow-bottom { position: absolute; left: 50%; width: 13px; height: 2px; border-radius: 2px; background: var(--text); }
 	.conversation-header-back-arrow-top { transform: translate(-6px, -4px) rotate(-45deg); }
 	.conversation-header-back-arrow-bottom { transform: translate(-6px, 4px) rotate(45deg); }
-	.conversation-header-summary { display: flex; min-width: 0; padding: 10px 16px; flex-direction: column; justify-content: center; overflow: hidden; }
+	.conversation-header-summary { display: flex; min-width: 0; flex: 1 1 0; padding: 10px 16px; flex-direction: column; justify-content: center; overflow: hidden; }
 	.conversation-header-summary-title { display: block; min-width: 0; overflow: hidden; color: var(--text); font-size: 14px; font-weight: 700; line-height: 18px; text-overflow: ellipsis; white-space: nowrap; }
 	.conversation-header-meta { display: flex; min-width: 0; margin-top: 4px; align-items: center; color: var(--muted); font-size: 10px; line-height: 14px; }
 	.conversation-header-folder-icon { position: relative; width: 12px; height: 8px; flex-shrink: 0; border-radius: 2px; background: var(--muted); }
@@ -881,7 +899,7 @@ onUnload(() => {
 	.conversation-header-meta-separator { flex-shrink: 0; margin: 0 7px; color: var(--muted); }
 	.conversation-header-status-dot { width: 6px; height: 6px; flex-shrink: 0; margin: 0 5px 0 0; border-radius: 50%; background: #667080; }
 	.conversation-header-status-dot.online { background: var(--accent); box-shadow: 0 0 0 3px rgba(70, 211, 154, .12); }
-	.conversation-header-actions { display: flex; min-width: 0; padding: 0; align-items: center; justify-content: space-evenly; }
+	.conversation-header-actions { display: flex; min-width: 0; flex: 0 0 104px; flex-shrink: 0; padding: 0; align-items: center; justify-content: space-evenly; }
 	.conversation-header-desktop-icon, .conversation-header-more-icon { display: flex; width: 50%; height: 100%; align-items: center; justify-content: center; }
 	.conversation-header-desktop-icon { flex-direction: column; }
 	.conversation-header-desktop-screen { width: 18px; height: 12px; box-sizing: border-box; border: 1.5px solid var(--text); border-radius: 2px; }
@@ -889,7 +907,8 @@ onUnload(() => {
 	.conversation-header-more-icon { gap: 3px; }
 	.conversation-header-more-icon > view { width: 4px; height: 4px; border-radius: 50%; background: var(--text); }
 	.chat-scroll { height: auto; min-height: 0; flex: 1; }
-.chat-content { min-height: 100%; }
+	.chat-content { min-height: 100%; padding: 0; }
+	.conversation-message-content { padding: 16px 13px 22px; }
 .composer { flex-shrink: 0; background: var(--bg); }
 /* 重构初版的局部样式覆盖了既有输入区控件尺寸，保留以便追溯。 */
 /* .composer-meta { display: flex; gap: 7px; overflow-x: auto; white-space: nowrap; } */
