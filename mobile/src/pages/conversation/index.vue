@@ -46,6 +46,17 @@ function conversationViewportKey() {
   return `${auracoderId.value}:${threadId.value}`;
 }
 
+/**
+ * 异常提示严格分两层：
+ * 给开发看：原始异常原样写入控制台日志，一个字一个标点符号都不能改；
+ * 给用户看：只展示业务语义标题（如"发送失败"），绝不带原始错误内容。
+ * 用模态框而不是 toast：toast 约 1.5 秒即消失，用户来不及看清提示。
+ */
+function reportError(title: string, error: unknown) {
+  console.error(title, error);
+  uni.showModal({ title, content: "系统出现异常，请稍后重试", showCancel: false, confirmText: "知道了" });
+}
+
 /*
  * 旧的试验性 NativeJS 代码保留作追溯，但不启用：该版本没有把选择结果复制到应用缓存目录。
  * 选择器曾使用 Intent.ACTION_OPEN_DOCUMENT、Intent.EXTRA_ALLOW_MULTIPLE、ClipData 与 activity.onActivityResult，
@@ -375,7 +386,7 @@ async function initializeConversation() {
       scrollToNewest();
     }
   } catch (error) {
-    uni.showToast({ title: error instanceof Error ? error.message : "无法加载会话", icon: "none" });
+    reportError("无法加载会话", error);
   } finally {
     initializing = false;
   }
@@ -413,7 +424,7 @@ async function loadOlder() {
       scrollIntoViewId.value = `msg-${anchorId}`;
     }
   } catch (error) {
-    uni.showToast({ title: error instanceof Error ? error.message : "无法加载历史消息", icon: "none" });
+    reportError("无法加载历史消息", error);
   } finally {
     suppressUnseenHint = false;
   }
@@ -453,7 +464,7 @@ function chooseEngine(engineId: string) {
         ?? model.supportedReasoningEfforts[0]?.reasoningEffort ?? ""
       : "";
   }).catch((error) => {
-    uni.showToast({ title: error instanceof Error ? error.message : "无法切换 CLI", icon: "none" });
+    reportError("无法切换 CLI", error);
   }).finally(() => {
     engineSaving.value = false;
   });
@@ -472,7 +483,7 @@ function chooseAutonomy(preset?: AutonomyPreset) {
       selectedAutonomyPreset.value = preset;
       permissionPickerOpen.value = false;
     }).catch((error) => {
-      uni.showToast({ title: error instanceof Error ? error.message : "无法更新权限", icon: "none" });
+      reportError("无法更新权限", error);
     }).finally(() => {
       permissionSaving.value = false;
     });
@@ -559,7 +570,7 @@ async function queueAttachment(filePath: string, fallbackName: string, fallbackM
   } catch (error) {
     const index = state.attachments.findIndex((item) => item.id === localId);
     if (index >= 0) state.attachments.splice(index, 1);
-    uni.showToast({ title: error instanceof Error ? error.message : "无法读取所选附件", icon: "none" });
+    reportError("无法读取所选附件", error);
   }
 }
 
@@ -583,7 +594,7 @@ function chooseAttachment() {
         file.fileName,
         file.mimeType,
         "file",
-      ))).catch((error) => uni.showToast({ title: error instanceof Error ? error.message : "无法打开系统文件选择器", icon: "none" }));
+      ))).catch((error) => reportError("无法打开系统文件选择器", error));
       if (chooseFile) {
         chooseFile({ count: remainingFiles, type: "all", success: (result: any) => {
           const paths = Array.isArray(result.tempFilePaths) ? result.tempFilePaths : result.tempFilePaths ? [result.tempFilePaths] : [];
@@ -643,7 +654,7 @@ async function sendMessage() {
     await nextTick();
     scrollToNewest();
   } catch (error) {
-    uni.showToast({ title: error instanceof Error ? error.message : "发送失败", icon: "none" });
+    reportError("发送失败", error);
   }
 }
 
@@ -652,7 +663,7 @@ async function retryBatch() {
   try {
     await conversationStore.retryBatch(auracoderId.value, threadId.value);
   } catch (error) {
-    uni.showToast({ title: error instanceof Error ? error.message : "重试发送失败", icon: "none" });
+    reportError("重试发送失败", error);
   }
 }
 
@@ -661,7 +672,7 @@ async function abortBatch() {
   try {
     await conversationStore.abortBatch(auracoderId.value, threadId.value);
   } catch (error) {
-    uni.showToast({ title: error instanceof Error ? error.message : "取消发送失败", icon: "none" });
+    reportError("取消发送失败", error);
   }
 }
 
@@ -669,7 +680,7 @@ async function stopTurn() {
   try {
     await auracoderConnectionManager.request(auracoderId.value, "turn.stop", { thread_id: threadId.value });
   } catch (error) {
-    uni.showToast({ title: error instanceof Error ? error.message : "无法停止执行", icon: "none" });
+    reportError("无法停止执行", error);
   }
 }
 
