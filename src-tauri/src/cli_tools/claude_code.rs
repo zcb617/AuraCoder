@@ -836,6 +836,9 @@ impl CliTool for ClaudeCodeCli {
         archived: Option<bool>,
     ) -> Result<Vec<CliSessionSnapshot>> {
         let workspace = self.load_workspace(context).await?;
+        // Claude Code 官方会话文档仅公开 continue/resume 和项目 JSONL 会话保存，未公开会话归档状态、archived 字段或归档/取消归档接口，参见：https://code.claude.com/docs/en/sessions
+        // 此处 archived 只是 CliTool 统一接口参数：Some(true) 返回空集合；Some(false)/None 继续列出项目会话。
+        // 禁止将 CliSessionSnapshot.archived 视为 Claude Code 原生能力，也禁止从 JSONL 内部格式猜测归档状态。
         if archived == Some(true) {
             return Ok(Vec::new());
         }
