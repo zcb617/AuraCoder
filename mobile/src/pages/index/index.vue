@@ -31,8 +31,12 @@ function toggleMoreMenu() {
   moreMenuVisible.value = !moreMenuVisible.value;
 }
 
-function runMoreAction(action: "refresh" | "settings") {
+function runMoreAction(action: "add" | "refresh" | "settings") {
   moreMenuVisible.value = false;
+  if (action === "add") {
+    openAddPage();
+    return;
+  }
   if (action === "refresh") {
     void refreshProjects();
     return;
@@ -68,6 +72,10 @@ function openSettings() {
   uni.navigateTo({ url: "/pages/settings/index" });
 }
 
+function openAddPage() {
+  uni.navigateTo({ url: "/pages/settings/auracoder/add" });
+}
+
 function openAuraCoderSettings() {
   uni.navigateTo({ url: "/pages/settings/auracoder/index" });
 }
@@ -100,8 +108,9 @@ onUnload(() => {
       <view class="remote-header-actions">
         <button class="remote-header-button" aria-label="更多操作" @tap="toggleMoreMenu"><view class="remote-more-icon" /></button>
         <view v-if="moreMenuVisible" class="remote-action-menu">
-          <button class="remote-action-button" :disabled="loading" @tap="runMoreAction('refresh')">刷新项目</button>
-          <button class="remote-action-button" @tap="runMoreAction('settings')">设置</button>
+          <button class="remote-action-button" @tap="runMoreAction('add')"><uni-icons class="remote-action-icon" type="link" :size="21" color="#8d97a7" /><text>添加连接</text></button>
+          <button class="remote-action-button" :disabled="loading" @tap="runMoreAction('refresh')"><uni-icons class="remote-action-icon" type="refreshempty" :size="21" color="#8d97a7" /><text>刷新项目</text></button>
+          <button class="remote-action-button" @tap="runMoreAction('settings')"><uni-icons class="remote-action-icon" type="settings" :size="21" color="#8d97a7" /><text>设置</text></button>
         </view>
       </view>
     </view>
@@ -191,10 +200,12 @@ onUnload(() => {
 .remote-title { position: absolute; top: 50%; left: 50%; color: var(--text); font-size: 17px; font-weight: 700; line-height: 1; transform: translate(-50%, -50%); }
 .remote-back-icon { width: 10px; height: 10px; border-bottom: 2px solid var(--text); border-left: 2px solid var(--text); transform: rotate(45deg) translate(2px, -2px); }
 .remote-more-icon { position: relative; width: 4px; height: 4px; border-radius: 50%; background: var(--text); box-shadow: 0 -7px 0 var(--text), 0 7px 0 var(--text); }
-.remote-action-menu { position: absolute; z-index: 4; top: calc(100% + 8px); right: 0; width: 128px; padding: 5px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
-.remote-action-button { display: block; width: 100%; min-height: 36px; margin: 0; padding: 0 10px; border: 0; border-radius: 8px; color: var(--text); background: transparent; font-size: 13px; text-align: left; }
+.remote-action-menu { position: absolute; z-index: 4; top: calc(100% + 10px); right: 0; width: 176px; padding: 8px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: 0 12px 28px rgba(0, 0, 0, .24); }
+.remote-action-button { display: flex; width: 100%; min-height: 48px; margin: 0; padding: 0 12px; box-sizing: border-box; align-items: center; border: 0; border-radius: 12px; color: var(--text); background: transparent; font-size: 14px; font-weight: 600; text-align: left; }
 .remote-action-button::after { border: 0; }
 .remote-action-button:active { background: var(--soft); }
+.remote-action-button:disabled { opacity: .48; }
+.remote-action-icon { width: 24px; margin-right: 10px; flex: none; }
 .remote-content-scroll { height: calc(100vh - 62px - env(safe-area-inset-top)); box-sizing: border-box; }
 .remote-content-page { min-height: 100%; padding: 18px 16px calc(104px + env(safe-area-inset-bottom)); box-sizing: border-box; }
 .remote-device-strip { display: flex; width: 100%; padding: 2px 0 16px; box-sizing: border-box; white-space: nowrap; }

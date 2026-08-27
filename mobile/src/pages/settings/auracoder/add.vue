@@ -69,7 +69,7 @@ onLoad((query) => { replacingAuraCoderId.value = String((query || {}).auracoderI
       <view class="divider"><view/><text>或粘贴配对内容</text><view/></view>
       <textarea v-model="pairingText" class="pair-input" placeholder="粘贴 AuraCoder Mobile 配对内容" placeholder-class="placeholder" :maxlength="20000"/>
       <button class="secondary-button" :disabled="!pairingText.trim()" @tap="savePairing(pairingText)">验证并保存</button>
-      <text v-if="errorMessage" class="form-error">{{ errorMessage }}</text><text class="security">配对凭据仅保存在当前设备的 uni-app Storage 中。</text>
+      <text v-if="errorMessage" class="form-error">{{ errorMessage }}</text><text class="security">配对凭据仅保存在当前设备的中。</text>
     </view>
   </scroll-view>
 </template>
