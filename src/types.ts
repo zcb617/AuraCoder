@@ -684,6 +684,7 @@ export interface AttachmentBlock {
   type: "attachment";
   fileName: string;
   filePath: string;
+  previewFilePath?: string;
   sizeBytes: number;
   mimeType?: string;
   browserAnnotation?: BrowserAnnotationMetadata;

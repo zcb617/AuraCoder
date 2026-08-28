@@ -160,6 +160,7 @@ import type {
   ActionType,
   ApprovalBlock,
   ApprovalResponse,
+  AttachmentBlock,
   ChatAttachment,
   ChatInputItem,
   ChatInputReference,
@@ -1381,6 +1382,7 @@ interface MessageRowProps {
   onLoadActionOutput: (messageId: string, actionId: string) => Promise<void>;
   onEditResend?: (text: string) => void;
   onOpenDiffFile?: (filePath: string) => void;
+  onOpenImageAttachment?: (attachment: AttachmentBlock) => void;
 }
 
 const THINKING_VARIANTS = [
@@ -1483,6 +1485,7 @@ function MessageRowView({
   onLoadActionOutput,
   onEditResend,
   onOpenDiffFile,
+  onOpenImageAttachment,
 }: MessageRowProps) {
   const { t, i18n } = useTranslation("chat");
   const isUser = message.role === "user";
@@ -1562,6 +1565,9 @@ function MessageRowView({
                         key={i}
                         attachment={block}
                         compact
+                        onOpen={onOpenImageAttachment
+                          ? () => onOpenImageAttachment(block)
+                          : undefined}
                       />
                     );
                   }
@@ -1636,6 +1642,7 @@ function MessageRowView({
                 onApproval={onApproval}
                 onLoadActionOutput={(actionId) => onLoadActionOutput(message.id, actionId)}
                 onOpenDiffFile={onOpenDiffFile}
+                onOpenImageAttachment={onOpenImageAttachment}
               />
               {showTurnTail && (
                 <div className="chat-turn-tail-status" role="status" aria-live="polite">
@@ -1704,7 +1711,8 @@ const MessageRow = memo(
     prev.onApproval === next.onApproval &&
     prev.onLoadActionOutput === next.onLoadActionOutput &&
     prev.onEditResend === next.onEditResend &&
-    prev.onOpenDiffFile === next.onOpenDiffFile,
+    prev.onOpenDiffFile === next.onOpenDiffFile &&
+    prev.onOpenImageAttachment === next.onOpenImageAttachment,
 );
 
 function getFileExtension(fileName: string): string {
@@ -6636,6 +6644,18 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const openFileInEditor = useFileStore((s) => s.openFile);
   const openUsageLimitsModal = useUiStore((s) => s.openUsageLimitsModal);
   const openImageAttachmentPreview = useUiStore((s) => s.openImageAttachmentPreview);
+  const openMessageImageAttachmentPreview = useUiStore(
+    (s) => s.openMessageImageAttachmentPreview,
+  );
+  const handleOpenImageAttachment = useCallback(
+    (attachment: AttachmentBlock) => {
+      if (!activeWorkspaceId) {
+        return;
+      }
+      openMessageImageAttachmentPreview(activeWorkspaceId, attachment);
+    },
+    [activeWorkspaceId, openMessageImageAttachmentPreview],
+  );
 
   const diffFileRootPath = activeWorkspace?.rootPath ?? null;
   const handleOpenDiffFile = useCallback(
@@ -7331,6 +7351,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                         onLoadActionOutput={handleLoadActionOutput}
                         onEditResend={handleEditResend}
                         onOpenDiffFile={handleOpenDiffFile}
+                        onOpenImageAttachment={handleOpenImageAttachment}
                       />
                     </MeasuredMessageRow>
                   );
@@ -7369,6 +7390,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                   onLoadActionOutput={handleLoadActionOutput}
                   onEditResend={handleEditResend}
                   onOpenDiffFile={handleOpenDiffFile}
+                  onOpenImageAttachment={handleOpenImageAttachment}
                 />
               );
             })}
@@ -7411,6 +7433,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
               assistantEngineName=""
               onApproval={handleApproval}
               onLoadActionOutput={handleLoadActionOutput}
+              onOpenImageAttachment={handleOpenImageAttachment}
             />
             <div
               role="status"

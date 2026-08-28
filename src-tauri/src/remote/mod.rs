@@ -1917,8 +1917,18 @@ impl RemoteTunnelManager {
                                                                 .and_then(|block| block.get("mimeType"))
                                                                 .and_then(Value::as_str)
                                                                 .map(str::to_string);
+                                                            let preview_file_path = attachment
+                                                                .and_then(|block| block.get("previewFilePath"))
+                                                                .and_then(Value::as_str)
+                                                                .map(str::trim)
+                                                                .filter(|value| !value.is_empty())
+                                                                .map(str::to_string);
                                                             match file_path {
-                                                                Some(file_path) => crate::commands::chat::read_attachment_preview(file_path, mime_type)
+                                                                Some(file_path) => crate::commands::chat::read_attachment_preview(
+                                                                    file_path,
+                                                                    mime_type,
+                                                                    preview_file_path,
+                                                                )
                                                                     .await
                                                                     .and_then(|preview| serde_json::to_value(preview).map_err(|error| error.to_string())),
                                                                 None => Err("history attachment was not found".to_string()),
@@ -2719,6 +2729,7 @@ fn mobile_message_value(message: crate::models::MessageDto) -> Result<Value, Str
                         "filePath".to_string(),
                         Value::String(String::new()),
                     );
+                    object.remove("previewFilePath");
                 }
             }
         }
@@ -2806,7 +2817,6 @@ mod tests {
         ThreadDto {
             id: "thread-1".to_string(),
             workspace_id: "ws-1".to_string(),
-            repo_id: None,
             engine_id: "codex".to_string(),
             model_id: "gpt-5.4".to_string(),
             engine_thread_id: engine_thread_id.map(str::to_string),
@@ -3101,7 +3111,8 @@ mod tests {
                 "fileName": "report.txt",
                 "mimeType": "text/plain",
                 "sizeBytes": 123,
-                "filePath": "C:/secret/report.txt"
+                "filePath": "C:/secret/report.txt",
+                "previewFilePath": "C:/secret/message-images/report.txt"
             }
         ]);
         let message = MessageDto {
@@ -3172,6 +3183,7 @@ mod tests {
             attachment_block.get("filePath").and_then(Value::as_str),
             Some("")
         );
+        assert!(attachment_block.get("previewFilePath").is_none());
     }
 
     #[test]

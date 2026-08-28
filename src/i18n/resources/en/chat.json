@@ -104,7 +104,7 @@
     "ratios": {
       "original": "Original"
     },
-    "empty": "Click a pending image attachment to preview it here",
+    "empty": "Click an image attachment to preview it here",
     "loading": "Loading image…",
     "unavailable": "This image preview could not be read",
     "loadFailed": "Failed to load the image preview",

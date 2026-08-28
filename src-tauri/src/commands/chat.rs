@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
@@ -220,6 +221,12 @@ enum ContentBlock {
         file_name: String,
         #[serde(rename = "filePath")]
         file_path: String,
+        #[serde(
+            rename = "previewFilePath",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        preview_file_path: Option<String>,
         #[serde(rename = "sizeBytes")]
         size_bytes: u64,
         #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
@@ -332,6 +339,7 @@ pub async fn save_pasted_image_attachment(
     mime_type: String,
     data_base64: String,
 ) -> Result<ChatAttachmentPayload, String> {
+    let _display_file_name = file_name.trim();
     let normalized_mime = mime_type.trim().to_lowercase();
     if !normalized_mime.starts_with("image/") {
         return Err("Pasted attachment is not an image.".to_string());
@@ -352,7 +360,7 @@ pub async fn save_pasted_image_attachment(
         return Err("Pasted image exceeds the 10 MB attachment limit.".to_string());
     }
 
-    let extension = pasted_image_extension(&file_name, &normalized_mime)
+    let extension = image_extension_for_mime_type(&normalized_mime)
         .ok_or_else(|| "Pasted image type is not supported.".to_string())?;
     let stored_file_name = format!("pasted-image-{}.{}", Uuid::new_v4().simple(), extension);
     let attachment_dir = runtime_env::app_data_dir()
@@ -386,44 +394,51 @@ const ATTACHMENT_PREVIEW_JPEG_QUALITY: u8 = 80;
 pub async fn read_attachment_preview(
     file_path: String,
     mime_type: Option<String>,
+    preview_file_path: Option<String>,
 ) -> Result<Option<AttachmentPreviewPayload>, String> {
-    let file_path = file_path.trim().to_string();
-    if file_path.is_empty() {
+    let selected_file_path = preview_file_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| file_path.trim());
+    if selected_file_path.is_empty() {
         return Ok(None);
     }
 
-    let Some(preview_mime_type) =
-        normalize_image_preview_mime_type(&file_path, mime_type.as_deref())
-    else {
+    match read_attachment_preview_file(selected_file_path, mime_type.as_deref()).await {
+        Ok(preview) => Ok(preview),
+        Err(error) => {
+            log::error!("{error:#}");
+            Err("图片预览加载失败".to_string())
+        }
+    }
+}
+
+async fn read_attachment_preview_file(
+    file_path: &str,
+    mime_type: Option<&str>,
+) -> anyhow::Result<Option<AttachmentPreviewPayload>> {
+    let Some(preview_mime_type) = normalize_image_preview_mime_type(file_path, mime_type) else {
         return Ok(None);
     };
 
-    let metadata = tokio_fs::metadata(&file_path)
+    let metadata = tokio_fs::metadata(file_path)
         .await
-        .map_err(|error| format!("failed to read attachment metadata: {error}"))?;
-    if !metadata.is_file() {
-        return Ok(None);
-    }
-    if metadata.len() > MAX_PASTED_IMAGE_ATTACHMENT_BYTES as u64 {
+        .with_context(|| format!("failed to read attachment metadata: {file_path}"))?;
+    if !metadata.is_file() || metadata.len() > MAX_PASTED_IMAGE_ATTACHMENT_BYTES as u64 {
         return Ok(None);
     }
 
-    // 原图直出会撑爆 Relay 单帧；改为缩略图编码（旧实现保留备查）。
-    /*
-    let bytes = tokio_fs::read(&file_path)
+    let bytes = tokio_fs::read(file_path)
         .await
-        .map_err(|error| format!("failed to read attachment preview: {error}"))?;
+        .with_context(|| format!("failed to read attachment preview: {file_path}"))?;
+    encode_attachment_preview(preview_mime_type, &bytes)
+}
 
-    Ok(Some(AttachmentPreviewPayload {
-        mime_type: preview_mime_type,
-        data_base64: BASE64.encode(bytes),
-    }))
-    */
-
-    let bytes = tokio_fs::read(&file_path)
-        .await
-        .map_err(|error| format!("failed to read attachment preview: {error}"))?;
-
+fn encode_attachment_preview(
+    preview_mime_type: String,
+    bytes: &[u8],
+) -> anyhow::Result<Option<AttachmentPreviewPayload>> {
     // SVG 是矢量格式，不参与位图缩放；超限则放弃预览。
     if preview_mime_type == "image/svg+xml" {
         if bytes.len() > ATTACHMENT_PREVIEW_MAX_BYTES {
@@ -435,9 +450,7 @@ pub async fn read_attachment_preview(
         }));
     }
 
-    let Ok(image) = image::load_from_memory(&bytes) else {
-        return Ok(None);
-    };
+    let image = image::load_from_memory(bytes).context("解析图片预览失败")?;
     let has_alpha = image.color().has_alpha();
     let (format, mime_type) = if has_alpha {
         (image::ImageFormat::Png, "image/png")
@@ -451,20 +464,18 @@ pub async fn read_attachment_preview(
             image.clone()
         };
         let mut buffer: Vec<u8> = Vec::new();
-        let encoded = if has_alpha {
+        if has_alpha {
             resized
                 .write_to(&mut std::io::Cursor::new(&mut buffer), format)
-                .map(|_| ())
+                .context("编码 PNG 图片预览失败")?;
         } else {
             image::codecs::jpeg::JpegEncoder::new_with_quality(
                 &mut std::io::Cursor::new(&mut buffer),
                 ATTACHMENT_PREVIEW_JPEG_QUALITY,
             )
             .encode_image(&resized)
-        };
-        let Ok(()) = encoded else {
-            return Ok(None);
-        };
+            .context("编码 JPEG 图片预览失败")?;
+        }
         if buffer.len() <= ATTACHMENT_PREVIEW_MAX_BYTES {
             return Ok(Some(AttachmentPreviewPayload {
                 mime_type: mime_type.to_string(),
@@ -475,7 +486,128 @@ pub async fn read_attachment_preview(
     Ok(None)
 }
 
-fn pasted_image_extension(_file_name: &str, mime_type: &str) -> Option<&'static str> {
+struct PersistentImagePreviewBatch {
+    file_paths: Vec<PathBuf>,
+    committed: bool,
+}
+
+impl PersistentImagePreviewBatch {
+    fn new() -> Self {
+        Self {
+            file_paths: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PersistentImagePreviewBatch {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for file_path in &self.file_paths {
+            if let Err(error) = std::fs::remove_file(file_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!("{error}");
+                }
+            }
+        }
+    }
+}
+
+async fn persist_message_image_previews(
+    attachments: &mut [TurnAttachment],
+) -> anyhow::Result<PersistentImagePreviewBatch> {
+    let mut batch = PersistentImagePreviewBatch::new();
+    let preview_directory = runtime_env::app_data_dir()
+        .join("attachments")
+        .join("message-images");
+    let mut preview_directory_ready = false;
+
+    for attachment in attachments {
+        let Some(preview_mime_type) = normalize_image_preview_mime_type(
+            &attachment.file_path,
+            attachment.mime_type.as_deref(),
+        ) else {
+            continue;
+        };
+        let extension = image_extension_for_mime_type(&preview_mime_type).ok_or_else(|| {
+            anyhow::anyhow!(
+                "无法保存附件 `{}` 的图片预览：不支持的图片格式",
+                attachment.file_name
+            )
+        })?;
+        let source_file_path = attachment.file_path.trim();
+        let metadata = tokio_fs::metadata(source_file_path)
+            .await
+            .with_context(|| format!("读取图片附件元数据失败：{}", attachment.file_name))?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "图片附件不是普通文件：{}",
+            attachment.file_name
+        );
+        anyhow::ensure!(
+            metadata.len() <= MAX_PASTED_IMAGE_ATTACHMENT_BYTES as u64,
+            "图片附件 `{}` 超过 10 MB 大小限制",
+            attachment.file_name
+        );
+        let bytes = tokio_fs::read(source_file_path)
+            .await
+            .with_context(|| format!("读取图片附件失败：{}", attachment.file_name))?;
+        anyhow::ensure!(
+            bytes.len() <= MAX_PASTED_IMAGE_ATTACHMENT_BYTES,
+            "图片附件 `{}` 超过 10 MB 大小限制",
+            attachment.file_name
+        );
+        anyhow::ensure!(
+            encode_attachment_preview(preview_mime_type, &bytes)?.is_some(),
+            "无法为图片附件 `{}` 生成预览",
+            attachment.file_name
+        );
+
+        if !preview_directory_ready {
+            tokio_fs::create_dir_all(&preview_directory)
+                .await
+                .context("创建聊天图片永久预览目录失败")?;
+            preview_directory_ready = true;
+        }
+        let target_file_path =
+            preview_directory.join(format!("{}.{}", Uuid::new_v4().simple(), extension));
+        let temporary_file_path =
+            preview_directory.join(format!(".{}.part", Uuid::new_v4().simple()));
+        batch.file_paths.push(temporary_file_path.clone());
+        tokio_fs::write(&temporary_file_path, &bytes)
+            .await
+            .with_context(|| format!("写入图片永久预览失败：{}", attachment.file_name))?;
+        tokio_fs::rename(&temporary_file_path, &target_file_path)
+            .await
+            .with_context(|| format!("提交图片永久预览失败：{}", attachment.file_name))?;
+        if let Some(last_file_path) = batch.file_paths.last_mut() {
+            *last_file_path = target_file_path.clone();
+        }
+        attachment.preview_file_path = Some(target_file_path.display().to_string());
+    }
+
+    Ok(batch)
+}
+
+async fn prepare_message_image_previews(
+    attachments: &mut [TurnAttachment],
+) -> Result<PersistentImagePreviewBatch, String> {
+    match persist_message_image_previews(attachments).await {
+        Ok(batch) => Ok(batch),
+        Err(error) => {
+            log::error!("{error:#}");
+            Err("无法保存图片预览，消息未发送".to_string())
+        }
+    }
+}
+
+fn image_extension_for_mime_type(mime_type: &str) -> Option<&'static str> {
     match mime_type {
         "image/png" => Some("png"),
         "image/jpeg" | "image/jpg" => Some("jpg"),
@@ -743,7 +875,7 @@ pub(crate) async fn send_message_inner(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let attachments = normalize_attachments(attachments)?;
+    let mut attachments = normalize_attachments(attachments)?;
     let input_items = normalize_input_items(message.as_str(), input_items)?;
     let plan_mode = plan_mode.unwrap_or(false);
     let browser_annotation_context = browser_annotation_context(&attachments);
@@ -1200,6 +1332,7 @@ pub(crate) async fn send_message_inner(
         &thread.workspace_id,
     );
 
+    let persistent_image_preview_batch = prepare_message_image_previews(&mut attachments).await?;
     let remote_attachment_batch = if execution_workspace.location_kind == "ssh"
         && !attachments.is_empty()
     {
@@ -1313,6 +1446,7 @@ pub(crate) async fn send_message_inner(
             return Err(error);
         }
     };
+    persistent_image_preview_batch.commit();
 
     let _ = app.emit(
         "thread-updated",
@@ -1563,15 +1697,17 @@ pub async fn steer_message(
         }
     })
     .await?;
+    let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
 
     let engine_thread_id = thread
         .engine_thread_id
         .clone()
         .ok_or_else(|| format!("thread `{thread_id}` has no active engine thread id"))?;
-    let attachments = normalize_attachments(attachments)?;
+    let mut attachments = normalize_attachments(attachments)?;
     let referenced_thread =
         resolve_auracoder_thread_reference(state.inner(), &thread, referenced_thread_id.as_deref())
             .await?;
+    let persistent_image_preview_batch = prepare_message_image_previews(&mut attachments).await?;
     // 阶段计划 3 直接拒绝 SSH steer 附件；阶段计划 4 使用同一安全上传前置流程。
     // if workspace.location_kind == "ssh" && !attachments.is_empty() {
     //     return Err("SSH 远端项目附件将在第4阶段剩余工作阶段计划4中接入；当前不能把本机附件路径发送给远端 Codex".to_string());
@@ -1632,7 +1768,7 @@ pub async fn steer_message(
         Some(client_steer_id.as_str()),
     );
 
-    let user_message = run_db(db.clone(), {
+    let user_message = match run_db(db.clone(), {
         let thread_id = thread.id.clone();
         let message = message.clone();
         let user_blocks = user_blocks.clone();
@@ -1651,9 +1787,17 @@ pub async fn steer_message(
             )
         }
     })
-    .await?;
+    .await
+    {
+        Ok(user_message) => user_message,
+        Err(error) => {
+            if let Some(batch) = remote_attachment_batch.as_ref() {
+                batch.cleanup().await;
+            }
+            return Err(error);
+        }
+    };
 
-    let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
     state.auracoder_thread_mcp_service.bind_engine_thread(
         &thread.engine_id,
         &engine_thread_id,
@@ -1690,6 +1834,7 @@ pub async fn steer_message(
                     user_message.id,
                     rollback_error
                 );
+                persistent_image_preview_batch.commit();
             }
 
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
@@ -1706,6 +1851,7 @@ pub async fn steer_message(
             return Err(err_to_string(error));
         }
     };
+    persistent_image_preview_batch.commit();
 
     let accepted_at = chrono::Utc::now().to_rfc3339();
     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
@@ -1767,6 +1913,7 @@ fn build_user_blocks(
         user_blocks.push(ContentBlock::Attachment {
             file_name: attachment.file_name.clone(),
             file_path: attachment.file_path.clone(),
+            preview_file_path: attachment.preview_file_path.clone(),
             size_bytes: attachment.size_bytes,
             mime_type: attachment.mime_type.clone(),
             browser_annotation: attachment.browser_annotation.clone(),
@@ -1893,6 +2040,7 @@ fn normalize_attachments(
         normalized.push(TurnAttachment {
             file_name,
             file_path,
+            preview_file_path: None,
             size_bytes: attachment.size_bytes,
             mime_type: attachment.mime_type,
             browser_annotation,
@@ -5279,6 +5427,7 @@ fn apply_event_to_blocks(
                 .map(|attachment| ContentBlock::Attachment {
                     file_name: attachment.file_name.clone(),
                     file_path: attachment.file_path.clone(),
+                    preview_file_path: attachment.preview_file_path.clone(),
                     size_bytes: attachment.size_bytes,
                     mime_type: attachment.mime_type.clone(),
                     browser_annotation: attachment.browser_annotation.clone(),
@@ -6175,6 +6324,7 @@ mod tests {
         TurnAttachment {
             file_name: file_name.to_string(),
             file_path: format!("/tmp/{file_name}"),
+            preview_file_path: None,
             size_bytes: 1,
             mime_type: mime_type.map(ToOwned::to_owned),
             browser_annotation: None,
@@ -6188,6 +6338,7 @@ mod tests {
         let attachment = TurnAttachment {
             file_name: "browser-annotation.png".to_string(),
             file_path: "/tmp/browser-annotation.png".to_string(),
+            preview_file_path: None,
             size_bytes: 1,
             mime_type: Some("image/png".to_string()),
             browser_annotation: Some(BrowserAnnotationMetadata {
@@ -7054,11 +7205,8 @@ mod tests {
     }
 
     #[test]
-    fn pasted_image_extension_rejects_unknown_image_mime() {
-        assert_eq!(
-            pasted_image_extension("pasted-image-1.png", "image/heic"),
-            None
-        );
+    fn image_extension_rejects_unknown_image_mime() {
+        assert_eq!(image_extension_for_mime_type("image/heic"), None);
     }
 
     #[test]
@@ -7553,6 +7701,7 @@ mod tests {
         let preview = read_attachment_preview(
             file_path.display().to_string(),
             Some("image/png".to_string()),
+            None,
         )
         .await
         .expect("large image preview should succeed");
@@ -7592,6 +7741,7 @@ mod tests {
         let preview = read_attachment_preview(
             file_path.display().to_string(),
             Some("image/png".to_string()),
+            None,
         )
         .await
         .expect("small image preview should succeed");
@@ -7615,6 +7765,149 @@ mod tests {
         fs::remove_dir_all(&root).expect("failed to clean up small image temp dir");
     }
 
+    /// 新发送图片生成永久预览路径；消息尚未持久化时，批次释放应清理永久副本。
+    #[tokio::test]
+    async fn persistent_image_preview_batch_cleans_uncommitted_files() {
+        let root = std::env::temp_dir().join(format!(
+            "auracoder-message-image-preview-uncommitted-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("failed to create temp root for persistent preview");
+        let source_file_path = root.join("source.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 128]))
+            .save(&source_file_path)
+            .expect("failed to save persistent preview source image");
+        let mut attachment = test_attachment("source.png", Some("image/png"));
+        attachment.file_path = source_file_path.display().to_string();
+        attachment.size_bytes = fs::metadata(&source_file_path)
+            .expect("failed to read source image metadata")
+            .len();
+
+        let batch = persist_message_image_previews(std::slice::from_mut(&mut attachment))
+            .await
+            .expect("persistent preview should be created");
+        let preview_file_path = PathBuf::from(
+            attachment
+                .preview_file_path
+                .as_deref()
+                .expect("attachment should contain persistent preview path"),
+        );
+        assert!(preview_file_path.is_file());
+
+        drop(batch);
+
+        assert!(!preview_file_path.exists());
+        fs::remove_dir_all(&root).expect("failed to clean up persistent preview temp dir");
+    }
+
+    /// 消息持久化后提交批次，永久图片副本应继续保留。
+    #[tokio::test]
+    async fn persistent_image_preview_batch_keeps_committed_files() {
+        let root = std::env::temp_dir().join(format!(
+            "auracoder-message-image-preview-committed-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("failed to create temp root for persistent preview");
+        let source_file_path = root.join("source.png");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([120, 60, 30]))
+            .save(&source_file_path)
+            .expect("failed to save persistent preview source image");
+        let mut attachment = test_attachment("source.png", Some("image/png"));
+        attachment.file_path = source_file_path.display().to_string();
+        attachment.size_bytes = fs::metadata(&source_file_path)
+            .expect("failed to read source image metadata")
+            .len();
+
+        let batch = persist_message_image_previews(std::slice::from_mut(&mut attachment))
+            .await
+            .expect("persistent preview should be created");
+        let preview_file_path = PathBuf::from(
+            attachment
+                .preview_file_path
+                .as_deref()
+                .expect("attachment should contain persistent preview path"),
+        );
+
+        batch.commit();
+
+        assert!(preview_file_path.is_file());
+        fs::remove_file(&preview_file_path)
+            .expect("failed to clean up committed persistent preview file");
+        fs::remove_dir_all(&root).expect("failed to clean up persistent preview temp dir");
+    }
+
+    /// 已发送消息读取时应优先使用永久副本，即使原附件路径已经失效。
+    #[tokio::test]
+    async fn read_attachment_preview_prefers_persistent_file_path() {
+        let root = std::env::temp_dir().join(format!(
+            "auracoder-attachment-preview-persistent-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("failed to create temp root for persistent preview");
+        let preview_file_path = root.join("persistent.png");
+        image::RgbaImage::from_pixel(12, 10, image::Rgba([10, 20, 30, 128]))
+            .save(&preview_file_path)
+            .expect("failed to save persistent preview image");
+
+        let preview = read_attachment_preview(
+            root.join("missing-original.png").display().to_string(),
+            Some("image/png".to_string()),
+            Some(preview_file_path.display().to_string()),
+        )
+        .await
+        .expect("persistent preview path should be preferred")
+        .expect("persistent preview should be available");
+
+        assert_eq!(preview.mime_type, "image/png");
+        let bytes = BASE64
+            .decode(preview.data_base64.as_bytes())
+            .expect("preview data should decode as base64");
+        let decoded =
+            image::load_from_memory(&bytes).expect("preview bytes should decode as an image");
+        assert_eq!((decoded.width(), decoded.height()), (12, 10));
+
+        fs::remove_dir_all(&root).expect("failed to clean up persistent preview temp dir");
+    }
+
+    /// 消息块序列化时应保留永久预览路径，供前端重新加载聊天记录后读取。
+    #[test]
+    fn user_attachment_block_serializes_persistent_preview_path() {
+        let mut attachment = test_attachment("result.png", Some("image/png"));
+        attachment.preview_file_path =
+            Some("C:\\AuraCoder\\attachments\\message-images\\result.png".to_string());
+
+        let blocks = build_user_blocks("查看结果", &[], &[attachment], false, false, None);
+        let value = serde_json::to_value(blocks).expect("user blocks should serialize");
+
+        assert_eq!(
+            value[0]["previewFilePath"],
+            "C:\\AuraCoder\\attachments\\message-images\\result.png"
+        );
+    }
+
+    /// 图片内容损坏时保留底层解码异常，IPC 仅返回业务语义错误。
+    #[tokio::test]
+    async fn read_attachment_preview_reports_invalid_image_as_business_error() {
+        let root = std::env::temp_dir().join(format!(
+            "auracoder-attachment-preview-invalid-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("failed to create temp root for invalid image");
+        let file_path = root.join("invalid.png");
+        fs::write(&file_path, b"not an image").expect("failed to write invalid image");
+
+        let error = read_attachment_preview(
+            file_path.display().to_string(),
+            Some("image/png".to_string()),
+            None,
+        )
+        .await
+        .expect_err("invalid image should return a business error");
+
+        assert_eq!(error, "图片预览加载失败");
+        fs::remove_dir_all(&root).expect("failed to clean up invalid image temp dir");
+    }
+
     /// 非图片附件（text/plain）预览应返回 None，不产生编码数据。
     #[tokio::test]
     async fn read_attachment_preview_rejects_non_image() {
@@ -7629,6 +7922,7 @@ mod tests {
         let preview = read_attachment_preview(
             file_path.display().to_string(),
             Some("text/plain".to_string()),
+            None,
         )
         .await
         .expect("non-image preview should not error");

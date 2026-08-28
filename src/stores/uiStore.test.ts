@@ -180,8 +180,38 @@ describe("uiStore focus mode", () => {
       showGitPanel: true,
       activeRightTool: "attachments",
       imageAttachmentPreview: {
+        source: "draft",
         workspaceId: "workspace-a",
         attachmentId: "image-1",
+      },
+    });
+  });
+
+  it("opens a sent image in the visible user attachment tool", () => {
+    useUiStore.setState({ showGitPanel: false, activeRightTool: "git" });
+
+    useUiStore.getState().openMessageImageAttachmentPreview("workspace-a", {
+      type: "attachment",
+      fileName: "result.png",
+      filePath: "/home/tester/.cache/auracoder/attachments/result.png",
+      previewFilePath: "C:\\AuraCoder\\attachments\\message-images\\result.png",
+      sizeBytes: 128,
+      mimeType: "image/png",
+      isRemote: true,
+    });
+
+    expect(useUiStore.getState()).toMatchObject({
+      showGitPanel: true,
+      activeRightTool: "attachments",
+      imageAttachmentPreview: {
+        source: "message",
+        workspaceId: "workspace-a",
+        attachment: {
+          type: "attachment",
+          fileName: "result.png",
+          previewFilePath: "C:\\AuraCoder\\attachments\\message-images\\result.png",
+          isRemote: true,
+        },
       },
     });
   });

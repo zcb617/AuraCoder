@@ -402,6 +402,8 @@ pub struct BrowserAnnotationMetadata {
 pub struct TurnAttachment {
     pub file_name: String,
     pub file_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_file_path: Option<String>,
     pub size_bytes: u64,
     pub mime_type: Option<String>,
     pub browser_annotation: Option<BrowserAnnotationMetadata>,

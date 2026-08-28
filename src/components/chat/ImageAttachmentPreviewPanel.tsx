@@ -15,7 +15,11 @@ import {
 import { useThreadStore } from "../../stores/threadStore";
 import { useUiStore } from "../../stores/uiStore";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
-import type { ChatAttachment, ImageAttachmentAnnotation } from "../../types";
+import type {
+  AttachmentBlock,
+  ChatAttachment,
+  ImageAttachmentAnnotation,
+} from "../../types";
 import {
   fitAspectRatioWithinBox,
   imagePointFromClientPosition,
@@ -72,9 +76,16 @@ export function ImageAttachmentPreviewPanel() {
   const setSessionAttachments = useChatComposerStore(
     (state) => state.setSessionAttachments,
   );
-  const attachment = previewTarget?.workspaceId === activeWorkspaceId
-    ? attachments.find((candidate) => candidate.id === previewTarget.attachmentId) ?? null
-    : null;
+  const draftAttachment =
+    previewTarget?.source === "draft" && previewTarget.workspaceId === activeWorkspaceId
+      ? attachments.find((candidate) => candidate.id === previewTarget.attachmentId) ?? null
+      : null;
+  const messageAttachment: AttachmentBlock | null =
+    previewTarget?.source === "message" && previewTarget.workspaceId === activeWorkspaceId
+      ? previewTarget.attachment
+      : null;
+  const attachment = draftAttachment ?? messageAttachment;
+  const isDraftPreview = draftAttachment !== null;
   const viewportRef = useRef<HTMLDivElement>(null);
   const cancelEditorRef = useRef(false);
   const [previewSrc, setPreviewSrc] = useState<string | null>(null);
@@ -117,8 +128,20 @@ export function ImageAttachmentPreviewPanel() {
       };
     }
 
+    if (messageAttachment?.isRemote && !messageAttachment.previewFilePath) {
+      setLoading(false);
+      setPreviewError(t("imagePreview.unavailable"));
+      return () => {
+        cancelled = true;
+      };
+    }
+
     setLoading(true);
-    void ipc.readAttachmentPreview(attachment.filePath, attachment.mimeType).then(
+    void ipc.readAttachmentPreview(
+      attachment.filePath,
+      attachment.mimeType,
+      messageAttachment?.previewFilePath,
+    ).then(
       (preview) => {
         if (cancelled) {
           return;
@@ -129,7 +152,8 @@ export function ImageAttachmentPreviewPanel() {
         }
         setPreviewSrc(`data:${preview.mimeType};base64,${preview.dataBase64}`);
       },
-      () => {
+      (error) => {
+        console.error(error);
         if (!cancelled) {
           setPreviewError(t("imagePreview.loadFailed"));
         }
@@ -143,7 +167,14 @@ export function ImageAttachmentPreviewPanel() {
     return () => {
       cancelled = true;
     };
-  }, [attachment?.filePath, attachment?.id, attachment?.mimeType, t]);
+  }, [
+    attachment?.filePath,
+    attachment?.mimeType,
+    messageAttachment?.previewFilePath,
+    messageAttachment?.isRemote,
+    previewTarget?.source,
+    t,
+  ]);
 
   const naturalRatio = naturalSize.width > 0 && naturalSize.height > 0
     ? naturalSize.width / naturalSize.height
@@ -168,7 +199,7 @@ export function ImageAttachmentPreviewPanel() {
         width: naturalSize.width * (zoom / 100),
         height: naturalSize.height * (zoom / 100),
       };
-  const annotations = attachment?.imageAnnotations ?? [];
+  const annotations = draftAttachment?.imageAnnotations ?? [];
   const visibleAnnotations: ImageAttachmentAnnotation[] = annotationEditor?.annotationId === null
     ? [
         ...annotations,
@@ -183,7 +214,7 @@ export function ImageAttachmentPreviewPanel() {
     : annotations;
 
   const commitAnnotationEditor = () => {
-    if (!annotationEditor || !attachment || !activeWorkspaceId) {
+    if (!annotationEditor || !draftAttachment || !activeWorkspaceId) {
       return;
     }
     const comment = annotationEditor.comment.trim();
@@ -229,7 +260,7 @@ export function ImageAttachmentPreviewPanel() {
     setSessionAttachments(
       composerSessionKey,
       currentAttachments.map((candidate) => {
-        if (candidate.id !== attachment.id) {
+        if (candidate.id !== draftAttachment.id) {
           return candidate;
         }
         const currentAnnotations = candidate.imageAnnotations ?? [];
@@ -254,7 +285,7 @@ export function ImageAttachmentPreviewPanel() {
   };
 
   const handleImageClick = (event: ReactMouseEvent<HTMLDivElement>) => {
-    if (!annotationEnabled || !attachment) {
+    if (!annotationEnabled || !isDraftPreview) {
       return;
     }
     if ((event.target as Element).closest("[data-image-annotation-control]")) {
@@ -279,19 +310,21 @@ export function ImageAttachmentPreviewPanel() {
   return (
     <section className="image-attachment-preview-panel" aria-label={t("imagePreview.title")}>
       <header className="image-attachment-preview-toolbar">
-        <button
-          type="button"
-          className={`image-attachment-preview-mark${annotationEnabled ? " active" : ""}`}
-          onClick={() => {
-            setAnnotationEnabled((enabled) => !enabled);
-            setAnnotationEditor(null);
-          }}
-          aria-pressed={annotationEnabled}
-          disabled={!previewSrc}
-        >
-          <Crosshair size={13} />
-          {t("imagePreview.mark")}
-        </button>
+        {isDraftPreview && (
+          <button
+            type="button"
+            className={`image-attachment-preview-mark${annotationEnabled ? " active" : ""}`}
+            onClick={() => {
+              setAnnotationEnabled((enabled) => !enabled);
+              setAnnotationEditor(null);
+            }}
+            aria-pressed={annotationEnabled}
+            disabled={!previewSrc}
+          >
+            <Crosshair size={13} />
+            {t("imagePreview.mark")}
+          </button>
+        )}
         <label className="image-attachment-preview-control">
           <span>{t("imagePreview.ratio")}</span>
           <select

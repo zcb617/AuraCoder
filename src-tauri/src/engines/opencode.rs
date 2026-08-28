@@ -4925,6 +4925,7 @@ opencode/gpt-5-nano
                     file_name: "说明.txt".to_string(),
                     file_path: "/home/tester/.cache/auracoder/attachments/workspace/thread/file.txt"
                         .to_string(),
+                    preview_file_path: None,
                     size_bytes: 12,
                     mime_type: Some("text/plain".to_string()),
                     browser_annotation: None,

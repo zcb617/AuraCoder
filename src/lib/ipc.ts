@@ -624,10 +624,15 @@ export const ipc = {
     selection: BrowserAnnotationSelection,
   ) =>
     invoke<BrowserAnnotationAttachment>("browser_capture_annotation", { scope, number, selection }),
-  readAttachmentPreview: (filePath: string, mimeType?: string | null) =>
+  readAttachmentPreview: (
+    filePath: string,
+    mimeType?: string | null,
+    previewFilePath?: string | null,
+  ) =>
     invoke<AttachmentPreview | null>("read_attachment_preview", {
       filePath,
       mimeType: mimeType ?? null,
+      previewFilePath: previewFilePath ?? null,
     }),
   sendMessage: (
     threadId: string,

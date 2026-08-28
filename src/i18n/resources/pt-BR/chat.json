@@ -104,7 +104,7 @@
     "ratios": {
       "original": "Original"
     },
-    "empty": "Clique em uma imagem pendente para visualizá-la aqui",
+    "empty": "Clique em uma imagem anexada para visualizá-la aqui",
     "loading": "Carregando imagem…",
     "unavailable": "Não foi possível ler a prévia desta imagem",
     "loadFailed": "Falha ao carregar a prévia da imagem",

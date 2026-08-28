@@ -3,6 +3,7 @@ import {
   COMMAND_PALETTE_DEFAULT_LAUNCH,
   type CommandPaletteLaunchState,
 } from "../lib/commandPalette";
+import type { AttachmentBlock } from "../types";
 
 const SIDEBAR_PINNED_KEY = "auracoder:sidebarPinned";
 const GIT_PANEL_PINNED_KEY = "auracoder:gitPanelPinned";
@@ -16,10 +17,17 @@ interface MessageFocusTarget {
   requestedAt: number;
 }
 
-interface ImageAttachmentPreviewTarget {
-  workspaceId: string;
-  attachmentId: string;
-}
+type ImageAttachmentPreviewTarget =
+  | {
+      source: "draft";
+      workspaceId: string;
+      attachmentId: string;
+    }
+  | {
+      source: "message";
+      workspaceId: string;
+      attachment: AttachmentBlock;
+    };
 
 interface FocusModeSnapshot {
   showSidebar: boolean;
@@ -72,6 +80,10 @@ interface UiState {
   setGitPanelPinned: (pinned: boolean) => void;
   setActiveRightTool: (tool: ActiveRightTool) => void;
   openImageAttachmentPreview: (workspaceId: string, attachmentId: string) => void;
+  openMessageImageAttachmentPreview: (
+    workspaceId: string,
+    attachment: AttachmentBlock,
+  ) => void;
   toggleExplorer: () => void;
   setExplorerOpen: (open: boolean) => void;
   setFocusMode: (enabled: boolean) => void;
@@ -229,7 +241,21 @@ export const useUiStore = create<UiState>((set) => ({
     set({
       activeRightTool: "attachments",
       showGitPanel: true,
-      imageAttachmentPreview: { workspaceId, attachmentId },
+      imageAttachmentPreview: {
+        source: "draft",
+        workspaceId,
+        attachmentId,
+      },
+    }),
+  openMessageImageAttachmentPreview: (workspaceId, attachment) =>
+    set({
+      activeRightTool: "attachments",
+      showGitPanel: true,
+      imageAttachmentPreview: {
+        source: "message",
+        workspaceId,
+        attachment: { ...attachment },
+      },
     }),
   toggleExplorer: () =>
     set((state) => {

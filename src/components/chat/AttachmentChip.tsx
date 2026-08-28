@@ -6,6 +6,7 @@ import { useChatFileContextMenu } from "./useChatFileContextMenu";
 interface AttachmentChipData {
   fileName: string;
   filePath: string;
+  previewFilePath?: string;
   sizeBytes?: number;
   mimeType?: string;
   isRemote?: boolean;
@@ -93,24 +94,28 @@ export function AttachmentChip({
     setThumbnailSrc(null);
     setThumbnailFailed(false);
 
-    if (
-      attachment.isRemote ||
-      !isImageAttachment(effectiveMimeType) ||
-      !attachment.filePath
-    ) {
+    const hasLocalPreviewSource = Boolean(
+      attachment.previewFilePath || (!attachment.isRemote && attachment.filePath),
+    );
+    if (!isImageAttachment(effectiveMimeType) || !hasLocalPreviewSource) {
       return () => {
         cancelled = true;
       };
     }
 
-    ipc.readAttachmentPreview(attachment.filePath, effectiveMimeType)
+    ipc.readAttachmentPreview(
+      attachment.filePath,
+      effectiveMimeType,
+      attachment.previewFilePath,
+    )
       .then((preview) => {
         if (cancelled || !preview) {
           return;
         }
         setThumbnailSrc(`data:${preview.mimeType};base64,${preview.dataBase64}`);
       })
-      .catch(() => {
+      .catch((error) => {
+        console.error(error);
         if (!cancelled) {
           setThumbnailFailed(true);
         }
@@ -119,7 +124,12 @@ export function AttachmentChip({
     return () => {
       cancelled = true;
     };
-  }, [attachment.filePath, attachment.isRemote, effectiveMimeType]);
+  }, [
+    attachment.filePath,
+    attachment.isRemote,
+    attachment.previewFilePath,
+    effectiveMimeType,
+  ]);
 
   const IconComponent = getAttachmentIcon(effectiveMimeType);
   const sizeBytes = attachment.sizeBytes ?? 0;

@@ -98,6 +98,7 @@ interface Props {
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   onLoadActionOutput?: (actionId: string) => Promise<void>;
   onOpenDiffFile?: (filePath: string) => void;
+  onOpenImageAttachment?: (attachment: AttachmentBlock) => void;
 }
 
 function isBlockLike(value: unknown): value is { type: string } {
@@ -778,7 +779,13 @@ function NoticeBlockView({ block }: { block: NoticeBlock }) {
   );
 }
 
-function SteerBlockView({ block }: { block: SteerBlock }) {
+function SteerBlockView({
+  block,
+  onOpenImageAttachment,
+}: {
+  block: SteerBlock;
+  onOpenImageAttachment?: (attachment: AttachmentBlock) => void;
+}) {
   const { t } = useTranslation("chat");
   const attachmentBlocks = block.attachments ?? [];
   const skillBlocks = block.skills ?? [];
@@ -825,6 +832,9 @@ function SteerBlockView({ block }: { block: SteerBlock }) {
                 <AttachmentChip
                   key={`attachment:${attachment.filePath}:${attachment.fileName}`}
                   attachment={attachment}
+                  onOpen={onOpenImageAttachment
+                    ? () => onOpenImageAttachment(attachment)
+                    : undefined}
                 />
               );
             })}
@@ -1943,6 +1953,7 @@ function renderSingleBlock(
   onApproval: (approvalId: string, response: ApprovalResponse) => void,
   onLoadActionOutput: ((actionId: string) => Promise<void>) | undefined,
   onOpenDiffFile: ((filePath: string) => void) | undefined,
+  onOpenImageAttachment: ((attachment: AttachmentBlock) => void) | undefined,
 ) {
   const blockKey = getMessageBlockKey(block, index, safeBlocks);
 
@@ -2042,7 +2053,13 @@ function renderSingleBlock(
 
   /* ── Steer ── */
   if (block.type === "steer") {
-    return <SteerBlockView key={blockKey} block={block} />;
+    return (
+      <SteerBlockView
+        key={blockKey}
+        block={block}
+        onOpenImageAttachment={onOpenImageAttachment}
+      />
+    );
   }
 
   /* ── Action ── */
@@ -2087,7 +2104,12 @@ function renderSingleBlock(
     const attachmentBlock = block as AttachmentBlock;
     return (
       <div key={blockKey} style={{ margin: "2px 12px", display: "inline-flex" }}>
-        <AttachmentChip attachment={attachmentBlock} />
+        <AttachmentChip
+          attachment={attachmentBlock}
+          onOpen={onOpenImageAttachment
+            ? () => onOpenImageAttachment(attachmentBlock)
+            : undefined}
+        />
       </div>
     );
   }
@@ -2113,6 +2135,7 @@ function MessageBlocksView({
   onApproval,
   onLoadActionOutput,
   onOpenDiffFile,
+  onOpenImageAttachment,
 }: Props) {
   const { t } = useTranslation("chat");
   const [expandedActionGroups, setExpandedActionGroups] = useState<Record<string, boolean>>({});
@@ -2276,6 +2299,7 @@ function MessageBlocksView({
           onApproval,
           onLoadActionOutput,
           onOpenDiffFile,
+          onOpenImageAttachment,
         );
       })}
     </div>
@@ -2291,5 +2315,6 @@ export const MessageBlocks = memo(
     prev.engineId === next.engineId &&
     prev.onApproval === next.onApproval &&
     prev.onLoadActionOutput === next.onLoadActionOutput &&
-    prev.onOpenDiffFile === next.onOpenDiffFile,
+    prev.onOpenDiffFile === next.onOpenDiffFile &&
+    prev.onOpenImageAttachment === next.onOpenImageAttachment,
 );

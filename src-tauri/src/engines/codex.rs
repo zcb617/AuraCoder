@@ -8095,6 +8095,7 @@ mod tests {
         let attachment = TurnAttachment {
             file_name: "说明.md".to_string(),
             file_path: "/home/tester/.cache/auracoder/attachments/workspace/thread/file.md".to_string(),
+            preview_file_path: None,
             size_bytes: 128,
             mime_type: Some("text/markdown".to_string()),
             browser_annotation: None,
