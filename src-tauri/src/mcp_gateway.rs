@@ -18,8 +18,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    auracoder_thread_mcp_service::AuraCoderThreadMcpService,
-    computer_control_service::ComputerControlService,
+    cli_tools::{CliTool, McpInvocationContext},
 };
 
 /// AuraCoder MCP Gateway 的生命周期状态。
@@ -32,13 +31,6 @@ pub(crate) enum GatewayState {
     Stopping,
 }
 
-/// 客户端租约的访问策略。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClientAccessPolicy {
-    Local,
-    SshRemoteThreadOnly,
-}
-
 /// 注册成功后返回给调用方的独立 Bearer 租约。
 #[derive(Debug, Clone)]
 pub(crate) struct ClientLease {
@@ -48,10 +40,6 @@ pub(crate) struct ClientLease {
     pub engine: String,
     /// 租约所属引擎实例。
     pub instance_id: String,
-    /// 租约访问策略。
-    pub policy: ClientAccessPolicy,
-    /// SSH 租约的连接标识。
-    pub ssh_connection_id: Option<String>,
     /// 创建租约时的服务代次；Gateway 重启后旧代次立即失效。
     pub generation: u64,
 }
@@ -71,9 +59,11 @@ struct TrustedContext {
 }
 
 /// 内存中的客户端记录。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ClientRecord {
     lease: ClientLease,
+    /// 当前 token 绑定的 CLI MCP 实现，Gateway 只通过该对象调用 MCP 接口。
+    cli: Arc<dyn CliTool>,
     context: Option<TrustedContext>,
 }
 
@@ -112,62 +102,34 @@ pub(crate) struct AuraCoderMcpGateway {
     operation: Mutex<()>,
     /// 生命周期状态。
     lifecycle: Arc<Mutex<GatewayLifecycle>>,
-    /// 电脑操作服务。
-    computer: Arc<ComputerControlService>,
-    /// 会话工具服务。
-    threads: Arc<AuraCoderThreadMcpService>,
     /// 内存租约表。
     clients: Arc<RwLock<HashMap<String, ClientRecord>>>,
     /// MCP 会话与租约 token 的绑定。
     sessions: Arc<RwLock<HashMap<String, String>>>,
     /// 活动工具调用与其租约取消令牌。
     active_calls: Arc<RwLock<HashMap<String, (String, CancellationToken)>>>,
-    /// 供所有既有 HTTP 连接读取的当前 MCP 工具目录。
-    catalog: Arc<RwLock<Vec<CatalogTool>>>,
 }
 
 impl AuraCoderMcpGateway {
-    /// 创建绑定现有业务服务的 Gateway。
-    pub(crate) fn new(
-        computer: Arc<ComputerControlService>,
-        threads: Arc<AuraCoderThreadMcpService>,
-    ) -> Self {
+    /// 创建只负责 MCP 协议、token 和请求生命周期的 Gateway。
+    pub(crate) fn new() -> Self {
         Self {
             operation: Mutex::new(()),
             lifecycle: Arc::new(Mutex::new(GatewayLifecycle::default())),
-            computer,
-            threads,
             clients: Arc::new(RwLock::new(HashMap::new())),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             active_calls: Arc::new(RwLock::new(HashMap::new())),
-            catalog: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
-    /// 注册本机客户端租约。
-    pub(crate) async fn register_local_client(
+    /// 注册当前 CLI 实现的 token 租约，并替换同一实例的旧租约。
+    pub(crate) async fn register_client(
         &self,
         engine: &str,
         instance_id: &str,
+        cli: Arc<dyn CliTool>,
     ) -> Result<ClientLease, String> {
-        self.register(engine, instance_id, ClientAccessPolicy::Local, None)
-            .await
-    }
-
-    /// 注册 SSH 远端线程客户端租约。
-    pub(crate) async fn register_ssh_remote_thread_client(
-        &self,
-        engine: &str,
-        instance_id: &str,
-        ssh_connection_id: &str,
-    ) -> Result<ClientLease, String> {
-        self.register(
-            engine,
-            instance_id,
-            ClientAccessPolicy::SshRemoteThreadOnly,
-            Some(ssh_connection_id),
-        )
-        .await
+        self.register(engine, instance_id, cli).await
     }
 
     /// 撤销租约及其上下文。
@@ -281,17 +243,6 @@ impl AuraCoderMcpGateway {
         for (_, (_, cancellation)) in self.active_calls.write().await.drain() {
             cancellation.cancel();
         }
-        let catalog = match self.catalog() {
-            Ok(value) => value,
-            Err(error) => {
-                log::error!("MCP Gateway 目录失败，原始错误：{error}");
-                let mut life = self.lifecycle.lock().await;
-                life.state = GatewayState::Failed;
-                life.last_error = Some(error.clone());
-                return Err(error);
-            }
-        };
-        *self.catalog.write().await = catalog;
         let listener = match TcpListener::bind(("127.0.0.1", 0)).await {
             Ok(listener) => listener,
             Err(error) => {
@@ -329,17 +280,15 @@ impl AuraCoderMcpGateway {
         Ok(())
     }
 
-    /// 重新读取电脑操作和会话工具，原子替换供既有 HTTP 连接使用的目录。
-    pub(crate) async fn refresh_catalog(&self) -> Result<(), String> {
-        let catalog = self.catalog()?;
-        *self.catalog.write().await = catalog;
-        Ok(())
-    }
-
     /// 先完整停止当前代次，再启动新代次。
     pub(crate) async fn restart(&self) -> Result<(), String> {
         self.shutdown().await;
         self.start().await
+    }
+
+    /// 保留旧设置命令的调用兼容；工具目录已改由当前 CliTool 动态提供，无需 Gateway 刷新。
+    pub(crate) async fn refresh_catalog(&self) -> Result<(), String> {
+        Ok(())
     }
 
     /// 停止 HTTP MCP 服务并清空所有内存租约。
@@ -391,8 +340,7 @@ impl AuraCoderMcpGateway {
         &self,
         engine: &str,
         instance: &str,
-        policy: ClientAccessPolicy,
-        ssh: Option<&str>,
+        cli: Arc<dyn CliTool>,
     ) -> Result<ClientLease, String> {
         if engine.trim().is_empty() || instance.trim().is_empty() {
             return Err("client lease 缺少 engine 或 instance_id".to_string());
@@ -409,11 +357,6 @@ impl AuraCoderMcpGateway {
             token: token.clone(),
             engine: engine.trim().to_string(),
             instance_id: instance.trim().to_string(),
-            policy,
-            ssh_connection_id: ssh
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string),
             generation,
         };
         let mut clients = self.clients.write().await;
@@ -432,6 +375,7 @@ impl AuraCoderMcpGateway {
             token,
             ClientRecord {
                 lease: lease.clone(),
+                cli,
                 context: None,
             },
         );
@@ -451,43 +395,13 @@ impl AuraCoderMcpGateway {
         Ok(lease)
     }
 
-    /// 读取并合并两个现有服务的工具目录。
-    fn catalog(&self) -> Result<Vec<CatalogTool>, String> {
-        let mut result = Vec::new();
-        match self.computer.sdk_tool_specs() {
-            Ok(specs) => {
-                for spec in specs {
-                    result.push(CatalogTool::from(spec, Owner::Computer)?);
-                }
-            }
-            Err(error) if error.starts_with("sdk_unavailable:") => {
-                // CUA SDK 不可用时保留会话工具，避免电脑操作故障阻断整个 Gateway。
-                log::warn!("MCP Gateway CUA 工具不可用，继续提供会话工具；原始错误：{error}");
-            }
-            Err(error) => return Err(format!("电脑操作目录不可用：{error}")),
-        }
-        for spec in self.threads.tool_specs() {
-            result.push(CatalogTool::from(spec, Owner::Thread)?);
-        }
-        let mut names = HashMap::new();
-        for tool in &result {
-            if names.insert(tool.name.clone(), ()).is_some() {
-                return Err(format!("工具目录存在重名：{}", tool.name));
-            }
-        }
-        Ok(result)
-    }
-
     /// 组装 HTTP 任务所需的共享状态。
     fn task_state(&self) -> TaskState {
         TaskState {
-            computer: self.computer.clone(),
-            threads: self.threads.clone(),
             clients: self.clients.clone(),
             sessions: self.sessions.clone(),
             active_calls: self.active_calls.clone(),
             lifecycle: self.lifecycle.clone(),
-            catalog: self.catalog.clone(),
         }
     }
 
@@ -505,62 +419,17 @@ impl AuraCoderMcpGateway {
 /// HTTP 任务共享状态。
 #[derive(Clone)]
 struct TaskState {
-    computer: Arc<ComputerControlService>,
-    threads: Arc<AuraCoderThreadMcpService>,
     clients: Arc<RwLock<HashMap<String, ClientRecord>>>,
     sessions: Arc<RwLock<HashMap<String, String>>>,
     active_calls: Arc<RwLock<HashMap<String, (String, CancellationToken)>>>,
     lifecycle: Arc<Mutex<GatewayLifecycle>>,
-    /// 供 HTTP 请求读取的当前 MCP 工具目录。
-    catalog: Arc<RwLock<Vec<CatalogTool>>>,
 }
 
-/// 工具业务归属。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Owner {
-    Computer,
-    Thread,
-}
-
-/// Gateway 中的工具目录项。
-#[derive(Clone)]
-struct CatalogTool {
-    name: String,
-    description: String,
-    schema: Value,
-    owner: Owner,
-}
-
-impl CatalogTool {
-    /// 从现有服务工具规格建立目录项。
-    fn from(spec: Value, owner: Owner) -> Result<Self, String> {
-        let name = spec
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| "MCP 工具缺少 name".to_string())?;
-        let description = spec
-            .get("description")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("MCP 工具 `{name}` 缺少 description"))?;
-        let schema = spec
-            .get("inputSchema")
-            .filter(|v| v.is_object())
-            .cloned()
-            .ok_or_else(|| format!("MCP 工具 `{name}` 缺少对象 inputSchema"))?;
-        Ok(Self {
-            name: name.to_string(),
-            description: description.to_string(),
-            schema,
-            owner,
-        })
-    }
-    /// 序列化为 tools/list 的标准工具对象。
-    fn json(&self) -> Value {
-        json!({"name": self.name, "description": self.description, "inputSchema": self.schema})
-    }
-}
+/*
+旧 Gateway 运行时代码：工具 Owner、CatalogTool 及工具目录校验曾由 Gateway
+负责。三层 MCP 改造后，这段运行代码仅保留迁移留痕，工具目录改由当前 CliTool
+直接提供。
+*/
 
 const MCP_PATH: &str = "/mcp";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -828,23 +697,28 @@ async fn handle_request(
             None,
         ),
         "tools/list" => {
-            // 旧实现：let tools = visible_tools(&client.lease, &catalog);
-            let tools = {
-                let catalog = state.catalog.read().await;
-                visible_tools(&client.lease, &catalog)
-            };
-            (
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": { "tools": tools }
-                }),
-                None,
-            )
+            match client.cli.list_mcp_tools() {
+                Ok(tools) => (
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": { "tools": tools }
+                    }),
+                    None,
+                ),
+                Err(error) => {
+                    log::error!(
+                        "MCP Gateway tools/list 调用当前 CLI 失败，原始错误：{error}"
+                    );
+                    (
+                        rpc_error(request_id, -32603, "internal_error"),
+                        None,
+                    )
+                }
+            }
         }
         "tools/call" => {
-            // 旧实现：dispatch_tool_call(&client, &rpc, &catalog, state.clone()).await
-            let call_result = dispatch_tool_call(&client, &rpc, state.clone()).await;
+            let call_result = call_cli_tool(&client, &rpc, state.clone()).await;
             (
                 json!({
                     "jsonrpc": "2.0",
@@ -956,6 +830,8 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     })
 }
 
+/*
+旧 Gateway 工具过滤入口已停用：
 fn visible_tools(lease: &ClientLease, catalog: &[CatalogTool]) -> Vec<Value> {
     catalog
         .iter()
@@ -963,76 +839,50 @@ fn visible_tools(lease: &ClientLease, catalog: &[CatalogTool]) -> Vec<Value> {
         .map(CatalogTool::json)
         .collect()
 }
+*/
 
-async fn dispatch_tool_call(
+/// 读取可信上下文并把 MCP 工具调用直接交给当前 token 绑定的 CLI 实现。
+async fn call_cli_tool(
     client: &ClientRecord,
     rpc: &RpcRequest,
-    // 旧实现：catalog: &[CatalogTool],
     state: TaskState,
 ) -> Value {
-    let dispatch_started_at = std::time::Instant::now();
-    log::info!(
-        "MCP Gateway dispatch tool call entered: lease={:?}, context={:?}, rpc={rpc:?}",
-        client.lease,
-        client.context,
-    );
     let Some(params) = rpc.params.as_ref().and_then(Value::as_object) else {
-        return tool_error("invalid_request: tools/call params 必须是对象");
+        return json!({
+            "content": [{ "type": "text", "text": "invalid_request: tools/call params 必须是对象" }],
+            "isError": true
+        });
     };
     let Some(name) = params.get("name").and_then(Value::as_str).map(str::trim) else {
-        return tool_error("invalid_request: tools/call 缺少 name");
+        return json!({
+            "content": [{ "type": "text", "text": "invalid_request: tools/call 缺少 name" }],
+            "isError": true
+        });
     };
-    // 旧实现：let Some(tool) = catalog.iter().find(|tool| tool.name == name) else {
-    // 旧实现：    return tool_error("tool_not_found");
-    // 旧实现：};
-    let tool = {
-        let catalog = state.catalog.read().await;
-        catalog.iter().find(|tool| tool.name == name).cloned()
-    };
-    let Some(tool) = tool else {
-        return tool_error("tool_not_found");
-    };
-    if client.lease.policy == ClientAccessPolicy::SshRemoteThreadOnly
-        && tool.owner == Owner::Computer
-    {
-        return tool_error("tool_not_allowed");
-    }
     let arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let context = client
-        .context
-        .clone()
-        .or_else(|| context_from_meta(params.get("_meta")));
+    let context = client.context.clone();
     let Some(context) = context else {
         log::info!(
-            "MCP Gateway dispatch tool call missing context: token={}, engine={}, instance_id={}, request_id={:?}, tool={}, arguments={arguments:?}, thread_id=None, turn_id=None, owner={:?}",
+            "MCP Gateway tools/call 缺少可信上下文: token={}, engine={}, instance_id={}, request_id={:?}, tool={}, arguments={arguments:?}",
             client.lease.token,
             client.lease.engine,
             client.lease.instance_id,
             rpc.id,
             name,
-            tool.owner,
         );
-        return tool_error("invocation_context_missing: trusted context 缺少 thread_id 或 turn_id");
+        return json!({
+            "content": [{ "type": "text", "text": "invocation_context_missing: trusted context 缺少 thread_id 或 turn_id" }],
+            "isError": true
+        });
     };
-    log::info!(
-        "MCP Gateway dispatch tool call resolved: token={}, engine={}, instance_id={}, request_id={:?}, tool={}, arguments={arguments:?}, thread_id={}, turn_id={}, owner={:?}",
-        client.lease.token,
-        client.lease.engine,
-        client.lease.instance_id,
-        rpc.id,
-        name,
-        context.thread_id,
-        context.turn_id,
-        tool.owner,
-    );
     let active_call_id = active_call_key(
         &client.lease.token,
-        rpc.id
-            .as_ref()
-            .unwrap_or(&Value::String(Uuid::new_v4().simple().to_string())),
+        rpc.id.as_ref().unwrap_or(&Value::String(
+            Uuid::new_v4().simple().to_string(),
+        )),
     );
     let cancellation = CancellationToken::new();
     state.active_calls.write().await.insert(
@@ -1047,67 +897,42 @@ async fn dispatch_tool_call(
             other => other.to_string(),
         })
         .unwrap_or_else(|| format!("mcp-call-{}", Uuid::new_v4().simple()));
-    let result = match tool.owner {
-        Owner::Thread => {
-            // 旧实现：直接 await invoke_for_engine，不监听租约替换产生的停止信号。
-            tokio::select! {
-                _ = cancellation.cancelled() => {
-                    Err("request_cancelled: 工具调用已停止".to_string())
-                }
-                result = state.threads.invoke_for_engine(
-                    &client.lease.engine,
-                    &context.thread_id,
-                    &tool.name,
-                    arguments,
-                ) => result,
-            }
-        }
-        Owner::Computer => {
-            state
-                .computer
-                .invoke_for_engine(
-                    &client.lease.engine,
-                    &context.thread_id,
-                    &context.turn_id,
-                    &tool.name,
-                    &call_id,
-                    arguments,
-                    cancellation,
-                )
-                .await
-        }
-    };
+    let result = client
+        .cli
+        .call_mcp_tool(
+            name,
+            arguments,
+            McpInvocationContext {
+                engine_thread_id: context.thread_id,
+                turn_id: context.turn_id,
+            },
+            call_id,
+            cancellation,
+        )
+        .await;
     state.active_calls.write().await.remove(&active_call_id);
     log::info!(
-        "MCP Gateway dispatch tool call execution finished: token={}, engine={}, instance_id={}, request_id={:?}, tool={}, thread_id={}, turn_id={}, owner={:?}, elapsed_ms={}, raw_result={result:?}",
+        "MCP Gateway tools/call execution finished: token={}, engine={}, instance_id={}, request_id={:?}, tool={}, raw_result={result:?}",
         client.lease.token,
         client.lease.engine,
         client.lease.instance_id,
         rpc.id,
         name,
-        context.thread_id,
-        context.turn_id,
-        tool.owner,
-        dispatch_started_at.elapsed().as_millis(),
     );
-    let mapped_result = match result {
-        Ok(value) => tool_success(value),
+    match serde_json::to_value(result) {
+        Ok(value) => value,
         Err(error) => {
-            log::warn!("MCP Gateway 工具执行失败，tool={name}，原始错误：{error}");
-            mapped_tool_error(&error)
+            log::error!("MCP Gateway 序列化 CLI MCP 结果失败，原始错误：{error}");
+            json!({
+                "content": [{ "type": "text", "text": "internal_error: MCP 工具结果不可序列化" }],
+                "isError": true
+            })
         }
-    };
-    log::info!(
-        "MCP Gateway dispatch tool call mapped result: token={}, engine={}, instance_id={}, request_id={:?}, tool={}, result={mapped_result:?}",
-        client.lease.token,
-        client.lease.engine,
-        client.lease.instance_id,
-        rpc.id,
-        name,
-    );
-    mapped_result
+    }
 }
 
+/*
+旧 Gateway 允许从模型 `_meta` 补充上下文，现仅保留代码留痕，不再执行：
 fn context_from_meta(meta: Option<&Value>) -> Option<TrustedContext> {
     let object = meta?.as_object()?;
     let thread_id = object
@@ -1127,6 +952,7 @@ fn context_from_meta(meta: Option<&Value>) -> Option<TrustedContext> {
         turn_id: turn_id.to_string(),
     })
 }
+*/
 
 fn active_call_key(token: &str, request_id: &Value) -> String {
     format!(
@@ -1135,6 +961,8 @@ fn active_call_key(token: &str, request_id: &Value) -> String {
     )
 }
 
+/*
+旧 Gateway 业务结果映射已停用，改由 BaseCliMcp 统一产生 McpToolResult：
 fn tool_success(value: Value) -> Value {
     if let Some(content) = value.get("content").and_then(Value::as_array) {
         return json!({ "content": content, "isError": false });
@@ -1169,7 +997,11 @@ fn mapped_tool_error(error: &str) -> Value {
     };
     tool_error(&format!("{public_code}: {public_message}"))
 }
+*/
 
+/*
+旧 Gateway 目录和业务分发测试已停用，保留完整测试代码作为迁移留痕；
+新的 MCP 验证测试只依赖真实 CliTool 和统一 register_client。
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1569,5 +1401,211 @@ mod tests {
             remote_tools[0]["name"],
             "get_auracoder_thread_message_count"
         );
+    }
+}
+*/
+
+#[cfg(test)]
+mod tests {
+    use super::{AuraCoderMcpGateway, GatewayState};
+    use crate::{
+        auracoder_thread_mcp_service::AuraCoderThreadMcpService,
+        cli_tools::{codex::CodexCli, CliTool},
+        computer_control_service::ComputerControlService,
+        config::app_config::AppConfig,
+        db::Database,
+        engines::EngineManager,
+        git::{repo::FileTreeCache, watcher::GitWatcherManager},
+        power::KeepAwakeManager,
+        scheduled_tasks::ScheduledTaskManager,
+        state::{AppState, TurnManager},
+        terminal::TerminalManager,
+        terminal_notifications::TerminalNotificationManager,
+    };
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    /// 构造 Gateway 直调 CliTool 测试使用的完整应用状态。
+    fn test_app_state() -> AppState {
+        let root = std::env::temp_dir().join(format!("auracoder-mcp-gateway-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("failed to create gateway test root");
+        let db = Database::open(root.join("workspaces.db")).expect("failed to create gateway test db");
+        AppState {
+            db: db.clone(),
+            config: Arc::new(AppConfig::default()),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            engines: Arc::new(EngineManager::new()),
+            git_watchers: Arc::new(GitWatcherManager::default()),
+            terminals: Arc::new(TerminalManager::default()),
+            notifications: Arc::new(TerminalNotificationManager::default()),
+            keep_awake: Arc::new(KeepAwakeManager::new()),
+            turns: Arc::new(TurnManager::default()),
+            file_tree_cache: Arc::new(FileTreeCache::new()),
+            extension_catalog_refreshes: Arc::new(
+                crate::extensions::refresh::ExtensionCatalogRefreshManager::default(),
+            ),
+            scheduled_tasks: Arc::new(ScheduledTaskManager::new()),
+            computer_control_service: Arc::new(ComputerControlService::default()),
+            auracoder_thread_mcp_service: Arc::new(AuraCoderThreadMcpService::new(db)),
+            mcp_gateway: Arc::new(AuraCoderMcpGateway::new()),
+            remote_access: Arc::new(crate::remote::RemoteTunnelManager::default()),
+            ssh_monitor: Arc::new(crate::ssh::monitor::SshConnectionMonitor::default()),
+        }
+    }
+
+    /// 验证 Gateway 只通过已登记 CliTool 提供目录，并拒绝模型 `_meta` 补充上下文。
+    #[tokio::test]
+    async fn gateway_registers_and_calls_current_cli_directly() {
+        let state = test_app_state();
+        let cli: Arc<dyn CliTool> = Arc::new(CodexCli::new(state.clone()));
+        let gateway = AuraCoderMcpGateway::new();
+        assert_eq!(gateway.status().await, GatewayState::Stopped);
+        gateway.start().await.expect("gateway should start");
+        let lease = gateway
+            .register_client("codex", "test-instance", cli)
+            .await
+            .expect("client lease should be issued");
+        let address = gateway.local_addr().await.expect("listener address");
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{address}/mcp"))
+            .bearer_auth(&lease.token)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list"
+            }))
+            .send()
+            .await
+            .expect("tools/list request should complete");
+        let body: Value = response.json().await.expect("tools/list response JSON");
+        assert_eq!(body["result"]["tools"].as_array().map(Vec::len), Some(2));
+
+        let invalid_token = client
+            .post(format!("http://{address}/mcp"))
+            .bearer_auth("invalid-token")
+            .json(&json!({"jsonrpc": "2.0", "id": 9, "method": "ping"}))
+            .send()
+            .await
+            .expect("invalid token request should complete");
+        assert_eq!(invalid_token.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let invalid_session = client
+            .post(format!("http://{address}/mcp"))
+            .bearer_auth(&lease.token)
+            .header("Mcp-Session-Id", "invalid-session")
+            .json(&json!({"jsonrpc": "2.0", "id": 10, "method": "ping"}))
+            .send()
+            .await
+            .expect("invalid session request should complete");
+        assert_eq!(invalid_session.status(), reqwest::StatusCode::BAD_REQUEST);
+        let pending_cancellation = tokio_util::sync::CancellationToken::new();
+        gateway.active_calls.write().await.insert(
+            "test-active-call".to_string(),
+            (lease.token.clone(), pending_cancellation.clone()),
+        );
+        assert!(gateway.revoke_client(&lease.token).await);
+        assert!(pending_cancellation.is_cancelled());
+
+        let cli: Arc<dyn CliTool> = Arc::new(CodexCli::new(state.clone()));
+        let lease = gateway
+            .register_client("codex", "test-instance", cli)
+            .await
+            .expect("replacement client lease should be issued");
+
+        let no_context = client
+            .post(format!("http://{address}/mcp"))
+            .bearer_auth(&lease.token)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_auracoder_thread_message_count",
+                    "arguments": {"thread_id": "thread"},
+                    "_meta": {"thread_id": "forged", "turn_id": "forged"}
+                }
+            }))
+            .send()
+            .await
+            .expect("tools/call request should complete");
+        let no_context_body: Value = no_context.json().await.expect("tools/call response JSON");
+        assert_eq!(no_context_body["result"]["isError"], true);
+        assert!(no_context_body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("invocation_context_missing"));
+
+        let workspace = crate::db::workspaces::upsert_workspace(
+            &state.db,
+            &std::env::temp_dir()
+                .join(format!("auracoder-gateway-workspace-{}", uuid::Uuid::new_v4()))
+                .to_string_lossy(),
+        )
+        .expect("workspace should be created");
+        let target_thread = crate::db::threads::create_thread(
+            &state.db,
+            &workspace.id,
+            "codex",
+            "model",
+            "Gateway direct call",
+        )
+        .expect("thread should be created");
+        crate::db::messages::insert_user_message(
+            &state.db,
+            &target_thread.id,
+            "one message",
+            None,
+            Some("codex"),
+            Some("model"),
+            None,
+        )
+        .expect("message should be inserted");
+        state.auracoder_thread_mcp_service.bind_engine_thread(
+            "codex",
+            "engine-thread",
+            &workspace.id,
+        );
+        gateway
+            .register_trusted_context(&lease.token, "engine-thread", "turn-1")
+            .await
+            .expect("trusted context should be registered");
+        let with_context = client
+            .post(format!("http://{address}/mcp"))
+            .bearer_auth(&lease.token)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_auracoder_thread_message_count",
+                    "arguments": {"thread_id": target_thread.id}
+                }
+            }))
+            .send()
+            .await
+            .expect("context tools/call request should complete");
+        let with_context_body: Value = with_context
+            .json()
+            .await
+            .expect("context tools/call response JSON");
+        assert_eq!(with_context_body["result"]["isError"], false);
+        let text = with_context_body["result"]["content"][0]["text"]
+            .as_str()
+            .expect("context tools/call text content");
+        let result: Value = serde_json::from_str(text).expect("context tool result JSON");
+        assert_eq!(result["message_count"], 1);
+        gateway.restart().await.expect("gateway should restart");
+        let old_generation = client
+            .post(format!(
+                "http://{}/mcp",
+                gateway.local_addr().await.expect("restarted address")
+            ))
+            .bearer_auth(&lease.token)
+            .json(&json!({"jsonrpc": "2.0", "id": 11, "method": "ping"}))
+            .send()
+            .await
+            .expect("old generation request should complete");
+        assert_eq!(old_generation.status(), reqwest::StatusCode::UNAUTHORIZED);
+        gateway.shutdown().await;
     }
 }

@@ -13,6 +13,7 @@ use anyhow::Context;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
+    cli_tools::{factory::CliToolFactory, CliLocationKind, CliMcpRuntime, CliTool},
     mcp_gateway::AuraCoderMcpGateway,
     message_notify_helper::CliHealthReconcileResult,
     ssh::cli_tunnel_registry::{self, SshCliTunnel},
@@ -33,6 +34,8 @@ pub(crate) struct SshCliService {
     cli_id: String,
     generation: u64,
     tunnel: Arc<SshCliTunnel>,
+    /// 当前生命周期服务登记到 Gateway 的 CLI MCP 实现。
+    cli: Arc<dyn CliTool>,
     /// 当前 SSH CLI 服务持有的 MCP Gateway 私有租约 Token。
     mcp_token: String,
     state: Mutex<SshCliServiceEntryState>,
@@ -155,6 +158,8 @@ pub(crate) struct SshCliServiceLifecycleRegistry {
     mutation_lock: Mutex<()>,
     /// 当前应用 MCP Gateway 的绑定引用，用于 SSH CLI 租约注册和撤销。
     mcp_gateway: RwLock<Option<Arc<AuraCoderMcpGateway>>>,
+    /// 创建 SSH CLI MCP 实现的统一工厂。
+    factory: RwLock<Option<Arc<CliToolFactory>>>,
 }
 
 static SSH_CLI_SERVICES: LazyLock<SshCliServiceLifecycleRegistry> =
@@ -162,8 +167,12 @@ static SSH_CLI_SERVICES: LazyLock<SshCliServiceLifecycleRegistry> =
 static NEXT_SERVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// 绑定 SSH 生命周期使用的 MCP Gateway，并同步绑定 Tunnel 注册表。
-pub(crate) async fn bind_mcp_gateway(gateway: Arc<AuraCoderMcpGateway>) {
+pub(crate) async fn bind_mcp_gateway(
+    gateway: Arc<AuraCoderMcpGateway>,
+    factory: Arc<CliToolFactory>,
+) {
     SSH_CLI_SERVICES.bind_mcp_gateway(gateway.clone()).await;
+    SSH_CLI_SERVICES.bind_factory(factory).await;
     cli_tunnel_registry::bind_mcp_gateway(gateway).await;
 }
 
@@ -312,6 +321,11 @@ impl SshCliServiceLifecycleRegistry {
         *self.mcp_gateway.write().await = Some(gateway);
     }
 
+    /// 保存创建 SSH CLI MCP 实现的统一工厂。
+    async fn bind_factory(&self, factory: Arc<CliToolFactory>) {
+        *self.factory.write().await = Some(factory);
+    }
+
     async fn list_ready(&self, connection_id: &str) -> Vec<Arc<SshCliService>> {
         let mut services = self
             .services
@@ -441,11 +455,24 @@ impl SshCliServiceLifecycleRegistry {
             .with_context(|| {
                 format!("启动 SSH CLI 服务失败: connection_id={connection_id} cli_id={cli_id}")
             })?;
+        let factory = self
+            .factory
+            .read()
+            .await
+            .clone()
+            .context("SSH CLI 服务尚未绑定 CLI Tool Factory")?;
+        let cli = factory.create_mcp_cli(
+            cli_id,
+            CliMcpRuntime {
+                cli_id: cli_id.to_string(),
+                location: CliLocationKind::Ssh,
+            },
+        )?;
         let mcp_lease = mcp_gateway
-            .register_ssh_remote_thread_client(
+            .register_client(
                 cli_id,
                 &format!("{connection_id}:{cli_id}"),
-                connection_id,
+                cli.clone(),
             )
             .await
             .map_err(|error| anyhow::anyhow!("注册 SSH CLI MCP 租约失败: {error}"))?;
@@ -470,6 +497,7 @@ impl SshCliServiceLifecycleRegistry {
             cli_id: cli_id.to_string(),
             generation: NEXT_SERVICE_GENERATION.fetch_add(1, Ordering::Relaxed),
             tunnel,
+            cli,
             mcp_token,
             state: Mutex::new(SshCliServiceEntryState::Ready),
         });

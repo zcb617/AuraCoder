@@ -2,7 +2,10 @@ pub mod claude_code;
 mod claude_code_session_lifecycle;
 pub mod codex;
 pub mod factory;
+mod mcp;
 pub mod opencode;
+
+pub(crate) use mcp::{BaseCliMcp, CliMcpRuntime};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -31,6 +34,59 @@ pub enum CliLocationKind {
     Local,
     /// 用户正在使用 SSH 远端项目。
     Ssh,
+}
+
+/// Gateway 注入的可信 MCP 调用上下文。
+///
+/// 这些字段只能由 Gateway 从已登记的 token 上下文构造，CLI 和模型提交的
+/// `_meta` 不得覆盖它们。
+#[derive(Debug, Clone)]
+pub struct McpInvocationContext {
+    /// 当前引擎线程的稳定标识，用于查询所属 AuraCoder 项目。
+    pub engine_thread_id: String,
+    /// 当前助手轮次的稳定标识，用于电脑操作授权和取消关联。
+    pub turn_id: String,
+}
+
+/// MCP 工具调用结果，统一承载成功内容或业务错误内容。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpToolResult {
+    /// MCP 标准内容块列表。
+    pub content: Vec<Value>,
+    /// 是否为业务错误结果；字段名遵循 MCP JSON 契约。
+    #[serde(rename = "isError")]
+    pub is_error: bool,
+}
+
+impl McpToolResult {
+    /// 将工具返回值包装为 MCP 成功内容；已有 content 数组保持原样。
+    pub(crate) fn success(value: Value) -> Self {
+        let content = value
+            .get("content")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| {
+                vec![serde_json::json!({
+                    "type": "text",
+                    "text": serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
+                })]
+            });
+        Self {
+            content,
+            is_error: false,
+        }
+    }
+
+    /// 将业务错误转换为 MCP 错误内容，并保留对外可读的错误语义。
+    pub(crate) fn error(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            content: vec![serde_json::json!({
+                "type": "text",
+                "text": format!("{code}: {}", message.into())
+            })],
+            is_error: true,
+        }
+    }
 }
 
 /// 当前 CLI 操作所属的 workspace 和机器目标。
@@ -201,6 +257,19 @@ pub trait CliTool: Send + Sync {
 
     /// 根据当前 CLI 已有能力决定页面显示哪些权限、沙箱和审批选项，避免用户选择该 CLI 不支持的操作。
     fn capabilities(&self) -> EngineCapabilities;
+
+    /// 返回当前 CLI 在当前固定运行位置支持的 MCP 工具目录。
+    fn list_mcp_tools(&self) -> Result<Vec<Value>, String>;
+
+    /// 在当前 CLI 中执行一个 MCP 工具；公共业务判断统一由 BaseCliMcp 完成。
+    async fn call_mcp_tool(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        context: McpInvocationContext,
+        call_id: String,
+        cancellation: CancellationToken,
+    ) -> McpToolResult;
 
     /// 用户按当前 CLI 和 workspace 选择本机或 SSH 执行目标，调用方无需依赖具体 CLI 实现。
     async fn execution_context(&self, workspace_id: Option<&str>) -> Result<CliExecutionContext>;

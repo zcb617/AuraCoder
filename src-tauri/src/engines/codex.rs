@@ -313,6 +313,10 @@ pub struct CodexEngine {
     state: Arc<Mutex<CodexState>>,
     transport_spawn_lock: Arc<Mutex<()>>,
     runtime_events: broadcast::Sender<CodexRuntimeEvent>,
+    /// 本地 Codex 子进程使用的 MCP Gateway Endpoint，仅在内存中保存。
+    mcp_gateway_endpoint: Arc<std::sync::Mutex<Option<String>>>,
+    /// 本地 Codex 子进程使用的 MCP Gateway token，仅在内存中保存且不写入日志。
+    mcp_gateway_token: Arc<std::sync::Mutex<Option<String>>>,
     computer_control_service:
         Arc<std::sync::Mutex<Option<Arc<crate::computer_control_service::ComputerControlService>>>>,
     /// AuraCoder 本地会话读取工具服务。
@@ -391,6 +395,8 @@ impl Default for CodexEngine {
             state: Arc::new(Mutex::new(CodexState::default())),
             transport_spawn_lock: Arc::new(Mutex::new(())),
             runtime_events,
+            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
+            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             transport_target: CodexTransportTarget::Local,
@@ -1685,6 +1691,16 @@ impl Engine for CodexEngine {
 }
 
 impl CodexEngine {
+    /// 设置本地 Codex 子进程连接 AuraCoder MCP Gateway 所需的 Endpoint 和 token。
+    pub fn set_mcp_gateway_connection(&self, endpoint: String, token: String) {
+        if let Ok(mut current) = self.mcp_gateway_endpoint.lock() {
+            *current = Some(endpoint);
+        }
+        if let Ok(mut current) = self.mcp_gateway_token.lock() {
+            *current = Some(token);
+        }
+    }
+
     pub fn set_computer_control_service(
         &self,
         service: Arc<crate::computer_control_service::ComputerControlService>,
@@ -1729,6 +1745,8 @@ impl CodexEngine {
             state: Arc::new(Mutex::new(CodexState::default())),
             transport_spawn_lock: Arc::new(Mutex::new(())),
             runtime_events,
+            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
+            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             transport_target: CodexTransportTarget::WebSocket(url),
@@ -3087,13 +3105,39 @@ impl CodexEngine {
             CodexTransportTarget::WebSocket(_) => None,
         };
 
+        let (mcp_gateway_endpoint, mcp_gateway_token) = match &self.transport_target {
+            CodexTransportTarget::Local => {
+                let endpoint = self
+                    .mcp_gateway_endpoint
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Codex MCP Gateway Endpoint 状态已损坏"))?
+                    .clone();
+                let token = self
+                    .mcp_gateway_token
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Codex MCP Gateway token 状态已损坏"))?
+                    .clone();
+                anyhow::ensure!(
+                    endpoint.is_some() == token.is_some(),
+                    "Codex 的 AuraCoder MCP 配置不完整"
+                );
+                (endpoint, token)
+            }
+            CodexTransportTarget::WebSocket(_) => (None, None),
+        };
+
         let mut backoff = TRANSPORT_RESTART_BASE_BACKOFF;
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..TRANSPORT_RESTART_MAX_ATTEMPTS {
             let transport = match (&self.transport_target, codex_executable.as_deref()) {
                 (CodexTransportTarget::Local, Some(executable)) => {
-                    CodexTransport::spawn(executable).await
+                    CodexTransport::spawn(
+                        executable,
+                        mcp_gateway_endpoint.as_deref(),
+                        mcp_gateway_token.as_deref(),
+                    )
+                    .await
                 }
                 (CodexTransportTarget::WebSocket(url), _) => {
                     CodexTransport::connect_websocket(url).await

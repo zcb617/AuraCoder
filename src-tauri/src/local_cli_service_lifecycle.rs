@@ -14,6 +14,7 @@ use crate::engines::{
     claude_sidecar::ClaudeSidecarEngine, codex::CodexEngine, opencode::OpenCodeEngine,
 };
 use crate::{
+    cli_tools::{factory::CliToolFactory, CliLocationKind, CliMcpRuntime, CliTool},
     commands::harness::detect_via_login_shell, mcp_gateway::AuraCoderMcpGateway,
     message_notify_helper::CliHealthReconcileResult, runtime_env,
 };
@@ -38,6 +39,8 @@ pub(crate) struct LocalCliService {
     cli_id: String,
     generation: u64,
     handle: LocalCliHandle,
+    /// 当前生命周期服务登记到 Gateway 的 CLI MCP 实现。
+    cli: Arc<dyn CliTool>,
     /// 当前本地 CLI 服务持有的 MCP Gateway 私有租约 Token。
     mcp_token: String,
     state: Mutex<LocalCliServiceEntryState>,
@@ -64,6 +67,8 @@ struct LocalCliServiceLifecycleRegistry {
     mutation_lock: Mutex<()>,
     /// 当前应用 MCP Gateway 的绑定引用，用于本地 CLI 租约注册和撤销。
     mcp_gateway: RwLock<Option<Arc<AuraCoderMcpGateway>>>,
+    /// 创建本机 CLI MCP 实现的统一工厂。
+    factory: RwLock<Option<Arc<CliToolFactory>>>,
 }
 
 static LOCAL_CLI_SERVICES: LazyLock<LocalCliServiceLifecycleRegistry> =
@@ -81,8 +86,12 @@ pub(crate) struct LocalCliServiceLifecycle;
 
 impl LocalCliServiceLifecycle {
     /// 绑定本地 CLI 生命周期使用的 MCP Gateway。
-    pub(crate) async fn bind_mcp_gateway(gateway: Arc<AuraCoderMcpGateway>) {
+    pub(crate) async fn bind_mcp_gateway(
+        gateway: Arc<AuraCoderMcpGateway>,
+        factory: Arc<CliToolFactory>,
+    ) {
         *LOCAL_CLI_SERVICES.mcp_gateway.write().await = Some(gateway);
+        *LOCAL_CLI_SERVICES.factory.write().await = Some(factory);
     }
 
     /// 为本地 CLI 当前轮次登记 AuraCoder MCP Gateway 可信上下文。
@@ -309,8 +318,21 @@ impl LocalCliServiceLifecycleRegistry {
             .await
             .clone()
             .context("本地 CLI 服务尚未绑定 MCP Gateway")?;
+        let factory = self
+            .factory
+            .read()
+            .await
+            .clone()
+            .context("本地 CLI 服务尚未绑定 CLI Tool Factory")?;
+        let cli = factory.create_mcp_cli(
+            cli_id,
+            CliMcpRuntime {
+                cli_id: cli_id.to_string(),
+                location: CliLocationKind::Local,
+            },
+        )?;
         let mcp_lease = gateway
-            .register_local_client(cli_id, cli_id)
+            .register_client(cli_id, cli_id, cli.clone())
             .await
             .map_err(|error| anyhow::anyhow!("注册本地 CLI MCP 租约失败: {error}"))?;
         let endpoint = match gateway.endpoint().await {
@@ -363,6 +385,7 @@ impl LocalCliServiceLifecycleRegistry {
             cli_id: cli_id.to_string(),
             generation: NEXT_SERVICE_GENERATION.fetch_add(1, Ordering::Relaxed),
             handle,
+            cli,
             mcp_token: mcp_lease.token.clone(),
             state: Mutex::new(LocalCliServiceEntryState::Ready),
         });
@@ -449,9 +472,17 @@ mod tests {
     use crate::{
         auracoder_thread_mcp_service::AuraCoderThreadMcpService,
         computer_control_service::ComputerControlService,
+        config::app_config::AppConfig,
         db::Database,
+        engines::EngineManager,
         engines::opencode::OpenCodeEngine,
+        git::{repo::FileTreeCache, watcher::GitWatcherManager},
         mcp_gateway::AuraCoderMcpGateway,
+        power::KeepAwakeManager,
+        scheduled_tasks::ScheduledTaskManager,
+        state::{AppState, TurnManager},
+        terminal::TerminalManager,
+        terminal_notifications::TerminalNotificationManager,
     };
     use std::sync::Arc;
     use tokio::sync::{Mutex, RwLock};
@@ -462,13 +493,38 @@ mod tests {
             "auracoder-local-cli-lifecycle-{}.db",
             uuid::Uuid::new_v4()
         ));
-        let db = Database::open(path).expect("test database should open");
-        let gateway = Arc::new(AuraCoderMcpGateway::new(
-            Arc::new(ComputerControlService::default()),
-            Arc::new(AuraCoderThreadMcpService::new(db)),
-        ));
+        let _db = Database::open(path).expect("test database should open");
+        let gateway = Arc::new(AuraCoderMcpGateway::new());
         gateway.start().await.expect("test gateway should start");
         gateway
+    }
+
+    /// 构造本地生命周期测试使用的完整应用状态。
+    fn test_app_state() -> AppState {
+        let root = std::env::temp_dir().join(format!("auracoder-local-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("failed to create local state root");
+        let db = Database::open(root.join("workspaces.db")).expect("failed to create local state db");
+        AppState {
+            db: db.clone(),
+            config: Arc::new(AppConfig::default()),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            engines: Arc::new(EngineManager::new()),
+            git_watchers: Arc::new(GitWatcherManager::default()),
+            terminals: Arc::new(TerminalManager::default()),
+            notifications: Arc::new(TerminalNotificationManager::default()),
+            keep_awake: Arc::new(KeepAwakeManager::new()),
+            turns: Arc::new(TurnManager::default()),
+            file_tree_cache: Arc::new(FileTreeCache::new()),
+            extension_catalog_refreshes: Arc::new(
+                crate::extensions::refresh::ExtensionCatalogRefreshManager::default(),
+            ),
+            scheduled_tasks: Arc::new(ScheduledTaskManager::new()),
+            computer_control_service: Arc::new(ComputerControlService::default()),
+            auracoder_thread_mcp_service: Arc::new(AuraCoderThreadMcpService::new(db)),
+            mcp_gateway: Arc::new(AuraCoderMcpGateway::new()),
+            remote_access: Arc::new(crate::remote::RemoteTunnelManager::default()),
+            ssh_monitor: Arc::new(crate::ssh::monitor::SshConnectionMonitor::default()),
+        }
     }
 
     /// 将测试用 Ready OpenCode 服务放入独立生命周期 Registry，隔离全局服务状态。
@@ -481,6 +537,7 @@ mod tests {
             resource_dir: RwLock::new(None),
             mutation_lock: Mutex::new(()),
             mcp_gateway: RwLock::new(Some(gateway)),
+            factory: RwLock::new(None),
         };
         registry.services.write().await.insert(
             "opencode".to_string(),
@@ -488,6 +545,7 @@ mod tests {
                 cli_id: "opencode".to_string(),
                 generation: 1,
                 handle: LocalCliHandle::OpenCode(Arc::new(OpenCodeEngine::default())),
+                cli: Arc::new(crate::cli_tools::opencode::OpenCodeCli::new(test_app_state())),
                 mcp_token: token,
                 state: Mutex::new(LocalCliServiceEntryState::Ready),
             }),
@@ -500,7 +558,11 @@ mod tests {
     async fn ready_opencode_service_registers_and_clears_mcp_context() {
         let gateway = test_gateway().await;
         let lease = gateway
-            .register_local_client("opencode", "opencode")
+            .register_client(
+                "opencode",
+                "opencode",
+                Arc::new(crate::cli_tools::opencode::OpenCodeCli::new(test_app_state())),
+            )
             .await
             .expect("OpenCode test lease should be issued");
         let token = lease.token.clone();
@@ -537,7 +599,11 @@ mod tests {
 
         let gateway = test_gateway().await;
         let lease = gateway
-            .register_local_client("opencode", "opencode")
+            .register_client(
+                "opencode",
+                "opencode",
+                Arc::new(crate::cli_tools::opencode::OpenCodeCli::new(test_app_state())),
+            )
             .await
             .expect("OpenCode test lease should be issued");
         let token = lease.token.clone();

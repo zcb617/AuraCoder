@@ -7,12 +7,13 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::{
+    BaseCliMcp,
     claude_code_session_lifecycle::{
         shared_claude_code_session_handles, ClaudeCodeSessionHandleRegistry,
     },
-    CliExecutionContext, CliForkedThread, CliLocationKind, CliReviewStarted,
+    CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime, CliReviewStarted,
     CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError, CliSessionSnapshot,
-    CliTool,
+    CliTool, McpInvocationContext, McpToolResult,
 };
 use crate::{
     config::app_config::ClaudeCodeSessionMode,
@@ -283,6 +284,8 @@ fn raw_permissions_value(
 
 /// Claude Code 对统一 CLI 操作接口的实现。
 pub struct ClaudeCodeCli {
+    /// 当前 Claude Code 共用的 MCP 业务实现。
+    mcp: BaseCliMcp,
     state: AppState,
     remote_turn_use:
         Arc<Mutex<Option<remote_project_claude_runtime_service::RemoteClaudeServiceUse>>>,
@@ -299,6 +302,7 @@ fn matches_claude_session_search(session: &ClaudeSessionSummary, query: Option<&
 impl Clone for ClaudeCodeCli {
     fn clone(&self) -> Self {
         Self {
+            mcp: self.mcp.clone(),
             state: self.state.clone(),
             remote_turn_use: self.remote_turn_use.clone(),
             session_handles: self.session_handles.clone(),
@@ -308,7 +312,20 @@ impl Clone for ClaudeCodeCli {
 
 impl ClaudeCodeCli {
     pub fn new(state: AppState) -> Self {
+        Self::with_mcp_runtime(
+            state,
+            CliMcpRuntime {
+                cli_id: "claude".to_string(),
+                location: CliLocationKind::Local,
+            },
+        )
+    }
+
+    /// 按 Factory 指定的本机或 SSH 运行位置创建 Claude Code MCP 实现。
+    pub(crate) fn with_mcp_runtime(state: AppState, runtime: CliMcpRuntime) -> Self {
+        let mcp = BaseCliMcp::new(state.clone(), runtime);
         Self {
+            mcp,
             state,
             remote_turn_use: Arc::new(Mutex::new(None)),
             session_handles: shared_claude_code_session_handles(),
@@ -641,6 +658,25 @@ impl CliTool for ClaudeCodeCli {
 
     fn capabilities(&self) -> EngineCapabilities {
         capabilities_for_engine("claude")
+    }
+
+    /// 返回 Claude Code 当前运行位置可用的 MCP 工具目录。
+    fn list_mcp_tools(&self) -> Result<Vec<Value>, String> {
+        self.mcp.list_mcp_tools()
+    }
+
+    /// 将 Claude Code MCP 调用委托给公共 BaseCliMcp 实现。
+    async fn call_mcp_tool(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        context: McpInvocationContext,
+        call_id: String,
+        cancellation: CancellationToken,
+    ) -> McpToolResult {
+        self.mcp
+            .call_mcp_tool(tool_name, arguments, context, call_id, cancellation)
+            .await
     }
 
     async fn execution_context(&self, workspace_id: Option<&str>) -> Result<CliExecutionContext> {
@@ -1856,12 +1892,7 @@ mod tests {
             auracoder_thread_mcp_service: Arc::new(
                 crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()),
             ),
-            mcp_gateway: Arc::new(crate::mcp_gateway::AuraCoderMcpGateway::new(
-                Arc::new(crate::computer_control_service::ComputerControlService::default()),
-                Arc::new(
-                    crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()),
-                ),
-            )),
+            mcp_gateway: Arc::new(crate::mcp_gateway::AuraCoderMcpGateway::new()),
             remote_access: Arc::new(crate::remote::RemoteTunnelManager::default()),
             ssh_monitor: Arc::new(crate::ssh::monitor::SshConnectionMonitor::default()),
         }

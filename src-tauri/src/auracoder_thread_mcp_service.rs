@@ -103,6 +103,74 @@ impl AuraCoderThreadMcpService {
         }
     }
 
+    /// 查询可信引擎线程登记的 AuraCoder 项目范围。
+    pub fn workspace_for_engine_thread(
+        &self,
+        engine_id: &str,
+        engine_thread_id: &str,
+    ) -> Result<String, String> {
+        let bindings = self
+            .bindings
+            .lock()
+            .map_err(|_| "AuraCoder 会话工具来源登记不可用".to_string())?;
+        bindings
+            .get(&(engine_id.trim().to_string(), engine_thread_id.trim().to_string()))
+            .cloned()
+            .ok_or_else(|| "当前引擎线程尚未登记 AuraCoder 项目范围".to_string())
+    }
+
+    /// 读取目标 AuraCoder 会话所属的项目，不判断调用方是否有权访问。
+    pub async fn thread_workspace(&self, thread_id: &str) -> Result<Option<String>, String> {
+        let db = self.db.clone();
+        let thread_id = thread_id.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            threads::get_thread(&db, &thread_id)
+                .map_err(|error| error.to_string())
+                .map(|thread| thread.map(|value| value.workspace_id))
+        })
+        .await
+        .map_err(|error| format!("AuraCoder 会话项目查询任务失败：{error}"))?
+    }
+
+    /// 读取目标 AuraCoder 会话的消息数量，不判断调用方是否有权访问。
+    pub async fn thread_message_count(&self, thread_id: &str) -> Result<Value, String> {
+        let db = self.db.clone();
+        let thread_id = thread_id.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            let message_count = messages::count_thread_messages(&db, &thread_id)
+                .map_err(|error| error.to_string())?;
+            Ok(json!({
+                "thread_id": thread_id,
+                "message_count": message_count
+            }))
+        })
+        .await
+        .map_err(|error| format!("AuraCoder 会话消息数量查询任务失败：{error}"))?
+    }
+
+    /// 按创建时间倒序分页读取目标 AuraCoder 会话消息，不判断调用方是否有权访问。
+    pub async fn thread_messages_page(
+        &self,
+        thread_id: &str,
+        page: u64,
+        page_size: u64,
+    ) -> Result<Value, String> {
+        let db = self.db.clone();
+        let thread_id = thread_id.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            let records = messages::get_thread_messages_page_desc(&db, &thread_id, page, page_size)
+                .map_err(|error| error.to_string())?;
+            Ok(json!({
+                "thread_id": thread_id,
+                "page": page,
+                "page_size": page_size,
+                "messages": records
+            }))
+        })
+        .await
+        .map_err(|error| format!("AuraCoder 会话消息分页查询任务失败：{error}"))?
+    }
+
     /// 按引擎来源读取一个会话工具。
     pub async fn invoke_for_engine(
         &self,

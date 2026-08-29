@@ -7,9 +7,10 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    CliExecutionContext, CliForkedThread, CliLocationKind, CliReviewStarted,
+    BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
+    CliReviewStarted,
     CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError, CliSessionSnapshot,
-    CliTool,
+    CliTool, McpInvocationContext, McpToolResult,
 };
 use crate::{
     db,
@@ -155,13 +156,28 @@ fn raw_permissions_value(
 /// 服务和生命周期入口。任何远端操作失败时都直接返回错误，不会改用本机 Codex。
 #[derive(Clone)]
 pub struct CodexCli {
+    /// 当前 Codex 共用的 MCP 业务实现。
+    mcp: BaseCliMcp,
     state: AppState,
     remote_turn_use: Arc<Mutex<Option<Arc<CodexEngine>>>>,
 }
 
 impl CodexCli {
     pub fn new(state: AppState) -> Self {
+        Self::with_mcp_runtime(
+            state,
+            CliMcpRuntime {
+                cli_id: "codex".to_string(),
+                location: CliLocationKind::Local,
+            },
+        )
+    }
+
+    /// 按 Factory 指定的本机或 SSH 运行位置创建 Codex MCP 实现。
+    pub(crate) fn with_mcp_runtime(state: AppState, runtime: CliMcpRuntime) -> Self {
+        let mcp = BaseCliMcp::new(state.clone(), runtime);
         Self {
+            mcp,
             state,
             remote_turn_use: Arc::new(Mutex::new(None)),
         }
@@ -570,6 +586,25 @@ impl CliTool for CodexCli {
 
     fn capabilities(&self) -> EngineCapabilities {
         capabilities_for_engine("codex")
+    }
+
+    /// 返回 Codex 当前运行位置可用的 MCP 工具目录。
+    fn list_mcp_tools(&self) -> Result<Vec<Value>, String> {
+        self.mcp.list_mcp_tools()
+    }
+
+    /// 将 Codex MCP 调用委托给公共 BaseCliMcp 实现。
+    async fn call_mcp_tool(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+        context: McpInvocationContext,
+        call_id: String,
+        cancellation: CancellationToken,
+    ) -> McpToolResult {
+        self.mcp
+            .call_mcp_tool(tool_name, arguments, context, call_id, cancellation)
+            .await
     }
 
     async fn execution_context(&self, workspace_id: Option<&str>) -> Result<CliExecutionContext> {

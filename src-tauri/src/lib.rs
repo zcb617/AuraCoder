@@ -143,10 +143,7 @@ pub fn run() {
     ));
     let auracoder_thread_mcp_service =
         Arc::new(auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()));
-    let mcp_gateway = Arc::new(mcp_gateway::AuraCoderMcpGateway::new(
-        computer_control_service.clone(),
-        auracoder_thread_mcp_service.clone(),
-    ));
+    let mcp_gateway = Arc::new(mcp_gateway::AuraCoderMcpGateway::new());
 
     let app_state = AppState {
         db,
@@ -261,10 +258,12 @@ pub fn run() {
             tauri::async_runtime::block_on(
                 local_cli_service_lifecycle::LocalCliServiceLifecycle::bind_mcp_gateway(
                     state.mcp_gateway.clone(),
+                    Arc::new(cli_tools::factory::CliToolFactory::new(state.clone())),
                 ),
             );
             tauri::async_runtime::block_on(ssh::cli_service_lifecycle::bind_mcp_gateway(
                 state.mcp_gateway.clone(),
+                Arc::new(cli_tools::factory::CliToolFactory::new(state.clone())),
             ));
             if let Err(error) =
                 tauri::async_runtime::block_on(state.notifications.start(handle.clone()))

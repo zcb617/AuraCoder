@@ -63,6 +63,10 @@ static LAST_OPENCODE_MESSAGE_SORT_VALUE: AtomicU64 = AtomicU64::new(0);
 pub struct OpenCodeEngine {
     state: Arc<Mutex<OpenCodeState>>,
     http: reqwest::Client,
+    /// 本地 OpenCode 实例使用的 MCP Gateway Endpoint，仅在内存中保存。
+    mcp_gateway_endpoint: Arc<std::sync::Mutex<Option<String>>>,
+    /// 本地 OpenCode 实例使用的 MCP Gateway token，仅在内存中保存且不写入日志。
+    mcp_gateway_token: Arc<std::sync::Mutex<Option<String>>>,
     computer_control_service: Arc<std::sync::Mutex<Option<Arc<ComputerControlService>>>>,
     /// AuraCoder 本地会话读取工具服务。
     auracoder_thread_mcp_service: Arc<std::sync::Mutex<Option<Arc<AuraCoderThreadMcpService>>>>,
@@ -648,6 +652,8 @@ impl Default for OpenCodeEngine {
         Self {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
+            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
+            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Local,
@@ -1082,6 +1088,16 @@ impl Engine for OpenCodeEngine {
 }
 
 impl OpenCodeEngine {
+    /// 设置本地 OpenCode 实例连接 AuraCoder MCP Gateway 所需的 Endpoint 和 token。
+    pub fn set_mcp_gateway_connection(&self, endpoint: String, token: String) {
+        if let Ok(mut current) = self.mcp_gateway_endpoint.lock() {
+            *current = Some(endpoint);
+        }
+        if let Ok(mut current) = self.mcp_gateway_token.lock() {
+            *current = Some(token);
+        }
+    }
+
     pub fn set_computer_control_service(&self, service: Arc<ComputerControlService>) {
         if let Ok(mut current) = self.computer_control_service.lock() {
             *current = Some(service);
@@ -1109,6 +1125,8 @@ impl OpenCodeEngine {
         Self {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
+            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
+            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
@@ -1131,17 +1149,21 @@ impl OpenCodeEngine {
 
         let created = Arc::new(match &self.target {
             OpenCodeTransportTarget::Local => {
-                let service = self
-                    .computer_control_service
+                let endpoint = self
+                    .mcp_gateway_endpoint
                     .lock()
-                    .ok()
-                    .and_then(|service| service.clone());
-                let auracoder_thread_service = self
-                    .auracoder_thread_mcp_service
+                    .map_err(|_| anyhow::anyhow!("OpenCode MCP Gateway Endpoint 状态已损坏"))?
+                    .clone();
+                let token = self
+                    .mcp_gateway_token
                     .lock()
-                    .ok()
-                    .and_then(|service| service.clone());
-                start_server(cwd, service, auracoder_thread_service).await?
+                    .map_err(|_| anyhow::anyhow!("OpenCode MCP Gateway token 状态已损坏"))?
+                    .clone();
+                anyhow::ensure!(
+                    endpoint.is_some() == token.is_some(),
+                    "OpenCode 的 AuraCoder MCP 配置不完整"
+                );
+                start_server(cwd, endpoint.as_deref(), token.as_deref()).await?
             }
             OpenCodeTransportTarget::Remote(endpoint) => OpenCodeServer {
                 cwd: cwd.to_string(),
@@ -3605,39 +3627,66 @@ async fn write_opencode_http_response(stream: &mut tokio::net::TcpStream, status
 
 async fn start_server(
     cwd: &str,
-    computer_control_service: Option<Arc<ComputerControlService>>,
-    auracoder_thread_mcp_service: Option<Arc<AuraCoderThreadMcpService>>,
+    mcp_gateway_endpoint: Option<&str>,
+    mcp_gateway_token: Option<&str>,
 ) -> Result<OpenCodeServer> {
     let executable = resolve_opencode_executable().context("`opencode` executable not found")?;
     let port = allocate_loopback_port()?;
     let password = Uuid::new_v4().to_string();
-    let callback_token = Uuid::new_v4().to_string();
     let run_dir = runtime_env::app_data_dir()
         .join("computer-control")
         .join("opencode-runs")
         .join(Uuid::new_v4().to_string());
     std::fs::create_dir_all(&run_dir)
         .with_context(|| format!("failed to create OpenCode runtime directory {}", run_dir.display()))?;
-    let callback_listener = AsyncTcpListener::bind((DEFAULT_HOST, 0)).await?;
-    let callback_url = format!("http://{DEFAULT_HOST}:{}/invoke", callback_listener.local_addr()?.port());
-    let tool_specs = match computer_control_service.as_ref() {
-        Some(service) => service.sdk_tool_specs().map_err(anyhow::Error::msg)?,
-        None => Vec::new(),
-    };
-    write_opencode_computer_control_tool(&run_dir, &callback_url, &callback_token, &tool_specs)?;
-    if auracoder_thread_mcp_service.is_some() {
-        let auracoder_specs = auracoder_thread_mcp_service
-            .as_ref()
-            .expect("checked AuraCoder 会话服务存在")
-            .tool_specs();
-        write_opencode_auracoder_thread_mcp_tool(
-            &run_dir,
-            &callback_url,
-            &callback_token,
-            &auracoder_specs,
-        )?;
+    let config_dir = run_dir.join(".opencode");
+    std::fs::create_dir_all(&config_dir).with_context(|| {
+        format!(
+            "failed to create isolated OpenCode config directory {}",
+            config_dir.display()
+        )
+    })?;
+    anyhow::ensure!(
+        mcp_gateway_endpoint.is_some() == mcp_gateway_token.is_some(),
+        "OpenCode 的 AuraCoder MCP 配置不完整"
+    );
+    if let (Some(endpoint), Some(token)) = (mcp_gateway_endpoint, mcp_gateway_token) {
+        let config_path = config_dir.join("opencode.json");
+        let mut config = if config_path.is_file() {
+            let raw = std::fs::read_to_string(&config_path).with_context(|| {
+                format!("failed to read isolated OpenCode config {}", config_path.display())
+            })?;
+            serde_json::from_str::<Value>(&raw).with_context(|| {
+                format!("isolated OpenCode config is invalid JSON: {}", config_path.display())
+            })?
+        } else {
+            Value::Object(serde_json::Map::new())
+        };
+        let config_object = config
+            .as_object_mut()
+            .context("isolated OpenCode config must be a JSON object")?;
+        let mcp_object = config_object
+            .entry("mcp".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .context("isolated OpenCode mcp config must be a JSON object")?;
+        let gateway_config = runtime_env::opencode_mcp_gateway_authenticated_config(
+            endpoint,
+            &format!("Bearer {token}"),
+        );
+        let gateway_entry = gateway_config
+            .get("mcp")
+            .and_then(Value::as_object)
+            .and_then(|mcp| mcp.get("auracoder"))
+            .cloned()
+            .context("OpenCode MCP Gateway 配置生成失败")?;
+        mcp_object.insert("auracoder".to_string(), gateway_entry);
+        let encoded = serde_json::to_vec_pretty(&config)
+            .context("failed to serialize isolated OpenCode MCP config")?;
+        std::fs::write(&config_path, encoded).with_context(|| {
+            format!("failed to write isolated OpenCode config {}", config_path.display())
+        })?;
     }
-    let callback_cancel = CancellationToken::new();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<String>();
 
     let mut command = Command::new(&executable);
@@ -3713,6 +3762,8 @@ async fn start_server(
     let (event_bus, _) =
         broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
     let pump_cancel = CancellationToken::new();
+    // 保留服务器结构中的取消令牌；旧 callback 服务器已停用，不再启动额外回调任务。
+    let callback_cancel = CancellationToken::new();
     let server = OpenCodeServer {
         cwd: cwd.to_string(),
         base_url,
@@ -3734,13 +3785,7 @@ async fn start_server(
         run_event_pump(pump_url, pump_password, pump_http, event_bus, pump_cancel).await;
     });
 
-    tokio::spawn(run_opencode_callback_server(
-        callback_listener,
-        callback_token,
-        computer_control_service,
-        auracoder_thread_mcp_service,
-        callback_cancel,
-    ));
+    // 旧 callback 工具服务器和动态工具文件已停用，MCP 请求统一经过 Gateway。
 
     Ok(server)
 }
@@ -4314,6 +4359,8 @@ mod tests {
         OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
+            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
+            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
@@ -4521,6 +4568,8 @@ mod tests {
         let engine = OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
+            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
+            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
@@ -4558,6 +4607,8 @@ mod tests {
         let engine = OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
+            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
+            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
@@ -4626,6 +4677,8 @@ mod tests {
         let engine = OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
+            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
+            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
@@ -4770,6 +4823,8 @@ mod tests {
         let engine = OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
+            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
+            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
@@ -5524,7 +5579,7 @@ opencode/gpt-5-nano
             let specs = service.sdk_tool_specs().map_err(anyhow::Error::msg)?;
             anyhow::ensure!(!specs.is_empty(), "CUA tool catalog is empty");
             std::fs::create_dir_all(&run_dir)?;
-            server = Some(start_server(&run_dir.to_string_lossy(), Some(service), None).await?);
+            server = Some(start_server(&run_dir.to_string_lossy(), None, None).await?);
             let active_server = server
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("OpenCode server was not created"))?;

@@ -683,28 +683,163 @@ struct AuthorizationState {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComputerControlAuthorization {
+    /// 当前授权请求的稳定标识，供用户响应或撤销授权时关联。
     pub request_id: String,
+    /// 发起电脑操作的 CLI 标识。
     pub agent: String,
+    /// 请求执行的 CUA 工具名称。
     pub tool: String,
+    /// 当前 MCP 调用的稳定标识。
     pub call_id: String,
+    /// 授权提示中展示的目标应用或资源名称。
     pub application: String,
+    /// 电脑操作的业务类别。
     pub operation: String,
+    /// 授权作用域。
     pub scope: String,
+    /// 发起授权的引擎线程标识。
     pub thread_id: String,
+    /// 发起授权的助手轮次标识。
     pub turn_id: String,
 }
 
+/// 为 BaseCliMcp 暴露既有电脑工具业务作用域分类。
+pub(crate) fn mcp_operation_kind(tool: &str) -> &'static str {
+    operation_kind(tool)
+}
+
+/// 为 BaseCliMcp 暴露既有电脑目标解析结果；该方法不判断运行位置或授权状态。
+pub(crate) fn resolve_mcp_target(tool: &str, arguments: &Value) -> Result<TargetResource, String> {
+    target_resource(tool, arguments)
+}
+
+/// 为 BaseCliMcp 暴露当前进程目标判定；该方法不改变授权状态。
+pub(crate) fn mcp_request_targets_current_process(arguments: &Value) -> bool {
+    request_targets_current_process(arguments)
+}
+
+/// 判断名称是否属于当前 CUA SDK 支持的电脑工具集合，即使 SDK 暂时不可用也能使用。
+pub(crate) fn is_known_mcp_computer_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "list_apps"
+            | "list_windows"
+            | "get_window_state"
+            | "get_accessibility_tree"
+            | "verify_state"
+            | "get_screen_size"
+            | "get_cursor_position"
+            | "health_report"
+            | "get_session_state"
+            | "click"
+            | "double_click"
+            | "right_click"
+            | "drag"
+            | "type_text"
+            | "press_key"
+            | "hotkey"
+            | "set_value"
+            | "invoke_menu"
+            | "scroll"
+            | "move_cursor"
+            | "zoom"
+            | "start_session"
+            | "end_session"
+            | "launch_app"
+            | "clipboard_read"
+            | "clipboard_write"
+    )
+}
+
 #[derive(Debug, Clone)]
-struct TargetResource {
-    key: String,
-    display: String,
-    scope: &'static str,
+pub(crate) struct TargetResource {
+    /// 用于持久授权匹配的稳定目标键。
+    pub(crate) key: String,
+    /// 用户授权提示中展示的目标名称。
+    pub(crate) display: String,
+    /// 当前电脑工具的业务作用域。
+    pub(crate) scope: &'static str,
 }
 
 pub struct ComputerControlService {
     sdk: Arc<CuaDriverSdk>,
     state: Mutex<AuthorizationState>,
     app_handle: StdMutex<Option<AppHandle>>,
+}
+
+/// CUA SDK 电脑工具的纯执行入口。
+///
+/// 该对象只负责读取 SDK 工具规格和执行 SDK 调用，不判断运行位置、开关、
+/// 目标范围或授权状态；这些业务判断由 `BaseCliMcp` 统一完成。
+pub struct ComputerControlTool {
+    /// 当前应用共享的 CUA SDK 执行依赖。
+    sdk: Arc<CuaDriverSdk>,
+}
+
+impl ComputerControlTool {
+    /// 创建绑定指定 CUA SDK 的纯电脑工具执行入口。
+    pub fn new(sdk: Arc<CuaDriverSdk>) -> Self {
+        Self { sdk }
+    }
+
+    /// 读取 CUA SDK 当前提供的电脑工具规格。
+    pub fn tool_specs(&self) -> Result<Vec<Value>, String> {
+        if !self.sdk.status().initialized {
+            return Err(service_error("sdk_unavailable", "CUA SDK 尚未就绪"));
+        }
+        let catalog = self.sdk.list_tools()?;
+        let catalog_tools = catalog
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| service_error("sdk_invalid_catalog", "CUA SDK 的工具目录没有 tools 数组"))?;
+        let mut tools = Vec::new();
+        for spec in catalog_tools {
+            let name = spec
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| service_error("sdk_invalid_catalog", "CUA SDK 工具缺少 name"))?;
+            let description = spec
+                .get("description")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    service_error(
+                        "sdk_invalid_catalog",
+                        &format!("CUA SDK 工具 `{name}` 缺少 description"),
+                    )
+                })?;
+            let input_schema = spec
+                .get("inputSchema")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    service_error(
+                        "sdk_invalid_catalog",
+                        &format!("CUA SDK 工具 `{name}` 的 inputSchema 不是 JSON 对象"),
+                    )
+                })?;
+            tools.push(json!({
+                "name": name,
+                "description": description,
+                "inputSchema": input_schema,
+            }));
+        }
+        if tools.is_empty() {
+            return Err(service_error(
+                "sdk_invalid_catalog",
+                "CUA SDK 未返回任何电脑操作工具",
+            ));
+        }
+        Ok(tools)
+    }
+
+    /// 返回 CUA SDK 是否已经完成初始化，供 BaseCliMcp 执行前检查。
+    pub fn sdk_ready(&self) -> bool {
+        self.sdk.status().initialized
+    }
+
+    /// 直接执行指定 CUA SDK 电脑工具，不附加任何授权和运行位置判断。
+    pub fn execute(&self, tool_name: &str, arguments: Value) -> Result<Value, String> {
+        self.sdk.invoke(tool_name, &arguments)
+    }
 }
 
 impl ComputerControlService {
@@ -875,7 +1010,8 @@ impl ComputerControlService {
         revoked || pending_was_cancelled
     }
 
-    fn has_persistent_authorization(target_key: &str) -> bool {
+    /// 判断指定电脑目标是否已有持久授权；不改变授权状态。
+    pub fn has_persistent_authorization(&self, target_key: &str) -> bool {
         AppConfig::load_or_create()
             .map(|config| {
                 config
@@ -885,6 +1021,54 @@ impl ComputerControlService {
                     .any(|authorization| authorization_matches_target(authorization, target_key))
             })
             .unwrap_or(false)
+    }
+
+    /// 请求用户确认一个已经由 BaseCliMcp 完成目标范围判断的电脑操作。
+    pub async fn request_authorization(
+        &self,
+        authorization: ComputerControlAuthorization,
+        target_key: String,
+        cancellation: CancellationToken,
+    ) -> Result<(), String> {
+        let request_id = authorization.request_id.clone();
+        let (response_tx, response_rx) = oneshot::channel();
+        {
+            let mut state = self.state.lock().await;
+            state.pending.insert(
+                request_id.clone(),
+                PendingAuthorization {
+                    target_key,
+                    authorization: authorization.clone(),
+                    response: response_tx,
+                },
+            );
+        }
+        let emit_result = self
+            .app_handle
+            .lock()
+            .map_err(|_| "电脑操作授权窗口状态已损坏".to_string())?
+            .as_ref()
+            .ok_or_else(|| "AuraCoder 窗口尚未就绪，无法发起电脑操作授权".to_string())?
+            .emit(COMPUTER_CONTROL_APPROVAL_EVENT, authorization);
+        if let Err(error) = emit_result {
+            self.state.lock().await.pending.remove(&request_id);
+            return Err(service_error(
+                "authorization_required",
+                &format!("无法显示电脑操作授权窗口：{error}"),
+            ));
+        }
+
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => Err(service_error("request_timeout", "电脑操作任务已取消")),
+            result = timeout(APPROVAL_TIMEOUT, response_rx) => match result {
+                Ok(Ok(true)) => Ok(()),
+                Ok(Ok(false)) => Err(service_error("permission_denied", "用户拒绝了电脑操作授权")),
+                Ok(Err(_)) => Err(service_error("authorization_required", "电脑操作授权请求已失效")),
+                Err(_) => Err(service_error("request_timeout", "电脑操作授权等待超时")),
+            },
+        };
+        self.state.lock().await.pending.remove(&request_id);
+        result
     }
 
     pub async fn respond(&self, request_id: &str, allowed: bool) -> Result<bool, String> {
@@ -1054,8 +1238,8 @@ impl ComputerControlService {
             ));
         }
         let operation = operation_kind(tool);
-        if !Self::has_persistent_authorization(&target.key) {
-            self.request_authorization(
+        if !self.has_persistent_authorization(&target.key) {
+            self.request_authorization_fields(
                 agent,
                 thread_id,
                 turn_id,
@@ -1073,7 +1257,7 @@ impl ComputerControlService {
             .map_err(|error| service_error("sdk_unavailable", &error))
     }
 
-    async fn request_authorization(
+    async fn request_authorization_fields(
         &self,
         agent: &str,
         thread_id: &str,
