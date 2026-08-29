@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +43,11 @@ impl BaseCliMcp {
 
     /// 列出当前 CLI 可用的会话工具和本机 CUA 工具。
     pub(crate) fn list_mcp_tools(&self) -> Result<Vec<Value>, String> {
+        log::info!(
+            "BaseCliMcp list tools started: cli_id={}, location={:?}",
+            self.runtime.cli_id,
+            self.runtime.location,
+        );
         let mut tools = self.state.auracoder_thread_mcp_service.tool_specs();
         if self.runtime.location == CliLocationKind::Local {
             let computer_tool =
@@ -49,11 +56,19 @@ impl BaseCliMcp {
                 Ok(computer_tools) => tools.extend(computer_tools),
                 Err(error) => {
                     log::warn!(
-                        "BaseCliMcp 读取本机 CUA 工具目录失败，保留会话工具；原始错误：{error}"
+                        "BaseCliMcp 读取本机 CUA 工具目录失败，保留会话工具；cli_id={}, location={:?}, result_code=tool_catalog_unavailable, 原始错误：{error}",
+                        self.runtime.cli_id,
+                        self.runtime.location,
                     );
                 }
             }
         }
+        log::info!(
+            "BaseCliMcp list tools finished: cli_id={}, location={:?}, tool_count={}",
+            self.runtime.cli_id,
+            self.runtime.location,
+            tools.len(),
+        );
         Ok(tools)
     }
 
@@ -66,11 +81,47 @@ impl BaseCliMcp {
         call_id: String,
         cancellation: CancellationToken,
     ) -> McpToolResult {
+        let started_at = Instant::now();
         let tool_name = tool_name.trim();
+        let engine_thread_id = context.engine_thread_id.clone();
+        let turn_id = context.turn_id.clone();
+        let argument_keys = arguments
+            .as_object()
+            .map(|value| value.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        log::info!(
+            "BaseCliMcp MCP call started: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, argument_keys={:?}",
+            self.runtime.cli_id,
+            self.runtime.location,
+            tool_name,
+            call_id,
+            engine_thread_id,
+            turn_id,
+            argument_keys,
+        );
         if tool_name.is_empty() {
+            log::warn!(
+                "BaseCliMcp MCP call rejected: cli_id={}, location={:?}, tool_name=<empty>, call_id={}, engine_thread_id={}, turn_id={}, result_code=invalid_request, is_error=true, duration_ms={}",
+                self.runtime.cli_id,
+                self.runtime.location,
+                call_id,
+                engine_thread_id,
+                turn_id,
+                started_at.elapsed().as_millis(),
+            );
             return McpToolResult::error("invalid_request", "MCP 工具名称不能为空");
         }
         if cancellation.is_cancelled() {
+            log::info!(
+                "BaseCliMcp MCP call rejected: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, result_code=request_cancelled, is_error=true, duration_ms={}",
+                self.runtime.cli_id,
+                self.runtime.location,
+                tool_name,
+                call_id,
+                engine_thread_id,
+                turn_id,
+                started_at.elapsed().as_millis(),
+            );
             return McpToolResult::error("request_cancelled", "工具调用已停止");
         }
 
@@ -83,13 +134,45 @@ impl BaseCliMcp {
             let source_workspace = match service
                 .workspace_for_engine_thread(&self.runtime.cli_id, &context.engine_thread_id)
             {
-                Ok(workspace_id) => workspace_id,
+                Ok(workspace_id) => {
+                    log::info!(
+                        "BaseCliMcp session tool binding read: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, result_code=ok",
+                        self.runtime.cli_id,
+                        self.runtime.location,
+                        tool_name,
+                        call_id,
+                        engine_thread_id,
+                        turn_id,
+                        workspace_id,
+                    );
+                    workspace_id
+                }
                 Err(error) => {
-                    log::warn!("BaseCliMcp 会话工具来源绑定查询失败，原始错误：{error}");
+                    log::warn!(
+                        "BaseCliMcp session tool binding read failed: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace=<unknown>, result_code=tool_not_allowed, is_error=true, duration_ms={}, 原始错误：{error}",
+                        self.runtime.cli_id,
+                        self.runtime.location,
+                        tool_name,
+                        call_id,
+                        engine_thread_id,
+                        turn_id,
+                        started_at.elapsed().as_millis(),
+                    );
                     return McpToolResult::error("tool_not_allowed", error);
                 }
             };
             let Some(args) = arguments.as_object() else {
+                log::warn!(
+                    "BaseCliMcp session tool arguments rejected: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, target_workspace=<unknown>, result_code=invalid_request, is_error=true, duration_ms={}",
+                    self.runtime.cli_id,
+                    self.runtime.location,
+                    tool_name,
+                    call_id,
+                    engine_thread_id,
+                    turn_id,
+                    source_workspace,
+                    started_at.elapsed().as_millis(),
+                );
                 return McpToolResult::error(
                     "invalid_request",
                     "AuraCoder 会话工具 arguments 必须是对象",
@@ -101,19 +184,76 @@ impl BaseCliMcp {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             else {
+                log::warn!(
+                    "BaseCliMcp session tool arguments rejected: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, target_workspace=<unknown>, result_code=invalid_request, is_error=true, duration_ms={}",
+                    self.runtime.cli_id,
+                    self.runtime.location,
+                    tool_name,
+                    call_id,
+                    engine_thread_id,
+                    turn_id,
+                    source_workspace,
+                    started_at.elapsed().as_millis(),
+                );
                 return McpToolResult::error("invalid_request", "缺少必填参数 thread_id");
             };
             let target_workspace = match service.thread_workspace(target_thread_id).await {
-                Ok(Some(workspace_id)) => workspace_id,
+                Ok(Some(workspace_id)) => {
+                    log::info!(
+                        "BaseCliMcp session target workspace read: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, target_workspace={}, result_code=ok",
+                        self.runtime.cli_id,
+                        self.runtime.location,
+                        tool_name,
+                        call_id,
+                        engine_thread_id,
+                        turn_id,
+                        source_workspace,
+                        workspace_id,
+                    );
+                    workspace_id
+                }
                 Ok(None) => {
+                    log::warn!(
+                        "BaseCliMcp session target workspace read: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, target_workspace=<missing>, result_code=tool_not_found, is_error=true, duration_ms={}",
+                        self.runtime.cli_id,
+                        self.runtime.location,
+                        tool_name,
+                        call_id,
+                        engine_thread_id,
+                        turn_id,
+                        source_workspace,
+                        started_at.elapsed().as_millis(),
+                    );
                     return McpToolResult::error("tool_not_found", "指定的 AuraCoder 会话不存在")
                 }
                 Err(error) => {
-                    log::warn!("BaseCliMcp 读取目标会话项目失败，原始错误：{error}");
+                    log::warn!(
+                        "BaseCliMcp session target workspace read failed: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, target_workspace=<unknown>, result_code=tool_execution_failed, is_error=true, duration_ms={}, 原始错误：{error}",
+                        self.runtime.cli_id,
+                        self.runtime.location,
+                        tool_name,
+                        call_id,
+                        engine_thread_id,
+                        turn_id,
+                        source_workspace,
+                        started_at.elapsed().as_millis(),
+                    );
                     return McpToolResult::error("tool_execution_failed", error);
                 }
             };
             if target_workspace != source_workspace {
+                log::warn!(
+                    "BaseCliMcp session workspace policy rejected: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, target_workspace={}, result_code=tool_not_allowed, is_error=true, duration_ms={}",
+                    self.runtime.cli_id,
+                    self.runtime.location,
+                    tool_name,
+                    call_id,
+                    engine_thread_id,
+                    turn_id,
+                    source_workspace,
+                    target_workspace,
+                    started_at.elapsed().as_millis(),
+                );
                 return McpToolResult::error(
                     "tool_not_allowed",
                     "AuraCoder 会话工具只允许读取当前项目的会话",
@@ -125,9 +265,33 @@ impl BaseCliMcp {
                 }
                 "get_auracoder_thread_messages_page" => {
                     let Some(page) = args.get("page").and_then(Value::as_u64) else {
+                        log::warn!(
+                            "BaseCliMcp session tool arguments rejected: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, target_workspace={}, result_code=invalid_request, is_error=true, duration_ms={}",
+                            self.runtime.cli_id,
+                            self.runtime.location,
+                            tool_name,
+                            call_id,
+                            engine_thread_id,
+                            turn_id,
+                            source_workspace,
+                            target_workspace,
+                            started_at.elapsed().as_millis(),
+                        );
                         return McpToolResult::error("invalid_request", "缺少必填参数 page");
                     };
                     let Some(page_size) = args.get("page_size").and_then(Value::as_u64) else {
+                        log::warn!(
+                            "BaseCliMcp session tool arguments rejected: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, target_workspace={}, result_code=invalid_request, is_error=true, duration_ms={}",
+                            self.runtime.cli_id,
+                            self.runtime.location,
+                            tool_name,
+                            call_id,
+                            engine_thread_id,
+                            turn_id,
+                            source_workspace,
+                            target_workspace,
+                            started_at.elapsed().as_millis(),
+                        );
                         return McpToolResult::error("invalid_request", "缺少必填参数 page_size");
                     };
                     service
@@ -137,9 +301,34 @@ impl BaseCliMcp {
                 _ => unreachable!("thread tool names are checked above"),
             };
             return match query {
-                Ok(value) => McpToolResult::success(value),
+                Ok(value) => {
+                    log::info!(
+                        "BaseCliMcp session query returned: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, target_workspace={}, result_code=ok, is_error=false, duration_ms={}",
+                        self.runtime.cli_id,
+                        self.runtime.location,
+                        tool_name,
+                        call_id,
+                        engine_thread_id,
+                        turn_id,
+                        source_workspace,
+                        target_workspace,
+                        started_at.elapsed().as_millis(),
+                    );
+                    McpToolResult::success(value)
+                }
                 Err(error) => {
-                    log::warn!("BaseCliMcp 会话工具查询失败，原始错误：{error}");
+                    log::warn!(
+                        "BaseCliMcp session query failed: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, target_workspace={}, result_code=tool_execution_failed, is_error=true, duration_ms={}, 原始错误：{error}",
+                        self.runtime.cli_id,
+                        self.runtime.location,
+                        tool_name,
+                        call_id,
+                        engine_thread_id,
+                        turn_id,
+                        source_workspace,
+                        target_workspace,
+                        started_at.elapsed().as_millis(),
+                    );
                     McpToolResult::error("tool_execution_failed", error)
                 }
             };
@@ -148,37 +337,103 @@ impl BaseCliMcp {
         if self.runtime.location == CliLocationKind::Ssh {
             // SSH CLI 只允许会话工具，电脑工具不得进入 CUA 执行路径。
             if is_known_mcp_computer_tool(tool_name) {
+                log::warn!(
+                    "BaseCliMcp SSH computer tool rejected: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, result_code=tool_not_allowed, is_error=true, duration_ms={}",
+                    self.runtime.cli_id,
+                    self.runtime.location,
+                    tool_name,
+                    call_id,
+                    engine_thread_id,
+                    turn_id,
+                    started_at.elapsed().as_millis(),
+                );
                 return McpToolResult::error("tool_not_allowed", "SSH 远端不允许电脑操作工具");
             }
+            log::warn!(
+                "BaseCliMcp SSH unknown tool rejected: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, result_code=tool_not_found, is_error=true, duration_ms={}",
+                self.runtime.cli_id,
+                self.runtime.location,
+                tool_name,
+                call_id,
+                engine_thread_id,
+                turn_id,
+                started_at.elapsed().as_millis(),
+            );
             return McpToolResult::error("tool_not_found", "未知的 MCP 工具");
         }
 
         let computer_control_enabled = match AppConfig::load_or_create() {
             Ok(config) => config.computer_control.enabled,
             Err(error) => {
-                log::error!("BaseCliMcp 读取电脑操作开关失败，原始错误：{error}");
+                log::error!(
+                    "BaseCliMcp computer control setting read failed: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, result_code=tool_not_allowed, 原始错误：{error}",
+                    self.runtime.cli_id,
+                    self.runtime.location,
+                    tool_name,
+                    call_id,
+                    engine_thread_id,
+                    turn_id,
+                );
                 false
             }
         };
         if !computer_control_enabled {
+            log::warn!(
+                "BaseCliMcp computer tool rejected by feature switch: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, result_code=tool_not_allowed, is_error=true, duration_ms={}",
+                self.runtime.cli_id,
+                self.runtime.location,
+                tool_name,
+                call_id,
+                engine_thread_id,
+                turn_id,
+                started_at.elapsed().as_millis(),
+            );
             return McpToolResult::error("tool_not_allowed", "AuraCoder 的电脑操作能力开关未开启");
         }
 
         let computer_tool = ComputerControlTool::new(self.state.computer_control_service.sdk());
         if !computer_tool.sdk_ready() {
-            log::warn!("BaseCliMcp CUA SDK 尚未就绪，拒绝电脑工具调用");
+            log::warn!(
+                "BaseCliMcp CUA SDK unavailable: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, result_code=tool_not_found, is_error=true, duration_ms={}",
+                self.runtime.cli_id,
+                self.runtime.location,
+                tool_name,
+                call_id,
+                engine_thread_id,
+                turn_id,
+                started_at.elapsed().as_millis(),
+            );
             return McpToolResult::error("tool_not_found", "电脑操作工具当前不可用");
         }
         let computer_specs = match computer_tool.tool_specs() {
             Ok(specs) => specs,
             Err(error) => {
-                log::warn!("BaseCliMcp 读取 CUA 工具目录失败，原始错误：{error}");
+                log::warn!(
+                    "BaseCliMcp CUA tool catalog read failed: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, result_code=tool_not_found, is_error=true, duration_ms={}, 原始错误：{error}",
+                    self.runtime.cli_id,
+                    self.runtime.location,
+                    tool_name,
+                    call_id,
+                    engine_thread_id,
+                    turn_id,
+                    started_at.elapsed().as_millis(),
+                );
                 return McpToolResult::error("tool_not_found", "电脑操作工具当前不可用");
             }
         };
         if !computer_specs.iter().any(|tool| {
             tool.get("name").and_then(Value::as_str) == Some(tool_name)
         }) {
+            log::warn!(
+                "BaseCliMcp unknown computer tool rejected: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, result_code=tool_not_found, is_error=true, duration_ms={}",
+                self.runtime.cli_id,
+                self.runtime.location,
+                tool_name,
+                call_id,
+                engine_thread_id,
+                turn_id,
+                started_at.elapsed().as_millis(),
+            );
             return McpToolResult::error("tool_not_found", "未知的 MCP 工具");
         }
 

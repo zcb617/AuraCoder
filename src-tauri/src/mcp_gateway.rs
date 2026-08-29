@@ -1,4 +1,11 @@
-use std::{collections::HashMap, convert::Infallible, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
+    convert::Infallible,
+    hash::{Hash, Hasher},
+    net::SocketAddr,
+    sync::Arc,
+    time::Instant,
+};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -158,17 +165,34 @@ impl AuraCoderMcpGateway {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<(), String> {
+        let token_summary = safe_token_summary(token);
+        let (engine, instance_id) = {
+            let clients = self.clients.read().await;
+            clients
+                .get(token.trim())
+                .map(|client| {
+                    (
+                        client.lease.engine.clone(),
+                        client.lease.instance_id.clone(),
+                    )
+                })
+                .unwrap_or_else(|| ("<unknown>".to_string(), "<unknown>".to_string()))
+        };
         log::info!(
-            "MCP Gateway register trusted context entered: token={}, thread_id={}, turn_id={}",
-            token,
+            "MCP Gateway register trusted context entered: token_summary={}, engine={}, instance_id={}, engine_thread_id={}, turn_id={}",
+            token_summary,
+            engine,
+            instance_id,
             thread_id,
             turn_id,
         );
         if thread_id.trim().is_empty() || turn_id.trim().is_empty() {
             let error = "trusted context 缺少 thread_id 或 turn_id".to_string();
             log::info!(
-                "MCP Gateway register trusted context failed: token={}, thread_id={}, turn_id={}, error={}",
-                token,
+                "MCP Gateway register trusted context failed: token_summary={}, engine={}, instance_id={}, engine_thread_id={}, turn_id={}, error={}",
+                token_summary,
+                engine,
+                instance_id,
                 thread_id,
                 turn_id,
                 error,
@@ -179,8 +203,10 @@ impl AuraCoderMcpGateway {
         let Some(client) = clients.get_mut(token.trim()) else {
             let error = "client lease 不存在或已撤销".to_string();
             log::info!(
-                "MCP Gateway register trusted context failed: token={}, thread_id={}, turn_id={}, error={}",
-                token,
+                "MCP Gateway register trusted context failed: token_summary={}, engine={}, instance_id={}, engine_thread_id={}, turn_id={}, error={}",
+                token_summary,
+                engine,
+                instance_id,
                 thread_id,
                 turn_id,
                 error,
@@ -192,34 +218,44 @@ impl AuraCoderMcpGateway {
             turn_id: turn_id.trim().to_string(),
         });
         log::info!(
-            "MCP Gateway register trusted context succeeded: token={}, thread_id={}, turn_id={}, context={:?}",
-            token,
+            "MCP Gateway register trusted context succeeded: token_summary={}, engine={}, instance_id={}, engine_thread_id={}, turn_id={}, context_registered=true",
+            token_summary,
+            client.lease.engine,
+            client.lease.instance_id,
             thread_id,
             turn_id,
-            client.context,
         );
         Ok(())
     }
 
     /// 清除可信上下文。
     pub(crate) async fn clear_trusted_context(&self, token: &str) -> bool {
+        let token_summary = safe_token_summary(token);
         let mut clients = self.clients.write().await;
         let Some(client) = clients.get_mut(token.trim()) else {
             log::info!(
-                "MCP Gateway clear trusted context result: token={}, context=None, cleared=false",
-                token,
+                "MCP Gateway clear trusted context result: token_summary={}, engine=<unknown>, instance_id=<unknown>, engine_thread_id=<unknown>, turn_id=<unknown>, cleared=false",
+                token_summary,
             );
             return false;
         };
+        let previous_context = client.context.clone();
         log::info!(
-            "MCP Gateway clear trusted context entered: token={}, context={:?}",
-            token,
-            client.context,
+            "MCP Gateway clear trusted context entered: token_summary={}, engine={}, instance_id={}, engine_thread_id={:?}, turn_id={:?}",
+            token_summary,
+            client.lease.engine,
+            client.lease.instance_id,
+            previous_context.as_ref().map(|context| context.thread_id.as_str()),
+            previous_context.as_ref().map(|context| context.turn_id.as_str()),
         );
         client.context = None;
         log::info!(
-            "MCP Gateway clear trusted context result: token={}, context=None, cleared=true",
-            token,
+            "MCP Gateway clear trusted context result: token_summary={}, engine={}, instance_id={}, engine_thread_id={:?}, turn_id={:?}, cleared=true",
+            token_summary,
+            client.lease.engine,
+            client.lease.instance_id,
+            previous_context.as_ref().map(|context| context.thread_id.as_str()),
+            previous_context.as_ref().map(|context| context.turn_id.as_str()),
         );
         true
     }
@@ -436,6 +472,22 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MCP_SESSION_HEADER: &str = "Mcp-Session-Id";
 const MAX_MCP_BODY_BYTES: usize = 1024 * 1024;
 
+/// 生成仅用于日志关联的安全 token 摘要，避免日志写入 Bearer 原文。
+fn safe_token_summary(token: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    token.hash(&mut hasher);
+    format!("len={},hash={:016x}", token.len(), hasher.finish())
+}
+
+/// 将 MCP request id 转换成不包含请求参数的日志字段。
+fn request_id_for_log(request_id: Option<&Value>) -> String {
+    match request_id {
+        Some(Value::String(value)) => value.clone(),
+        Some(value) => value.to_string(),
+        None => "<none>".to_string(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
     #[serde(default)]
@@ -497,11 +549,12 @@ async fn handle_request(
     state: TaskState,
     // 旧实现：catalog: Arc<Vec<CatalogTool>>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    let authorization_present = request.headers().contains_key(header::AUTHORIZATION);
     log::info!(
-        "MCP Gateway request entered: method={}, uri={}, headers={:?}",
+        "MCP Gateway request entered: method={}, uri={}, authorization_present={}",
         request.method(),
         request.uri(),
-        request.headers(),
+        authorization_present,
     );
     if request.uri().path() != MCP_PATH {
         return Ok(simple_response(
@@ -536,18 +589,20 @@ async fn handle_request(
     };
     let Some(client) = client else {
         log::info!(
-            "MCP Gateway authentication failed after token extraction: token={}, method={}, uri={}",
-            token,
+            "MCP Gateway authentication failed after token extraction: token_summary={}, method={}, uri={}",
+            safe_token_summary(&token),
             request.method(),
             request.uri(),
         );
         return Ok(authentication_error());
     };
     log::info!(
-        "MCP Gateway client lease resolved: token={}, lease={:?}, context={:?}",
-        token,
-        client.lease,
-        client.context,
+        "MCP Gateway client lease resolved: token_summary={}, engine={}, instance_id={}, generation={}, context_registered={}",
+        safe_token_summary(&token),
+        client.lease.engine,
+        client.lease.instance_id,
+        client.lease.generation,
+        client.context.is_some(),
     );
     {
         let lifecycle = state.lifecycle.lock().await;
@@ -589,10 +644,11 @@ async fn handle_request(
         }
     };
     log::info!(
-        "MCP Gateway request body collected: token={}, lease={:?}, body={}",
-        token,
-        client.lease,
-        String::from_utf8_lossy(&body),
+        "MCP Gateway request body collected: token_summary={}, engine={}, instance_id={}, body_bytes={}",
+        safe_token_summary(&token),
+        client.lease.engine,
+        client.lease.instance_id,
+        body.len(),
     );
     if body.len() > MAX_MCP_BODY_BYTES {
         return Ok(simple_response(
@@ -612,9 +668,12 @@ async fn handle_request(
         }
     };
     log::info!(
-        "MCP Gateway RPC request parsed: token={}, lease={:?}, rpc={rpc:?}",
-        token,
-        client.lease,
+        "MCP Gateway RPC request parsed: token_summary={}, engine={}, instance_id={}, request_id={}, method={}",
+        safe_token_summary(&token),
+        client.lease.engine,
+        client.lease.instance_id,
+        request_id_for_log(rpc.id.as_ref()),
+        rpc.method,
     );
     if rpc
         .jsonrpc
@@ -644,9 +703,13 @@ async fn handle_request(
         let mut response = Response::new(Full::new(Bytes::new()));
         *response.status_mut() = StatusCode::ACCEPTED;
         log::info!(
-            "MCP Gateway notification response: status={}, token={}, rpc={rpc:?}",
+            "MCP Gateway notification response: status={}, token_summary={}, engine={}, instance_id={}, request_id={}, method={}",
             StatusCode::ACCEPTED,
-            token,
+            safe_token_summary(&token),
+            client.lease.engine,
+            client.lease.instance_id,
+            request_id_for_log(rpc.id.as_ref()),
+            rpc.method,
         );
         return Ok(response);
     }
@@ -655,9 +718,13 @@ async fn handle_request(
         let mut response = Response::new(Full::new(Bytes::new()));
         *response.status_mut() = StatusCode::ACCEPTED;
         log::info!(
-            "MCP Gateway notification response: status={}, token={}, rpc={rpc:?}",
+            "MCP Gateway notification response: status={}, token_summary={}, engine={}, instance_id={}, request_id={}, method={}",
             StatusCode::ACCEPTED,
-            token,
+            safe_token_summary(&token),
+            client.lease.engine,
+            client.lease.instance_id,
+            request_id_for_log(rpc.id.as_ref()),
+            rpc.method,
         );
         return Ok(response);
     }
@@ -718,6 +785,31 @@ async fn handle_request(
             }
         }
         "tools/call" => {
+            let tool_name = rpc
+                .params
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|params| params.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("<missing>");
+            let argument_keys = rpc
+                .params
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|params| params.get("arguments"))
+                .and_then(Value::as_object)
+                .map(|arguments| arguments.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            log::info!(
+                "MCP Gateway tools/call arrived: request_id={}, tool={}, engine={}, instance_id={}, trusted_context_present={}, argument_keys={:?}",
+                request_id_for_log(rpc.id.as_ref()),
+                tool_name,
+                client.lease.engine,
+                client.lease.instance_id,
+                client.context.is_some(),
+                argument_keys,
+            );
             let call_result = call_cli_tool(&client, &rpc, state.clone()).await;
             (
                 json!({
@@ -739,12 +831,13 @@ async fn handle_request(
     };
 
     log::info!(
-        "MCP Gateway RPC result constructed: token={}, engine={}, instance_id={}, request_id={:?}, method={}, result={result:?}, session_id={:?}",
-        token,
+        "MCP Gateway RPC result constructed: token_summary={}, engine={}, instance_id={}, request_id={}, method={}, result_is_error={:?}, session_id={:?}",
+        safe_token_summary(&token),
         client.lease.engine,
         client.lease.instance_id,
-        rpc.id,
+        request_id_for_log(rpc.id.as_ref()),
         rpc.method,
+        result.get("result").and_then(|value| value.get("isError")),
         session_id,
     );
     let session_header = session_id.as_deref();
@@ -801,9 +894,10 @@ fn json_response(
         }
     };
     log::info!(
-        "MCP Gateway JSON response: status={}, value={value:?}, body={}, session_id={:?}",
+        "MCP Gateway JSON response: status={}, payload_bytes={}, result_is_error={:?}, session_id={:?}",
         status,
-        String::from_utf8_lossy(&body),
+        body.len(),
+        value.get("result").and_then(|result| result.get("isError")),
         session_id,
     );
     let mut response = Response::new(Full::new(Bytes::from(body)));
@@ -847,13 +941,29 @@ async fn call_cli_tool(
     rpc: &RpcRequest,
     state: TaskState,
 ) -> Value {
+    let started_at = Instant::now();
+    let request_id = request_id_for_log(rpc.id.as_ref());
     let Some(params) = rpc.params.as_ref().and_then(Value::as_object) else {
+        log::warn!(
+            "MCP Gateway tools/call parameter validation failed: request_id={}, call_id=<not_registered>, tool=<missing>, engine={}, instance_id={}, engine_thread_id=<none>, turn_id=<none>, is_error=true, duration_ms={}, result_code=invalid_request",
+            request_id,
+            client.lease.engine,
+            client.lease.instance_id,
+            started_at.elapsed().as_millis(),
+        );
         return json!({
             "content": [{ "type": "text", "text": "invalid_request: tools/call params 必须是对象" }],
             "isError": true
         });
     };
     let Some(name) = params.get("name").and_then(Value::as_str).map(str::trim) else {
+        log::warn!(
+            "MCP Gateway tools/call parameter validation failed: request_id={}, call_id=<not_registered>, tool=<missing>, engine={}, instance_id={}, engine_thread_id=<none>, turn_id=<none>, is_error=true, duration_ms={}, result_code=invalid_request",
+            request_id,
+            client.lease.engine,
+            client.lease.instance_id,
+            started_at.elapsed().as_millis(),
+        );
         return json!({
             "content": [{ "type": "text", "text": "invalid_request: tools/call 缺少 name" }],
             "isError": true
@@ -866,18 +976,20 @@ async fn call_cli_tool(
     let context = client.context.clone();
     let Some(context) = context else {
         log::info!(
-            "MCP Gateway tools/call 缺少可信上下文: token={}, engine={}, instance_id={}, request_id={:?}, tool={}, arguments={arguments:?}",
-            client.lease.token,
+            "MCP Gateway tools/call trusted context missing: request_id={}, call_id=<not_registered>, tool={}, engine={}, instance_id={}, engine_thread_id=<none>, turn_id=<none>, is_error=true, duration_ms={}, result_code=invocation_context_missing",
+            request_id,
+            name,
             client.lease.engine,
             client.lease.instance_id,
-            rpc.id,
-            name,
+            started_at.elapsed().as_millis(),
         );
         return json!({
             "content": [{ "type": "text", "text": "invocation_context_missing: trusted context 缺少 thread_id 或 turn_id" }],
             "isError": true
         });
     };
+    let engine_thread_id = context.thread_id.clone();
+    let turn_id = context.turn_id.clone();
     let active_call_id = active_call_key(
         &client.lease.token,
         rpc.id.as_ref().unwrap_or(&Value::String(
@@ -897,32 +1009,82 @@ async fn call_cli_tool(
             other => other.to_string(),
         })
         .unwrap_or_else(|| format!("mcp-call-{}", Uuid::new_v4().simple()));
+    log::info!(
+        "MCP Gateway active call registered: request_id={}, call_id={}, tool={}, engine={}, instance_id={}, engine_thread_id={}, turn_id={}, is_error=false, duration_ms={}, active_call_registered=true",
+        request_id,
+        call_id,
+        name,
+        client.lease.engine,
+        client.lease.instance_id,
+        engine_thread_id,
+        turn_id,
+        started_at.elapsed().as_millis(),
+    );
+    log::info!(
+        "MCP Gateway entering CliTool: request_id={}, call_id={}, tool={}, engine={}, instance_id={}, engine_thread_id={}, turn_id={}, is_error=false, duration_ms={}",
+        request_id,
+        call_id,
+        name,
+        client.lease.engine,
+        client.lease.instance_id,
+        engine_thread_id,
+        turn_id,
+        started_at.elapsed().as_millis(),
+    );
     let result = client
         .cli
         .call_mcp_tool(
             name,
             arguments,
             McpInvocationContext {
-                engine_thread_id: context.thread_id,
-                turn_id: context.turn_id,
+                engine_thread_id: engine_thread_id.clone(),
+                turn_id: turn_id.clone(),
             },
-            call_id,
+            call_id.clone(),
             cancellation,
         )
         .await;
-    state.active_calls.write().await.remove(&active_call_id);
+    let result_is_error = result.is_error;
     log::info!(
-        "MCP Gateway tools/call execution finished: token={}, engine={}, instance_id={}, request_id={:?}, tool={}, raw_result={result:?}",
-        client.lease.token,
+        "MCP Gateway CliTool returned: request_id={}, call_id={}, tool={}, engine={}, instance_id={}, engine_thread_id={}, turn_id={}, is_error={}, duration_ms={}",
+        request_id,
+        call_id,
         client.lease.engine,
         client.lease.instance_id,
-        rpc.id,
         name,
+        engine_thread_id,
+        turn_id,
+        result_is_error,
+        started_at.elapsed().as_millis(),
+    );
+    let active_call_removed = state.active_calls.write().await.remove(&active_call_id).is_some();
+    log::info!(
+        "MCP Gateway active call cleaned: request_id={}, call_id={}, tool={}, engine={}, instance_id={}, engine_thread_id={}, turn_id={}, is_error={}, duration_ms={}, active_call_removed={}",
+        request_id,
+        call_id,
+        name,
+        client.lease.engine,
+        client.lease.instance_id,
+        engine_thread_id,
+        turn_id,
+        result_is_error,
+        started_at.elapsed().as_millis(),
+        active_call_removed,
     );
     match serde_json::to_value(result) {
         Ok(value) => value,
         Err(error) => {
-            log::error!("MCP Gateway 序列化 CLI MCP 结果失败，原始错误：{error}");
+            log::error!(
+                "MCP Gateway 序列化 CLI MCP 结果失败: request_id={}, call_id={}, tool={}, engine={}, instance_id={}, engine_thread_id={}, turn_id={}, is_error=true, duration_ms={}, 原始错误：{error}",
+                request_id,
+                call_id,
+                name,
+                client.lease.engine,
+                client.lease.instance_id,
+                engine_thread_id,
+                turn_id,
+                started_at.elapsed().as_millis(),
+            );
             json!({
                 "content": [{ "type": "text", "text": "internal_error: MCP 工具结果不可序列化" }],
                 "isError": true

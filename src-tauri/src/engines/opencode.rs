@@ -851,6 +851,12 @@ impl Engine for OpenCodeEngine {
             input,
         )?;
         let prompt_message_id = prompt.message_id.clone();
+        log::info!(
+            "OpenCode event subscription established: engine_thread_id={}, prompt_message_id={}, transport={}, subscribed=true",
+            engine_thread_id,
+            prompt_message_id,
+            if self.is_remote_target() { "remote" } else { "local" },
+        );
         let prompt_request =
             self.prompt_message(engine_thread_id, session.server.as_ref(), prompt.body);
         tokio::pin!(prompt_request);
@@ -918,7 +924,15 @@ impl Engine for OpenCodeEngine {
                             anyhow::bail!("OpenCode event bus closed before the turn completed");
                         }
                     };
-                    if event_matches_session(event.as_ref(), engine_thread_id) {
+                    let matched = event_matches_session(event.as_ref(), engine_thread_id);
+                    log::debug!(
+                        "OpenCode SSE event received: event_type={}, session_id={:?}, engine_thread_id={}, matched={}",
+                        event.event_type,
+                        event_session_id(event.as_ref()),
+                        engine_thread_id,
+                        matched,
+                    );
+                    if matched {
                         last_relevant_event_at = Instant::now();
                         self.handle_event(
                             engine_thread_id,
@@ -926,6 +940,7 @@ impl Engine for OpenCodeEngine {
                             &mut mapper,
                             &event_tx,
                             session.server.clone(),
+                            matched,
                         )
                         .await;
                     } else if last_relevant_event_at.elapsed() > SSE_IDLE_TIMEOUT {
@@ -1865,9 +1880,16 @@ impl OpenCodeEngine {
         mapper: &mut OpenCodeTurnMapper,
         event_tx: &mpsc::Sender<EngineEvent>,
         server: Arc<OpenCodeServer>,
+        matched: bool,
     ) {
-        if !event_matches_session(event, engine_thread_id) {
-            return;
+        if event.event_type == "permission.asked" {
+            log::info!(
+                "OpenCode permission.asked received: engine_thread_id={}, request_id={:?}, permission={:?}, matched={}",
+                engine_thread_id,
+                event.properties.get("id").and_then(Value::as_str),
+                event.properties.get("permission").and_then(Value::as_str),
+                matched,
+            );
         }
 
         match event.event_type.as_str() {
@@ -2000,6 +2022,13 @@ impl OpenCodeEngine {
                 mapper.content_seen = true;
                 self.handle_permission_asked(&event.properties, event_tx, server)
                     .await;
+                log::info!(
+                    "OpenCode permission.asked handed to approval handler: engine_thread_id={}, request_id={:?}, permission={:?}, matched={}",
+                    engine_thread_id,
+                    event.properties.get("id").and_then(Value::as_str),
+                    event.properties.get("permission").and_then(Value::as_str),
+                    matched,
+                );
             }
             "question.asked" => {
                 mapper.content_seen = true;
@@ -2275,10 +2304,19 @@ impl OpenCodeEngine {
         event_tx: &mpsc::Sender<EngineEvent>,
         server: Arc<OpenCodeServer>,
     ) {
+        let session_id = properties.get("sessionID").and_then(Value::as_str);
+        let permission = properties
+            .get("permission")
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
         let Some(request_id) = properties.get("id").and_then(Value::as_str) else {
+            log::warn!(
+                "OpenCode permission request missing request_id: session_id={:?}, permission={}",
+                session_id,
+                permission,
+            );
             return;
         };
-        let session_id = properties.get("sessionID").and_then(Value::as_str);
         let permission_mode = if let Some(session_id) = session_id {
             let state = self.state.lock().await;
             state
@@ -2289,6 +2327,13 @@ impl OpenCodeEngine {
         } else {
             OpenCodePermissionMode::Ask
         };
+        log::info!(
+            "OpenCode permission request handling started: request_id={}, session_id={:?}, permission={}, permission_mode={:?}",
+            request_id,
+            session_id,
+            permission,
+            permission_mode,
+        );
 
         // 已选择“完全自主”或“拒绝”时，权限请求由引擎直接回复，不进入 AuraCoder
         // 审批队列，因此不会生成审批卡。请求失败只记录日志，仍不得退化为 ask。
@@ -2313,21 +2358,31 @@ impl OpenCodeEngine {
                 Ok::<(), anyhow::Error>(())
             }
             .await;
-            if let Err(error) = result {
-                log::error!(
-                    "OpenCode permission automatic reply failed: reply={} request_id={} session_id={:?}: {error:#}",
-                    reply,
-                    request_id,
-                    session_id
-                );
+            match result {
+                Ok(()) => {
+                    log::info!(
+                        "OpenCode permission automatic reply succeeded: reply={}, request_id={}, session_id={:?}, permission={}, permission_mode={:?}, http_success=true",
+                        reply,
+                        request_id,
+                        session_id,
+                        permission,
+                        permission_mode,
+                    );
+                }
+                Err(error) => {
+                    log::error!(
+                        "OpenCode permission automatic reply failed: reply={} request_id={} session_id={:?} permission={} permission_mode={:?}: {error:#}",
+                        reply,
+                        request_id,
+                        session_id,
+                        permission,
+                        permission_mode,
+                    );
+                }
             }
             return;
         }
 
-        let permission = properties
-            .get("permission")
-            .and_then(Value::as_str)
-            .unwrap_or("tool");
         let approval_id = format!("opencode-permission-{request_id}");
         let action_type = action_type_for_permission(permission);
         let patterns = properties
@@ -2343,9 +2398,16 @@ impl OpenCodeEngine {
                 server,
             },
         );
+        log::info!(
+            "OpenCode permission approval pending: approval_id={}, request_id={}, session_id={:?}, permission={}, permission_mode={:?}",
+            approval_id,
+            request_id,
+            session_id,
+            permission,
+            permission_mode,
+        );
 
-        event_tx
-            .send(EngineEvent::ApprovalRequested {
+        let approval_event = EngineEvent::ApprovalRequested {
                 approval_id,
                 action_type,
                 summary: format!("OpenCode requests {permission} permission"),
@@ -2361,9 +2423,29 @@ impl OpenCodeEngine {
                     "_opencodeSessionID": properties.get("sessionID").cloned().unwrap_or_else(|| json!(null)),
                     "_opencodeCwd": cwd,
                 }),
-            })
-            .await
-            .ok();
+            };
+        match event_tx.send(approval_event).await {
+            Ok(()) => {
+                log::info!(
+                    "OpenCode permission approval event sent: approval_id={}, request_id={}, session_id={:?}, permission={}, permission_mode={:?}, send_success=true",
+                    format!("opencode-permission-{request_id}"),
+                    request_id,
+                    session_id,
+                    permission,
+                    permission_mode,
+                );
+            }
+            Err(error) => {
+                log::error!(
+                    "OpenCode permission approval event send failed: approval_id={}, request_id={}, session_id={:?}, permission={}, permission_mode={:?}, send_success=false, send_error={error}",
+                    format!("opencode-permission-{request_id}"),
+                    request_id,
+                    session_id,
+                    permission,
+                    permission_mode,
+                );
+            }
+        }
     }
 
     async fn handle_question_asked(
@@ -3811,7 +3893,11 @@ async fn run_event_pump(
             Err(error) => {
                 let message = format!("SSE连接失败：{error}");
                 log::warn!("opencode {message}");
-                let _ = event_bus.send(OpenCodeBusItem::Failure(message));
+                if let Err(send_error) = event_bus.send(OpenCodeBusItem::Failure(message)) {
+                    log::debug!(
+                        "OpenCode SSE failure event bus send failed: event_type=connection_failure, session_id=None, send_error={send_error}"
+                    );
+                }
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = sleep(backoff) => {}
@@ -3826,7 +3912,11 @@ async fn run_event_pump(
             Err(error) => {
                 let message = format!("SSE连接状态异常：{error}");
                 log::warn!("opencode {message}");
-                let _ = event_bus.send(OpenCodeBusItem::Failure(message));
+                if let Err(send_error) = event_bus.send(OpenCodeBusItem::Failure(message)) {
+                    log::debug!(
+                        "OpenCode SSE failure event bus send failed: event_type=http_status_failure, session_id=None, send_error={send_error}"
+                    );
+                }
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = sleep(backoff) => {}
@@ -3850,7 +3940,11 @@ async fn run_event_pump(
                         Err(error) => {
                             let message = format!("SSE事件读取失败：{error}");
                             log::warn!("opencode {message}");
-                            let _ = event_bus.send(OpenCodeBusItem::Failure(message));
+                            if let Err(send_error) = event_bus.send(OpenCodeBusItem::Failure(message)) {
+                                log::debug!(
+                                    "OpenCode SSE failure event bus send failed: event_type=stream_read_failure, session_id=None, send_error={send_error}"
+                                );
+                            }
                             break;
                         }
                     };
@@ -3867,15 +3961,39 @@ async fn run_event_pump(
                                 Ok(event) => event,
                                 Err(error) => {
                                     log::warn!(
-                                        "opencode event parse failed: {error}; event={raw_event}"
+                                        "opencode event parse failed: {error}; event_bytes={}"
+                                        , raw_event.len()
                                     );
-                                    let _ = event_bus.send(OpenCodeBusItem::Failure(format!(
-                                        "SSE事件解析失败：{error}"
-                                    )));
+                                    if let Err(send_error) = event_bus.send(OpenCodeBusItem::Failure(
+                                        format!("SSE事件解析失败：{error}"),
+                                    )) {
+                                        log::debug!(
+                                            "OpenCode SSE failure event bus send failed: event_type=parse_failure, session_id=None, send_error={send_error}"
+                                        );
+                                    }
                                     continue;
                                 }
                             };
-                            let _ = event_bus.send(OpenCodeBusItem::Event(Arc::new(event)));
+                            let event_type = event.event_type.clone();
+                            let session_id = event_session_id(&event).map(str::to_string);
+                            let event = Arc::new(event);
+                            match event_bus.send(OpenCodeBusItem::Event(event)) {
+                                Ok(receiver_count) => {
+                                    log::debug!(
+                                        "OpenCode SSE event bus sent: event_type={}, session_id={:?}, receiver_count={}",
+                                        event_type,
+                                        session_id,
+                                        receiver_count,
+                                    );
+                                }
+                                Err(send_error) => {
+                                    log::debug!(
+                                        "OpenCode SSE event bus send failed: event_type={}, session_id={:?}, send_error={send_error}",
+                                        event_type,
+                                        session_id,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -4040,28 +4158,33 @@ fn executable_augmented_path(executable: &Path) -> Option<OsString> {
 }
 */
 
-fn event_matches_session(event: &OpenCodeBusEvent, session_id: &str) -> bool {
+/// 从 OpenCode SSE 事件的允许字段中提取安全会话标识，供链路日志和会话匹配共用。
+fn event_session_id(event: &OpenCodeBusEvent) -> Option<&str> {
     event
         .properties
         .get("sessionID")
         .and_then(Value::as_str)
-        .map(|value| value == session_id)
-        .unwrap_or_else(|| {
+        .or_else(|| {
             event
                 .properties
                 .get("info")
                 .and_then(|value| value.get("sessionID"))
                 .and_then(Value::as_str)
-                .or_else(|| {
-                    event
-                        .properties
-                        .get("part")
-                        .and_then(|value| value.get("sessionID"))
-                        .and_then(Value::as_str)
-                })
-                .map(|value| value == session_id)
-                .unwrap_or(false)
         })
+        .or_else(|| {
+            event
+                .properties
+                .get("part")
+                .and_then(|value| value.get("sessionID"))
+                .and_then(Value::as_str)
+        })
+}
+
+/// 判断 OpenCode SSE 事件是否属于当前引擎线程，保持原有字段优先级和过滤语义。
+fn event_matches_session(event: &OpenCodeBusEvent, session_id: &str) -> bool {
+    event_session_id(event)
+        .map(|value| value == session_id)
+        .unwrap_or(false)
 }
 
 pub fn extract_persisted_approval_route(details: &Value) -> Option<ApprovalRequestRoute> {
