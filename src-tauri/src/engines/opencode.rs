@@ -84,6 +84,8 @@ struct RemoteOpenCodeEndpoint {
     password: String,
     event_bus: broadcast::Sender<OpenCodeBusItem>,
     pump_cancel: CancellationToken,
+    #[cfg(test)]
+    workspace_event_pump_enabled: bool,
 }
 
 impl Drop for RemoteOpenCodeEndpoint {
@@ -1130,13 +1132,19 @@ impl OpenCodeEngine {
         let (event_bus, _) =
             broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
         let pump_cancel = CancellationToken::new();
+        /*
+        旧实现按 SSH 连接启动一条未携带项目目录的共享 SSE：
         tokio::spawn(run_event_pump(
             base_url.clone(),
             password.clone(),
+            None,
             reqwest::Client::new(),
             event_bus.clone(),
             pump_cancel.clone(),
         ));
+        OpenCode 会把该订阅绑定到远端进程 cwd，无法收到其他项目目录的事件。
+        远端 SSE 改由 ensure_server 按项目目录创建并随 OpenCodeServer 释放。
+        */
         Self {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
@@ -1149,6 +1157,8 @@ impl OpenCodeEngine {
                 password,
                 event_bus,
                 pump_cancel,
+                #[cfg(test)]
+                workspace_event_pump_enabled: true,
             })),
         }
     }
@@ -1180,17 +1190,42 @@ impl OpenCodeEngine {
                 );
                 start_server(cwd, endpoint.as_deref(), token.as_deref()).await?
             }
-            OpenCodeTransportTarget::Remote(endpoint) => OpenCodeServer {
-                cwd: cwd.to_string(),
-                base_url: endpoint.base_url.clone(),
-                password: endpoint.password.clone(),
-                child: Mutex::new(None),
-                event_bus: endpoint.event_bus.clone(),
-                pump_cancel: None,
-                callback_cancel: None,
-                run_dir: None,
-                include_directory_header: !cwd.is_empty(),
-            },
+            OpenCodeTransportTarget::Remote(endpoint) => {
+                let include_directory_header = !cwd.is_empty();
+                #[cfg(test)]
+                let workspace_event_pump_enabled = endpoint.workspace_event_pump_enabled;
+                #[cfg(not(test))]
+                let workspace_event_pump_enabled = true;
+                let (event_bus, pump_cancel) =
+                    if include_directory_header && workspace_event_pump_enabled {
+                        let (event_bus, _) = broadcast::channel::<OpenCodeBusItem>(
+                            OPENCODE_EVENT_BUFFER_CAPACITY,
+                        );
+                        let pump_cancel = CancellationToken::new();
+                        tokio::spawn(run_event_pump(
+                            endpoint.base_url.clone(),
+                            endpoint.password.clone(),
+                            Some(cwd.to_string()),
+                            reqwest::Client::new(),
+                            event_bus.clone(),
+                            pump_cancel.clone(),
+                        ));
+                        (event_bus, Some(pump_cancel))
+                    } else {
+                        (endpoint.event_bus.clone(), None)
+                    };
+                OpenCodeServer {
+                    cwd: cwd.to_string(),
+                    base_url: endpoint.base_url.clone(),
+                    password: endpoint.password.clone(),
+                    child: Mutex::new(None),
+                    event_bus,
+                    pump_cancel,
+                    callback_cancel: None,
+                    run_dir: None,
+                    include_directory_header,
+                }
+            }
         });
         let existing = {
             let mut state = self.state.lock().await;
@@ -3864,7 +3899,15 @@ async fn start_server(
     let pump_password = server.password.clone();
     let pump_http = reqwest::Client::new();
     tokio::spawn(async move {
-        run_event_pump(pump_url, pump_password, pump_http, event_bus, pump_cancel).await;
+        run_event_pump(
+            pump_url,
+            pump_password,
+            None,
+            pump_http,
+            event_bus,
+            pump_cancel,
+        )
+        .await;
     });
 
     // 旧 callback 工具服务器和动态工具文件已停用，MCP 请求统一经过 Gateway。
@@ -3875,6 +3918,7 @@ async fn start_server(
 async fn run_event_pump(
     base_url: String,
     password: String,
+    directory: Option<String>,
     http: reqwest::Client,
     event_bus: broadcast::Sender<OpenCodeBusItem>,
     cancel: CancellationToken,
@@ -3888,7 +3932,13 @@ async fn run_event_pump(
             return;
         }
 
-        let response = match http.get(&url).headers(auth_headers(&password)).send().await {
+        let request = http.get(&url).headers(auth_headers(&password));
+        let request = if let Some(directory) = directory.as_deref() {
+            request.header("X-OpenCode-Directory", directory)
+        } else {
+            request
+        };
+        let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
                 let message = format!("SSE连接失败：{error}");
@@ -4491,6 +4541,7 @@ mod tests {
                 password: "runtime-secret".to_string(),
                 event_bus,
                 pump_cancel: CancellationToken::new(),
+                workspace_event_pump_enabled: false,
             })),
         }
     }
@@ -4650,6 +4701,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_event_pump_subscribes_to_each_workspace_directory() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut directories = Vec::new();
+            let mut streams = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request_bytes = vec![0_u8; 4096];
+                let mut length = 0;
+                while !request_bytes[..length]
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n")
+                {
+                    let read = stream.read(&mut request_bytes[length..]).await.unwrap();
+                    assert!(read > 0, "event pump closed before sending HTTP headers");
+                    length += read;
+                }
+                let request = String::from_utf8_lossy(&request_bytes[..length]);
+                assert!(request.starts_with("GET /event HTTP/1.1"));
+                assert!(request.lines().any(|line| {
+                    line.split_once(':').is_some_and(|(name, _)| {
+                        name.eq_ignore_ascii_case("authorization")
+                    })
+                }));
+                let directory = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("x-opencode-directory")
+                            .then(|| value.trim().to_string())
+                    })
+                    .expect("remote event subscription must include its workspace directory");
+                directories.push(directory);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                streams.push(stream);
+            }
+            directories
+        });
+
+        let (event_bus, _) =
+            broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
+        let engine = OpenCodeEngine {
+            state: Arc::new(Mutex::new(OpenCodeState::default())),
+            http: reqwest::Client::new(),
+            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
+            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
+            computer_control_service: Arc::new(std::sync::Mutex::new(None)),
+            auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
+            target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
+                base_url: format!("http://{address}"),
+                password: "runtime-secret".to_string(),
+                event_bus,
+                pump_cancel: CancellationToken::new(),
+                workspace_event_pump_enabled: true,
+            })),
+        };
+
+        let project_a = engine.ensure_server("/var/work/project-a").await.unwrap();
+        let project_b = engine.ensure_server("/var/work/project-b").await.unwrap();
+        let mut directories = timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("workspace event pumps did not connect")
+            .unwrap();
+        project_a.stop().await;
+        project_b.stop().await;
+
+        directories.sort();
+        assert_eq!(
+            directories,
+            vec![
+                "/var/work/project-a".to_string(),
+                "/var/work/project-b".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn read_session_requests_only_id_path_with_basic_auth() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -4700,6 +4837,7 @@ mod tests {
                 password: "runtime-secret".to_string(),
                 event_bus,
                 pump_cancel: CancellationToken::new(),
+                workspace_event_pump_enabled: false,
             })),
         };
         let summary = engine
@@ -4739,6 +4877,7 @@ mod tests {
                 password: "runtime-secret".to_string(),
                 event_bus,
                 pump_cancel: CancellationToken::new(),
+                workspace_event_pump_enabled: false,
             })),
         };
 
@@ -4809,6 +4948,7 @@ mod tests {
                 password: "runtime-secret".to_string(),
                 event_bus,
                 pump_cancel: CancellationToken::new(),
+                workspace_event_pump_enabled: false,
             })),
         };
         let server = engine.ensure_server("/var/work/project-a").await.unwrap();
@@ -4955,6 +5095,7 @@ mod tests {
                 password: "runtime-secret".to_string(),
                 event_bus,
                 pump_cancel: CancellationToken::new(),
+                workspace_event_pump_enabled: false,
             })),
         };
         let server = engine.ensure_server("/var/work/project-a").await.unwrap();
