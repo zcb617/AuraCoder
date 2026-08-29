@@ -752,7 +752,7 @@ async fn handle_request(
                     "result": {
                         "protocolVersion": requested_protocol,
                         "capabilities": { "tools": { "listChanged": false } },
-                        "serverInfo": { "name": "AuraCoder MCP Gateway", "version": "1.0.2" }
+                        "serverInfo": { "name": "AuraCoder MCP Gateway", "version": "1.0.3" }
                     }
                 }),
                 Some(session_id),
