@@ -267,6 +267,60 @@ pub fn quote_posix(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// 生成 Codex app-server 使用的 MCP Gateway 单项配置覆盖参数。
+///
+/// 该兼容入口保留旧调用方的 URL 配置行为；新调用方应使用
+/// `codex_mcp_gateway_config_overrides` 同时配置 URL 与 Bearer Token 环境变量名。
+pub fn codex_mcp_gateway_config_override(endpoint: &str) -> String {
+    let encoded_endpoint = serde_json::to_string(endpoint).unwrap_or_else(|_| "\"\"".to_string());
+    format!("mcp_servers.auracoder.url={encoded_endpoint}")
+}
+
+/// 生成 Codex app-server 使用的 MCP Gateway URL 与 Bearer Token 环境变量名覆盖参数。
+pub fn codex_mcp_gateway_config_overrides(
+    endpoint: &str,
+    bearer_token_env_var: &str,
+) -> Vec<String> {
+    let encoded_endpoint = serde_json::to_string(endpoint).unwrap_or_else(|_| "\"\"".to_string());
+    let encoded_bearer_token_env_var =
+        serde_json::to_string(bearer_token_env_var).unwrap_or_else(|_| "\"\"".to_string());
+    vec![
+        format!("mcp_servers.auracoder.url={encoded_endpoint}"),
+        format!("mcp_servers.auracoder.bearer_token_env_var={encoded_bearer_token_env_var}"),
+    ]
+}
+
+/// 生成 OpenCode 独立配置文件中的 MCP Gateway 远程服务结构。
+pub fn opencode_mcp_gateway_config(endpoint: &str) -> serde_json::Value {
+    serde_json::json!({
+        "mcp": {
+            "auracoder": {
+                "type": "remote",
+                "url": endpoint,
+            }
+        }
+    })
+}
+
+/// 生成本地 OpenCode 实例使用的带 Authorization Header 的 MCP Gateway 远程服务结构。
+pub fn opencode_mcp_gateway_authenticated_config(
+    endpoint: &str,
+    authorization_header: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "mcp": {
+            "auracoder": {
+                "type": "remote",
+                "url": endpoint,
+                "enabled": true,
+                "headers": {
+                    "Authorization": authorization_header,
+                },
+            }
+        }
+    })
+}
+
 /// 生成远端 OpenCode 服务密码环境变量的导出片段。
 pub fn get_remote_opencode_env(password: &str) -> String {
     format!("export OPENCODE_SERVER_PASSWORD={};", quote_posix(password))
@@ -1373,6 +1427,61 @@ mod tests {
         );
         assert!(get_remote_claude_env("a-b").is_err());
         assert!(get_remote_claude_env("").is_err());
+
+        let codex_overrides =
+            codex_mcp_gateway_config_overrides("http://127.0.0.1:30123/mcp", "AURACODER_MCP_TOKEN");
+        assert_eq!(codex_overrides.len(), 2);
+        assert_eq!(
+            codex_overrides[0],
+            "mcp_servers.auracoder.url=\"http://127.0.0.1:30123/mcp\""
+        );
+        assert_eq!(
+            codex_overrides[1],
+            "mcp_servers.auracoder.bearer_token_env_var=\"AURACODER_MCP_TOKEN\""
+        );
+        assert!(codex_overrides
+            .iter()
+            .all(|value| !value.starts_with("mcp_servers={")));
+        assert!(codex_overrides
+            .iter()
+            .all(|value| !value.contains("ac_test_token")));
+
+        let opencode_config = opencode_mcp_gateway_config("http://127.0.0.1:30123/mcp");
+        assert_eq!(
+            opencode_config["mcp"]["auracoder"]["type"],
+            serde_json::Value::String("remote".to_string())
+        );
+        assert_eq!(
+            opencode_config["mcp"]["auracoder"]["url"],
+            serde_json::Value::String("http://127.0.0.1:30123/mcp".to_string())
+        );
+        let authenticated_opencode_config = opencode_mcp_gateway_authenticated_config(
+            "http://127.0.0.1:30123/mcp",
+            "Bearer ac_test_token",
+        );
+        assert_eq!(
+            authenticated_opencode_config["mcp"]["auracoder"]["type"],
+            serde_json::Value::String("remote".to_string())
+        );
+        assert_eq!(
+            authenticated_opencode_config["mcp"]["auracoder"]["url"],
+            serde_json::Value::String("http://127.0.0.1:30123/mcp".to_string())
+        );
+        assert_eq!(
+            authenticated_opencode_config["mcp"]["auracoder"]["enabled"],
+            true
+        );
+        assert_eq!(
+            authenticated_opencode_config["mcp"]["auracoder"]["headers"]["Authorization"],
+            serde_json::Value::String("Bearer ac_test_token".to_string())
+        );
+        assert_eq!(
+            authenticated_opencode_config
+                .as_object()
+                .map(|value| value.len()),
+            Some(1)
+        );
+        assert!(authenticated_opencode_config.get("oauth").is_none());
     }
 
     #[test]
@@ -1757,7 +1866,10 @@ mod tests {
             Some(Path::new(r"C:\Users\auracoder\AppData\Roaming")),
             Some(Path::new(r"C:\Users\auracoder")),
         );
-        assert_eq!(normalize_path(&path), "C:/Users/auracoder/AppData/Local/AuraCoder");
+        assert_eq!(
+            normalize_path(&path),
+            "C:/Users/auracoder/AppData/Local/AuraCoder"
+        );
     }
 
     #[test]
@@ -1946,7 +2058,8 @@ mod tests {
 
     #[test]
     fn migrate_legacy_app_data_dir_moves_existing_legacy_tree() {
-        let root = std::env::temp_dir().join(format!("auracoder-app-data-migrate-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("auracoder-app-data-migrate-{}", Uuid::new_v4()));
         let current = root.join("AppData").join("Local").join("AuraCoder");
         let legacy = root.join(".agent-workspace");
 
@@ -1968,7 +2081,8 @@ mod tests {
 
     #[test]
     fn migrate_legacy_app_data_dir_preserves_existing_target_data() {
-        let root = std::env::temp_dir().join(format!("auracoder-app-data-preserve-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("auracoder-app-data-preserve-{}", Uuid::new_v4()));
         let current = root.join("AppData").join("Local").join("AuraCoder");
         let legacy = root.join(".agent-workspace");
 

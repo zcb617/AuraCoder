@@ -2428,7 +2428,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         let all_ids = [first_ids, second_ids, third_ids].concat();
-        let unique_ids = all_ids.iter().cloned().collect::<std::collections::HashSet<_>>();
+        let unique_ids = all_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
         assert_eq!(unique_ids.len(), 5);
         assert_eq!(all_ids.len(), 5);
 

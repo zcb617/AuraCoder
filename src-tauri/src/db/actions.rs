@@ -187,9 +187,7 @@ pub fn find_pending_opencode_permission_approval_ids(
         let details = match serde_json::from_str::<Value>(&raw_details) {
             Ok(details) => details,
             Err(error) => {
-                log::warn!(
-                    "failed to parse pending approval details for {approval_id}: {error}"
-                );
+                log::warn!("failed to parse pending approval details for {approval_id}: {error}");
                 continue;
             }
         };

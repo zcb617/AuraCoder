@@ -4111,6 +4111,12 @@ mod tests {
             auracoder_thread_mcp_service: Arc::new(
                 crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()),
             ),
+            mcp_gateway: Arc::new(crate::mcp_gateway::AuraCoderMcpGateway::new(
+                Arc::new(crate::computer_control_service::ComputerControlService::default()),
+                Arc::new(
+                    crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()),
+                ),
+            )),
             remote_access: Arc::new(crate::remote::RemoteTunnelManager::default()),
             ssh_monitor: Arc::new(crate::ssh::monitor::SshConnectionMonitor::default()),
         }

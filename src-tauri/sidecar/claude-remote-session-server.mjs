@@ -13,14 +13,18 @@ const MAX_TRANSCRIPT_LINES = 200;
 // Claude Code 会话文件名使用 UUID 作为会话 ID；只接受该格式，避免把请求路径当作文件路径。
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// 解析远端 Claude 会话服务的监听参数和 SSH Tunnel 注入的 MCP Gateway 地址。
 function parseArguments(argv) {
   let host = "127.0.0.1";
   let port;
+  let mcpGatewayUrl;
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === "--host") {
       host = argv[++index];
     } else if (argv[index] === "--port") {
       port = Number(argv[++index]);
+    } else if (argv[index] === "--mcp-gateway-url") {
+      mcpGatewayUrl = argv[++index];
     }
   }
   if (
@@ -33,7 +37,7 @@ function parseArguments(argv) {
       "Usage: claude-remote-session-server.mjs --host <127.0.0.1|::1> --port <port>",
     );
   }
-  return { host, port };
+  return { host, port, mcpGatewayUrl };
 }
 
 function writeJson(response, status, payload) {
@@ -290,7 +294,13 @@ async function readJsonBody(request) {
   return JSON.parse(text || "{}");
 }
 
-const { host, port } = parseArguments(process.argv.slice(2));
+const { host, port, mcpGatewayUrl } = parseArguments(process.argv.slice(2));
+// 远端 Claude 服务只从启动进程环境读取 MCP 租约 Token，不接受 HTTP 请求携带的 Token。
+const configuredMcpGatewayToken = process.env.AURACODER_MCP_TOKEN;
+const mcpGatewayToken =
+  typeof configuredMcpGatewayToken === "string" && configuredMcpGatewayToken.trim()
+    ? configuredMcpGatewayToken.trim()
+    : undefined;
 const server = http.createServer(async (request, response) => {
   const requestUrl = new URL(request.url ?? "/", `http://${host}:${port}`);
   if (request.method === "GET" && requestUrl.pathname === "/health") {
@@ -328,12 +338,15 @@ const server = http.createServer(async (request, response) => {
         return;
       }
       const handleId = randomUUID();
+      const { mcpGatewayToken: _requestMcpGatewayToken, ...requestParams } = params ?? {};
       const event = await sendAgentCommandAndWait(
         {
           id: handleId,
           method: "create_session_handle",
           params: {
-            ...params,
+            ...requestParams,
+            ...(mcpGatewayUrl ? { mcpGatewayUrl } : {}),
+            ...(mcpGatewayToken ? { mcpGatewayToken } : {}),
             threadId,
             handleId,
           },
@@ -372,11 +385,17 @@ const server = http.createServer(async (request, response) => {
         return;
       }
       const params = await readJsonBody(request);
+      const { mcpGatewayToken: _requestMcpGatewayToken, ...requestParams } = params ?? {};
       const event = await sendAgentCommandAndWait(
         {
           id: randomUUID(),
           method: "send_session_message",
-          params: { ...params, threadId },
+          params: {
+            ...requestParams,
+            ...(mcpGatewayUrl ? { mcpGatewayUrl } : {}),
+            ...(mcpGatewayToken ? { mcpGatewayToken } : {}),
+            threadId,
+          },
         },
         "session_message_accepted",
       );

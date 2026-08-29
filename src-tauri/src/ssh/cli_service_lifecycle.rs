@@ -13,6 +13,7 @@ use anyhow::Context;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
+    mcp_gateway::AuraCoderMcpGateway,
     message_notify_helper::CliHealthReconcileResult,
     ssh::cli_tunnel_registry::{self, SshCliTunnel},
 };
@@ -32,6 +33,8 @@ pub(crate) struct SshCliService {
     cli_id: String,
     generation: u64,
     tunnel: Arc<SshCliTunnel>,
+    /// 当前 SSH CLI 服务持有的 MCP Gateway 私有租约 Token。
+    mcp_token: String,
     state: Mutex<SshCliServiceEntryState>,
 }
 
@@ -150,11 +153,19 @@ impl SshCliService {
 pub(crate) struct SshCliServiceLifecycleRegistry {
     services: RwLock<HashMap<String, HashMap<String, Arc<SshCliService>>>>,
     mutation_lock: Mutex<()>,
+    /// 当前应用 MCP Gateway 的绑定引用，用于 SSH CLI 租约注册和撤销。
+    mcp_gateway: RwLock<Option<Arc<AuraCoderMcpGateway>>>,
 }
 
 static SSH_CLI_SERVICES: LazyLock<SshCliServiceLifecycleRegistry> =
     LazyLock::new(SshCliServiceLifecycleRegistry::default);
 static NEXT_SERVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// 绑定 SSH 生命周期使用的 MCP Gateway，并同步绑定 Tunnel 注册表。
+pub(crate) async fn bind_mcp_gateway(gateway: Arc<AuraCoderMcpGateway>) {
+    SSH_CLI_SERVICES.bind_mcp_gateway(gateway.clone()).await;
+    cli_tunnel_registry::bind_mcp_gateway(gateway).await;
+}
 
 /// 取得已由启动阶段登记的远端 CLI 服务；该方法不会启动或重连服务。
 pub async fn get(connection_id: &str, cli_id: &str) -> anyhow::Result<Arc<SshCliService>> {
@@ -169,6 +180,30 @@ pub async fn list_ready(connection_id: &str) -> Vec<Arc<SshCliService>> {
 /// 启动并登记一个远端 CLI 服务。相同“连接配置 ID + CLI ID”重复调用时复用已有服务。
 pub async fn set(connection_id: &str, cli_id: &str) -> anyhow::Result<Arc<SshCliService>> {
     SSH_CLI_SERVICES.set(connection_id, cli_id).await
+}
+
+/// 为 SSH CLI 当前轮次登记 AuraCoder MCP Gateway 可信上下文。
+///
+/// 业务调用方只提供 SSH 连接、CLI、引擎线程和 AuraCoder 轮次标识；本方法从 Ready
+/// 服务内部取得私有 MCP Token，避免 Token 暴露到聊天业务层。
+pub async fn register_mcp_context(
+    connection_id: &str,
+    cli_id: &str,
+    engine_thread_id: &str,
+    turn_id: &str,
+) -> anyhow::Result<()> {
+    SSH_CLI_SERVICES
+        .register_mcp_context(connection_id, cli_id, engine_thread_id, turn_id)
+        .await
+}
+
+/// 清除 SSH CLI 当前轮次的 AuraCoder MCP Gateway 可信上下文。
+///
+/// 清理失败会返回原始错误链，调用方可以记录异常但不需要接触私有 MCP Token。
+pub async fn clear_mcp_context(connection_id: &str, cli_id: &str) -> anyhow::Result<()> {
+    SSH_CLI_SERVICES
+        .clear_mcp_context(connection_id, cli_id)
+        .await
 }
 
 /// 终止一个远端 CLI 服务并移除其运行时登记。
@@ -272,6 +307,11 @@ pub async fn terminate_all() -> anyhow::Result<()> {
 }
 
 impl SshCliServiceLifecycleRegistry {
+    /// 保存 SSH CLI 生命周期使用的 MCP Gateway。
+    async fn bind_mcp_gateway(&self, gateway: Arc<AuraCoderMcpGateway>) {
+        *self.mcp_gateway.write().await = Some(gateway);
+    }
+
     async fn list_ready(&self, connection_id: &str) -> Vec<Arc<SshCliService>> {
         let mut services = self
             .services
@@ -314,6 +354,58 @@ impl SshCliServiceLifecycleRegistry {
         Ok(service)
     }
 
+    /// 使用 Ready SSH CLI 服务持有的私有 Token 登记 Gateway 可信上下文。
+    async fn register_mcp_context(
+        &self,
+        connection_id: &str,
+        cli_id: &str,
+        engine_thread_id: &str,
+        turn_id: &str,
+    ) -> anyhow::Result<()> {
+        let service = self.get(connection_id, cli_id).await?;
+        let gateway = self
+            .mcp_gateway
+            .read()
+            .await
+            .clone()
+            .context("SSH CLI 服务尚未绑定 MCP Gateway")
+            .with_context(|| {
+                format!(
+                    "登记 SSH CLI MCP 可信上下文失败: connection_id={connection_id} cli_id={cli_id}"
+                )
+            })?;
+        gateway
+            .register_trusted_context(&service.mcp_token, engine_thread_id, turn_id)
+            .await
+            .map_err(anyhow::Error::msg)
+            .with_context(|| {
+                format!(
+                    "登记 SSH CLI MCP 可信上下文失败: connection_id={connection_id} cli_id={cli_id}"
+                )
+            })
+    }
+
+    /// 使用 Ready SSH CLI 服务持有的私有 Token 清除 Gateway 可信上下文。
+    async fn clear_mcp_context(&self, connection_id: &str, cli_id: &str) -> anyhow::Result<()> {
+        let service = self.get(connection_id, cli_id).await?;
+        let gateway = self
+            .mcp_gateway
+            .read()
+            .await
+            .clone()
+            .context("SSH CLI 服务尚未绑定 MCP Gateway")
+            .with_context(|| {
+                format!(
+                    "清除 SSH CLI MCP 可信上下文失败: connection_id={connection_id} cli_id={cli_id}"
+                )
+            })?;
+        anyhow::ensure!(
+            gateway.clear_trusted_context(&service.mcp_token).await,
+            "清除 SSH CLI MCP 可信上下文失败：租约不存在或已撤销: connection_id={connection_id} cli_id={cli_id}"
+        );
+        Ok(())
+    }
+
     async fn set(&self, connection_id: &str, cli_id: &str) -> anyhow::Result<Arc<SshCliService>> {
         // 服务创建必须按注册表串行执行，避免并发刷新为同一个 connection_id + cli_id
         // 重复启动远端服务端。
@@ -340,12 +432,45 @@ impl SshCliServiceLifecycleRegistry {
             .with_context(|| {
                 format!("SSH CLI Tunnel 未建立: connection_id={connection_id} cli_id={cli_id}")
             })?;
-        cli_tunnel_registry::start_remote_cli_service_for_tunnel(tunnel.as_ref()).await?;
+        let mcp_gateway = self
+            .mcp_gateway
+            .read()
+            .await
+            .clone()
+            .context("SSH CLI 服务尚未绑定 MCP Gateway")
+            .with_context(|| {
+                format!("启动 SSH CLI 服务失败: connection_id={connection_id} cli_id={cli_id}")
+            })?;
+        let mcp_lease = mcp_gateway
+            .register_ssh_remote_thread_client(
+                cli_id,
+                &format!("{connection_id}:{cli_id}"),
+                connection_id,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("注册 SSH CLI MCP 租约失败: {error}"))?;
+        if let Err(error) = cli_tunnel_registry::start_remote_cli_service_with_mcp_token(
+            tunnel.clone(),
+            &mcp_lease.token,
+        )
+        .await
+        {
+            if !mcp_gateway.revoke_client(&mcp_lease.token).await {
+                log::warn!(
+                    "启动 SSH 远端 CLI 服务失败后撤销 MCP 租约失败：租约不存在或已撤销: connection_id={} cli_id={}",
+                    connection_id,
+                    cli_id
+                );
+            }
+            return Err(error);
+        }
+        let mcp_token = mcp_lease.token;
         let service = Arc::new(SshCliService {
             connection_id: connection_id.to_string(),
             cli_id: cli_id.to_string(),
             generation: NEXT_SERVICE_GENERATION.fetch_add(1, Ordering::Relaxed),
             tunnel,
+            mcp_token,
             state: Mutex::new(SshCliServiceEntryState::Ready),
         });
 
@@ -356,15 +481,21 @@ impl SshCliServiceLifecycleRegistry {
                 existing.clone()
             } else {
                 host_services.insert(cli_id.to_string(), service.clone());
-                service
+                service.clone()
             }
         };
-        let state = registered.state.lock().await;
-        anyhow::ensure!(
-            *state == SshCliServiceEntryState::Ready,
-            "SSH 远端 CLI 服务正在终止，不能重复登记: connection_id={connection_id} cli_id={cli_id}"
-        );
-        drop(state);
+        if !Arc::ptr_eq(&registered, &service) {
+            mcp_gateway.revoke_client(&service.mcp_token).await;
+        }
+        let ready = *registered.state.lock().await == SshCliServiceEntryState::Ready;
+        if !ready {
+            if Arc::ptr_eq(&registered, &service) {
+                mcp_gateway.revoke_client(&service.mcp_token).await;
+            }
+            anyhow::bail!(
+                "SSH 远端 CLI 服务正在终止，不能重复登记: connection_id={connection_id} cli_id={cli_id}"
+            );
+        }
         Ok(registered)
     }
 
@@ -383,21 +514,27 @@ impl SshCliServiceLifecycleRegistry {
         match result {
             Ok(stopped) => {
                 let mut services = self.services.write().await;
-                let remove_connection = if let Some(host_services) = services.get_mut(connection_id)
-                {
-                    let remove_service = host_services
-                        .get(cli_id)
-                        .map(|registered| Arc::ptr_eq(registered, &service))
-                        .unwrap_or(false);
-                    if remove_service {
-                        host_services.remove(cli_id);
-                    }
-                    host_services.is_empty()
-                } else {
-                    false
-                };
+                let (remove_service, remove_connection) =
+                    if let Some(host_services) = services.get_mut(connection_id) {
+                        let removed = host_services
+                            .get(cli_id)
+                            .map(|registered| Arc::ptr_eq(registered, &service))
+                            .unwrap_or(false);
+                        if removed {
+                            host_services.remove(cli_id);
+                        }
+                        (removed, host_services.is_empty())
+                    } else {
+                        (false, false)
+                    };
                 if remove_connection {
                     services.remove(connection_id);
+                }
+                drop(services);
+                if stopped && remove_service {
+                    if let Some(gateway) = self.mcp_gateway.read().await.clone() {
+                        gateway.revoke_client(&service.mcp_token).await;
+                    }
                 }
                 Ok(stopped)
             }

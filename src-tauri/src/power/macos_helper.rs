@@ -377,7 +377,10 @@ mod tests {
 
     #[test]
     fn socket_path_is_expected() {
-        assert_eq!(HELPER_SOCKET_PATH, "/var/run/com.auracoder.app.keepawake.sock");
+        assert_eq!(
+            HELPER_SOCKET_PATH,
+            "/var/run/com.auracoder.app.keepawake.sock"
+        );
     }
 
     #[test]

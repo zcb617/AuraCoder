@@ -85,6 +85,7 @@ import { SshConnectionsSettings } from "./SshConnectionsSettings";
 import type {
   ComputerControlStatus,
   DefaultFileOpenTarget,
+  McpServiceStatus,
   PowerSettingsInput,
   TerminalNotificationIntegrationId,
   TerminalNotificationIntegrationStatus,
@@ -255,6 +256,7 @@ export function SettingsPage() {
   const [terminalFontSize, setTerminalFontSize] = useState(DEFAULT_TERMINAL_FONT_SIZE);
   const [updatingTerminalPreference, setUpdatingTerminalPreference] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [mcpServiceStatus, setMcpServiceStatus] = useState<McpServiceStatus>({ state: "abnormal" });
   const [powerDraft, setPowerDraft] = useState<PowerSettingsInput | null>(null);
   const [customHours, setCustomHours] = useState("");
   const [customMinutes, setCustomMinutes] = useState("");
@@ -279,6 +281,23 @@ export function SettingsPage() {
   useEffect(() => {
     void getVersion().then(setAppVersion).catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    if (section !== "about") return;
+    let cancelled = false;
+    setMcpServiceStatus({ state: "abnormal" });
+    void ipc.getMcpServiceStatus()
+      .then((status) => {
+        if (!cancelled) setMcpServiceStatus(status);
+      })
+      .catch((error) => {
+        console.error("读取 MCP 服务状态失败。", error);
+        if (!cancelled) setMcpServiceStatus({ state: "abnormal" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [section]);
 
   useEffect(() => {
     if (!settingsWorkspaceId && selectedWorkspace) {
@@ -1635,6 +1654,19 @@ export function SettingsPage() {
                 >
                   <span className="usp-version-value">
                     {appVersion ? `v${appVersion}` : t("app:settingsPage.versionUnavailable")}
+                  </span>
+                </SettingsRow>
+                <SettingsRow
+                  icon={mcpServiceStatus.state === "normal"
+                    ? <CheckCircle2 size={17} />
+                    : <AlertCircle size={17} className="usp-status-icon-error" />}
+                  title={t("app:settingsPage.about.mcpServiceStatusTitle")}
+                  description={t("app:settingsPage.about.mcpServiceStatusDescription")}
+                >
+                  <span className="usp-version-value">
+                    {mcpServiceStatus.state === "normal"
+                      ? t("app:settingsPage.about.mcpServiceStatusNormal")
+                      : t("app:settingsPage.about.mcpServiceStatusAbnormal")}
                   </span>
                 </SettingsRow>
                 <SettingsRow

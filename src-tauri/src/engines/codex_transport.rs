@@ -36,6 +36,8 @@ use super::trim_action_output_delta_content;
 const INCOMING_EVENT_BUFFER_CAPACITY: usize = 6400;
 const TRANSPORT_ERROR_LINE_MAX_CHARS: usize = 16 * 1024;
 const TRANSPORT_ERROR_LINE_TRUNCATED_PREFIX: &str = "... [protocol line truncated; showing tail]\n";
+/// Codex app-server 读取 AuraCoder MCP Gateway Bearer Token 的固定环境变量名。
+const CODEX_MCP_GATEWAY_TOKEN_ENV: &str = "AURACODER_MCP_TOKEN";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CodexTransportEventDiagnostics {
@@ -101,7 +103,16 @@ impl Drop for CodexTransport {
 }
 
 impl CodexTransport {
-    pub async fn spawn(codex_executable: &str) -> anyhow::Result<Self> {
+    /// 启动本地 Codex app-server，并按需追加 MCP Gateway 配置覆盖参数。
+    pub async fn spawn(
+        codex_executable: &str,
+        mcp_gateway_endpoint: Option<&str>,
+        mcp_gateway_token: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        if mcp_gateway_endpoint.is_some() != mcp_gateway_token.is_some() {
+            return Err(anyhow::anyhow!("Codex 的 AuraCoder MCP 配置不完整"));
+        }
+
         let mut command = Command::new(codex_executable);
         process_utils::configure_tokio_command(&mut command);
         // 旧登录 Shell 环境导入和手工 PATH 处理由 runtime_env::get 接替：
@@ -110,6 +121,8 @@ impl CodexTransport {
         //     command.env("PATH", augmented_path);
         // }
         let mut codex_environment = runtime_env::get(Path::new(codex_executable)).await;
+        // 不让父进程可能已有的同名令牌进入环境快照日志；有效令牌只通过 command.env 注入。
+        codex_environment.remove(std::ffi::OsStr::new(CODEX_MCP_GATEWAY_TOKEN_ENV));
         // 旧判断保留：trace 曾被解读为局域网连接失败与这些启动变量无关。
         // 0.72.5 对照确认：本地网络用途声明与子进程应用身份过滤必须同时生效。
         #[cfg(target_os = "macos")]
@@ -119,15 +132,23 @@ impl CodexTransport {
         }
         command.envs(codex_environment.clone());
 
-        let codex_arguments = [
+        let mut codex_arguments = vec![
             "app-server".to_string(),
             "--listen".to_string(),
             "stdio://".to_string(),
         ];
+        if let (Some(endpoint), Some(token)) = (mcp_gateway_endpoint, mcp_gateway_token) {
+            command.env(CODEX_MCP_GATEWAY_TOKEN_ENV, token);
+            for config_override in runtime_env::codex_mcp_gateway_config_overrides(
+                endpoint,
+                CODEX_MCP_GATEWAY_TOKEN_ENV,
+            ) {
+                codex_arguments.push("-c".to_string());
+                codex_arguments.push(config_override);
+            }
+        }
         let mut command = command
-            .arg(&codex_arguments[0])
-            .arg(&codex_arguments[1])
-            .arg(&codex_arguments[2])
+            .args(&codex_arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -152,6 +173,7 @@ impl CodexTransport {
                 Err(error) => error.to_string(),
             };
             let auracoder_environment = std::env::vars_os()
+                .filter(|(key, _)| key != std::ffi::OsStr::new(CODEX_MCP_GATEWAY_TOKEN_ENV))
                 .map(|(key, value)| {
                     (
                         key.to_string_lossy().into_owned(),
@@ -645,18 +667,16 @@ impl CodexTransport {
                         Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
                         Ok(Message::Close(frame)) => {
                             #[cfg(target_os = "macos")]
-                            crate::engines::codex::append_codex_transport_log(
-                                &serde_json::json!({
-                                    "at": Utc::now().to_rfc3339(),
-                                    "event": "codex_websocket_closed",
-                                    "close_code": frame
-                                        .as_ref()
-                                        .map(|frame| u16::from(frame.code)),
-                                    "close_reason": frame
-                                        .as_ref()
-                                        .map(|frame| frame.reason.to_string()),
-                                }),
-                            )
+                            crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                                "at": Utc::now().to_rfc3339(),
+                                "event": "codex_websocket_closed",
+                                "close_code": frame
+                                    .as_ref()
+                                    .map(|frame| u16::from(frame.code)),
+                                "close_reason": frame
+                                    .as_ref()
+                                    .map(|frame| frame.reason.to_string()),
+                            }))
                             .await;
                             break;
                         }
@@ -664,13 +684,11 @@ impl CodexTransport {
                         Err(error) => {
                             log::warn!("codex websocket read error: {error}");
                             #[cfg(target_os = "macos")]
-                            crate::engines::codex::append_codex_transport_log(
-                                &serde_json::json!({
-                                    "at": Utc::now().to_rfc3339(),
-                                    "event": "codex_websocket_read_error",
-                                    "error": error.to_string(),
-                                }),
-                            )
+                            crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                                "at": Utc::now().to_rfc3339(),
+                                "event": "codex_websocket_read_error",
+                                "error": error.to_string(),
+                            }))
                             .await;
                             break;
                         }

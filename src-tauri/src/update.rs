@@ -243,8 +243,10 @@ impl UpdateManager {
                 let updates_directory = updates_dir(app)?;
                 let pid = current_process_id();
                 let unique_id = macos_job_unique_id()?;
-                let ready_path = updates_directory.join(format!("macos-relaunch-ready-{pid}-{unique_id}"));
-                let log_path = updates_directory.join(format!("macos-relaunch-{pid}-{unique_id}.log"));
+                let ready_path =
+                    updates_directory.join(format!("macos-relaunch-ready-{pid}-{unique_id}"));
+                let log_path =
+                    updates_directory.join(format!("macos-relaunch-{pid}-{unique_id}.log"));
                 let job = MacosUpdateJob {
                     mode: MacosUpdateMode::Relaunch,
                     old_process_id: pid,
@@ -466,7 +468,10 @@ impl UpdateManager {
     }
 
     /// 安装已经完成下载的更新，并返回当前平台的重启方式。
-    pub fn install_downloaded_update(&self, app: &AppHandle) -> Result<UpdateInstallResult, String> {
+    pub fn install_downloaded_update(
+        &self,
+        app: &AppHandle,
+    ) -> Result<UpdateInstallResult, String> {
         let saved = read_saved_update(app)?.ok_or_else(|| "没有已下载完成的更新".to_string())?;
         let file_path = saved_file_path(app, &saved)?;
         let file_size = fs::metadata(&file_path)
@@ -516,7 +521,8 @@ impl UpdateManager {
             let pid = current_process_id();
             let updates_directory = updates_dir(app)?;
             let unique_id = macos_job_unique_id()?;
-            let ready_path = updates_directory.join(format!("macos-install-ready-{pid}-{unique_id}"));
+            let ready_path =
+                updates_directory.join(format!("macos-install-ready-{pid}-{unique_id}"));
             let log_path = updates_directory.join(format!("macos-install-{pid}-{unique_id}.log"));
             let job = MacosUpdateJob {
                 mode: MacosUpdateMode::Install,
@@ -593,9 +599,8 @@ impl UpdateManager {
         #[cfg(target_os = "macos")]
         {
             let archive = Path::new(archive_path);
-            let metadata = fs::metadata(archive).map_err(|error| {
-                format!("本地更新包不存在或无法读取: {archive_path}: {error}")
-            })?;
+            let metadata = fs::metadata(archive)
+                .map_err(|error| format!("本地更新包不存在或无法读取: {archive_path}: {error}"))?;
             if !metadata.is_file() {
                 return Err(format!("本地更新包不是普通文件: {archive_path}"));
             }
@@ -608,9 +613,8 @@ impl UpdateManager {
                     "本地更新包格式不受支持，需要 .app.tar.gz: {archive_path}"
                 ));
             }
-            let bytes = fs::read(archive).map_err(|error| {
-                format!("无法读取本地更新包 {archive_path}: {error}")
-            })?;
+            let bytes = fs::read(archive)
+                .map_err(|error| format!("无法读取本地更新包 {archive_path}: {error}"))?;
             if bytes.is_empty() {
                 return Err(format!("本地更新包为空: {archive_path}"));
             }
@@ -724,7 +728,8 @@ fn spawn_macos_updater(app: &AppHandle, job: MacosUpdateJob) -> Result<(), Strin
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_nanos();
-    let helper_directory = updates_directory.join(format!("macos-updater-{}-{unique}", current_process_id()));
+    let helper_directory =
+        updates_directory.join(format!("macos-updater-{}-{unique}", current_process_id()));
     fs::create_dir_all(&helper_directory).map_err(|error| error.to_string())?;
     let helper_path = helper_directory.join("AuraCoderUpdater");
     fs::write(&helper_path, MACOS_UPDATER_BYTES).map_err(|error| error.to_string())?;
@@ -752,7 +757,12 @@ fn spawn_macos_updater(app: &AppHandle, job: MacosUpdateJob) -> Result<(), Strin
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| format!("启动 macOS updater 失败，日志路径 {}: {error}", job.log_path))?;
+        .map_err(|error| {
+            format!(
+                "启动 macOS updater 失败，日志路径 {}: {error}",
+                job.log_path
+            )
+        })?;
     let helper_pid = child.id();
     log::info!(
         "macOS updater started mode={:?} old_pid={} archive={:?} target={} job={} ready={} completion={} helper_pid={}",

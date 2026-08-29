@@ -19,8 +19,8 @@ use crate::{
     models::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CodexAppDto, CodexPluginDto,
         CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
-        ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto, ThreadDto,
-        PermissionComponentJson, ThreadStatusDto, WorkspaceDto,
+        ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
+        PermissionComponentJson, ThreadDto, ThreadStatusDto, WorkspaceDto,
     },
 };
 
@@ -443,10 +443,7 @@ pub trait CliTool: Send + Sync {
     /// 用户在聊天输入框中按下斜杠时，读取当前 CLI 在当前项目中可用的扩展菜单项；
     /// 三个 CLI 返回同一种 ExtensionItemDto 结构，前端按统一规则解析展示。
     /// 远端读取失败时不得回退读取本机数据。
-    async fn get_extensions(
-        &self,
-        context: &CliExecutionContext,
-    ) -> Result<Vec<ExtensionItemDto>>;
+    async fn get_extensions(&self, context: &CliExecutionContext) -> Result<Vec<ExtensionItemDto>>;
 
     /// 用户安装、卸载、启用、停用或认证扩展时，只对当前 CLI 和当前项目执行所选操作，并返回页面需要显示的结果。
     async fn perform_extension_action(

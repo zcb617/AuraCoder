@@ -159,6 +159,12 @@ export interface HelperStatus {
   message?: string | null;
 }
 
+/** MCP 服务运行状态快照，供设置页只读展示服务是否正常。 */
+export interface McpServiceStatus {
+  /** 后端返回的 MCP 服务业务运行状态。 */
+  state: "normal" | "abnormal";
+}
+
 export type TerminalNotificationIntegrationId = "claude" | "codex";
 
 export interface TerminalNotificationIntegrationStatus {

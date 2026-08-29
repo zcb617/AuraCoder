@@ -79,7 +79,8 @@ pub async fn refresh_kind(
                                     read_only_reason: Some("codex_skill_toggle".to_string()),
                                     warning: None,
 
-                                    ..Default::default()},
+                                    ..Default::default()
+                                },
                             )
                         })
                         .collect::<BTreeMap<_, _>>();
@@ -225,7 +226,8 @@ fn parse_plugins(
             read_only_reason: None,
             warning: None,
 
-            ..Default::default()};
+            ..Default::default()
+        };
         items.insert(id, item);
     }
 
@@ -291,7 +293,8 @@ fn parse_plugins(
                 read_only_reason: None,
                 warning: None,
 
-                ..Default::default()},
+                ..Default::default()
+            },
         );
     }
 
@@ -483,7 +486,8 @@ fn remote_plugin_skills(plugins: &[RemoteInstalledPlugin]) -> Vec<ExtensionItemD
                 read_only_reason: Some("codex_skill_toggle".to_string()),
                 warning: None,
 
-                ..Default::default()});
+                ..Default::default()
+            });
         }
     }
     items.into_values().collect()
@@ -650,7 +654,8 @@ fn parse_mcp_servers(
                 // normalized health state, never a raw configuration-derived reason.
                 warning: None,
 
-                ..Default::default()})
+                ..Default::default()
+            })
         })
         .collect()
 }

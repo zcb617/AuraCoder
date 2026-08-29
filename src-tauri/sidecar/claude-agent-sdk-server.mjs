@@ -128,6 +128,22 @@ const pendingApprovals = new Map();
 let shuttingDown = false;
 const claudeCodeExecutable = process.env.PANES_CLAUDE_CODE_EXECUTABLE?.trim() || null;
 const execFileAsync = promisify(execFile);
+const { inspect } = await import("no" + "de:util");
+
+// 开发阶段将 Claude SDK 与 MCP 调用的完整原始链路写入 stderr，便于还原一次完整业务轮次。
+function traceClaudeSdk(eventName, payload) {
+  const inspectedPayload = inspect(payload, {
+    depth: null,
+    maxArrayLength: null,
+    maxStringLength: null,
+    breakLength: Infinity,
+    compact: true,
+  });
+  process.stderr.write(
+    `[claude-sdk-trace] ${new Date().toISOString()} event=${eventName} payload=${inspectedPayload}\n`,
+  );
+}
+
 // 本机 Claude 会话扫描最多返回的摘要数量，避免历史文件过多阻塞 IPC。
 const MAX_CLAUDE_SESSIONS = 500;
 // 本机 Claude 会话摘要读取的最大 JSONL 行数，避免读取完整历史内容。
@@ -1839,8 +1855,10 @@ async function handleUsageLimits(req) {
   });
 }
 
+// 处理 Claude 查询请求，并为本地会话接入统一 Gateway 的 HTTP MCP server。
 async function handleQuery(req, persistentSession = null) {
   const { id, params = {} } = req;
+  traceClaudeSdk("handle_query_enter", { request: req, persistentSession });
   const {
     prompt,
     attachments = [],
@@ -1860,6 +1878,8 @@ async function handleQuery(req, persistentSession = null) {
     threadId,
     computerControlTools = [],
     auracoderThreadTools = [],
+    mcpGatewayUrl,
+    mcpGatewayToken,
     settingSources,
     strictMcpConfig,
     enforceApprovalRouting,
@@ -1888,16 +1908,35 @@ async function handleQuery(req, persistentSession = null) {
   try {
     const normalizedSandboxMode = normalizeSandboxMode(sandboxMode);
     const normalizedWritableRoots = normalizeWritableRoots(sessionCwd, writableRoots);
-    const auracoderComputerControlServer = createAuraCoderComputerControlServer(
-      context,
-      computerControlTools,
-    );
-    const auracoderThreadServer = createAuraCoderThreadServer(context, auracoderThreadTools);
-    if (auracoderComputerControlServer) {
-      toolList.push("mcp__auracoder-computer-control__*");
+    // 旧实现保留迁移留痕：统一 Gateway 接替进程内自定义工具服务器。
+    // const auracoderComputerControlServer = createAuraCoderComputerControlServer(
+    //   context,
+    //   computerControlTools,
+    // );
+    // const auracoderThreadServer = createAuraCoderThreadServer(context, auracoderThreadTools);
+    // const auracoderGatewayServer = typeof mcpGatewayUrl === "string" && mcpGatewayUrl.trim()
+    //   ? { type: "http", url: mcpGatewayUrl.trim() }
+    //   : null;
+    const hasMcpGatewayUrl = typeof mcpGatewayUrl === "string" && mcpGatewayUrl.trim().length > 0;
+    const hasMcpGatewayToken = typeof mcpGatewayToken === "string" && mcpGatewayToken.length > 0;
+    if (hasMcpGatewayUrl !== hasMcpGatewayToken) {
+      const internalError = new Error(
+        `MCP Gateway 配置不完整：url_present=${hasMcpGatewayUrl}, token_present=${hasMcpGatewayToken}`,
+      );
+      console.error("Claude MCP Gateway 配置异常", internalError);
+      throw new Error("AuraCoder MCP 配置不完整，Claude 会话无法启动", { cause: internalError });
     }
-    if (auracoderThreadServer) {
-      toolList.push("mcp__auracoder-thread__*");
+    const mcpServers = {};
+    if (hasMcpGatewayUrl && hasMcpGatewayToken) {
+      if (Object.prototype.hasOwnProperty.call(mcpServers, "auracoder")) {
+        throw new Error("AuraCoder MCP 名称冲突，Claude 会话无法启动");
+      }
+      mcpServers.auracoder = {
+        type: "http",
+        url: mcpGatewayUrl.trim(),
+        headers: { Authorization: `Bearer ${mcpGatewayToken}` },
+      };
+      toolList.push("mcp__auracoder__*");
     }
     const automaticallyAllowedTools = enforceApprovalRouting
       ? permissionOptions.decisionMode === "read-only"
@@ -1919,16 +1958,7 @@ async function handleQuery(req, persistentSession = null) {
         ? { allowDangerouslySkipPermissions: true }
         : {}),
       allowedTools: automaticallyAllowedTools,
-      ...(auracoderComputerControlServer || auracoderThreadServer
-        ? {
-            mcpServers: {
-              ...(auracoderComputerControlServer
-                ? { "auracoder-computer-control": auracoderComputerControlServer }
-                : {}),
-              ...(auracoderThreadServer ? { "auracoder-thread": auracoderThreadServer } : {}),
-            },
-          }
-        : {}),
+      ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
       canUseTool: buildPermissionHandler({
         context,
         cwd: sessionCwd,
@@ -1977,6 +2007,7 @@ async function handleQuery(req, persistentSession = null) {
           matcher: ".*",
           hooks: [
             async (hookInput) => {
+              traceClaudeSdk("pre_tool_use", { requestId: id, hookInput });
               const toolName = hookInput?.tool_name || hookInput?.name || "unknown";
               if (toolName === "AskUserQuestion") {
                 return {};
@@ -2022,6 +2053,7 @@ async function handleQuery(req, persistentSession = null) {
           matcher: ".*",
           hooks: [
             async (hookInput) => {
+              traceClaudeSdk("post_tool_use", { requestId: id, hookInput });
               const toolName = hookInput?.tool_name || hookInput?.name || "unknown";
               if (toolName === "AskUserQuestion") {
                 return {};
@@ -2061,6 +2093,7 @@ async function handleQuery(req, persistentSession = null) {
           matcher: ".*",
           hooks: [
             async (hookInput) => {
+              traceClaudeSdk("post_tool_use_failure", { requestId: id, hookInput });
               const toolName = hookInput?.tool_name || hookInput?.name || "unknown";
               if (toolName === "AskUserQuestion") {
                 return {};
@@ -2113,6 +2146,7 @@ async function handleQuery(req, persistentSession = null) {
       sessionCwd,
       sessionId || resume || "",
     );
+    traceClaudeSdk("query_create", { requestId: id, promptInput, options });
     const query = queryFn({ prompt: promptInput, options });
     context.query = query;
     if (persistentSession) {
@@ -2133,6 +2167,7 @@ async function handleQuery(req, persistentSession = null) {
     });
 
     for await (const message of query) {
+      traceClaudeSdk(`sdk_message_${id}`, { requestId: id, message });
       if (context.cancelled) {
         break;
       }
@@ -2171,6 +2206,14 @@ async function handleQuery(req, persistentSession = null) {
           });
         }
       } else if (message.type === "result") {
+        traceClaudeSdk("sdk_result_before_processing", {
+          requestId: id,
+          message,
+          sawTextDelta,
+          terminalStatus,
+          context,
+          contextStopReason: context.stopReason,
+        });
         actualSessionId = message.session_id || actualSessionId;
         setContextSessionId(context, actualSessionId);
         updateContextTokenUsage(context, {
@@ -2195,10 +2238,25 @@ async function handleQuery(req, persistentSession = null) {
           });
         }
         if (persistentSession) {
+          traceClaudeSdk("emit_turn_completed_before", {
+            requestId: id,
+            context,
+            status: persistentSession.interruptRequested ? "interrupted" : terminalStatus,
+            sawTextDelta,
+            terminalStatus,
+            contextStopReason: context.stopReason,
+          });
           emitTurnCompleted(
             context,
             persistentSession.interruptRequested ? "interrupted" : terminalStatus,
           );
+          traceClaudeSdk("emit_turn_completed_after", {
+            requestId: id,
+            context,
+            sawTextDelta,
+            terminalStatus,
+            contextStopReason: context.stopReason,
+          });
           persistentSession.interruptRequested = false;
           sawTextDelta = false;
           terminalStatus = "completed";
@@ -2272,8 +2330,29 @@ async function handleQuery(req, persistentSession = null) {
     }
 
     setContextSessionId(context, actualSessionId);
+    traceClaudeSdk("emit_turn_completed_before_final", {
+      requestId: id,
+      context,
+      status: context.cancelled ? "interrupted" : terminalStatus,
+      sawTextDelta,
+      terminalStatus,
+      contextStopReason: context.stopReason,
+    });
     emitTurnCompleted(context, context.cancelled ? "interrupted" : terminalStatus);
+    traceClaudeSdk("emit_turn_completed_after_final", {
+      requestId: id,
+      context,
+      sawTextDelta,
+      terminalStatus,
+      contextStopReason: context.stopReason,
+    });
   } catch (err) {
+    traceClaudeSdk("handle_query_error", {
+      requestId: id,
+      error: err,
+      stack: err?.stack,
+      context,
+    });
     emit({
       id,
       type: "error",
@@ -2283,6 +2362,7 @@ async function handleQuery(req, persistentSession = null) {
     setContextSessionId(context, actualSessionId);
     emitTurnCompleted(context, "failed");
   } finally {
+    traceClaudeSdk("handle_query_finally", { requestId: id, context });
     cleanupPendingApprovalsForQuery(id, "Claude query was canceled.");
     cleanupPendingComputerControlCalls(context, "Claude query was canceled.");
     activeQueries.delete(id);

@@ -129,7 +129,8 @@ fn parse_skills(value: &Value, cwd: Option<&str>) -> Vec<ExtensionItemDto> {
                 read_only_reason: Some("opencode_skill".to_string()),
                 warning: None,
 
-                ..Default::default()})
+                ..Default::default()
+            })
         })
         .collect()
 }
@@ -168,7 +169,8 @@ fn parse_config(value: &Value) -> Vec<ExtensionItemDto> {
             read_only_reason: Some("opencode_plugin_jsonc".to_string()),
             warning: None,
 
-            ..Default::default()});
+            ..Default::default()
+        });
     }
 
     if let Some(servers) = value.get("mcp").and_then(Value::as_object) {
@@ -328,7 +330,9 @@ mod tests {
             }
         }));
         assert_eq!(items.len(), 2);
-        assert!(items.iter().all(|item| item.id != "auracoder-computer-control"));
+        assert!(items
+            .iter()
+            .all(|item| item.id != "auracoder-computer-control"));
         assert!(items.iter().all(|item| !item.officially_available));
     }
 

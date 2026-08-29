@@ -43,7 +43,8 @@ mod tests {
     use uuid::Uuid;
 
     fn test_app_state() -> AppState {
-        let root = std::env::temp_dir().join(format!("auracoder-cli-tool-factory-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("auracoder-cli-tool-factory-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("failed to create test root");
 
         let db = crate::db::Database::open(root.join("workspaces.db"))
@@ -72,8 +73,12 @@ mod tests {
                 crate::computer_control_service::ComputerControlService::default(),
             ),
             auracoder_thread_mcp_service: Arc::new(
-                crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db),
+                crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()),
             ),
+            mcp_gateway: Arc::new(crate::mcp_gateway::AuraCoderMcpGateway::new(
+                Arc::new(crate::computer_control_service::ComputerControlService::default()),
+                Arc::new(crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db)),
+            )),
             remote_access: Arc::new(crate::remote::RemoteTunnelManager::default()),
             ssh_monitor: Arc::new(crate::ssh::monitor::SshConnectionMonitor::default()),
         }

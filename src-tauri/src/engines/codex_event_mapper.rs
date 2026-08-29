@@ -113,8 +113,7 @@ impl TurnEventMapper {
                 //     vec![EngineEvent::TextDelta { content }]
                 // }
                 if let Some(subagent_thread_id) = subagent_thread_id {
-                    let Some(item_id) =
-                        extract_any_string(params, &["itemId", "item_id", "id"])
+                    let Some(item_id) = extract_any_string(params, &["itemId", "item_id", "id"])
                     else {
                         return Vec::new();
                     };
@@ -123,11 +122,8 @@ impl TurnEventMapper {
                         return Vec::new();
                     };
                     self.streamed_agent_message_items.insert(item_id);
-                    let content = extract_any_string(
-                        params,
-                        &["delta", "text", "content"],
-                    )
-                    .unwrap_or_default();
+                    let content = extract_any_string(params, &["delta", "text", "content"])
+                        .unwrap_or_default();
                     if content.is_empty() {
                         Vec::new()
                     } else {
@@ -138,11 +134,12 @@ impl TurnEventMapper {
                         }]
                     }
                 } else {
-                    if let Some(item_id) = extract_any_string(params, &["itemId", "item_id", "id"]) {
+                    if let Some(item_id) = extract_any_string(params, &["itemId", "item_id", "id"])
+                    {
                         self.streamed_agent_message_items.insert(item_id);
                     }
-                    let content =
-                        extract_any_string(params, &["delta", "text", "content"]).unwrap_or_default();
+                    let content = extract_any_string(params, &["delta", "text", "content"])
+                        .unwrap_or_default();
                     if content.is_empty() {
                         Vec::new()
                     } else {
@@ -273,13 +270,11 @@ impl TurnEventMapper {
             //     .collect(),
             // "itemstarted" => self.map_item_started(params),
             // "itemcompleted" => self.map_item_completed(params),
-            "hookstarted" | "hookcompleted" => map_hook_notification(
-                method_key.as_str(),
-                params,
-                subagent_thread_id,
-            )
-            .into_iter()
-            .collect(),
+            "hookstarted" | "hookcompleted" => {
+                map_hook_notification(method_key.as_str(), params, subagent_thread_id)
+                    .into_iter()
+                    .collect()
+            }
             "itemstarted" => self.map_item_started(params, subagent_thread_id),
             "itemcompleted" => self.map_item_completed(params, subagent_thread_id),
             "itemcommandexecutionoutputdelta"
@@ -553,12 +548,10 @@ impl TurnEventMapper {
             "subAgentActivity" => {
                 let engine_item_id = extract_any_string(item, &["id"]);
                 let action_id = self.resolve_or_register_action(engine_item_id.as_deref());
-                let activity_kind = extract_any_string(item, &["kind"])
-                    .unwrap_or_else(|| "updated".to_string());
-                let activity_thread_id = extract_any_string(
-                    item,
-                    &["agentThreadId", "agent_thread_id"],
-                );
+                let activity_kind =
+                    extract_any_string(item, &["kind"]).unwrap_or_else(|| "updated".to_string());
+                let activity_thread_id =
+                    extract_any_string(item, &["agentThreadId", "agent_thread_id"]);
                 let details = annotate_subagent_details(
                     item.clone(),
                     activity_thread_id.as_deref().or(subagent_thread_id),
@@ -593,11 +586,8 @@ impl TurnEventMapper {
                 if let Some(subagent_thread_id) = subagent_thread_id {
                     let engine_item_id = extract_any_string(item, &["id"]);
                     let action_id = self.resolve_or_register_action(engine_item_id.as_deref());
-                    let mut details = annotate_subagent_details(
-                        item.clone(),
-                        Some(subagent_thread_id),
-                        None,
-                    );
+                    let mut details =
+                        annotate_subagent_details(item.clone(), Some(subagent_thread_id), None);
                     if let Some(object) = details.as_object_mut() {
                         object.insert("subagentMessage".to_string(), Value::Bool(true));
                     }
@@ -2383,7 +2373,10 @@ mod tests {
         assert_eq!(started.len(), 1);
         match &started[0] {
             EngineEvent::ActionStarted { details, .. } => {
-                assert_eq!(details.get("subagentThreadId"), Some(&json!("child_thread")));
+                assert_eq!(
+                    details.get("subagentThreadId"),
+                    Some(&json!("child_thread"))
+                );
             }
             other => panic!("expected child action started event; received {other:?}"),
         }
@@ -2401,7 +2394,10 @@ mod tests {
         assert_eq!(message_started.len(), 1);
         let message_action_id = match &message_started[0] {
             EngineEvent::ActionStarted {
-                action_id, details, summary, ..
+                action_id,
+                details,
+                summary,
+                ..
             } => {
                 assert_eq!(summary, "子代理进度");
                 assert_eq!(details.get("subagentMessage"), Some(&json!(true)));
@@ -2455,9 +2451,14 @@ mod tests {
             Some("parent_thread"),
         );
         match &activity[0] {
-            EngineEvent::ActionStarted { summary, details, .. } => {
+            EngineEvent::ActionStarted {
+                summary, details, ..
+            } => {
                 assert_eq!(summary, "子代理已开始");
-                assert_eq!(details.get("subagentThreadId"), Some(&json!("child_thread")));
+                assert_eq!(
+                    details.get("subagentThreadId"),
+                    Some(&json!("child_thread"))
+                );
                 assert_eq!(details.get("subagentActivity"), Some(&json!("started")));
                 assert_eq!(details.get("agentPath"), Some(&json!("编码任务")));
             }

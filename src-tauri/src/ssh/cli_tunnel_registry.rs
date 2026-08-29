@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::{
     db::ssh_connections::SshConnectionRecord,
+    mcp_gateway::AuraCoderMcpGateway,
     message_notify_helper::notify_app_startup_progress,
     runtime_env,
     // ssh::{gateway, runtime::quote_posix},
@@ -30,6 +31,8 @@ pub struct SshCliTunnel {
     cli_id: String,
     local_port: u16,
     remote_port: u16,
+    /// MCP Gateway 在远端 SSH 主机上承载反向转发的端口。
+    mcp_reverse_port: u16,
     remote_service_secret: Option<String>,
     process: Mutex<Option<Child>>,
     pub(crate) service_lifecycle: Mutex<RemoteCliServiceLifecycle>,
@@ -57,11 +60,13 @@ pub struct SshRemoteServerInitializationResult {
 }
 
 impl SshCliTunnel {
+    /// 创建同时承载远端 CLI 本地转发与 MCP Gateway 反向转发的 SSH Tunnel。
     pub fn new(
         connection: SshConnectionRecord,
         cli_id: String,
         local_port: u16,
         remote_port: u16,
+        mcp_reverse_port: u16,
         process: Child,
     ) -> Self {
         let connection_id = connection.dto.id.clone();
@@ -76,6 +81,7 @@ impl SshCliTunnel {
             cli_id,
             local_port,
             remote_port,
+            mcp_reverse_port,
             remote_service_secret,
             process: Mutex::new(Some(process)),
             service_lifecycle: Mutex::new(RemoteCliServiceLifecycle::default()),
@@ -101,6 +107,11 @@ impl SshCliTunnel {
 
     pub fn remote_port(&self) -> u16 {
         self.remote_port
+    }
+
+    /// 返回当前 SSH Tunnel 承载 MCP Gateway 的远端反向端口。
+    pub fn mcp_reverse_port(&self) -> u16 {
+        self.mcp_reverse_port
     }
 
     pub fn remote_service_secret(&self) -> Option<&str> {
@@ -180,6 +191,8 @@ pub enum AddSshCliTunnelResult {
 #[derive(Default)]
 pub struct SshCliTunnelRegistry {
     tunnels: RwLock<HashMap<String, HashMap<String, Arc<SshCliTunnel>>>>,
+    /// 当前应用 MCP Gateway 的绑定引用，用于创建 Tunnel 时读取实际监听端口。
+    mcp_gateway: RwLock<Option<Arc<AuraCoderMcpGateway>>>,
 }
 
 static SSH_CLI_TUNNELS: LazyLock<SshCliTunnelRegistry> =
@@ -187,6 +200,11 @@ static SSH_CLI_TUNNELS: LazyLock<SshCliTunnelRegistry> =
 
 pub async fn add(tunnel: SshCliTunnel) -> AddSshCliTunnelResult {
     SSH_CLI_TUNNELS.add(tunnel).await
+}
+
+/// 绑定应用内 MCP Gateway，供 SSH Tunnel 在创建时取得实际监听端口。
+pub(crate) async fn bind_mcp_gateway(gateway: Arc<AuraCoderMcpGateway>) {
+    SSH_CLI_TUNNELS.bind_mcp_gateway(gateway).await;
 }
 
 /// 启动阶段恢复所有未删除且启用的 SSH 服务器及其 CLI 隧道。
@@ -249,6 +267,7 @@ pub async fn register_cli_tunnels(
 ) -> (Vec<String>, Vec<String>) {
     let mut restored_cli_ids = Vec::new();
     let mut tunnel_errors = Vec::new();
+    let mut mcp_gateway_port = None;
 
     for cli_id in cli_versions.keys() {
         let Some(preferred_remote_port) = preferred_remote_port(cli_id) else {
@@ -259,31 +278,45 @@ pub async fn register_cli_tunnels(
             restored_cli_ids.push(cli_id.clone());
             continue;
         }
-
-        let remote_port = match gateway::run_command(
-            record,
-            &format!(
-                "port={preferred_remote_port}; while ss -ltn 2>/dev/null | awk '{{print $4}}' | grep -Eq \"[:.]${{port}}$\"; do port=$((port + 1)); [ \"$port\" -le 65535 ] || exit 1; done; printf '%s\\n' \"$port\""
-            ),
-        )
-        .await
-        .and_then(|output| {
-            output
-                .trim()
-                .parse::<u16>()
-                .map_err(anyhow::Error::from)
-        }) {
-            Ok(remote_port) => remote_port,
-            Err(error) => {
-                let message = format!(
-                    "failed to allocate remote SSH CLI port connection={} cli={}: {error}",
-                    record.dto.id, cli_id
-                );
-                log::warn!("{message}");
-                tunnel_errors.push(message);
-                continue;
+        if mcp_gateway_port.is_none() {
+            match SSH_CLI_TUNNELS.mcp_gateway_port().await {
+                Ok(port) => mcp_gateway_port = Some(port),
+                Err(error) => {
+                    let message = format!("无法建立 SSH CLI Tunnel：MCP Gateway 未就绪: {error:#}");
+                    log::warn!("{message}");
+                    tunnel_errors.push(message);
+                    continue;
+                }
             }
-        };
+        }
+
+        let remote_port =
+            match allocate_remote_port(record, preferred_remote_port, 65535, None).await {
+                Ok(remote_port) => remote_port,
+                Err(error) => {
+                    let message = format!(
+                        "failed to allocate remote SSH CLI port connection={} cli={}: {error}",
+                        record.dto.id, cli_id
+                    );
+                    log::warn!("{message}");
+                    tunnel_errors.push(message);
+                    continue;
+                }
+            };
+
+        let mcp_reverse_port =
+            match allocate_remote_port(record, 30000, 60000, Some(remote_port)).await {
+                Ok(port) => port,
+                Err(error) => {
+                    let message = format!(
+                        "failed to allocate remote MCP reverse port connection={} cli={}: {error}",
+                        record.dto.id, cli_id
+                    );
+                    log::warn!("{message}");
+                    tunnel_errors.push(message);
+                    continue;
+                }
+            };
 
         let local_listener = match tokio::net::TcpListener::bind(("127.0.0.1", 0)).await {
             Ok(listener) => listener,
@@ -311,7 +344,16 @@ pub async fn register_cli_tunnels(
         };
         drop(local_listener);
 
-        match gateway::open_tunnel(record, local_port, "127.0.0.1", remote_port).await {
+        match gateway::open_tunnel(
+            record,
+            local_port,
+            "127.0.0.1",
+            remote_port,
+            mcp_reverse_port,
+            mcp_gateway_port.expect("MCP Gateway 端口已在 Tunnel 创建前取得"),
+        )
+        .await
+        {
             Ok(mut process) => {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 match process.try_wait() {
@@ -341,17 +383,19 @@ pub async fn register_cli_tunnels(
                     cli_id.clone(),
                     local_port,
                     remote_port,
+                    mcp_reverse_port,
                     process,
                 ))
                 .await;
                 match added {
                     AddSshCliTunnelResult::Added(tunnel) => {
                         log::info!(
-                            "registered SSH CLI tunnel connection={} cli={} local_port={} remote_port={}",
+                            "registered SSH CLI tunnel connection={} cli={} local_port={} remote_port={} mcp_reverse_port={}",
                             tunnel.connection_id(),
                             tunnel.cli_id(),
                             tunnel.local_port(),
-                            tunnel.remote_port()
+                            tunnel.remote_port(),
+                            tunnel.mcp_reverse_port()
                         );
                         restored_cli_ids.push(cli_id.clone());
                     }
@@ -390,6 +434,23 @@ fn preferred_remote_port(cli_id: &str) -> Option<u16> {
     }
 }
 
+/// 在远端监听端口中分配指定范围内的首个空闲端口，并排除当前 Tunnel 的普通端口。
+async fn allocate_remote_port(
+    record: &SshConnectionRecord,
+    start: u16,
+    end: u16,
+    excluded_port: Option<u16>,
+) -> anyhow::Result<u16> {
+    let excluded_check = excluded_port
+        .map(|port| format!(" || \"$port\" -eq {port}"))
+        .unwrap_or_default();
+    let command = format!(
+        "port={start}; while ss -ltn 2>/dev/null | awk '{{print $4}}' | grep -Eq \"[:.]${{port}}$\"{excluded_check}; do port=$((port + 1)); [ \"$port\" -le {end} ] || exit 1; done; printf '%s\\n' \"$port\""
+    );
+    let output = gateway::run_command(record, &command).await?;
+    output.trim().parse::<u16>().context("解析远端空闲端口失败")
+}
+
 pub async fn get(connection_id: &str, cli_id: &str) -> Option<Arc<SshCliTunnel>> {
     SSH_CLI_TUNNELS.get(connection_id, cli_id).await
 }
@@ -408,6 +469,16 @@ pub async fn start_remote_cli_service(
 ) -> anyhow::Result<Arc<SshCliTunnel>> {
     SSH_CLI_TUNNELS
         .start_remote_cli_service(connection_id, cli_id)
+        .await
+}
+
+/// 由 SSH CLI 服务生命周期使用已签发的 MCP Token 启动并常驻远端 CLI 服务。
+pub(crate) async fn start_remote_cli_service_with_mcp_token(
+    tunnel: Arc<SshCliTunnel>,
+    mcp_token: &str,
+) -> anyhow::Result<Arc<SshCliTunnel>> {
+    SSH_CLI_TUNNELS
+        .start_remote_cli_service_with_mcp_token(tunnel, mcp_token)
         .await
 }
 
@@ -460,6 +531,26 @@ pub async fn shutdown() {
 }
 
 impl SshCliTunnelRegistry {
+    /// 保存应用内 MCP Gateway，供 Tunnel 创建流程统一读取实际监听端口。
+    pub(crate) async fn bind_mcp_gateway(&self, gateway: Arc<AuraCoderMcpGateway>) {
+        *self.mcp_gateway.write().await = Some(gateway);
+    }
+
+    /// 读取正在监听的 MCP Gateway 端口；未绑定或服务未启动时返回业务错误。
+    async fn mcp_gateway_port(&self) -> anyhow::Result<u16> {
+        let gateway = self
+            .mcp_gateway
+            .read()
+            .await
+            .clone()
+            .context("SSH CLI Tunnel 尚未绑定 MCP Gateway")?;
+        let address = gateway
+            .local_addr()
+            .await
+            .context("MCP Gateway 尚未启动，无法建立 SSH 反向转发")?;
+        Ok(address.port())
+    }
+
     pub async fn add(&self, tunnel: SshCliTunnel) -> AddSshCliTunnelResult {
         let connection_id = tunnel.connection_id().to_string();
         let cli_id = tunnel.cli_id().to_string();
@@ -547,7 +638,30 @@ impl SshCliTunnelRegistry {
         let mut lifecycle = tunnel.service_lifecycle.lock().await;
         let acquired_resident_use = lifecycle.resident_use_count == 0;
         lifecycle.resident_use_count = 1;
-        if let Err(error) = ensure_remote_cli_service_running(tunnel.as_ref(), &mut lifecycle).await
+        if let Err(error) =
+            ensure_remote_cli_service_running(tunnel.as_ref(), &mut lifecycle, None).await
+        {
+            if acquired_resident_use {
+                lifecycle.resident_use_count = 0;
+            }
+            return Err(error);
+        }
+        drop(lifecycle);
+        Ok(tunnel)
+    }
+
+    /// 使用 SSH CLI 生命周期签发的 MCP Token 启动远端服务并登记常驻占用。
+    async fn start_remote_cli_service_with_mcp_token(
+        &self,
+        tunnel: Arc<SshCliTunnel>,
+        mcp_token: &str,
+    ) -> anyhow::Result<Arc<SshCliTunnel>> {
+        let mut lifecycle = tunnel.service_lifecycle.lock().await;
+        let acquired_resident_use = lifecycle.resident_use_count == 0;
+        lifecycle.resident_use_count = 1;
+        if let Err(error) =
+            ensure_remote_cli_service_running(tunnel.as_ref(), &mut lifecycle, Some(mcp_token))
+                .await
         {
             if acquired_resident_use {
                 lifecycle.resident_use_count = 0;
@@ -585,7 +699,8 @@ impl SshCliTunnelRegistry {
         })?;
         let mut lifecycle = tunnel.service_lifecycle.lock().await;
         lifecycle.temporary_use_count += 1;
-        if let Err(error) = ensure_remote_cli_service_running(tunnel.as_ref(), &mut lifecycle).await
+        if let Err(error) =
+            ensure_remote_cli_service_running(tunnel.as_ref(), &mut lifecycle, None).await
         {
             lifecycle.temporary_use_count -= 1;
             return Err(error);
@@ -624,7 +739,8 @@ impl SshCliTunnelRegistry {
             .persistent_session_uses
             .entry(thread_id.to_string())
             .or_insert(0) += 1;
-        if let Err(error) = ensure_remote_cli_service_running(tunnel.as_ref(), &mut lifecycle).await
+        if let Err(error) =
+            ensure_remote_cli_service_running(tunnel.as_ref(), &mut lifecycle, None).await
         {
             lifecycle.release_persistent_session_use(thread_id);
             return Err(error);
@@ -677,15 +793,20 @@ impl SshCliTunnelRegistry {
     }
 }
 
+/// 按当前 SSH CLI 服务生命周期启动远端进程；只有已签发的 MCP 租约才能启动停止状态的服务。
 async fn ensure_remote_cli_service_running(
     tunnel: &SshCliTunnel,
     lifecycle: &mut RemoteCliServiceLifecycle,
+    mcp_token: Option<&str>,
 ) -> anyhow::Result<()> {
     if lifecycle.service_state == RemoteCliServiceState::Running {
         return Ok(());
     }
+    let Some(mcp_token) = mcp_token.filter(|token| !token.trim().is_empty()) else {
+        anyhow::bail!("必须由 SSH CLI 服务生命周期签发 MCP 租约后启动");
+    };
     lifecycle.service_state = RemoteCliServiceState::Starting;
-    match start_remote_cli_service_for_tunnel(tunnel).await {
+    match start_remote_cli_service_for_tunnel(tunnel, mcp_token).await {
         Ok(()) => {
             lifecycle.service_generation = lifecycle.service_generation.wrapping_add(1).max(1);
             lifecycle.service_state = RemoteCliServiceState::Running;
@@ -735,7 +856,12 @@ async fn close_remote_cli_service_if_unused(
 /// 不得直接调用。
 pub(crate) async fn start_remote_cli_service_for_tunnel(
     tunnel: &SshCliTunnel,
+    mcp_token: &str,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !mcp_token.trim().is_empty(),
+        "启动 SSH 远端 CLI 服务必须提供有效 MCP 租约 Token"
+    );
     if tunnel.cli_id() == "claude" {
         let prerequisite_command = wrap_remote_login_shell_command(
             "node -e 'const [major, minor] = process.versions.node.split(\".\").map(Number); const compatible = (major > 20 || (major === 20 && minor >= 5)) && typeof Symbol.dispose === \"symbol\" && typeof Symbol.asyncDispose === \"symbol\"; process.exit(compatible ? 0 : 45)' && claude_path=$(type -P claude) || exit 44; \"$claude_path\" auth status >/dev/null || exit 46",
@@ -755,7 +881,7 @@ pub(crate) async fn start_remote_cli_service_for_tunnel(
                 )
             })?;
     }
-    let start_command = build_remote_service_start_command(tunnel)?;
+    let start_command = build_remote_service_start_command(tunnel, mcp_token)?;
     gateway::run_command(tunnel.connection(), &start_command)
         .await
         .with_context(|| {
@@ -821,33 +947,62 @@ ss -ltn 2>/dev/null | awk '{{print $4}}' | grep -Eq \"[:.]${{port}}$\"",
     }
 }
 
-fn build_remote_service_start_command(tunnel: &SshCliTunnel) -> anyhow::Result<String> {
+/// 构造带当前 MCP 租约认证的远端 CLI 服务启动命令，并注入 Tunnel 的 Gateway Endpoint。
+fn build_remote_service_start_command(
+    tunnel: &SshCliTunnel,
+    mcp_token: &str,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !mcp_token.trim().is_empty(),
+        "构造 SSH 远端 CLI 服务启动命令必须提供有效 MCP 租约 Token"
+    );
     let pid_file = remote_service_pid_file(tunnel);
     let log_file = remote_service_log_file(tunnel);
     let runtime_dir = remote_service_runtime_dir(tunnel);
+    let mcp_endpoint = format!("http://127.0.0.1:{}/mcp", tunnel.mcp_reverse_port());
     let launch_command = match tunnel.cli_id() {
-        "codex" => format!(
-            // "exec codex app-server --listen ws://127.0.0.1:{}",
-            "exec env codex app-server --listen ws://127.0.0.1:{}",
-            tunnel.remote_port()
-        ),
+        "codex" => {
+            let codex_overrides = runtime_env::codex_mcp_gateway_config_overrides(
+                &mcp_endpoint,
+                "AURACODER_MCP_TOKEN",
+            )
+            .into_iter()
+            .map(|config_override| format!("-c {}", runtime_env::quote_posix(&config_override)))
+            .collect::<Vec<_>>()
+            .join(" ");
+            format!(
+                "export AURACODER_MCP_TOKEN={}; exec env codex app-server --listen ws://127.0.0.1:{} {}",
+                runtime_env::quote_posix(mcp_token),
+                tunnel.remote_port(),
+                codex_overrides,
+            )
+        }
         "opencode" => {
             let secret = tunnel
                 .remote_service_secret()
                 .context("OpenCode 远端服务密码不存在")?;
             let opencode_env = runtime_env::get_remote_opencode_env(secret);
+            let config_dir = format!("{runtime_dir}/.opencode");
+            let config = runtime_env::opencode_mcp_gateway_authenticated_config(
+                &mcp_endpoint,
+                &format!("Bearer {mcp_token}"),
+            )
+            .to_string();
             format!(
-                "{opencode_env}exec env opencode serve --hostname 127.0.0.1 --port {}",
+                "{opencode_env}export OPENCODE_CONFIG_DIR=\"{config_dir}\"; export XDG_CONFIG_HOME=\"{runtime_dir}\"; mkdir -p \"$OPENCODE_CONFIG_DIR\"; printf '%s' {} > \"$OPENCODE_CONFIG_DIR/opencode.json\"; exec env opencode serve --hostname 127.0.0.1 --port {}",
+                runtime_env::quote_posix(&config),
                 tunnel.remote_port()
             )
         }
         "claude" => {
             let claude_env = runtime_env::get_remote_claude_env("claude_path")?;
             format!(
-                "claude_path=$(type -P claude) || {{ echo 'Claude Code executable not found' >&2; exit 44; }}; {claude_env}exec env no{} {}/claude-remote-session-server.mjs --host 127.0.0.1 --port {}",
+                "claude_path=$(type -P claude) || {{ echo 'Claude Code executable not found' >&2; exit 44; }}; {claude_env}export AURACODER_MCP_TOKEN={}; exec env no{} {}/claude-remote-session-server.mjs --host 127.0.0.1 --port {} --mcp-gateway-url {}",
+                runtime_env::quote_posix(mcp_token),
                 "de",
                 claude_runtime_remote_root(),
                 tunnel.remote_port(),
+                runtime_env::quote_posix(&mcp_endpoint),
             )
         }
         other => anyhow::bail!("当前未实现该 SSH 远端 CLI 服务启动: {other}"),
@@ -1130,6 +1285,7 @@ mod tests {
             cli_id: cli_id.to_string(),
             local_port,
             remote_port: local_port,
+            mcp_reverse_port: 30123,
             remote_service_secret: (cli_id == "opencode").then(|| "secret".to_string()),
             process: Mutex::new(None),
             service_lifecycle: Mutex::new(RemoteCliServiceLifecycle::default()),
@@ -1155,10 +1311,27 @@ mod tests {
     #[test]
     fn remote_service_pid_tracks_the_login_shell_that_execs_the_cli() {
         let tunnel = tunnel("host-a", "codex", 43100);
-        let command = build_remote_service_start_command(&tunnel).expect("start command");
+        let command =
+            build_remote_service_start_command(&tunnel, "test-mcp-token").expect("start command");
 
         assert!(command.contains("nohup \"${SHELL:-/bin/sh}\" -lic"));
         assert!(!command.contains("nohup sh -lc"));
+    }
+
+    #[tokio::test]
+    async fn stopped_remote_service_requires_an_mcp_lease_token() {
+        let tunnel = tunnel("host-a", "codex", 43100);
+        let mut lifecycle = RemoteCliServiceLifecycle::default();
+
+        let error = ensure_remote_cli_service_running(&tunnel, &mut lifecycle, None)
+            .await
+            .expect_err("stopped service must reject startup without an MCP lease token");
+
+        assert!(error
+            .to_string()
+            .contains("必须由 SSH CLI 服务生命周期签发 MCP 租约后启动"));
+        assert_eq!(lifecycle.service_state, RemoteCliServiceState::Stopped);
+        assert_eq!(lifecycle.resident_use_count, 0);
     }
 
     #[test]
@@ -1224,6 +1397,8 @@ mod tests {
             panic!("第二次添加必须返回已有隧道");
         };
         assert_eq!(existing.local_port(), 41001);
+        assert_eq!(existing.mcp_reverse_port(), 30123);
+        assert!((30000..=60000).contains(&existing.mcp_reverse_port()));
         assert_eq!(registry.list_by_host("host-a").await.len(), 1);
     }
 
@@ -1255,10 +1430,17 @@ mod tests {
     #[test]
     fn build_codex_remote_service_start_command_uses_remote_port() {
         let command =
-            build_remote_service_start_command(&tunnel("host-a", "codex", 41001)).unwrap();
+            build_remote_service_start_command(&tunnel("host-a", "codex", 41001), "test-mcp-token")
+                .unwrap();
         assert!(command.contains("codex app-server --listen ws://127.0.0.1:41001"));
         assert!(command.contains("\"${SHELL:-/bin/sh}\" -lic"));
         assert!(command.contains("exec env codex app-server"));
+        assert!(command.contains(" -c "));
+        assert!(command.contains("mcp_servers.auracoder.url=\"http://127.0.0.1:30123/mcp\""));
+        assert!(
+            command.contains("mcp_servers.auracoder.bearer_token_env_var=\"AURACODER_MCP_TOKEN\"")
+        );
+        assert!(command.contains("AURACODER_MCP_TOKEN="));
         // 旧断言允许复用任意存活的 Codex PID，无法保证旧服务端口与新 Tunnel 一致：
         // assert!(command.contains("exit 0;"));
         assert!(command.contains("pid=$(cat \"$pid_file\"); kill \"$pid\""));
@@ -1267,8 +1449,11 @@ mod tests {
 
     #[test]
     fn build_opencode_remote_service_start_command_uses_password_and_remote_port() {
-        let command =
-            build_remote_service_start_command(&tunnel("host-a", "opencode", 41002)).unwrap();
+        let command = build_remote_service_start_command(
+            &tunnel("host-a", "opencode", 41002),
+            "test-mcp-token",
+        )
+        .unwrap();
         let opencode_env = runtime_env::get_remote_opencode_env("");
         let opencode_env_prefix = opencode_env
             .split('=')
@@ -1278,18 +1463,31 @@ mod tests {
         assert!(command.contains("opencode serve --hostname 127.0.0.1 --port 41002"));
         assert!(command.contains("\"${SHELL:-/bin/sh}\" -lic"));
         assert!(command.contains("exec env opencode serve"));
+        assert!(command.contains("OPENCODE_CONFIG_DIR"));
+        assert!(command.contains("XDG_CONFIG_HOME"));
+        assert!(command.contains("opencode.json"));
+        assert!(command.contains("\"type\":\"remote\""));
+        assert!(command.contains("http://127.0.0.1:30123/mcp"));
+        assert!(command.contains("\"Authorization\":\"Bearer test-mcp-token\""));
         assert!(command.contains("pid=$(cat \"$pid_file\"); kill \"$pid\""));
         assert!(!command.contains("exit 0;"));
     }
 
     #[test]
     fn build_claude_remote_service_start_command_uses_session_adapter_and_remote_port() {
-        let command =
-            build_remote_service_start_command(&tunnel("host-a", "claude", 41003)).unwrap();
+        let command = build_remote_service_start_command(
+            &tunnel("host-a", "claude", 41003),
+            "test-mcp-token",
+        )
+        .unwrap();
         assert!(command.contains("claude-remote-session-server.mjs"));
         assert!(command.contains("$HOME/.cache/auracoder/runtime/claude/"));
         assert!(!command.contains("'$HOME/.cache/auracoder/runtime/claude/"));
         assert!(command.contains("--host 127.0.0.1 --port 41003"));
+        assert!(command.contains("--mcp-gateway-url"));
+        assert!(command.contains("http://127.0.0.1:30123/mcp"));
+        assert!(command.contains("AURACODER_MCP_TOKEN="));
+        assert!(!command.contains("--mcp-gateway-token"));
         assert!(command.contains("type -P claude"));
         let claude_env =
             runtime_env::get_remote_claude_env("claude_path").expect("Claude environment prefix");

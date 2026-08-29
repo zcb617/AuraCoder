@@ -21,7 +21,9 @@ use crate::{
 /// 本机 CLI 目录统一从本地 CLI 生命周期取数：逐个 Ready 服务调用对应 CliTool 的
 /// get_engine_info，保证模型列表来自启动阶段已预热的引擎实例，而不是临时冷启动的实例。
 /// 本机取数不依赖具体项目，因此使用仅标记 location_kind 的本机上下文。
-pub(crate) async fn list_local_engine_infos(state: &AppState) -> Result<Vec<EngineInfoDto>, String> {
+pub(crate) async fn list_local_engine_infos(
+    state: &AppState,
+) -> Result<Vec<EngineInfoDto>, String> {
     let services = LocalCliServiceLifecycle::list_ready().await;
     let factory = CliToolFactory::new(state.clone());
     let mut engines = Vec::new();

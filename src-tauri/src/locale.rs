@@ -267,9 +267,18 @@ mod tests {
 
     #[test]
     fn returns_localized_tray_menu_strings() {
-        assert_eq!(tray_menu_strings("en"), ("Open AuraCoder", "Quit AuraCoder"));
-        assert_eq!(tray_menu_strings("pt-BR"), ("Abrir AuraCoder", "Sair do AuraCoder"));
-        assert_eq!(tray_menu_strings("zh-CN"), ("打开 AuraCoder", "退出 AuraCoder"));
+        assert_eq!(
+            tray_menu_strings("en"),
+            ("Open AuraCoder", "Quit AuraCoder")
+        );
+        assert_eq!(
+            tray_menu_strings("pt-BR"),
+            ("Abrir AuraCoder", "Sair do AuraCoder")
+        );
+        assert_eq!(
+            tray_menu_strings("zh-CN"),
+            ("打开 AuraCoder", "退出 AuraCoder")
+        );
     }
 
     #[test]

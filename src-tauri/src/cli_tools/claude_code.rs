@@ -18,11 +18,12 @@ use crate::{
     config::app_config::ClaudeCodeSessionMode,
     db,
     engines::{
-        capabilities_for_engine, claude_remote::RemoteClaudeSessionNotFoundError,
-        claude_sidecar::{ClaudeSessionSummary, ClaudeSidecarEngine}, map_engine_capabilities, map_model_info,
-        map_provider_usage, ApprovalRequestRoute, CodexRuntimeEvent, Engine, EngineCapabilities,
-        EngineEvent, EngineSteerReceipt, EngineThread, ModelInfo, SandboxPolicy, ThreadScope,
-        ThreadSyncSnapshot, TurnInput,
+        capabilities_for_engine,
+        claude_remote::RemoteClaudeSessionNotFoundError,
+        claude_sidecar::{ClaudeSessionSummary, ClaudeSidecarEngine},
+        map_engine_capabilities, map_model_info, map_provider_usage, ApprovalRequestRoute,
+        CodexRuntimeEvent, Engine, EngineCapabilities, EngineEvent, EngineSteerReceipt,
+        EngineThread, ModelInfo, SandboxPolicy, ThreadScope, ThreadSyncSnapshot, TurnInput,
     },
     extensions,
     local_cli_service_lifecycle::{LocalCliHandle, LocalCliServiceLifecycle},
@@ -289,13 +290,9 @@ pub struct ClaudeCodeCli {
 }
 
 /// 判断本机 Claude 会话是否符合用户输入的标题或会话 ID 搜索条件。
-fn matches_claude_session_search(
-    session: &ClaudeSessionSummary,
-    query: Option<&str>,
-) -> bool {
+fn matches_claude_session_search(session: &ClaudeSessionSummary, query: Option<&str>) -> bool {
     query.map_or(true, |query| {
-        session.title.to_lowercase().contains(&query.to_lowercase())
-            || session.id.contains(query)
+        session.title.to_lowercase().contains(&query.to_lowercase()) || session.id.contains(query)
     })
 }
 
@@ -1127,19 +1124,40 @@ impl CliTool for ClaudeCodeCli {
         );
         let (mode, sandbox_mode, allow_network) = match preset {
             Some("automatic") => (None, None, None),
-            None if autonomy_is_empty || (approval.is_none() && sandbox.is_none() && network.is_none()) => (None, None, None),
+            None if autonomy_is_empty
+                || (approval.is_none() && sandbox.is_none() && network.is_none()) =>
+            {
+                (None, None, None)
+            }
             Some("read-only") => (Some("dontAsk"), Some("read-only"), Some(false)),
             Some("ask") => (Some("default"), Some("workspace-write"), Some(false)),
             Some("auto") => (Some("acceptEdits"), Some("workspace-write"), None),
-            Some("full") => (Some("bypassPermissions"), Some("workspace-write"), Some(true)),
+            Some("full") => (
+                Some("bypassPermissions"),
+                Some("workspace-write"),
+                Some(true),
+            ),
             _ => (
                 /*
                 // 旧权限 preset 映射已由 SDK 原生 permissionMode 接替：
                 match approval { Some("restricted") => Some("restricted"), Some("ask") => Some("standard"), Some("autonomous") => Some("trusted"), _ => None },
                 */
-                match approval { Some("restricted") => Some("dontAsk"), Some("ask") => Some("default"), Some("autonomous") => Some("bypassPermissions"), _ => None },
-                match sandbox { Some("read-only") => Some("read-only"), Some("workspace-write") => Some("workspace-write"), _ => None },
-                match network { Some("enabled") => Some(true), Some("restricted") => Some(false), _ => None },
+                match approval {
+                    Some("restricted") => Some("dontAsk"),
+                    Some("ask") => Some("default"),
+                    Some("autonomous") => Some("bypassPermissions"),
+                    _ => None,
+                },
+                match sandbox {
+                    Some("read-only") => Some("read-only"),
+                    Some("workspace-write") => Some("workspace-write"),
+                    _ => None,
+                },
+                match network {
+                    Some("enabled") => Some(true),
+                    Some("restricted") => Some(false),
+                    _ => None,
+                },
             ),
         };
         let raw_value = raw_permissions_value(thread, mode, sandbox_mode, allow_network);
@@ -1338,8 +1356,9 @@ impl CliTool for ClaudeCodeCli {
             .await;
         }
         let engine = self.local_engine().await?;
-        engine.set_computer_control_service(self.state.computer_control_service.clone());
-        engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
+        // 旧实现保留迁移留痕：统一 Gateway 接替本地 Claude 的进程内工具服务。
+        // engine.set_computer_control_service(self.state.computer_control_service.clone());
+        // engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
         Engine::start_thread(
             engine.as_ref(),
             scope,
@@ -1436,8 +1455,9 @@ impl CliTool for ClaudeCodeCli {
             }
         }
         let engine = self.local_engine().await?;
-        engine.set_computer_control_service(self.state.computer_control_service.clone());
-        engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
+        // 旧实现保留迁移留痕：统一 Gateway 接替本地 Claude 的进程内工具服务。
+        // engine.set_computer_control_service(self.state.computer_control_service.clone());
+        // engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
         Engine::send_message(
             engine.as_ref(),
             engine_thread_id,
@@ -1836,6 +1856,12 @@ mod tests {
             auracoder_thread_mcp_service: Arc::new(
                 crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()),
             ),
+            mcp_gateway: Arc::new(crate::mcp_gateway::AuraCoderMcpGateway::new(
+                Arc::new(crate::computer_control_service::ComputerControlService::default()),
+                Arc::new(
+                    crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()),
+                ),
+            )),
             remote_access: Arc::new(crate::remote::RemoteTunnelManager::default()),
             ssh_monitor: Arc::new(crate::ssh::monitor::SshConnectionMonitor::default()),
         }
@@ -1971,17 +1997,49 @@ mod tests {
     #[test]
     fn permissions_read_native_permission_modes() {
         let expected = [
-            ("dontAsk", "read-only", "restricted", "read-only", "restricted"),
+            (
+                "dontAsk",
+                "read-only",
+                "restricted",
+                "read-only",
+                "restricted",
+            ),
             ("default", "ask", "ask", "workspace-write", "restricted"),
-            ("acceptEdits", "auto", "autonomous", "workspace-write", "automatic"),
-            ("bypassPermissions", "full", "autonomous", "workspace-write", "enabled"),
+            (
+                "acceptEdits",
+                "auto",
+                "autonomous",
+                "workspace-write",
+                "automatic",
+            ),
+            (
+                "bypassPermissions",
+                "full",
+                "autonomous",
+                "workspace-write",
+                "enabled",
+            ),
         ];
         for (mode, preset, approval, sandbox, network) in expected {
-            let network_field = if mode == "acceptEdits" { "" } else { ",\"allowNetwork\":false" };
-            let network_field = if mode == "dontAsk" { ",\"allowNetwork\":false" } else { network_field };
-            let network_field = if mode == "bypassPermissions" { ",\"allowNetwork\":true" } else { network_field };
+            let network_field = if mode == "acceptEdits" {
+                ""
+            } else {
+                ",\"allowNetwork\":false"
+            };
+            let network_field = if mode == "dontAsk" {
+                ",\"allowNetwork\":false"
+            } else {
+                network_field
+            };
+            let network_field = if mode == "bypassPermissions" {
+                ",\"allowNetwork\":true"
+            } else {
+                network_field
+            };
             let values = permissions_from_thread(&permission_thread(
-                Some(&format!(r#"{{"permissionMode":"{mode}","sandboxMode":"{sandbox}"{network_field}}}"#)),
+                Some(&format!(
+                    r#"{{"permissionMode":"{mode}","sandboxMode":"{sandbox}"{network_field}}}"#
+                )),
                 None,
             ))
             .unwrap();
@@ -2001,7 +2059,12 @@ mod tests {
             ("bypassPermissions", "workspace-write", true),
         ];
         for (mode, sandbox, network) in cases {
-            let raw = raw_permissions_value(&permission_thread(None, None), Some(mode), Some(sandbox), Some(network));
+            let raw = raw_permissions_value(
+                &permission_thread(None, None),
+                Some(mode),
+                Some(sandbox),
+                Some(network),
+            );
             assert_eq!(raw["permissionMode"], json!(mode));
             assert_eq!(raw["sandboxMode"], json!(sandbox));
             assert_eq!(raw["allowNetwork"], json!(network));
@@ -2016,7 +2079,12 @@ mod tests {
             ),
             None,
         );
-        let raw = raw_permissions_value(&thread, Some("bypassPermissions"), Some("workspace-write"), Some(true));
+        let raw = raw_permissions_value(
+            &thread,
+            Some("bypassPermissions"),
+            Some("workspace-write"),
+            Some(true),
+        );
         assert_eq!(raw["permissionMode"], json!("bypassPermissions"));
         /*
         // 旧 trusted 保存值已由 SDK 原生 bypassPermissions 接替：

@@ -4,13 +4,13 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    auracoder_thread_mcp_service::AuraCoderThreadMcpService,
     computer_control_service::ComputerControlService, config::app_config::AppConfig, db::Database,
     engines::EngineManager, extensions::refresh::ExtensionCatalogRefreshManager,
-    git::repo::FileTreeCache, git::watcher::GitWatcherManager, power::KeepAwakeManager,
-    remote::RemoteTunnelManager, scheduled_tasks::ScheduledTaskManager,
+    git::repo::FileTreeCache, git::watcher::GitWatcherManager, mcp_gateway::AuraCoderMcpGateway,
+    power::KeepAwakeManager, remote::RemoteTunnelManager, scheduled_tasks::ScheduledTaskManager,
     ssh::monitor::SshConnectionMonitor, terminal::TerminalManager,
     terminal_notifications::TerminalNotificationManager,
-    auracoder_thread_mcp_service::AuraCoderThreadMcpService,
 };
 
 #[derive(Clone)]
@@ -28,6 +28,8 @@ pub struct AppState {
     pub extension_catalog_refreshes: Arc<ExtensionCatalogRefreshManager>,
     pub scheduled_tasks: Arc<ScheduledTaskManager>,
     pub computer_control_service: Arc<ComputerControlService>,
+    /// 读取本地 MCP Gateway 的真实生命周期状态。
+    pub mcp_gateway: Arc<AuraCoderMcpGateway>,
     /// 读取 AuraCoder 本地会话的 MCP 服务。
     pub auracoder_thread_mcp_service: Arc<AuraCoderThreadMcpService>,
     pub remote_access: Arc<RemoteTunnelManager>,

@@ -7,6 +7,9 @@ const result = spawnSync(tauriCommand, ["dev", ...process.argv.slice(2)], {
   stdio: "inherit",
   // 注入开发构建标识，让 Rust 运行时使用开发版默认数据库目录。
   env: { ...process.env, PANES_BUILD_TYPE: "development" },
+  // Windows 的 tauri.cmd 是批处理 shim，必须经 shell 启动。
+  shell: process.platform === "win32",
+  windowsHide: true,
 });
 
 // 启动 Tauri 失败时直接抛出原始错误，确保失败原因对调用方可见。

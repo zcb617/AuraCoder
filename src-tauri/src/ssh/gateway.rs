@@ -32,12 +32,18 @@ pub async fn open_tunnel(
     local_port: u16,
     remote_host: &str,
     remote_port: u16,
+    mcp_reverse_port: u16,
+    mcp_gateway_port: u16,
 ) -> anyhow::Result<Child> {
     let mut command = build_session_command(record)?;
     command
         .args(["-L"])
         .arg(format!(
             "127.0.0.1:{local_port}:{remote_host}:{remote_port}"
+        ))
+        .args(["-R"])
+        .arg(format!(
+            "127.0.0.1:{mcp_reverse_port}:127.0.0.1:{mcp_gateway_port}"
         ))
         .args([
             "-o",

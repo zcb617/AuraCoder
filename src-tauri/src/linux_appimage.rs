@@ -547,7 +547,8 @@ mod tests {
     #[test]
     fn rewrites_desktop_entry_when_appimage_path_changes() {
         let paths = TestPaths::new();
-        let first_env = integration_env(&paths, Some(paths.appimage_path("AuraCoder One.AppImage")));
+        let first_env =
+            integration_env(&paths, Some(paths.appimage_path("AuraCoder One.AppImage")));
         let second_path = paths.appimage_path("AuraCoder Two.AppImage");
 
         ensure_appimage_desktop_integration_with_env(&first_env)
@@ -563,7 +564,9 @@ mod tests {
         let desktop_entry = fs::read_to_string(paths.managed_desktop_entry())
             .expect("desktop entry should be readable");
         assert!(desktop_entry.contains(&escape_desktop_exec_arg(&second_path)));
-        assert!(!desktop_entry.contains("AuraCoder One.AppImage\" %U\nTryExec=AuraCoder One.AppImage"));
+        assert!(
+            !desktop_entry.contains("AuraCoder One.AppImage\" %U\nTryExec=AuraCoder One.AppImage")
+        );
     }
 
     #[test]

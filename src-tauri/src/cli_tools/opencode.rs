@@ -179,8 +179,9 @@ impl OpenCodeCli {
 
     async fn configure_local_computer_control(&self) -> Result<Arc<OpenCodeEngine>> {
         let engine = self.local_engine().await?;
-        engine.set_computer_control_service(self.state.computer_control_service.clone());
-        engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
+        // 旧版本机工具服务注入已由统一 MCP Gateway 接替，保留原调用但不再执行。
+        // engine.set_computer_control_service(self.state.computer_control_service.clone());
+        // engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
         Ok(engine)
     }
 
@@ -1322,9 +1323,10 @@ impl CliTool for OpenCodeCli {
                 .await
         } else {
             let engine = self.local_engine().await?;
-            engine.set_computer_control_service(self.state.computer_control_service.clone());
-            engine
-                .set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
+            // 旧版本机工具服务注入已由统一 MCP Gateway 接替，保留原调用但不再执行。
+            // engine.set_computer_control_service(self.state.computer_control_service.clone());
+            // engine
+            //     .set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
             engine.runtime_catalog(&cwd).await
         }
     }

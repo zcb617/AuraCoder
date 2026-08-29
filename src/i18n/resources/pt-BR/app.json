@@ -963,7 +963,11 @@
       "localUpdateTitle": "Teste de atualização local",
       "localUpdateDescription": "Selecione um pacote .app.tar.gz local para executar o fluxo completo de instalação, encerramento e reinício.",
       "localUpdateSelect": "Selecionar pacote de atualização",
-      "localUpdateSelecting": "Selecionando..."
+      "localUpdateSelecting": "Selecionando...",
+      "mcpServiceStatusTitle": "Status do serviço MCP",
+      "mcpServiceStatusDescription": "Mostra se o serviço MCP do AuraCoder está funcionando normalmente.",
+      "mcpServiceStatusNormal": "Normal",
+      "mcpServiceStatusAbnormal": "Anormal"
     }
   },
   "notificationSettings": {

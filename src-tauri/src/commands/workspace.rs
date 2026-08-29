@@ -7,10 +7,7 @@ use crate::{
         FileTreeEntryDto, FileTreePageDto, SshConnectionTestDto, SshRemoteDirectoryDto,
         TrustLevelDto, WorkspaceDto,
     },
-    ssh::{
-        gateway, remote_fs,
-        runtime::resolve_workspace_target,
-    },
+    ssh::{gateway, remote_fs, runtime::resolve_workspace_target},
     state::AppState,
     workspace_startup::{
         normalize_workspace_startup_preset as normalize_preset,
@@ -179,12 +176,7 @@ pub async fn create_ssh_workspace(
         .map(|directory| directory.path)
         .ok_or_else(|| "远端目录解析失败".to_string())?;
     let workspace = run_db(state.db.clone(), move |db| {
-        db::workspaces::create_ssh_workspace(
-            db,
-            &connection_id,
-            &name,
-            &root_path,
-        )
+        db::workspaces::create_ssh_workspace(db, &connection_id, &name, &root_path)
     })
     .await?;
 

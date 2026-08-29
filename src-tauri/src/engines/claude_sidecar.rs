@@ -23,10 +23,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    computer_control_service::ComputerControlService,
     auracoder_thread_mcp_service::AuraCoderThreadMcpService,
-    process_utils,
-    runtime_env,
+    computer_control_service::ComputerControlService, process_utils, runtime_env,
 };
 
 use super::{
@@ -317,7 +315,9 @@ struct ClaudeTransport {
 }
 
 impl ClaudeTransport {
-    async fn spawn(sidecar_path: PathBuf) -> anyhow::Result<(Self, oneshot::Receiver<SidecarEvent>)> {
+    async fn spawn(
+        sidecar_path: PathBuf,
+    ) -> anyhow::Result<(Self, oneshot::Receiver<SidecarEvent>)> {
         // Windows 扩展路径只在进程启动边界转换，其他平台保持原始路径。
         #[cfg(target_os = "windows")]
         let sidecar_path = crate::path_utils::normalize_windows_path(sidecar_path);
@@ -415,35 +415,41 @@ impl ClaudeTransport {
                 let mut lines = BufReader::new(stdout).lines();
                 loop {
                     match lines.next_line().await {
-                        Ok(Some(line)) => match serde_json::from_str::<SidecarEvent>(&line) {
-                            Ok(event) => {
-                                let event = trim_sidecar_event_for_buffer(event);
-                                if matches!(event, SidecarEvent::Ready | SidecarEvent::Error { .. }) {
+                        Ok(Some(line)) => {
+                            if !line.trim().is_empty() {
+                                log::info!("claude sidecar stdout raw line: {line}");
+                            }
+                            match serde_json::from_str::<SidecarEvent>(&line) {
+                                Ok(event) => {
+                                    let event = trim_sidecar_event_for_buffer(event);
+                                    if matches!(event, SidecarEvent::Ready | SidecarEvent::Error { .. })
+                                    {
+                                        if let Some(sender) = startup_tx.take() {
+                                            let _ = sender.send(event.clone());
+                                        }
+                                    }
+                                    let _ = tx.send(event);
+                                }
+                                Err(e) => {
+                                    let message = format!("Claude事件解析失败：{e}");
+                                    log::warn!(
+                                        "claude sidecar: failed to parse event: {e} — line: {line}"
+                                    );
+                                    let event = SidecarEvent::Error {
+                                        id: None,
+                                        message,
+                                        recoverable: Some(false),
+                                        error_type: Some("event_parse_error".to_string()),
+                                        is_auth_error: Some(false),
+                                    };
                                     if let Some(sender) = startup_tx.take() {
                                         let _ = sender.send(event.clone());
                                     }
+                                    let _ = tx.send(event);
+                                    break;
                                 }
-                                let _ = tx.send(event);
                             }
-                            Err(e) => {
-                                let message = format!("Claude事件解析失败：{e}");
-                                log::warn!(
-                                    "claude sidecar: failed to parse event: {e} — line: {line}"
-                                );
-                                let event = SidecarEvent::Error {
-                                    id: None,
-                                    message,
-                                    recoverable: Some(false),
-                                    error_type: Some("event_parse_error".to_string()),
-                                    is_auth_error: Some(false),
-                                };
-                                if let Some(sender) = startup_tx.take() {
-                                    let _ = sender.send(event.clone());
-                                }
-                                let _ = tx.send(event);
-                                break;
-                            }
-                        },
+                        }
                         Ok(None) => {
                             log::info!("claude sidecar stdout EOF");
                             let event = SidecarEvent::Error {
@@ -488,7 +494,7 @@ impl ClaudeTransport {
                     match lines.next_line().await {
                         Ok(Some(line)) => {
                             if !line.trim().is_empty() {
-                                log::debug!("claude sidecar stderr: {line}");
+                                log::info!("claude sidecar stderr raw line: {line}");
                                 if let Ok(mut tail) = stderr_tail.lock() {
                                     tail.push_back(line);
                                     while tail.len() > 20 {
@@ -511,8 +517,7 @@ impl ClaudeTransport {
                 event_tx,
                 runtime_path,
                 sidecar_path: sidecar_path.to_string_lossy().into_owned(),
-                claude_cli_path: claude_executable
-                    .map(|path| path.to_string_lossy().into_owned()),
+                claude_cli_path: claude_executable.map(|path| path.to_string_lossy().into_owned()),
                 sdk_module_path,
                 stderr_tail,
                 stderr_complete_rx: Mutex::new(Some(stderr_complete_rx)),
@@ -680,6 +685,7 @@ impl ClaudeTransport {
     async fn send_command(&self, command: &serde_json::Value) -> anyhow::Result<()> {
         let mut stdin = self.stdin.lock().await;
         let payload = serde_json::to_string(command)? + "\n";
+        log::info!("claude sidecar stdin command payload: {payload}");
         stdin
             .write_all(payload.as_bytes())
             .await
@@ -816,6 +822,10 @@ pub struct ClaudeSidecarEngine {
     computer_control_service: Arc<StdMutex<Option<Arc<ComputerControlService>>>>,
     /// 当前 Claude 会话使用的 AuraCoder 本地会话读取工具服务引用。
     auracoder_thread_mcp_service: Arc<StdMutex<Option<Arc<AuraCoderThreadMcpService>>>>,
+    /// 本地 Claude 会话使用的 MCP Gateway Endpoint。
+    mcp_gateway_endpoint: Arc<StdMutex<Option<String>>>,
+    /// 本地 Claude 会话访问 MCP Gateway 使用的鉴权令牌。
+    mcp_gateway_token: Arc<StdMutex<Option<String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -864,6 +874,24 @@ impl ClaudeSidecarEngine {
     pub fn set_resource_dir(&self, resource_dir: Option<PathBuf>) {
         let mut state = self.state.blocking_lock();
         state.resource_dir = resource_dir;
+    }
+
+    /// 旧版仅设置本地 Claude 会话 MCP Gateway Endpoint 的入口，已由统一 Gateway 连接入口接替。
+    pub fn set_mcp_gateway_endpoint(&self, endpoint: String) {
+        // 旧实现保留迁移留痕：统一 Gateway 连接入口需要同时交付 Endpoint 和 Token。
+        // if let Ok(mut current) = self.mcp_gateway_endpoint.lock() {
+        //     *current = Some(endpoint);
+        // }
+    }
+
+    /// 设置本地 Claude 会话使用的 MCP Gateway Endpoint 和鉴权令牌。
+    pub fn set_mcp_gateway_connection(&self, endpoint: String, token: String) {
+        if let Ok(mut current) = self.mcp_gateway_endpoint.lock() {
+            *current = Some(endpoint);
+        }
+        if let Ok(mut current) = self.mcp_gateway_token.lock() {
+            *current = Some(token);
+        }
     }
 
     pub async fn prewarm(&self) -> anyhow::Result<()> {
@@ -921,7 +949,9 @@ impl ClaudeSidecarEngine {
             Ok(Ok(event)) => {
                 let diagnostics = transport.startup_diagnostics().await;
                 transport.kill().await;
-                anyhow::bail!("claude sidecar returned unexpected startup event {event:?}; {diagnostics}");
+                anyhow::bail!(
+                    "claude sidecar returned unexpected startup event {event:?}; {diagnostics}"
+                );
             }
             Ok(Err(_)) => {
                 let diagnostics = transport.startup_diagnostics().await;
@@ -931,7 +961,9 @@ impl ClaudeSidecarEngine {
             Err(_) => {
                 let diagnostics = transport.startup_diagnostics().await;
                 transport.kill().await;
-                anyhow::bail!("claude sidecar did not become ready within 15 seconds; {diagnostics}");
+                anyhow::bail!(
+                    "claude sidecar did not become ready within 15 seconds; {diagnostics}"
+                );
             }
         }
 
@@ -2059,24 +2091,44 @@ impl Engine for ClaudeSidecarEngine {
         //         state.auracoder_thread_mcp_service.clone(),
         //     )
         // };
-        let computer_control_service = self
-            .computer_control_service
+        // 旧实现保留迁移留痕：统一 Gateway 接替进程内工具服务和专属 IPC 回调。
+        // let computer_control_service = self
+        //     .computer_control_service
+        //     .lock()
+        //     .ok()
+        //     .and_then(|service| service.clone());
+        // let auracoder_thread_mcp_service = self
+        //     .auracoder_thread_mcp_service
+        //     .lock()
+        //     .ok()
+        //     .and_then(|service| service.clone());
+        // let computer_control_tools = match computer_control_service.as_ref() {
+        //     Some(service) => service.sdk_tool_specs().map_err(anyhow::Error::msg)?,
+        //     None => Vec::new(),
+        // };
+        // let auracoder_thread_tools = auracoder_thread_mcp_service
+        //     .as_ref()
+        //     .map(|service| service.tool_specs())
+        //     .unwrap_or_default();
+        let mcp_gateway_endpoint = self
+            .mcp_gateway_endpoint
             .lock()
             .ok()
-            .and_then(|service| service.clone());
-        let auracoder_thread_mcp_service = self
-            .auracoder_thread_mcp_service
+            .and_then(|endpoint| endpoint.clone());
+        let mcp_gateway_token = self
+            .mcp_gateway_token
             .lock()
             .ok()
-            .and_then(|service| service.clone());
-        let computer_control_tools = match computer_control_service.as_ref() {
-            Some(service) => service.sdk_tool_specs().map_err(anyhow::Error::msg)?,
-            None => Vec::new(),
-        };
-        let auracoder_thread_tools = auracoder_thread_mcp_service
-            .as_ref()
-            .map(|service| service.tool_specs())
-            .unwrap_or_default();
+            .and_then(|token| token.clone());
+        if mcp_gateway_endpoint.is_some() != mcp_gateway_token.is_some() {
+            let internal_error = anyhow::anyhow!(
+                "MCP Gateway 配置不完整：endpoint_present={}, token_present={}",
+                mcp_gateway_endpoint.is_some(),
+                mcp_gateway_token.is_some()
+            );
+            log::error!("Claude MCP 配置异常：{internal_error:#}");
+            return Err(anyhow::anyhow!("AuraCoder MCP 配置不完整，Claude 会话无法启动"));
+        }
 
         let request_id = Uuid::new_v4().to_string();
         {
@@ -2124,10 +2176,15 @@ impl Engine for ClaudeSidecarEngine {
             "reasoningEffort": thread_config.sandbox.reasoning_effort.clone(),
             "planMode": plan_mode,
             "threadId": engine_thread_id,
-            "computerControlTools": computer_control_tools,
-            "auracoderThreadTools": auracoder_thread_tools,
+            // 旧实现保留迁移留痕：统一 Gateway 接替进程内工具规格。
+            // "computerControlTools": computer_control_tools,
+            // "auracoderThreadTools": auracoder_thread_tools,
             "settingSources": ["user", "project"],
         });
+        if let (Some(endpoint), Some(token)) = (mcp_gateway_endpoint, mcp_gateway_token) {
+            params["mcpGatewayUrl"] = serde_json::Value::String(endpoint);
+            params["mcpGatewayToken"] = serde_json::Value::String(token);
+        }
 
         if let Some(ref session_id) = thread_config.agent_session_id {
             params["resume"] = serde_json::Value::String(session_id.clone());
@@ -2140,6 +2197,11 @@ impl Engine for ClaudeSidecarEngine {
             "method": "query",
             "params": params,
         });
+        log::info!(
+            "Claude send_message command prepared: engine_thread_id={}, request_id={}, command={command:?}",
+            engine_thread_id,
+            request_id,
+        );
 
         let mut incoming_rx = spawn_claude_incoming_pump(Arc::clone(&transport));
         transport.send_command(&command).await?;
@@ -2165,9 +2227,23 @@ impl Engine for ClaudeSidecarEngine {
                 event = incoming_rx.recv() => {
                     match event {
                         Some(ClaudeIncomingEvent::Message(sidecar_event)) => {
+                            let sidecar_event_debug = format!("{sidecar_event:?}");
+                            let sidecar_event_request_id = sidecar_event.request_id().map(str::to_string);
+                            log::info!(
+                                "Claude sidecar event received before request filter: engine_thread_id={}, current_request_id={}, event_request_id={:?}, sidecar_event={sidecar_event_debug}",
+                                engine_thread_id_owned,
+                                request_id,
+                                sidecar_event_request_id,
+                            );
                             // Filter events by request ID
                             if let Some(eid) = sidecar_event.request_id() {
                                 if eid != request_id {
+                                    log::info!(
+                                        "Claude sidecar event discarded by request filter: engine_thread_id={}, current_request_id={}, event_request_id={}, sidecar_event={sidecar_event_debug}",
+                                        engine_thread_id_owned,
+                                        request_id,
+                                        eid,
+                                    );
                                     continue;
                                 }
                             }
@@ -2268,98 +2344,102 @@ impl Engine for ClaudeSidecarEngine {
                                         .await
                                         .ok();
                                 }
-                                SidecarEvent::ComputerControlToolCall {
-                                    call_id,
-                                    tool_name,
-                                    arguments,
-                                    thread_id: event_thread_id,
-                                    turn_id,
-                                    ..
-                                } => {
-                                    if let Some(event_thread_id) = event_thread_id.as_deref() {
-                                        if event_thread_id != engine_thread_id_owned {
-                                            log::debug!(
-                                                "Claude computer-control call thread mismatch: event={}, engine={}",
-                                                event_thread_id,
-                                                engine_thread_id_owned
-                                            );
-                                        }
-                                    }
-                                    let effective_turn_id =
-                                        turn_id.unwrap_or_else(|| request_id.clone());
-                                    let is_auracoder_thread_tool = auracoder_thread_mcp_service
-                                        .as_ref()
-                                        .map(|service| {
-                                            service.tool_specs().iter().any(|spec| {
-                                                spec.get("name")
-                                                    .and_then(serde_json::Value::as_str)
-                                                    == Some(tool_name.as_str())
-                                            })
-                                        })
-                                        .unwrap_or(false);
-                                    let result = if is_auracoder_thread_tool {
-                                        match auracoder_thread_mcp_service.as_ref() {
-                                            Some(service) => service
-                                                .invoke_for_engine(
-                                                    "claude",
-                                                    &engine_thread_id_owned,
-                                                    &tool_name,
-                                                    arguments,
-                                                )
-                                                .await,
-                                            None => Err(
-                                                "AuraCoder 会话 MCP 服务尚未绑定到 Claude 引擎".to_string(),
-                                            ),
-                                        }
-                                    } else {
-                                        match computer_control_service.as_ref() {
-                                        Some(service) => {
-                                            service
-                                                .invoke_for_engine(
-                                                    "claude",
-                                                    &engine_thread_id_owned,
-                                                    &effective_turn_id,
-                                                    &tool_name,
-                                                    &call_id,
-                                                    arguments,
-                                                    cancellation.clone(),
-                                                )
-                                                .await
-                                        }
-                                        None => Err(
-                                            "电脑操作服务尚未绑定到 Claude 引擎".to_string(),
-                                        ),
-                                        }
-                                    };
-                                    let response = match result {
-                                        Ok(value) => serde_json::json!({
-                                            "requestId": request_id.clone(),
-                                            "callId": call_id,
-                                            "result": value,
-                                        }),
-                                        Err(error) => serde_json::json!({
-                                            "requestId": request_id.clone(),
-                                            "callId": call_id,
-                                            "error": error,
-                                        }),
-                                    };
-                                    if let Err(error) = transport
-                                        .send_command(&serde_json::json!({
-                                            "method": "computer_control_tool_result",
-                                            "params": response,
-                                        }))
-                                        .await
-                                    {
-                                        event_tx
-                                            .send(EngineEvent::Error {
-                                                message: format!(
-                                                    "Claude 电脑操作结果发送失败：{error:#}"
-                                                ),
-                                                recoverable: false,
-                                            })
-                                            .await
-                                            .ok();
-                                    }
+                                // 旧实现保留迁移留痕：标准 MCP 调用不再进入专属电脑操作 IPC 回调分支。
+                                // SidecarEvent::ComputerControlToolCall {
+                                //     call_id,
+                                //     tool_name,
+                                //     arguments,
+                                //     thread_id: event_thread_id,
+                                //     turn_id,
+                                //     ..
+                                // } => {
+                                //     if let Some(event_thread_id) = event_thread_id.as_deref() {
+                                //         if event_thread_id != engine_thread_id_owned {
+                                //             log::debug!(
+                                //                 "Claude computer-control call thread mismatch: event={}, engine={}",
+                                //                 event_thread_id,
+                                //                 engine_thread_id_owned
+                                //             );
+                                //         }
+                                //     }
+                                //     let effective_turn_id =
+                                //         turn_id.unwrap_or_else(|| request_id.clone());
+                                //     let is_auracoder_thread_tool = auracoder_thread_mcp_service
+                                //         .as_ref()
+                                //         .map(|service| {
+                                //             service.tool_specs().iter().any(|spec| {
+                                //                 spec.get("name")
+                                //                     .and_then(serde_json::Value::as_str)
+                                //                     == Some(tool_name.as_str())
+                                //             })
+                                //         })
+                                //         .unwrap_or(false);
+                                //     let result = if is_auracoder_thread_tool {
+                                //         match auracoder_thread_mcp_service.as_ref() {
+                                //             Some(service) => service
+                                //                 .invoke_for_engine(
+                                //                     "claude",
+                                //                     &engine_thread_id_owned,
+                                //                     &tool_name,
+                                //                     arguments,
+                                //                 )
+                                //                 .await,
+                                //             None => Err(
+                                //                 "AuraCoder 会话 MCP 服务尚未绑定到 Claude 引擎".to_string(),
+                                //             ),
+                                //         }
+                                //     } else {
+                                //         match computer_control_service.as_ref() {
+                                //         Some(service) => {
+                                //             service
+                                //                 .invoke_for_engine(
+                                //                     "claude",
+                                //                     &engine_thread_id_owned,
+                                //                     &effective_turn_id,
+                                //                     &tool_name,
+                                //                     &call_id,
+                                //                     arguments,
+                                //                     cancellation.clone(),
+                                //                 )
+                                //                 .await
+                                //         }
+                                //         None => Err(
+                                //             "电脑操作服务尚未绑定到 Claude 引擎".to_string(),
+                                //         ),
+                                //         }
+                                //     };
+                                //     let response = match result {
+                                //         Ok(value) => serde_json::json!({
+                                //             "requestId": request_id.clone(),
+                                //             "callId": call_id,
+                                //             "result": value,
+                                //         }),
+                                //         Err(error) => serde_json::json!({
+                                //             "requestId": request_id.clone(),
+                                //             "callId": call_id,
+                                //             "error": error,
+                                //         }),
+                                //     };
+                                //     if let Err(error) = transport
+                                //         .send_command(&serde_json::json!({
+                                //             "method": "computer_control_tool_result",
+                                //             "params": response,
+                                //         }))
+                                //         .await
+                                //     {
+                                //         event_tx
+                                //             .send(EngineEvent::Error {
+                                //                 message: format!(
+                                //                     "Claude 电脑操作结果发送失败：{error:#}"
+                                //                 ),
+                                //                 recoverable: false,
+                                //             })
+                                //             .await
+                                //             .ok();
+                                //     }
+                                // }
+                                SidecarEvent::ComputerControlToolCall { .. } => {
+                                    // 旧专属 IPC 事件已停用，统一 Gateway MCP 调用不经过此分支。
                                 }
                                 SidecarEvent::ApprovalRequested {
                                     approval_id,
@@ -2385,6 +2465,15 @@ impl Engine for ClaudeSidecarEngine {
                                     stop_reason,
                                     ..
                                 } => {
+                                    log::info!(
+                                        "Claude TurnCompleted before EngineEvent send: engine_thread_id={}, request_id={}, status={}, session_id={:?}, token_usage={:?}, stop_reason={:?}",
+                                        engine_thread_id_owned,
+                                        request_id,
+                                        status,
+                                        session_id,
+                                        token_usage,
+                                        stop_reason,
+                                    );
                                     if let Some(sid) = session_id {
                                         let mut state = state_ref.lock().await;
                                         if let Some(config) = state.threads.get_mut(&engine_thread_id_owned) {
@@ -2512,6 +2601,12 @@ impl Engine for ClaudeSidecarEngine {
                                 | SidecarEvent::Sessions { .. }
                                 | SidecarEvent::Version { .. } => {}
                             }
+                            log::info!(
+                                "Claude sidecar event handled after request filter: engine_thread_id={}, current_request_id={}, event_request_id={:?}, sidecar_event={sidecar_event_debug}",
+                                engine_thread_id_owned,
+                                request_id,
+                                sidecar_event_request_id,
+                            );
                         }
                         Some(ClaudeIncomingEvent::Lagged(n)) => {
                             log::warn!("claude sidecar: event receiver lagged by {n} messages");
@@ -2683,6 +2778,10 @@ mod tests {
     async fn service_setters_are_safe_inside_tokio_runtime() {
         let engine = ClaudeSidecarEngine::default();
         engine.set_computer_control_service(Arc::new(ComputerControlService::default()));
+        engine.set_mcp_gateway_connection(
+            "http://127.0.0.1:30123/mcp".to_string(),
+            "test-mcp-gateway-token".to_string(),
+        );
 
         let db_path = std::env::temp_dir().join(format!(
             "claude-sidecar-services-{}.db",
@@ -2708,11 +2807,26 @@ mod tests {
             auracoder_thread_mcp_service.is_some(),
             "AuraCoder thread MCP service should be saved"
         );
+        let mcp_gateway_endpoint = engine
+            .mcp_gateway_endpoint
+            .lock()
+            .expect("MCP Gateway endpoint mutex should not be poisoned");
+        assert_eq!(
+            mcp_gateway_endpoint.as_deref(),
+            Some("http://127.0.0.1:30123/mcp")
+        );
+        drop(mcp_gateway_endpoint);
+        let mcp_gateway_token = engine
+            .mcp_gateway_token
+            .lock()
+            .expect("MCP Gateway token mutex should not be poisoned");
+        assert_eq!(mcp_gateway_token.as_deref(), Some("test-mcp-gateway-token"));
     }
 
     #[tokio::test]
     async fn startup_handshake_keeps_immediate_ready_event() {
-        let temp_dir = std::env::temp_dir().join(format!("claude-sidecar-ready-{}", Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("claude-sidecar-ready-{}", Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).expect("temporary sidecar directory");
         let script_path = temp_dir.join("ready.mjs");
         fs::write(
@@ -2774,7 +2888,8 @@ mod tests {
 
     #[tokio::test]
     async fn startup_error_preserves_stderr_paths_and_exit_status() {
-        let temp_dir = std::env::temp_dir().join(format!("claude-sidecar-error-{}", Uuid::new_v4()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("claude-sidecar-error-{}", Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).expect("temporary sidecar directory");
         let script_path = temp_dir.join("error.mjs");
         fs::write(

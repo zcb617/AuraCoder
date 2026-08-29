@@ -173,6 +173,15 @@ pub async fn set_computer_control_enabled(
             .map_err(|error| error.to_string())??;
     }
 
+    if let Err(error) = state.mcp_gateway.refresh_catalog().await {
+        log::error!(
+            "failed to refresh MCP Gateway catalog after changing computer control: {error}"
+        );
+        return Err(
+            "电脑操作设置已保存，但 AI 工具列表同步失败，请重试或重启 AuraCoder。".to_string(),
+        );
+    }
+
     current_status(service).await
 }
 

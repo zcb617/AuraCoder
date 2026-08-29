@@ -305,7 +305,9 @@ fn runtime_config_for_task(
         engine_id: thread.engine_id.clone(),
         model_id: thread.model_id.clone(),
         reasoning_effort: thread.reasoning_effort.clone(),
-        service_tier: thread.engine_metadata.as_ref()
+        service_tier: thread
+            .engine_metadata
+            .as_ref()
             .and_then(|value| value.get("serviceTier"))
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned),

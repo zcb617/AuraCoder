@@ -55,6 +55,7 @@ import type {
   InstallProgressEvent,
   InstallResult,
   HelperStatus,
+  McpServiceStatus,
   KeepAwakeState,
   PowerSettings,
   PowerSettingsInput,
@@ -99,6 +100,8 @@ import type {
 import type { ScheduledTask, ScheduledTaskInput } from "../types";
 
 export const ipc = {
+  /** 读取 MCP 服务当前运行状态，供设置页 about 分区只读展示。 */
+  getMcpServiceStatus: () => invoke<McpServiceStatus>("get_mcp_service_status"),
   getUpdateState: () => invoke<UpdateProcessState>("get_update_state"),
   isUpdateDownloaded: () => invoke<boolean>("is_update_downloaded"),
   checkForUpdate: (source: "manual" | "automatic") =>

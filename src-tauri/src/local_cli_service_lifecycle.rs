@@ -14,8 +14,8 @@ use crate::engines::{
     claude_sidecar::ClaudeSidecarEngine, codex::CodexEngine, opencode::OpenCodeEngine,
 };
 use crate::{
-    commands::harness::detect_via_login_shell, message_notify_helper::CliHealthReconcileResult,
-    runtime_env,
+    commands::harness::detect_via_login_shell, mcp_gateway::AuraCoderMcpGateway,
+    message_notify_helper::CliHealthReconcileResult, runtime_env,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +38,8 @@ pub(crate) struct LocalCliService {
     cli_id: String,
     generation: u64,
     handle: LocalCliHandle,
+    /// 当前本地 CLI 服务持有的 MCP Gateway 私有租约 Token。
+    mcp_token: String,
     state: Mutex<LocalCliServiceEntryState>,
 }
 
@@ -60,6 +62,8 @@ struct LocalCliServiceLifecycleRegistry {
     services: RwLock<HashMap<String, Arc<LocalCliService>>>,
     resource_dir: RwLock<Option<PathBuf>>,
     mutation_lock: Mutex<()>,
+    /// 当前应用 MCP Gateway 的绑定引用，用于本地 CLI 租约注册和撤销。
+    mcp_gateway: RwLock<Option<Arc<AuraCoderMcpGateway>>>,
 }
 
 static LOCAL_CLI_SERVICES: LazyLock<LocalCliServiceLifecycleRegistry> =
@@ -76,6 +80,32 @@ const LOCAL_CLI_COMMANDS: [(&str, &str); 3] = [
 pub(crate) struct LocalCliServiceLifecycle;
 
 impl LocalCliServiceLifecycle {
+    /// 绑定本地 CLI 生命周期使用的 MCP Gateway。
+    pub(crate) async fn bind_mcp_gateway(gateway: Arc<AuraCoderMcpGateway>) {
+        *LOCAL_CLI_SERVICES.mcp_gateway.write().await = Some(gateway);
+    }
+
+    /// 为本地 CLI 当前轮次登记 AuraCoder MCP Gateway 可信上下文。
+    ///
+    /// 业务调用方只提供 CLI、引擎线程和 AuraCoder 轮次标识；本方法从 Ready 服务
+    /// 内部取得私有 MCP Token，避免 Token 暴露到聊天业务层。
+    pub(crate) async fn register_mcp_context(
+        cli_id: &str,
+        engine_thread_id: &str,
+        turn_id: &str,
+    ) -> anyhow::Result<()> {
+        LOCAL_CLI_SERVICES
+            .register_mcp_context(cli_id, engine_thread_id, turn_id)
+            .await
+    }
+
+    /// 清除本地 CLI 当前轮次的 AuraCoder MCP Gateway 可信上下文。
+    ///
+    /// 清理失败会返回原始错误链，调用方可以记录异常但不需要接触私有 MCP Token。
+    pub(crate) async fn clear_mcp_context(cli_id: &str) -> anyhow::Result<()> {
+        LOCAL_CLI_SERVICES.clear_mcp_context(cli_id).await
+    }
+
     /// 探测本机三种聊天 CLI，并将已安装的 CLI 服务逐个登记到生命周期 MAP。
     // 旧入口没有接收 Tauri 实际解析出的安装包资源目录，Claude 生命周期只能回退到
     // 编译期路径；该路径在安装后的用户机器上不存在：
@@ -191,7 +221,9 @@ impl LocalCliServiceLifecycleRegistry {
             .await
             .get(cli_id)
             .cloned()
-            .with_context(|| format!("本地 CLI 服务未在 AuraCoder 启动阶段登记: cli_id={cli_id}"))?;
+            .with_context(|| {
+                format!("本地 CLI 服务未在 AuraCoder 启动阶段登记: cli_id={cli_id}")
+            })?;
 
         let state = service.state.lock().await;
         anyhow::ensure!(
@@ -200,6 +232,43 @@ impl LocalCliServiceLifecycleRegistry {
         );
         drop(state);
         Ok(service)
+    }
+
+    /// 使用 Ready 本地 CLI 服务持有的私有 Token 登记 Gateway 可信上下文。
+    async fn register_mcp_context(
+        &self,
+        cli_id: &str,
+        engine_thread_id: &str,
+        turn_id: &str,
+    ) -> anyhow::Result<()> {
+        let service = self.get(cli_id).await?;
+        let gateway = self
+            .mcp_gateway
+            .read()
+            .await
+            .clone()
+            .context("本地 CLI 服务尚未绑定 MCP Gateway")?;
+        gateway
+            .register_trusted_context(&service.mcp_token, engine_thread_id, turn_id)
+            .await
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("登记本地 CLI MCP 可信上下文失败: cli_id={cli_id}"))
+    }
+
+    /// 使用 Ready 本地 CLI 服务持有的私有 Token 清除 Gateway 可信上下文。
+    async fn clear_mcp_context(&self, cli_id: &str) -> anyhow::Result<()> {
+        let service = self.get(cli_id).await?;
+        let gateway = self
+            .mcp_gateway
+            .read()
+            .await
+            .clone()
+            .context("本地 CLI 服务尚未绑定 MCP Gateway")?;
+        anyhow::ensure!(
+            gateway.clear_trusted_context(&service.mcp_token).await,
+            "清除本地 CLI MCP 可信上下文失败：租约不存在或已撤销: cli_id={cli_id}"
+        );
+        Ok(())
     }
 
     async fn list_ready(&self) -> Vec<Arc<LocalCliService>> {
@@ -234,36 +303,67 @@ impl LocalCliServiceLifecycleRegistry {
             return Ok(service);
         }
 
-        let handle = match cli_id {
-            "codex" => {
-                let engine = Arc::new(CodexEngine::default());
-                engine.prewarm().await?;
-                LocalCliHandle::Codex(engine)
+        let gateway = self
+            .mcp_gateway
+            .read()
+            .await
+            .clone()
+            .context("本地 CLI 服务尚未绑定 MCP Gateway")?;
+        let mcp_lease = gateway
+            .register_local_client(cli_id, cli_id)
+            .await
+            .map_err(|error| anyhow::anyhow!("注册本地 CLI MCP 租约失败: {error}"))?;
+        let endpoint = match gateway.endpoint().await {
+            Some(endpoint) => endpoint,
+            None => {
+                gateway.revoke_client(&mcp_lease.token).await;
+                anyhow::bail!("MCP Gateway 尚未启动，无法配置本地 CLI 服务")
             }
-            "opencode" => {
-                let engine = Arc::new(OpenCodeEngine::default());
-                engine.prewarm().await?;
-                LocalCliHandle::OpenCode(engine)
+        };
+        let handle_result: anyhow::Result<LocalCliHandle> = async {
+            Ok(match cli_id {
+                "codex" => {
+                    let engine = Arc::new(CodexEngine::default());
+                    engine.set_mcp_gateway_connection(endpoint.clone(), mcp_lease.token.clone());
+                    engine.prewarm().await?;
+                    LocalCliHandle::Codex(engine)
+                }
+                "opencode" => {
+                    let engine = Arc::new(OpenCodeEngine::default());
+                    engine.set_mcp_gateway_connection(endpoint.clone(), mcp_lease.token.clone());
+                    engine.prewarm().await?;
+                    LocalCliHandle::OpenCode(engine)
+                }
+                "claude" => {
+                    let engine = Arc::new(ClaudeSidecarEngine::default());
+                    engine.set_mcp_gateway_connection(endpoint.clone(), mcp_lease.token.clone());
+                    let resource_dir = self.resource_dir.read().await.clone();
+                    let resource_engine = engine.clone();
+                    tokio::task::spawn_blocking(move || {
+                        resource_engine.set_resource_dir(resource_dir);
+                    })
+                    .await
+                    .context("向 Claude 本地 CLI 服务注入安装包资源目录失败")?;
+                    engine.prewarm().await?;
+                    LocalCliHandle::Claude(engine)
+                }
+                _ => anyhow::bail!("不支持的本地 CLI 工具: {cli_id}"),
+            })
+        }
+        .await;
+        let handle = match handle_result {
+            Ok(handle) => handle,
+            Err(error) => {
+                gateway.revoke_client(&mcp_lease.token).await;
+                return Err(error);
             }
-            "claude" => {
-                let engine = Arc::new(ClaudeSidecarEngine::default());
-                let resource_dir = self.resource_dir.read().await.clone();
-                let resource_engine = engine.clone();
-                tokio::task::spawn_blocking(move || {
-                    resource_engine.set_resource_dir(resource_dir);
-                })
-                .await
-                .context("向 Claude 本地 CLI 服务注入安装包资源目录失败")?;
-                engine.prewarm().await?;
-                LocalCliHandle::Claude(engine)
-            }
-            _ => anyhow::bail!("不支持的本地 CLI 工具: {cli_id}"),
         };
 
         let service = Arc::new(LocalCliService {
             cli_id: cli_id.to_string(),
             generation: NEXT_SERVICE_GENERATION.fetch_add(1, Ordering::Relaxed),
             handle,
+            mcp_token: mcp_lease.token.clone(),
             state: Mutex::new(LocalCliServiceEntryState::Ready),
         });
 
@@ -273,16 +373,21 @@ impl LocalCliServiceLifecycleRegistry {
                 existing.clone()
             } else {
                 services.insert(cli_id.to_string(), service.clone());
-                service
+                service.clone()
             }
         };
 
-        let state = registered.state.lock().await;
-        anyhow::ensure!(
-            *state == LocalCliServiceEntryState::Ready,
-            "本地 CLI 服务正在终止，不能重复登记: cli_id={cli_id}"
-        );
-        drop(state);
+        if !Arc::ptr_eq(&registered, &service) {
+            gateway.revoke_client(&mcp_lease.token).await;
+        }
+
+        let ready = *registered.state.lock().await == LocalCliServiceEntryState::Ready;
+        if !ready {
+            if Arc::ptr_eq(&registered, &service) {
+                gateway.revoke_client(&mcp_lease.token).await;
+            }
+            anyhow::bail!("本地 CLI 服务正在终止，不能重复登记: cli_id={cli_id}");
+        }
         Ok(registered)
     }
 
@@ -301,6 +406,12 @@ impl LocalCliServiceLifecycleRegistry {
             .unwrap_or(false);
         if remove_service {
             services.remove(cli_id);
+        }
+        drop(services);
+        if remove_service {
+            if let Some(gateway) = self.mcp_gateway.read().await.clone() {
+                gateway.revoke_client(&service.mcp_token).await;
+            }
         }
         Ok(remove_service)
     }
@@ -326,5 +437,142 @@ impl LocalCliServiceLifecycleRegistry {
         } else {
             anyhow::bail!("停止本地 CLI 服务失败: {}", errors.join("; "));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LocalCliHandle, LocalCliService, LocalCliServiceEntryState,
+        LocalCliServiceLifecycleRegistry,
+    };
+    use crate::{
+        auracoder_thread_mcp_service::AuraCoderThreadMcpService,
+        computer_control_service::ComputerControlService,
+        db::Database,
+        engines::opencode::OpenCodeEngine,
+        mcp_gateway::AuraCoderMcpGateway,
+    };
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, RwLock};
+
+    /// 构造生命周期登记测试所需的已启动 MCP Gateway。
+    async fn test_gateway() -> Arc<AuraCoderMcpGateway> {
+        let path = std::env::temp_dir().join(format!(
+            "auracoder-local-cli-lifecycle-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::open(path).expect("test database should open");
+        let gateway = Arc::new(AuraCoderMcpGateway::new(
+            Arc::new(ComputerControlService::default()),
+            Arc::new(AuraCoderThreadMcpService::new(db)),
+        ));
+        gateway.start().await.expect("test gateway should start");
+        gateway
+    }
+
+    /// 将测试用 Ready OpenCode 服务放入独立生命周期 Registry，隔离全局服务状态。
+    async fn test_registry(
+        gateway: Arc<AuraCoderMcpGateway>,
+        token: String,
+    ) -> LocalCliServiceLifecycleRegistry {
+        let registry = LocalCliServiceLifecycleRegistry {
+            services: RwLock::new(std::collections::HashMap::new()),
+            resource_dir: RwLock::new(None),
+            mutation_lock: Mutex::new(()),
+            mcp_gateway: RwLock::new(Some(gateway)),
+        };
+        registry.services.write().await.insert(
+            "opencode".to_string(),
+            Arc::new(LocalCliService {
+                cli_id: "opencode".to_string(),
+                generation: 1,
+                handle: LocalCliHandle::OpenCode(Arc::new(OpenCodeEngine::default())),
+                mcp_token: token,
+                state: Mutex::new(LocalCliServiceEntryState::Ready),
+            }),
+        );
+        registry
+    }
+
+    /// 验证 Ready OpenCode 服务可通过私有 Token 登记并清理可信上下文。
+    #[tokio::test]
+    async fn ready_opencode_service_registers_and_clears_mcp_context() {
+        let gateway = test_gateway().await;
+        let lease = gateway
+            .register_local_client("opencode", "opencode")
+            .await
+            .expect("OpenCode test lease should be issued");
+        let token = lease.token.clone();
+        let registry = test_registry(gateway.clone(), token.clone()).await;
+
+        registry
+            .register_mcp_context("opencode", "engine-thread", "assistant-message")
+            .await
+            .expect("OpenCode context should register");
+        registry
+            .clear_mcp_context("opencode")
+            .await
+            .expect("OpenCode context should clear");
+
+        registry
+            .clear_mcp_context("opencode")
+            .await
+            .expect("clearing an already empty context should remain idempotent");
+
+        gateway.shutdown().await;
+    }
+
+    /// 验证不存在 Ready 服务、未绑定 Gateway 和失效租约均返回业务错误且不泄露 Token。
+    #[tokio::test]
+    async fn mcp_context_errors_preserve_business_boundary_without_token() {
+        let missing_registry = LocalCliServiceLifecycleRegistry::default();
+        let missing_service_error = missing_registry
+            .register_mcp_context("opencode", "engine-thread", "assistant-message")
+            .await
+            .expect_err("missing service should fail");
+        assert!(missing_service_error
+            .to_string()
+            .contains("服务未在 AuraCoder 启动阶段登记"));
+
+        let gateway = test_gateway().await;
+        let lease = gateway
+            .register_local_client("opencode", "opencode")
+            .await
+            .expect("OpenCode test lease should be issued");
+        let token = lease.token.clone();
+        let registry = test_registry(gateway.clone(), token.clone()).await;
+        gateway.revoke_client(&token).await;
+
+        let revoked_error = registry
+            .register_mcp_context("opencode", "engine-thread", "assistant-message")
+            .await
+            .expect_err("revoked lease should fail");
+        let revoked_error_chain = format!("{revoked_error:#}");
+        assert!(revoked_error_chain.contains("client lease 不存在或已撤销"));
+        assert!(!revoked_error_chain.contains(&token));
+
+        let unbound_registry = LocalCliServiceLifecycleRegistry::default();
+        let service = registry
+            .services
+            .read()
+            .await
+            .get("opencode")
+            .cloned()
+            .expect("test service should exist");
+        unbound_registry
+            .services
+            .write()
+            .await
+            .insert("opencode".to_string(), service);
+        let unbound_error = unbound_registry
+            .clear_mcp_context("opencode")
+            .await
+            .expect_err("unbound gateway should fail");
+        assert!(unbound_error
+            .to_string()
+            .contains("尚未绑定 MCP Gateway"));
+
+        gateway.shutdown().await;
     }
 }

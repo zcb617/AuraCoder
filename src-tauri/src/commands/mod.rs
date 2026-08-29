@@ -7,6 +7,7 @@ pub mod extensions;
 pub mod files;
 pub mod git;
 pub mod harness;
+pub mod mcp_gateway;
 pub mod power;
 pub mod remote;
 pub mod scheduled_tasks;

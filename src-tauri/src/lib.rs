@@ -1,5 +1,6 @@
-pub(crate) mod cli_tools;
+mod auracoder_thread_mcp_service;
 mod cli_service_health;
+pub(crate) mod cli_tools;
 mod commands;
 mod computer_control_sdk;
 mod computer_control_service;
@@ -14,10 +15,10 @@ mod linux_appimage;
 mod linux_webkit;
 mod local_cli_service_lifecycle;
 mod locale;
+mod mcp_gateway;
 pub(crate) mod message_notify_helper;
 mod models;
 mod path_utils;
-mod auracoder_thread_mcp_service;
 mod power;
 mod process_utils;
 mod remote;
@@ -140,8 +141,11 @@ pub fn run() {
     let computer_control_service = Arc::new(computer_control_service::ComputerControlService::new(
         computer_control_sdk.clone(),
     ));
-    let auracoder_thread_mcp_service = Arc::new(auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(
-        db.clone(),
+    let auracoder_thread_mcp_service =
+        Arc::new(auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()));
+    let mcp_gateway = Arc::new(mcp_gateway::AuraCoderMcpGateway::new(
+        computer_control_service.clone(),
+        auracoder_thread_mcp_service.clone(),
     ));
 
     let app_state = AppState {
@@ -158,6 +162,7 @@ pub fn run() {
         extension_catalog_refreshes: Arc::new(ExtensionCatalogRefreshManager::default()),
         scheduled_tasks: Arc::new(ScheduledTaskManager::new()),
         computer_control_service,
+        mcp_gateway,
         auracoder_thread_mcp_service,
         remote_access: Arc::new(RemoteTunnelManager::default()),
         ssh_monitor: Arc::new(ssh::monitor::SshConnectionMonitor::default()),
@@ -250,6 +255,17 @@ pub fn run() {
                     );
                 }
             }
+            if let Err(error) = tauri::async_runtime::block_on(state.mcp_gateway.start()) {
+                log::error!("AuraCoder MCP Gateway 启动失败: {error}");
+            }
+            tauri::async_runtime::block_on(
+                local_cli_service_lifecycle::LocalCliServiceLifecycle::bind_mcp_gateway(
+                    state.mcp_gateway.clone(),
+                ),
+            );
+            tauri::async_runtime::block_on(ssh::cli_service_lifecycle::bind_mcp_gateway(
+                state.mcp_gateway.clone(),
+            ));
             if let Err(error) =
                 tauri::async_runtime::block_on(state.notifications.start(handle.clone()))
             {
@@ -391,6 +407,7 @@ pub fn run() {
             commands::remote::regenerate_remote_access_identity,
             commands::remote::refresh_remote_pairing_token,
             commands::remote::revoke_remote_device,
+            commands::mcp_gateway::get_mcp_service_status,
             commands::ssh_connections::list_ssh_connections,
             commands::ssh_connections::list_deleted_ssh_connections,
             commands::ssh_connections::scan_ssh_config_hosts,
@@ -615,6 +632,7 @@ pub fn run() {
                 .state::<AppState>()
                 .computer_control_service
                 .clone();
+            let mcp_gateway = app_handle.state::<AppState>().mcp_gateway.clone();
             let computer_control_sdk = app_handle
                 .state::<Arc<computer_control_sdk::CuaDriverSdk>>()
                 .inner()
@@ -625,12 +643,6 @@ pub fn run() {
                     log::warn!("failed to release keep awake on shutdown: {error}");
                 }
                 terminals.shutdown().await;
-                computer_control_service.revoke_all().await;
-                if let Err(error) = computer_control_sdk.shutdown() {
-                    log::warn!("failed to shut down CUA SDK runtime: {error}");
-                }
-                remote_access.shutdown().await;
-                ssh_monitor.shutdown().await;
                 if let Err(error) =
                     local_cli_service_lifecycle::LocalCliServiceLifecycle::terminate_all().await
                 {
@@ -640,6 +652,13 @@ pub fn run() {
                     log::warn!("关闭 AuraCoder 时停止 SSH 远端 CLI 服务失败: {error:#}");
                 }
                 ssh::cli_tunnel_registry::shutdown().await;
+                mcp_gateway.shutdown().await;
+                computer_control_service.revoke_all().await;
+                if let Err(error) = computer_control_sdk.shutdown() {
+                    log::warn!("failed to shut down CUA SDK runtime: {error}");
+                }
+                remote_access.shutdown().await;
+                ssh_monitor.shutdown().await;
             });
         }
         _ => {}

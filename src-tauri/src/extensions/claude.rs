@@ -199,7 +199,8 @@ pub(crate) fn parse_plugins(
             read_only_reason: managed.then(|| "managed_policy".to_string()),
             warning: None,
 
-            ..Default::default()};
+            ..Default::default()
+        };
         items.insert(id, item);
     }
 
@@ -256,7 +257,8 @@ pub(crate) fn parse_plugins(
                 read_only_reason: None,
                 warning: None,
 
-                ..Default::default()},
+                ..Default::default()
+            },
         );
     }
     items.into_values().collect()
@@ -331,7 +333,8 @@ fn scan_skills(
                 read_only_reason: Some("claude_skill_toggle".to_string()),
                 warning: None,
 
-                ..Default::default()};
+                ..Default::default()
+            };
             items.insert(id, item);
         }
     }
@@ -450,7 +453,8 @@ pub(crate) fn parse_mcp_servers(output: &str) -> Vec<ExtensionItemDto> {
                 read_only_reason: managed_by_plugin.then(|| "plugin_managed_mcp".to_string()),
                 warning: None,
 
-                ..Default::default()})
+                ..Default::default()
+            })
         })
         .collect()
 }

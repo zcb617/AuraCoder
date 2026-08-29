@@ -1592,7 +1592,9 @@ fn build_terminal_env_config_for(is_windows: bool, inputs: TerminalEnvInputs) ->
         Some(value) => Some(value.to_string()),
     };
     let colorterm = inputs.colorterm.or_else(|| Some("truecolor".to_string()));
-    let term_program = inputs.term_program.or_else(|| Some("AuraCoder".to_string()));
+    let term_program = inputs
+        .term_program
+        .or_else(|| Some("AuraCoder".to_string()));
     let term_program_version = inputs
         .term_program_version
         .or_else(|| Some(env!("CARGO_PKG_VERSION").to_string()));

@@ -45,13 +45,17 @@ use crate::{
         TurnInputItem,
         STREAMED_DIFF_MAX_CHARS,
     },
+    local_cli_service_lifecycle::LocalCliServiceLifecycle,
     models::{
         ActionOutputDto, EngineInfoDto, EngineModelDto, MessageDto, MessageStatusDto,
         MessageWindowCursorDto, MessageWindowDto, SearchResultDto, SteerReceiptDto, ThreadDto,
         ThreadStatusDto, ThreadUpdateDto, TrustLevelDto,
     },
     runtime_env,
-    ssh::remote_attachments::{self, RemoteAttachmentBatch},
+    ssh::{
+        cli_service_lifecycle as ssh_cli_service_lifecycle,
+        remote_attachments::{self, RemoteAttachmentBatch},
+    },
     state::AppState,
 };
 
@@ -2751,6 +2755,17 @@ async fn run_turn(
     cancellation: CancellationToken,
 ) {
     let max_output_chars = state.config.debug.max_action_output_chars;
+    log::info!(
+        "chat run_turn entered: thread_id={}, engine_id={}, engine_thread_id={}, assistant_message_id={}, client_turn_id={:?}, turn_input={turn_input:?}, codex_cli_present={}, opencode_cli_present={}, claude_cli_present={}",
+        thread.id,
+        thread.engine_id,
+        engine_thread_id,
+        assistant_message_id,
+        client_turn_id,
+        codex_cli.is_some(),
+        opencode_cli.is_some(),
+        claude_cli.is_some(),
+    );
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAPACITY);
 
     let engines = state.engines.clone();
@@ -2762,8 +2777,36 @@ async fn run_turn(
     let cli_turn = codex_cli.or(opencode_cli).or(claude_cli);
     let cli_turn_for_engine = cli_turn.clone();
     let engines_for_engine = engines.clone();
+    let assistant_message_id_for_engine = assistant_message_id.clone();
 
     let mut engine_task = tokio::spawn(async move {
+        if let Some((_, context)) = cli_turn_for_engine.as_ref() {
+            match context.location_kind {
+                CliLocationKind::Local => {
+                    LocalCliServiceLifecycle::register_mcp_context(
+                        &thread_for_engine.engine_id,
+                        &engine_thread_for_engine,
+                        &assistant_message_id_for_engine,
+                    )
+                    .await
+                    .context("当前CLI无法登记AuraCoder MCP调用上下文")?;
+                }
+                CliLocationKind::Ssh => {
+                    let connection_id = context
+                        .ssh_connection_id
+                        .as_deref()
+                        .context("SSH 远端项目未绑定连接")?;
+                    ssh_cli_service_lifecycle::register_mcp_context(
+                        connection_id,
+                        &thread_for_engine.engine_id,
+                        &engine_thread_for_engine,
+                        &assistant_message_id_for_engine,
+                    )
+                    .await
+                    .context("当前 SSH CLI 无法登记 AuraCoder MCP 调用上下文")?;
+                }
+            }
+        }
         if let Some((cli, context)) = cli_turn_for_engine {
             let send_result = cli
                 .send_message(
@@ -2922,6 +2965,7 @@ async fn run_turn(
         Failed(anyhow::Error),
     }
 
+    #[derive(Debug)]
     enum TurnWait {
         Engine(std::result::Result<anyhow::Result<()>, tokio::task::JoinError>),
         Event(Option<EngineEvent>),
@@ -2952,6 +2996,14 @@ async fn run_turn(
                 _ = tokio::time::sleep(TURN_EVENT_IDLE_TIMEOUT) => TurnWait::TimedOut,
             }
         };
+
+        log::info!(
+            "chat run_turn wait result: thread_id={}, engine_id={}, engine_thread_id={}, assistant_message_id={}, wait={wait:?}",
+            thread.id,
+            thread.engine_id,
+            engine_thread_id,
+            assistant_message_id,
+        );
 
         let incoming_event = match wait {
             TurnWait::Engine(Ok(Ok(()))) => {
@@ -3046,6 +3098,14 @@ async fn run_turn(
                 ));
             }
         };
+
+        log::info!(
+            "chat run_turn incoming EngineEvent before processing: thread_id={}, engine_id={}, engine_thread_id={}, assistant_message_id={}, event={incoming_event:?}",
+            thread.id,
+            thread.engine_id,
+            engine_thread_id,
+            assistant_message_id,
+        );
 
         if let EngineEvent::Error {
             message,
@@ -3475,6 +3535,29 @@ async fn run_turn(
                 engine_task.abort();
                 let _ = engine_task.await;
             }
+        }
+    }
+
+    if let Some((_, context)) = cli_turn.as_ref() {
+        let clear_result = match context.location_kind {
+            CliLocationKind::Local => {
+                LocalCliServiceLifecycle::clear_mcp_context(&thread.engine_id).await
+            }
+            CliLocationKind::Ssh => match context.ssh_connection_id.as_deref() {
+                Some(connection_id) => {
+                    ssh_cli_service_lifecycle::clear_mcp_context(connection_id, &thread.engine_id)
+                        .await
+                }
+                None => Err(anyhow::anyhow!("SSH 远端项目未绑定连接")),
+            },
+        };
+        if let Err(error) = clear_result {
+            log::error!(
+                "清理当前 CLI AuraCoder MCP 调用上下文失败: engine_id={}, thread_id={}, engine_thread_id={}, error={error:#}",
+                thread.engine_id,
+                thread.id,
+                engine_thread_id,
+            );
         }
     }
 
@@ -4529,6 +4612,12 @@ async fn process_stream_event(
 ) -> EventProgress {
     let process_sequence = NEXT_STREAM_PROCESS_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let processing_started_at = Instant::now();
+    log::info!(
+        "chat process_stream_event entered: thread_id={}, engine_id={}, assistant_message_id={}, event={event:?}",
+        thread.id,
+        thread.engine_id,
+        assistant_message_id,
+    );
     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
         "at": chrono::Utc::now().to_rfc3339(),
         "event": "engine_event_processing_start",
@@ -4819,6 +4908,23 @@ async fn flush_stream_state(
 ) {
     let flush_sequence = NEXT_STREAM_FLUSH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let flush_started_at = Instant::now();
+    let blocks_json_for_log = match serde_json::to_string(blocks) {
+        Ok(value) => value,
+        Err(error) => format!("<blocks serialization failed: {error:#}>"),
+    };
+    log::info!(
+        "chat flush_stream_state entered: thread_id={}, engine_id={}, assistant_message_id={}, blocks_json={}, message_status={message_status:?}, thread_status={thread_status:?}, turn_model_id={}, blocks_dirty={}, message_state_dirty={}, thread_status_dirty={}, turn_model_dirty={}, force={}",
+        thread.id,
+        thread.engine_id,
+        assistant_message_id,
+        blocks_json_for_log,
+        turn_model_id,
+        *blocks_dirty,
+        *message_state_dirty,
+        *thread_status_dirty,
+        *turn_model_dirty,
+        force,
+    );
     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
         "at": chrono::Utc::now().to_rfc3339(),
         "event": "engine_stream_state_flush_start",
@@ -4880,7 +4986,13 @@ async fn flush_stream_state(
     if *blocks_dirty && should_flush_blocks {
         match serde_json::to_string(blocks) {
             Ok(blocks_json) => {
-                if let Err(error) = run_db(state.db.clone(), {
+                log::info!(
+                    "chat flush_stream_state blocks serialized before DB write: thread_id={}, assistant_message_id={}, blocks_json={}",
+                    thread.id,
+                    assistant_message_id,
+                    blocks_json,
+                );
+                let persist_result = run_db(state.db.clone(), {
                     let assistant_message_id = assistant_message_id.to_string();
                     let message_status = message_status.clone();
                     let turn_model_id = turn_model_id.to_string();
@@ -4894,8 +5006,13 @@ async fn flush_stream_state(
                         )
                     }
                 })
-                .await
-                {
+                .await;
+                log::info!(
+                    "chat flush_stream_state blocks DB write result: thread_id={}, assistant_message_id={}, result={persist_result:?}",
+                    thread.id,
+                    assistant_message_id,
+                );
+                if let Err(error) = persist_result {
                     log::warn!("failed to persist assistant stream blocks: {error}");
                 } else {
                     *blocks_dirty = false;
@@ -4910,15 +5027,20 @@ async fn flush_stream_state(
             }
         }
     } else if *message_state_dirty && should_flush_state {
-        if let Err(error) = run_db(state.db.clone(), {
+        let persist_result = run_db(state.db.clone(), {
             let assistant_message_id = assistant_message_id.to_string();
             let message_status = message_status.clone();
             move |db| {
                 db::messages::update_assistant_status(db, &assistant_message_id, message_status)
             }
         })
-        .await
-        {
+        .await;
+        log::info!(
+            "chat flush_stream_state message status DB write result: thread_id={}, assistant_message_id={}, message_status={message_status:?}, result={persist_result:?}",
+            thread.id,
+            assistant_message_id,
+        );
+        if let Err(error) = persist_result {
             log::warn!("failed to persist assistant stream status: {error}");
         } else {
             *message_state_dirty = false;
@@ -4927,7 +5049,7 @@ async fn flush_stream_state(
     }
 
     if *turn_model_dirty && should_flush_state {
-        if let Err(error) = run_db(state.db.clone(), {
+        let persist_result = run_db(state.db.clone(), {
             let assistant_message_id = assistant_message_id.to_string();
             let turn_model_id = turn_model_id.to_string();
             move |db| {
@@ -4938,8 +5060,14 @@ async fn flush_stream_state(
                 )
             }
         })
-        .await
-        {
+        .await;
+        log::info!(
+            "chat flush_stream_state model DB write result: thread_id={}, assistant_message_id={}, turn_model_id={}, result={persist_result:?}",
+            thread.id,
+            assistant_message_id,
+            turn_model_id,
+        );
+        if let Err(error) = persist_result {
             log::warn!("failed to persist assistant turn model id during stream: {error}");
         } else {
             *turn_model_dirty = false;
@@ -4949,13 +5077,18 @@ async fn flush_stream_state(
 
     if *thread_status_dirty && should_flush_state && *last_persisted_thread_status != *thread_status
     {
-        if let Err(error) = run_db(state.db.clone(), {
+        let persist_result = run_db(state.db.clone(), {
             let thread_id = thread.id.clone();
             let thread_status = thread_status.clone();
             move |db| db::threads::update_thread_status(db, &thread_id, thread_status)
         })
-        .await
-        {
+        .await;
+        log::info!(
+            "chat flush_stream_state thread status DB write result: thread_id={}, assistant_message_id={}, thread_status={thread_status:?}, result={persist_result:?}",
+            thread.id,
+            assistant_message_id,
+        );
+        if let Err(error) = persist_result {
             log::warn!("failed to persist thread status during stream: {error}");
         } else {
             *last_persisted_thread_status = thread_status.clone();
@@ -6273,6 +6406,12 @@ mod tests {
             auracoder_thread_mcp_service: Arc::new(
                 crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()),
             ),
+            mcp_gateway: Arc::new(crate::mcp_gateway::AuraCoderMcpGateway::new(
+                Arc::new(crate::computer_control_service::ComputerControlService::default()),
+                Arc::new(
+                    crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()),
+                ),
+            )),
             remote_access: Arc::new(crate::remote::RemoteTunnelManager::default()),
             ssh_monitor: Arc::new(crate::ssh::monitor::SshConnectionMonitor::default()),
         }

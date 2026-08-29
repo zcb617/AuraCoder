@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     CliExecutionContext, CliForkedThread, CliLocationKind, CliReviewStarted,
-    CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError,
-    CliSessionSnapshot, CliTool,
+    CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError, CliSessionSnapshot,
+    CliTool,
 };
 use crate::{
     db,
@@ -17,17 +17,17 @@ use crate::{
         capabilities_for_engine,
         codex::{CodexEngine, CodexReviewStarted, CodexThreadNotFoundError},
         map_engine_capabilities, map_model_info, map_provider_usage, validate_engine_sandbox_mode,
-        ApprovalRequestRoute,
-        CodexRuntimeEvent, Engine, EngineCapabilities, EngineEvent, EngineSteerReceipt,
-        EngineThread, ModelInfo, SandboxPolicy, ThreadScope, ThreadSyncSnapshot, TurnInput,
+        ApprovalRequestRoute, CodexRuntimeEvent, Engine, EngineCapabilities, EngineEvent,
+        EngineSteerReceipt, EngineThread, ModelInfo, SandboxPolicy, ThreadScope,
+        ThreadSyncSnapshot, TurnInput,
     },
     extensions,
     local_cli_service_lifecycle::{LocalCliHandle, LocalCliServiceLifecycle},
     models::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CodexAppDto, CodexPluginDto,
         CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
-        ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto, ThreadDto,
-        PermissionComponentJson, ThreadStatusDto, WorkspaceDto,
+        ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
+        PermissionComponentJson, ThreadDto, ThreadStatusDto, WorkspaceDto,
     },
     path_utils, remote_project_codex_runtime_service, remote_project_session_refresh_service, ssh,
     state::AppState,
@@ -43,37 +43,71 @@ fn default_permission_component() -> PermissionComponentJson {
 }
 
 fn set_permission_array(values: &mut PermissionComponentJson, key: &str, items: &[&str]) {
-    values.insert(key.to_string(), Value::Array(items.iter().map(|item| json!(item)).collect()));
+    values.insert(
+        key.to_string(),
+        Value::Array(items.iter().map(|item| json!(item)).collect()),
+    );
 }
 
 fn set_or_remove(object: &mut serde_json::Map<String, Value>, key: &str, value: Option<Value>) {
-    if let Some(value) = value { object.insert(key.to_string(), value); } else { object.remove(key); }
+    if let Some(value) = value {
+        object.insert(key.to_string(), value);
+    } else {
+        object.remove(key);
+    }
 }
 
-fn permission_choice<'a>(values: &'a PermissionComponentJson, key: &str) -> Result<Option<&'a str>> {
+fn permission_choice<'a>(
+    values: &'a PermissionComponentJson,
+    key: &str,
+) -> Result<Option<&'a str>> {
     let value = values.get(key).context(format!("缺少权限参数: {key}"))?;
-    let array = value.as_array().context(format!("权限参数必须是数组: {key}"))?;
+    let array = value
+        .as_array()
+        .context(format!("权限参数必须是数组: {key}"))?;
     Ok(array.first().and_then(Value::as_str))
 }
 
 fn validate_permission_component(values: &PermissionComponentJson) -> Result<()> {
     let allowed = [
-        ("autonomyPreset", ["automatic", "read-only", "ask", "auto", "full"].as_slice()),
-        ("trust", ["automatic", "trusted", "standard", "restricted"].as_slice()),
-        ("approval", ["automatic", "restricted", "ask", "autonomous"].as_slice()),
-        ("sandbox", ["automatic", "read-only", "workspace-write", "full-access"].as_slice()),
+        (
+            "autonomyPreset",
+            ["automatic", "read-only", "ask", "auto", "full"].as_slice(),
+        ),
+        (
+            "trust",
+            ["automatic", "trusted", "standard", "restricted"].as_slice(),
+        ),
+        (
+            "approval",
+            ["automatic", "restricted", "ask", "autonomous"].as_slice(),
+        ),
+        (
+            "sandbox",
+            ["automatic", "read-only", "workspace-write", "full-access"].as_slice(),
+        ),
         ("network", ["automatic", "enabled", "restricted"].as_slice()),
-        ("defaultForNewThreads", ["automatic", "read-only", "ask", "auto", "full"].as_slice()),
+        (
+            "defaultForNewThreads",
+            ["automatic", "read-only", "ask", "auto", "full"].as_slice(),
+        ),
     ];
     for key in values.keys() {
-        anyhow::ensure!(allowed.iter().any(|(name, _)| name == key), "未知权限参数: {key}");
+        anyhow::ensure!(
+            allowed.iter().any(|(name, _)| name == key),
+            "未知权限参数: {key}"
+        );
     }
     for (key, choices) in allowed {
         let value = values.get(key).context(format!("缺少权限参数: {key}"))?;
-        let array = value.as_array().context(format!("权限参数必须是数组: {key}"))?;
+        let array = value
+            .as_array()
+            .context(format!("权限参数必须是数组: {key}"))?;
         anyhow::ensure!(array.len() <= 1, "权限参数数组最多只能有一个值: {key}");
         for item in array {
-            let item = item.as_str().context(format!("权限参数值必须是字符串: {key}"))?;
+            let item = item
+                .as_str()
+                .context(format!("权限参数值必须是字符串: {key}"))?;
             anyhow::ensure!(choices.contains(&item), "权限参数值不支持: {key}={item}");
         }
     }
@@ -143,8 +177,9 @@ impl CodexCli {
 
     async fn configure_local_computer_control(&self) -> Result<Arc<CodexEngine>> {
         let engine = self.local_engine().await?;
-        engine.set_computer_control_service(self.state.computer_control_service.clone());
-        engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
+        // 旧本地动态工具注入入口保留迁移留痕，统一 MCP Gateway 已接替：
+        // engine.set_computer_control_service(self.state.computer_control_service.clone());
+        // engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
         Ok(engine)
     }
 
@@ -312,7 +347,9 @@ impl CodexCli {
             set_permission_array(&mut result, "autonomyPreset", &[]);
         }
         if approval.is_some_and(Value::is_object)
-            || object.get("permissionProfile").is_some_and(Value::is_object)
+            || object
+                .get("permissionProfile")
+                .is_some_and(Value::is_object)
         {
             set_permission_array(&mut result, "approval", &[]);
             set_permission_array(&mut result, "autonomyPreset", &[]);
@@ -331,7 +368,9 @@ impl CodexCli {
         };
         set_permission_array(&mut result, "approval", approval_values);
         if approval.is_some_and(Value::is_object)
-            || object.get("permissionProfile").is_some_and(Value::is_object)
+            || object
+                .get("permissionProfile")
+                .is_some_and(Value::is_object)
         {
             set_permission_array(&mut result, "approval", &[]);
         }
@@ -366,7 +405,10 @@ impl CodexCli {
     ) -> Result<PermissionComponentJson> {
         self.load_workspace(context).await?;
         anyhow::ensure!(thread.engine_id == "codex", "当前会话不属于 Codex");
-        anyhow::ensure!(thread.workspace_id == context.workspace_id, "当前会话不属于该 workspace");
+        anyhow::ensure!(
+            thread.workspace_id == context.workspace_id,
+            "当前会话不属于该 workspace"
+        );
         validate_permission_component(&values)?;
         let current = <Self as CliTool>::get_permissions(self, context, thread).await?;
         if current.get("autonomyPreset") == values.get("autonomyPreset")
@@ -375,8 +417,12 @@ impl CodexCli {
             && current.get("network") == values.get("network")
         {
             let mut result = current;
-            if let Some(value) = values.get("trust") { result.insert("trust".to_string(), value.clone()); }
-            if let Some(value) = values.get("defaultForNewThreads") { result.insert("defaultForNewThreads".to_string(), value.clone()); }
+            if let Some(value) = values.get("trust") {
+                result.insert("trust".to_string(), value.clone());
+            }
+            if let Some(value) = values.get("defaultForNewThreads") {
+                result.insert("defaultForNewThreads".to_string(), value.clone());
+            }
             return Ok(result);
         }
         let preset = permission_choice(&values, "autonomyPreset")?;
@@ -389,16 +435,33 @@ impl CodexCli {
             .is_some_and(Vec::is_empty);
         let (approval_raw, mut sandbox_raw, network_raw) = match preset {
             Some("automatic") => (None, None, None),
-            None if autonomy_is_empty || (approval.is_none() && sandbox.is_none() && network.is_none()) =>
-                (None, None, None),
+            None if autonomy_is_empty
+                || (approval.is_none() && sandbox.is_none() && network.is_none()) =>
+            {
+                (None, None, None)
+            }
             Some("read-only") => (Some("untrusted"), Some("read-only"), Some(false)),
             Some("ask") => (Some("on-request"), Some("workspace-write"), Some(false)),
             Some("auto") => (Some("on-request"), Some("workspace-write"), Some(true)),
             Some("full") => (Some("never"), Some("danger-full-access"), Some(true)),
             _ => (
-                match approval { Some("restricted") => Some("untrusted"), Some("ask") => Some("on-request"), Some("autonomous") => Some("never"), _ => None },
-                match sandbox { Some("read-only") => Some("read-only"), Some("workspace-write") => Some("workspace-write"), Some("full-access") => Some("danger-full-access"), _ => None },
-                match network { Some("enabled") => Some(true), Some("restricted") => Some(false), _ => None },
+                match approval {
+                    Some("restricted") => Some("untrusted"),
+                    Some("ask") => Some("on-request"),
+                    Some("autonomous") => Some("never"),
+                    _ => None,
+                },
+                match sandbox {
+                    Some("read-only") => Some("read-only"),
+                    Some("workspace-write") => Some("workspace-write"),
+                    Some("full-access") => Some("danger-full-access"),
+                    _ => None,
+                },
+                match network {
+                    Some("enabled") => Some(true),
+                    Some("restricted") => Some(false),
+                    _ => None,
+                },
             ),
         };
         let external_sandbox = if context.location_kind == CliLocationKind::Ssh {
@@ -414,7 +477,9 @@ impl CodexCli {
         let saved = db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw))?;
         let mut result = Self::permissions_from_thread(&saved, external_sandbox)?;
         for key in ["trust", "defaultForNewThreads"] {
-            if let Some(value) = values.get(key) { result.insert(key.to_string(), value.clone()); }
+            if let Some(value) = values.get(key) {
+                result.insert(key.to_string(), value.clone());
+            }
         }
         Ok(result)
     }
@@ -862,7 +927,10 @@ impl CliTool for CodexCli {
     ) -> Result<PermissionComponentJson> {
         self.load_workspace(context).await?;
         anyhow::ensure!(thread.engine_id == "codex", "当前会话不属于 Codex");
-        anyhow::ensure!(thread.workspace_id == context.workspace_id, "当前会话不属于该 workspace");
+        anyhow::ensure!(
+            thread.workspace_id == context.workspace_id,
+            "当前会话不属于该 workspace"
+        );
         let external_sandbox = if context.location_kind == CliLocationKind::Ssh {
             false
         } else {
@@ -984,7 +1052,11 @@ impl CliTool for CodexCli {
         }
         */
         if let Some(value) = patch.approvals_reviewer {
-            set_or_remove(&mut raw, "approvalsReviewer", value.map(|value| json!(value)));
+            set_or_remove(
+                &mut raw,
+                "approvalsReviewer",
+                value.map(|value| json!(value)),
+            );
         }
         if (updates_sandbox || updates_network) && !updates_permission_profile {
             raw.remove("permissionProfile");
@@ -1716,10 +1788,13 @@ mod tests {
         assert_eq!(values.get("autonomyPreset"), Some(&json!(["auto"])));
         assert_eq!(values.get("network"), Some(&json!(["enabled"])));
 
-        let values = CodexCli::permissions_from_thread(&thread(
-            Some(r#"{"approvalPolicy":"untrusted"}"#),
-            Some(json!({"sandboxMode":"read-only","sandboxAllowNetwork":false})),
-        ), false)
+        let values = CodexCli::permissions_from_thread(
+            &thread(
+                Some(r#"{"approvalPolicy":"untrusted"}"#),
+                Some(json!({"sandboxMode":"read-only","sandboxAllowNetwork":false})),
+            ),
+            false,
+        )
         .unwrap();
         assert_eq!(values.get("autonomyPreset"), Some(&json!([])));
         assert_eq!(values.get("approval"), Some(&json!(["restricted"])));
@@ -1752,7 +1827,12 @@ mod tests {
             ),
             None,
         );
-        let raw = raw_permissions_value(&thread, Some("never"), Some("danger-full-access"), Some(true));
+        let raw = raw_permissions_value(
+            &thread,
+            Some("never"),
+            Some("danger-full-access"),
+            Some(true),
+        );
         assert_eq!(raw["approvalPolicy"], json!("never"));
         assert_eq!(raw["sandboxMode"], json!("danger-full-access"));
         assert_eq!(raw["allowNetwork"], json!(true));
@@ -1763,7 +1843,8 @@ mod tests {
 
     #[test]
     fn permissions_reject_invalid_non_empty_json() {
-        let error = CodexCli::permissions_from_thread(&thread(Some("[1]"), None), false).unwrap_err();
+        let error =
+            CodexCli::permissions_from_thread(&thread(Some("[1]"), None), false).unwrap_err();
         assert!(error.to_string().contains("必须是对象"));
     }
 
@@ -1771,21 +1852,30 @@ mod tests {
     fn permissions_read_external_sandbox_presets_without_sandbox_field() {
         // 外部沙箱模式下保存端抹掉沙箱字段，识别端按同一契约补回预设。
         let values = CodexCli::permissions_from_thread(
-            &thread(Some(r#"{"approvalPolicy":"untrusted","allowNetwork":false}"#), None),
+            &thread(
+                Some(r#"{"approvalPolicy":"untrusted","allowNetwork":false}"#),
+                None,
+            ),
             true,
         )
         .unwrap();
         assert_eq!(values.get("autonomyPreset"), Some(&json!(["read-only"])));
 
         let values = CodexCli::permissions_from_thread(
-            &thread(Some(r#"{"approvalPolicy":"on-request","allowNetwork":false}"#), None),
+            &thread(
+                Some(r#"{"approvalPolicy":"on-request","allowNetwork":false}"#),
+                None,
+            ),
             true,
         )
         .unwrap();
         assert_eq!(values.get("autonomyPreset"), Some(&json!(["ask"])));
 
         let values = CodexCli::permissions_from_thread(
-            &thread(Some(r#"{"approvalPolicy":"on-request","allowNetwork":true}"#), None),
+            &thread(
+                Some(r#"{"approvalPolicy":"on-request","allowNetwork":true}"#),
+                None,
+            ),
             true,
         )
         .unwrap();
@@ -1796,7 +1886,10 @@ mod tests {
     fn permissions_read_missing_sandbox_stays_custom_without_external_sandbox() {
         // 同样的三元组在外部沙箱关闭时仍是用户手工组合，必须保持自定义。
         let values = CodexCli::permissions_from_thread(
-            &thread(Some(r#"{"approvalPolicy":"on-request","allowNetwork":false}"#), None),
+            &thread(
+                Some(r#"{"approvalPolicy":"on-request","allowNetwork":false}"#),
+                None,
+            ),
             false,
         )
         .unwrap();

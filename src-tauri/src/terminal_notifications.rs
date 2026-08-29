@@ -1342,7 +1342,8 @@ fn is_managed_claude_hook_command(command: &str) -> bool {
     if trimmed == CLAUDE_HOOK_COMMAND {
         return true;
     }
-    trimmed.contains(CLAUDE_HOOK_SUBCOMMAND) && trimmed.contains(&managed_auracoder_cli_path_string())
+    trimmed.contains(CLAUDE_HOOK_SUBCOMMAND)
+        && trimmed.contains(&managed_auracoder_cli_path_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1515,8 +1516,10 @@ fn send_notify_request(
     addr: &SocketAddr,
     request: &NotificationIngressRequest,
 ) -> anyhow::Result<()> {
-    let mut stream = TcpStream::connect_timeout(addr, Duration::from_secs(2))
-        .with_context(|| format!("failed to connect to AuraCoder notification ingress at {addr}"))?;
+    let mut stream =
+        TcpStream::connect_timeout(addr, Duration::from_secs(2)).with_context(|| {
+            format!("failed to connect to AuraCoder notification ingress at {addr}")
+        })?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
@@ -2226,8 +2229,11 @@ mod tests {
 
     #[test]
     fn normalize_notification_text_trims_collapses_and_truncates() {
-        let normalized =
-            normalize_notification_text(Some("  hello\n\nworld  from   auracoder  "), "fallback", 11);
+        let normalized = normalize_notification_text(
+            Some("  hello\n\nworld  from   auracoder  "),
+            "fallback",
+            11,
+        );
         assert_eq!(normalized, "hello world…");
     }
 

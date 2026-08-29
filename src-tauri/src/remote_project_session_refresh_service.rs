@@ -812,7 +812,8 @@ mod tests {
     use rusqlite::params;
 
     fn test_database_and_workspace() -> (Database, WorkspaceDto) {
-        let path = std::env::temp_dir().join(format!("auracoder-claude-refresh-{}.db", Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("auracoder-claude-refresh-{}.db", Uuid::new_v4()));
         let db = Database::open(path).expect("failed to create test database");
         let workspace_id = format!("workspace-{}", Uuid::new_v4());
         let root_path = format!("/tmp/auracoder-claude-refresh-{}", Uuid::new_v4());
