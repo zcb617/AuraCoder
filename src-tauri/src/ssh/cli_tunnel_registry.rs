@@ -982,14 +982,24 @@ fn build_remote_service_start_command(
                 .remote_service_secret()
                 .context("OpenCode 远端服务密码不存在")?;
             let opencode_env = runtime_env::get_remote_opencode_env(secret);
-            let config_dir = format!("{runtime_dir}/.opencode");
+            // 旧实现使用隔离目录替换用户全局配置，导致自定义 provider 丢失，禁止恢复执行：
+            // let config_dir = format!("{runtime_dir}/.opencode");
+            let config_path = format!("{runtime_dir}/opencode.auracoder.json");
             let config = runtime_env::opencode_mcp_gateway_authenticated_config(
                 &mcp_endpoint,
                 &format!("Bearer {mcp_token}"),
             )
             .to_string();
+            /*
+            旧实现使用 OPENCODE_CONFIG_DIR 和 XDG_CONFIG_HOME 替换用户全局配置目录，导致自定义 provider 丢失，禁止恢复：
             format!(
                 "{opencode_env}export OPENCODE_CONFIG_DIR=\"{config_dir}\"; export XDG_CONFIG_HOME=\"{runtime_dir}\"; mkdir -p \"$OPENCODE_CONFIG_DIR\"; printf '%s' {} > \"$OPENCODE_CONFIG_DIR/opencode.json\"; exec env opencode serve --hostname 127.0.0.1 --port {}",
+                runtime_env::quote_posix(&config),
+                tunnel.remote_port()
+            )
+            */
+            format!(
+                "{opencode_env}export OPENCODE_CONFIG=\"{config_path}\"; mkdir -p \"{runtime_dir}\"; printf '%s' {} > \"$OPENCODE_CONFIG\"; exec env opencode serve --hostname 127.0.0.1 --port {}",
                 runtime_env::quote_posix(&config),
                 tunnel.remote_port()
             )
@@ -1463,9 +1473,16 @@ mod tests {
         assert!(command.contains("opencode serve --hostname 127.0.0.1 --port 41002"));
         assert!(command.contains("\"${SHELL:-/bin/sh}\" -lic"));
         assert!(command.contains("exec env opencode serve"));
-        assert!(command.contains("OPENCODE_CONFIG_DIR"));
-        assert!(command.contains("XDG_CONFIG_HOME"));
-        assert!(command.contains("opencode.json"));
+        // 旧断言验证隔离用户全局配置目录的行为，禁止恢复：
+        // assert!(command.contains("OPENCODE_CONFIG_DIR"));
+        // assert!(command.contains("XDG_CONFIG_HOME"));
+        assert!(command.contains("OPENCODE_CONFIG="));
+        assert!(command.contains("opencode.auracoder.json"));
+        assert!(command.contains("> \"$OPENCODE_CONFIG\""));
+        assert!(!command.contains("export OPENCODE_CONFIG_DIR="));
+        assert!(!command.contains("export XDG_CONFIG_HOME="));
+        // 旧断言检查隔离目录中的默认文件名，禁止恢复：
+        // assert!(command.contains("opencode.json"));
         assert!(command.contains("\"type\":\"remote\""));
         assert!(command.contains("http://127.0.0.1:30123/mcp"));
         assert!(command.contains("\"Authorization\":\"Bearer test-mcp-token\""));
