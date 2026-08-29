@@ -229,6 +229,19 @@ export function permissionSaveWaitAction(
   return "complete";
 }
 
+/**
+ * 判断权限变更是否需要同步更新项目级信任等级，避免相同或非法等级触发无效写入。
+ */
+export function shouldUpdateWorkspaceTrustLevel(
+  nextTrust: string | null,
+  currentTrust: TrustLevel | null | undefined,
+): nextTrust is TrustLevel {
+  return (
+    (nextTrust === "trusted" || nextTrust === "standard" || nextTrust === "restricted")
+    && nextTrust !== currentTrust
+  );
+}
+
 /** 统一权限组件使用 automatic 表示旧全局默认 inherit。 */
 function autonomyPresetToComponentValue(preset: AutonomyPresetId | null): string | null {
   if (preset === "inherit") return "automatic";
@@ -3106,7 +3119,11 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         const nextTrust = Array.isArray(next.trust) && typeof next.trust[0] === "string"
           ? next.trust[0] as TrustLevel
           : null;
-        if (nextTrust === "trusted" || nextTrust === "standard" || nextTrust === "restricted") {
+        const currentWorkspaceTrustLevel =
+          useWorkspaceStore.getState().workspaces.find(
+            (workspace) => workspace.id === thread.workspaceId,
+          )?.trustLevel ?? workspaceTrustLevel;
+        if (shouldUpdateWorkspaceTrustLevel(nextTrust, currentWorkspaceTrustLevel)) {
           await onWorkspaceTrustLevelChange(nextTrust);
         }
         const nextDefaultValue = Array.isArray(next.defaultForNewThreads)

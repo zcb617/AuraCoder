@@ -56,6 +56,7 @@ import {
   isWorkspaceSurfaceVisible,
   toggleWorkspaceEditorLayout,
 } from "./lib/workspacePaneNavigation";
+import { workspaceThreadCatalogKey } from "./lib/workspaceThreadCatalog";
 import {
   usesCustomWindowFrame,
   isTerminalInputFocused,
@@ -142,6 +143,7 @@ function resolveChatNotificationBody(
 export function App() {
   const loadWorkspaces = useWorkspaceStore((s) => s.loadWorkspaces);
   const workspaces = useWorkspaceStore((s) => s.workspaces);
+  const threadCatalogKey = workspaceThreadCatalogKey(workspaces);
   const activeWorkspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
   const completeSshSessionSync = useWorkspaceStore((s) => s.completeSshSessionSync);
   const loadEngines = useEngineStore((s) => s.load);
@@ -236,7 +238,8 @@ export function App() {
   ]);
 
   useEffect(() => {
-    const localWorkspaceIds = workspaces
+    const currentWorkspaces = useWorkspaceStore.getState().workspaces;
+    const localWorkspaceIds = currentWorkspaces
       .filter((workspace) => workspace.locationKind !== "ssh")
       .map((workspace) => workspace.id);
     if (localWorkspaceIds.length > 0) {
@@ -245,7 +248,7 @@ export function App() {
 
     // SSH 项目只展示本地数据库中的缓存；远端扫描由 SSH 专用后端服务完成，
     // 完成后再通过通知触发同样的数据库重载，绝不能走本地 CLI 发现路线。
-    for (const workspace of workspaces) {
+    for (const workspace of currentWorkspaces) {
       if (workspace.locationKind !== "ssh") {
         continue;
       }
@@ -258,7 +261,7 @@ export function App() {
     }
   }, [
     // engines,
-    workspaces,
+    threadCatalogKey,
     refreshAllThreads,
     reloadThreadsFromLocalDatabase,
   ]);
