@@ -621,6 +621,7 @@
     },
     "turnProgress": {
       "running": "{{engine}} 仍在运行",
+      "receivedAndThinking": "{{engine}} 已收到消息，正在思考中",
       "runningAction": "正在执行：{{summary}}",
       "runningWithSteer": "{{engine}} 仍在运行，追加消息正在等待进入当前处理步骤",
       "waitingForApproval": "等待你的确认"

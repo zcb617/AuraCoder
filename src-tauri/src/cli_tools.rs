@@ -523,6 +523,14 @@ pub trait CliTool: Send + Sync {
         scope: Option<&str>,
     ) -> Result<ExtensionActionResultDto>;
 
+    /// 用户未选择 workspace 时，在本机用户级 CLI 配置中执行全局扩展动作。
+    async fn perform_global_extension_action(
+        &self,
+        item: ExtensionItemDto,
+        action: &str,
+        scope: Option<&str>,
+    ) -> Result<ExtensionActionResultDto>;
+
     /// 用户在 Codex 会话中创建分支时，从当前会话建立一个独立的新会话，并在侧栏显示新会话。
     async fn fork_thread(
         &self,

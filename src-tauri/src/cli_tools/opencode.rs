@@ -1625,6 +1625,16 @@ impl CliTool for OpenCodeCli {
         extensions::opencode::perform_action(&item, action, Some(cwd.as_str())).await
     }
 
+    /// 用户未选择 workspace 时，使用本机用户级 OpenCode 配置执行全局扩展动作。
+    async fn perform_global_extension_action(
+        &self,
+        item: ExtensionItemDto,
+        action: &str,
+        _scope: Option<&str>,
+    ) -> Result<ExtensionActionResultDto> {
+        extensions::opencode::perform_action(&item, action, None).await
+    }
+
     async fn fork_thread(
         &self,
         context: &CliExecutionContext,

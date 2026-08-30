@@ -94,6 +94,7 @@ describe("chatStore send", () => {
     });
     useChatStore.setState({
       threadId: "thread-1",
+      sessionReadyByThread: {},
       messages: [],
       olderCursor: null,
       hasOlderMessages: false,
@@ -123,6 +124,7 @@ describe("chatStore send", () => {
     const state = useChatStore.getState();
     expect(state.streaming).toBe(true);
     expect(state.preparingEngineId).toBe("codex");
+    expect(state.sessionReadyByThread).toEqual({});
     expect(state.messages).toHaveLength(2);
     expect(state.messages[0]).toMatchObject({
       role: "user",
@@ -139,6 +141,48 @@ describe("chatStore send", () => {
     pendingRequest.resolve("assistant-message-id");
     await expect(sendPromise).resolves.toBe(true);
     expect(useChatStore.getState().preparingEngineId).toBeNull();
+  });
+
+  it("keeps a ready thread ready across subsequent sends", async () => {
+    vi.useFakeTimers();
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+    mockIpc.sendMessage.mockResolvedValueOnce("assistant-message-id-1");
+    await expect(
+      useChatStore.getState().send("first", {
+        engineId: "codex",
+        modelId: "gpt-5.3-codex",
+      }),
+    ).resolves.toBe(true);
+
+    expect(streamHandler).not.toBeNull();
+    streamHandler!({
+      type: "TurnStarted",
+      client_turn_id: "client-turn-1",
+    });
+    streamHandler!({ type: "TurnCompleted", status: "completed" });
+    await vi.advanceTimersByTimeAsync(20);
+    expect(useChatStore.getState().sessionReadyByThread).toEqual({ "thread-1": true });
+
+    const secondRequest = deferred<string>();
+    mockIpc.sendMessage.mockReturnValueOnce(secondRequest.promise);
+    const secondSend = useChatStore.getState().send("second", {
+      engineId: "codex",
+      modelId: "gpt-5.3-codex",
+    });
+
+    expect(useChatStore.getState().sessionReadyByThread).toEqual({ "thread-1": true });
+    secondRequest.resolve("assistant-message-id-2");
+    await expect(secondSend).resolves.toBe(true);
+    expect(useChatStore.getState().sessionReadyByThread).toEqual({ "thread-1": true });
+
+    vi.useRealTimers();
   });
 
   it("shows remote attachment preparation until the send request is accepted", async () => {
@@ -166,8 +210,70 @@ describe("chatStore send", () => {
     expect(state.streaming).toBe(false);
     expect(state.preparingEngineId).toBeNull();
     expect(state.status).toBe("error");
+    expect(state.sessionReadyByThread).toEqual({});
     expect(state.messages).toEqual([]);
   });
+
+  it("keeps a first turn unready when it is interrupted before TurnStarted", async () => {
+    vi.useFakeTimers();
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+    mockIpc.sendMessage.mockResolvedValueOnce("assistant-message-id");
+    await expect(
+      useChatStore.getState().send("hello", {
+        engineId: "codex",
+        modelId: "gpt-5.3-codex",
+      }),
+    ).resolves.toBe(true);
+
+    expect(streamHandler).not.toBeNull();
+    streamHandler!({ type: "TurnCompleted", status: "interrupted" });
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(useChatStore.getState().sessionReadyByThread).toEqual({});
+
+    vi.useRealTimers();
+  });
+
+  it.each(["failed", "interrupted"] as const)(
+    "keeps readiness after TurnStarted and terminal status %s",
+    async (terminalStatus) => {
+      vi.useFakeTimers();
+
+      let streamHandler: ((event: StreamEvent) => void) | null = null;
+      mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+        streamHandler = onEvent;
+        return () => {};
+      });
+
+      await useChatStore.getState().setActiveThread("thread-1");
+      mockIpc.sendMessage.mockResolvedValueOnce("assistant-message-id");
+      await expect(
+        useChatStore.getState().send("hello", {
+          engineId: "codex",
+          modelId: "gpt-5.3-codex",
+        }),
+      ).resolves.toBe(true);
+
+      expect(streamHandler).not.toBeNull();
+      streamHandler!({
+        type: "TurnStarted",
+        client_turn_id: "client-turn-terminal",
+      });
+      streamHandler!({ type: "TurnCompleted", status: terminalStatus });
+      await vi.advanceTimersByTimeAsync(20);
+
+      expect(useChatStore.getState().sessionReadyByThread).toEqual({ "thread-1": true });
+
+      vi.useRealTimers();
+    },
+  );
 
   it("persists a complete runtime selection before sending the message", async () => {
     mockIpc.updateThreadRuntimeSelection.mockResolvedValueOnce(undefined);
@@ -332,6 +438,7 @@ describe("chatStore send", () => {
     const matchedAssistant = state.messages.find((message) => message.id === optimisticAssistant?.id);
     const trailingAssistant = state.messages.find((message) => message.id === "assistant-other");
 
+    expect(state.sessionReadyByThread).toEqual({ "thread-1": true });
     expect(matchedAssistant?.blocks).toEqual([{ type: "text", content: "matched content" }]);
     expect(trailingAssistant?.blocks ?? []).toEqual([]);
     expect(mockRecordPerfMetric).toHaveBeenCalledWith(
@@ -398,6 +505,7 @@ describe("chatStore send", () => {
     expect(state.status).toBe("error");
     expect(state.streaming).toBe(false);
     expect(state.turnStartedAt).toBeNull();
+    expect(state.sessionReadyByThread).toEqual({ "thread-1": true });
     expect(assistant?.status).toBe("error");
     expect(assistant?.blocks).toHaveLength(2);
     expect(assistant?.blocks).toEqual(
@@ -452,6 +560,7 @@ describe("chatStore send", () => {
     await vi.advanceTimersByTimeAsync(20);
     expect(useChatStore.getState().status).toBe("error");
     expect(useChatStore.getState().streaming).toBe(false);
+    expect(useChatStore.getState().sessionReadyByThread).toEqual({});
 
     streamHandler!({
       type: "TurnStarted",
@@ -768,6 +877,7 @@ describe("chatStore send", () => {
 
     await useChatStore.getState().setActiveThread("thread-1");
 
+    expect(useChatStore.getState().sessionReadyByThread).toEqual({ "thread-1": true });
     expect(useChatStore.getState()).toMatchObject({
       usageLimits: null,
       usageLimitsLoading: true,
@@ -796,6 +906,45 @@ describe("chatStore send", () => {
       windowFableWeeklyPercent: 55,
       windowFiveHourResetsAt: "2025-02-19T21:20:00.000Z",
     });
+  });
+
+  it("does not restore readiness for blank or missing engine thread ids", async () => {
+    const blankEngineThread: Thread = {
+      id: "thread-blank",
+      workspaceId: "workspace-1",
+      engineId: "claude",
+      modelId: "sonnet",
+      engineThreadId: "   ",
+      engineMetadata: {},
+      title: "Blank engine thread",
+      status: "idle",
+      messageCount: 0,
+      totalTokens: 0,
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+    };
+    const missingEngineThread: Thread = {
+      ...blankEngineThread,
+      id: "thread-null",
+      engineThreadId: null,
+      title: "Missing engine thread",
+    };
+    useThreadStore.setState({
+      threads: [blankEngineThread, missingEngineThread],
+      threadsByWorkspace: {
+        "workspace-1": [blankEngineThread, missingEngineThread],
+      },
+      archivedThreadsByWorkspace: {},
+      activeThreadId: null,
+      loading: false,
+      error: undefined,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-blank");
+    expect(useChatStore.getState().sessionReadyByThread).toEqual({});
+
+    await useChatStore.getState().setActiveThread("thread-null");
+    expect(useChatStore.getState().sessionReadyByThread).toEqual({});
   });
 
   it("preserves stdin action output chunks from streamed events", async () => {

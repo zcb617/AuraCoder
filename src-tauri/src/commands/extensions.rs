@@ -15,6 +15,11 @@ pub async fn get_extension_catalog(
     cwd: Option<String>,
 ) -> Result<CachedExtensionCatalogDto, String> {
     let cwd = normalize_cwd(cwd);
+    if is_global_context(workspace_id.as_deref(), cwd.as_deref()) {
+        return extensions::refresh::load_cached_catalog(state.inner(), provider_id.trim(), None)
+            .await
+            .map_err(err_to_string);
+    }
     let (cli, context) = extensions::resolve_extension_cli(
         state.inner(),
         provider_id.trim(),
@@ -53,6 +58,20 @@ pub async fn request_extension_catalog_refresh(
 ) -> Result<CachedExtensionCatalogDto, String> {
     let cwd = normalize_cwd(cwd);
     let requested_kinds = kinds.unwrap_or_default();
+    if is_global_context(workspace_id.as_deref(), cwd.as_deref()) {
+        extensions::refresh::request_catalog_refresh(
+            app,
+            state.inner().clone(),
+            provider_id.trim(),
+            None,
+            requested_kinds,
+        )
+        .await
+        .map_err(err_to_string)?;
+        return extensions::refresh::load_cached_catalog(state.inner(), provider_id.trim(), None)
+            .await
+            .map_err(err_to_string);
+    }
     let (cli, context) = extensions::resolve_extension_cli(
         state.inner(),
         provider_id.trim(),
@@ -94,6 +113,17 @@ pub async fn get_extension_details(
     cwd: Option<String>,
 ) -> Result<ExtensionItemDto, String> {
     let cwd = normalize_cwd(cwd);
+    if is_global_context(workspace_id.as_deref(), cwd.as_deref()) {
+        let catalog =
+            extensions::refresh::load_cached_catalog(state.inner(), provider_id.trim(), None)
+                .await
+                .map_err(err_to_string)?;
+        return catalog
+            .items
+            .into_iter()
+            .find(|item| item.kind == kind && item.id == extension_id)
+            .ok_or_else(|| "extension not found in the current catalog".to_string());
+    }
     let (cli, context) = extensions::resolve_extension_cli(
         state.inner(),
         provider_id.trim(),
@@ -127,6 +157,38 @@ pub async fn perform_extension_action(
     cwd: Option<String>,
 ) -> Result<ExtensionActionResultDto, String> {
     let cwd = normalize_cwd(cwd);
+    if is_global_context(workspace_id.as_deref(), cwd.as_deref()) {
+        let item =
+            extensions::refresh::load_cached_catalog(state.inner(), provider_id.trim(), None)
+                .await
+                .map_err(err_to_string)?
+                .items
+                .into_iter()
+                .find(|item| item.kind == kind.trim() && item.id == extension_id.trim())
+                .ok_or_else(|| "extension not found in the cached catalog".to_string())?;
+        let cli = CliToolFactory::new(state.inner().clone())
+            .create(provider_id.trim())
+            .map_err(err_to_string)?;
+        let result = cli
+            .perform_global_extension_action(item, action.trim(), scope.as_deref())
+            .await
+            .map_err(err_to_string)?;
+        if extensions::refresh::request_catalog_refresh(
+            app,
+            state.inner().clone(),
+            result.provider_id.as_str(),
+            None,
+            extensions::refresh::affected_refresh_kinds(&result.kind),
+        )
+        .await
+        .is_err()
+        {
+            log::warn!(
+                "failed to queue global extension catalog refresh after an extension action"
+            );
+        }
+        return Ok(result);
+    }
     let (cli, context) = extensions::resolve_extension_cli(
         state.inner(),
         provider_id.trim(),
@@ -187,6 +249,28 @@ fn normalize_cwd(cwd: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// 判断扩展请求是否应读取本机用户级全局目录，而不是任何 workspace 目录。
+fn is_global_context(workspace_id: Option<&str>, cwd: Option<&str>) -> bool {
+    workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+        && cwd.is_none()
+}
+
 fn err_to_string(error: impl std::fmt::Display) -> String {
     format!("{error:#}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_global_context;
+
+    #[test]
+    fn identifies_only_missing_workspace_and_cwd_as_global_context() {
+        assert!(is_global_context(None, None));
+        assert!(is_global_context(Some("  \t"), None));
+        assert!(!is_global_context(Some("workspace"), None));
+        assert!(!is_global_context(None, Some("C:/work/project")));
+    }
 }

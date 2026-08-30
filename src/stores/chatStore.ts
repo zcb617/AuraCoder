@@ -26,6 +26,8 @@ import type {
 
 interface ChatState {
   threadId: string | null;
+  /** 记录各线程是否已经完成 CLI 会话准备，仅存在于当前前端内存。 */
+  sessionReadyByThread: Record<string, boolean>;
   messages: Message[];
   olderCursor: MessageWindowCursor | null;
   hasOlderMessages: boolean;
@@ -1883,6 +1885,7 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
 
 export const useChatStore = create<ChatState>((set, get) => ({
   threadId: null,
+  sessionReadyByThread: {},
   messages: [],
   olderCursor: null,
   hasOlderMessages: false,
@@ -1911,6 +1914,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (currentThreadId && get().streaming) {
       cleanupBackgroundListener(currentThreadId);
       listenThreadEvents(currentThreadId, (event) => {
+        if (event.type === "TurnStarted") {
+          markThreadSessionReady(currentThreadId);
+        }
         if (event.type === "TurnCompleted") {
           cleanupBackgroundListener(currentThreadId!);
         }
@@ -1983,6 +1989,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       messages = applyHydrationWindow(messages);
       if (bindSeq !== activeThreadBindSeq) {
         return;
+      }
+
+      const hasEngineThreadId =
+        typeof activeThread?.engineThreadId === "string" &&
+        activeThread.engineThreadId.trim().length > 0;
+      if (hasEngineThreadId) {
+        markThreadSessionReady(threadId);
       }
 
       const queuedStreamEvents: StreamEvent[] = [];
@@ -2116,6 +2129,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const unlistenStream = await listenThreadEvents(threadId, (event) => {
         if (bindSeq !== activeThreadBindSeq) {
           return;
+        }
+        if (event.type === "TurnStarted") {
+          markThreadSessionReady(threadId);
         }
         const pendingTurnMeta = pendingTurnMetaByThread.get(threadId);
         if (
@@ -2685,3 +2701,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 }));
+
+/**
+ * 标记指定线程已经收到会话启动事件，供消息面板关闭后续首轮占位提示。
+ * 已经标记的线程直接复用原状态，避免重复创建状态对象。
+ */
+function markThreadSessionReady(threadId: string | null): void {
+  if (!threadId) {
+    return;
+  }
+
+  useChatStore.setState((state) => {
+    if (state.sessionReadyByThread[threadId] === true) {
+      return state;
+    }
+    return {
+      ...state,
+      sessionReadyByThread: {
+        ...state.sessionReadyByThread,
+        [threadId]: true,
+      },
+    };
+  });
+}

@@ -621,6 +621,7 @@
     },
     "turnProgress": {
       "running": "{{engine}} is still running",
+      "receivedAndThinking": "{{engine}} has received your message and is thinking",
       "runningAction": "Running: {{summary}}",
       "runningWithSteer": "{{engine}} is still running; the follow-up is waiting to enter the current processing step",
       "waitingForApproval": "Waiting for your confirmation"

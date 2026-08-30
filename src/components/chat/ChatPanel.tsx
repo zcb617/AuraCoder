@@ -1390,6 +1390,10 @@ interface MessageRowProps {
   assistantEngineId: string;
   /** 当前消息回合实际使用的 CLI 名称，用于运行状态文案。 */
   assistantEngineName: string;
+  /** 允许当前尾部空流式助手显示首轮会话准备占位。 */
+  allowInitialPreparation: boolean;
+  /** 允许当前尾部空流式助手在会话就绪后显示已收到消息并思考状态。 */
+  allowTurnStartedThinking: boolean;
   preparingLabel?: string;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   onLoadActionOutput: (messageId: string, actionId: string) => Promise<void>;
@@ -1493,6 +1497,8 @@ function MessageRowView({
   assistantLabel,
   assistantEngineId,
   assistantEngineName,
+  allowInitialPreparation,
+  allowTurnStartedThinking,
   preparingLabel,
   onApproval,
   onLoadActionOutput,
@@ -1533,8 +1539,26 @@ function MessageRowView({
     [message.blocks],
   );
   const hasAssistantContent = !isUser && hasVisibleContent(message.blocks);
-  const showAssistantShell = !isUser && (hasAssistantContent || message.status === "streaming");
-  const showThinkingPlaceholder = showAssistantShell && !hasAssistantContent;
+  const showInitialPreparation =
+    !isUser &&
+    message.status === "streaming" &&
+    !hasAssistantContent &&
+    allowInitialPreparation;
+  const showReceivedAndThinking =
+    !isUser &&
+    message.status === "streaming" &&
+    !hasAssistantContent &&
+    allowTurnStartedThinking;
+  const showAssistantShell =
+    !isUser &&
+    (hasAssistantContent ||
+      showInitialPreparation ||
+      showReceivedAndThinking ||
+      Boolean(preparingLabel));
+  const showThinkingPlaceholder =
+    !isUser &&
+    !hasAssistantContent &&
+    (showInitialPreparation || showReceivedAndThinking || Boolean(preparingLabel));
   const showTurnTail = hasAssistantContent && message.status === "streaming";
   const hasPendingApproval = (message.blocks ?? []).some(
     (block) => block.type === "approval" && block.status === "pending",
@@ -1546,6 +1570,10 @@ function MessageRowView({
     (block) => block.type === "steer" && block.deliveryStatus === "accepted",
   );
   const thinkingVariant = useThinkingVariant(showThinkingPlaceholder);
+
+  if (!isUser && !showAssistantShell) {
+    return null;
+  }
 
   return (
     <div
@@ -1682,6 +1710,20 @@ function MessageRowView({
                 </div>
               )}
             </>
+          ) : showReceivedAndThinking && !preparingLabel ? (
+            <div className="chat-turn-tail-status" role="status" aria-live="polite">
+              <Loader2 size={12} className="chat-send-spinner" aria-hidden="true" />
+              <span>
+                {t("messageBlocks.turnProgress.receivedAndThinking", {
+                  engine: assistantEngineName,
+                })}
+              </span>
+              <span className="chat-streaming-dots" aria-hidden="true">
+                <span />
+                <span />
+                <span />
+              </span>
+            </div>
           ) : (
             <div
               style={{
@@ -1720,6 +1762,8 @@ const MessageRow = memo(
     prev.assistantLabel === next.assistantLabel &&
     prev.assistantEngineId === next.assistantEngineId &&
     prev.assistantEngineName === next.assistantEngineName &&
+    prev.allowInitialPreparation === next.allowInitialPreparation &&
+    prev.allowTurnStartedThinking === next.allowTurnStartedThinking &&
     prev.preparingLabel === next.preparingLabel &&
     prev.onApproval === next.onApproval &&
     prev.onLoadActionOutput === next.onLoadActionOutput &&
@@ -2016,6 +2060,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     error,
     setActiveThread: bindChatThread,
     threadId,
+    sessionReady,
   } = useChatStore(
     useShallow((state) => ({
       messages: state.messages,
@@ -2037,6 +2082,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       error: state.error,
       setActiveThread: state.setActiveThread,
       threadId: state.threadId,
+      /** 当前线程是否已收到 CLI 会话启动事件。 */
+      sessionReady:
+        state.threadId !== null && state.sessionReadyByThread[state.threadId] === true,
     })),
   );
   const messageFocusTarget = useUiStore((s) => s.messageFocusTarget);
@@ -7353,12 +7401,19 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                         assistantLabel={assistantIdentity?.label ?? ""}
                         assistantEngineId={assistantIdentity?.engineId ?? ""}
                         assistantEngineName={assistantIdentity?.engineName ?? ""}
+                        allowInitialPreparation={
+                          !sessionReady && message.id === messages[messages.length - 1]?.id
+                        }
+                        allowTurnStartedThinking={
+                          sessionReady && message.id === messages[messages.length - 1]?.id
+                        }
                         preparingLabel={
                           activeWorkspace?.locationKind === "ssh" &&
                           preparingAttachments &&
                           message.id === messages[messages.length - 1]?.id
                             ? t("panel.uploadingRemoteAttachments")
                             : activeWorkspace?.locationKind === "ssh" &&
+                                !sessionReady &&
                                 preparingEngineId === "claude" &&
                                 message.id === messages[messages.length - 1]?.id
                               ? t("panel.preparingRemoteEngine", { engine: "Claude Code" })
@@ -7392,12 +7447,19 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                   assistantLabel={assistantIdentity?.label ?? ""}
                   assistantEngineId={assistantIdentity?.engineId ?? ""}
                   assistantEngineName={assistantIdentity?.engineName ?? ""}
+                  allowInitialPreparation={
+                    !sessionReady && message.id === messages[messages.length - 1]?.id
+                  }
+                  allowTurnStartedThinking={
+                    sessionReady && message.id === messages[messages.length - 1]?.id
+                  }
                   preparingLabel={
                     activeWorkspace?.locationKind === "ssh" &&
                     preparingAttachments &&
                     message.id === messages[messages.length - 1]?.id
                       ? t("panel.uploadingRemoteAttachments")
                       : activeWorkspace?.locationKind === "ssh" &&
+                          !sessionReady &&
                           preparingEngineId === "claude" &&
                           message.id === messages[messages.length - 1]?.id
                         ? t("panel.preparingRemoteEngine", { engine: "Claude Code" })
@@ -7448,6 +7510,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
               assistantLabel=""
               assistantEngineId=""
               assistantEngineName=""
+              allowInitialPreparation={false}
+              allowTurnStartedThinking={false}
               onApproval={handleApproval}
               onLoadActionOutput={handleLoadActionOutput}
               onOpenImageAttachment={handleOpenImageAttachment}

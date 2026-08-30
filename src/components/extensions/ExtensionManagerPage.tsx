@@ -549,7 +549,7 @@ export function ExtensionManagerPage() {
             </div>
           )}
 
-          {catalog?.refreshErrors?.map((error) => (
+          {!loading && catalog?.refreshErrors?.map((error) => (
             <div className="em-warning" key={`${error.kind}:${error.code}`}>
               <ShieldAlert size={14} />
               {t(`extensions:refreshErrors.${error.code}`, {
