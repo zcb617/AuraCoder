@@ -682,6 +682,71 @@ mod tests {
         .expect("registering a context should wake the background scheduler");
     }
 
+    /// 验证首次读取全局目录时注册三个扩展类型，并立即保留后台刷新状态。
+    #[tokio::test]
+    async fn cache_read_registers_global_context_without_a_snapshot() {
+        let state = test_app_state();
+        let catalog = load_cached_catalog(&state, "codex", None)
+            .await
+            .expect("failed to read empty global extension catalog cache");
+
+        assert_eq!(catalog.cwd, None);
+        assert!(!catalog.has_snapshot);
+        assert!(catalog.items.is_empty());
+        assert!(catalog.refreshing);
+        assert_eq!(
+            snapshot_db::load_snapshots(&state.db, "codex", &context_key(None))
+                .unwrap()
+                .len(),
+            snapshot_db::EXTENSION_KINDS.len(),
+        );
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            state
+                .extension_catalog_refreshes
+                .wait_for_scheduler_wakeup(),
+        )
+        .await
+        .expect("registering the global context should wake the background scheduler");
+    }
+
+    /// 验证全局目录已有旧快照时仍返回旧数据，同时报告后台刷新状态。
+    #[tokio::test]
+    async fn cache_read_preserves_global_snapshot_while_refreshing() {
+        let state = test_app_state();
+        let context_key = context_key(None);
+        let attempted_at = Utc::now().to_rfc3339();
+        snapshot_db::ensure_context(&state.db, "codex", &context_key, &attempted_at)
+            .expect("failed to register global cache context");
+        let previous_item = ExtensionItemDto {
+            id: "global-skill".to_string(),
+            provider_id: "codex".to_string(),
+            kind: "skill".to_string(),
+            name: "Global Skill".to_string(),
+            installed: Some(true),
+            ..Default::default()
+        };
+        snapshot_db::record_success(
+            &state.db,
+            "codex",
+            &context_key,
+            "skill",
+            &[previous_item],
+            &attempted_at,
+        )
+        .expect("failed to save global cache snapshot");
+
+        let catalog = load_cached_catalog(&state, "codex", None)
+            .await
+            .expect("failed to read global extension catalog snapshot");
+
+        assert_eq!(catalog.cwd, None);
+        assert!(catalog.has_snapshot);
+        assert!(catalog.refreshing);
+        assert_eq!(catalog.items.len(), 1);
+        assert_eq!(catalog.items[0].id, "global-skill");
+    }
+
     #[tokio::test]
     async fn cache_read_schedules_existing_context_once_per_run() {
         let state = test_app_state();

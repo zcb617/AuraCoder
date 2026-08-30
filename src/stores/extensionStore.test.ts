@@ -79,6 +79,12 @@ describe("extensionStore helpers", () => {
     ).not.toBe(buildExtensionCacheKey({ ...baseContext, workspaceId: "ssh-target-b" }));
   });
 
+  it("uses the global cache key when workspace and cwd are absent", () => {
+    expect(
+      buildExtensionCacheKey({ providerId: "codex", workspaceId: null, cwd: null }),
+    ).toBe("codex::global::");
+  });
+
   it("prefers the active thread provider over persisted and default providers", () => {
     expect(resolveExtensionProvider("workspace", { workspace: "claude" }, "opencode", "codex"))
       .toBe("opencode");
@@ -172,6 +178,40 @@ describe("extensionStore helpers", () => {
     await useExtensionStore.getState().requestRefresh(context);
 
     expect(requestRefresh).toHaveBeenCalledWith("codex", "workspace", "D:/work/project");
+    expect(getCatalog).not.toHaveBeenCalled();
+    expect(useExtensionStore.getState().entries[key]?.catalog?.items[0]?.id).toBe("cached");
+    expect(useExtensionStore.getState().entries[key]?.refreshRequested).toBe(true);
+    requestRefresh.mockRestore();
+    getCatalog.mockRestore();
+  });
+
+  it("queues a global refresh with null workspace and cwd while keeping the old catalog", async () => {
+    const context = {
+      providerId: "codex" as const,
+      workspaceId: null,
+      cwd: null,
+    };
+    const cached = catalog("cached");
+    const requestRefresh = vi
+      .spyOn(ipc, "requestExtensionCatalogRefresh")
+      .mockResolvedValue({ ...cached, cwd: null, refreshing: true });
+    const getCatalog = vi.spyOn(ipc, "getExtensionCatalog");
+    const key = buildExtensionCacheKey(context);
+    useExtensionStore.setState({
+      entries: {
+        [key]: {
+          context,
+          phase: "ready",
+          catalog: cached,
+          stale: false,
+          requestSequence: 0,
+        },
+      },
+    });
+
+    await useExtensionStore.getState().requestRefresh(context);
+
+    expect(requestRefresh).toHaveBeenCalledWith("codex", null, null);
     expect(getCatalog).not.toHaveBeenCalled();
     expect(useExtensionStore.getState().entries[key]?.catalog?.items[0]?.id).toBe("cached");
     expect(useExtensionStore.getState().entries[key]?.refreshRequested).toBe(true);

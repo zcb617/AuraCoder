@@ -137,6 +137,20 @@ pub async fn refresh_catalog_kinds(
         if !requested.contains(kind) {
             continue;
         }
+        if cwd.is_none() {
+            let result = match provider_id {
+                "codex" => crate::extensions::codex::refresh_kind(&state.engines, None, kind).await,
+                "claude" => {
+                    crate::extensions::claude::refresh_kind(&state.engines, None, kind).await
+                }
+                "opencode" => {
+                    crate::extensions::opencode::refresh_kind(&state.engines, None, kind).await
+                }
+                _ => unreachable!(),
+            };
+            results.push(result);
+            continue;
+        }
         let result = match provider_id {
             "codex" => {
                 let codex = CliToolFactory::new(state.clone())

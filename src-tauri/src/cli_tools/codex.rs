@@ -1674,6 +1674,16 @@ impl CliTool for CodexCli {
             .await
     }
 
+    /// 用户未选择 workspace 时，使用本机用户级 Codex 配置执行全局扩展动作。
+    async fn perform_global_extension_action(
+        &self,
+        item: ExtensionItemDto,
+        action: &str,
+        _scope: Option<&str>,
+    ) -> Result<ExtensionActionResultDto> {
+        crate::extensions::codex::perform_action(&item, action, None).await
+    }
+
     async fn fork_thread(
         &self,
         context: &CliExecutionContext,
