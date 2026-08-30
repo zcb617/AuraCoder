@@ -1655,11 +1655,23 @@ describe("claude-agent-sdk-server sidecar", () => {
       _claudeRequestId: "request-approval-1",
     });
     harness.send({
+      id: "approval-response-accept-for-session",
       method: "approval_response",
       params: {
         approvalId: approvalEvent.approvalId,
         response: { decision: "accept_for_session" },
       },
+    });
+
+    const approvalResponseResult = await harness.waitFor(
+      (event) =>
+        event.id === "approval-response-accept-for-session" &&
+        event.type === "approval_response_result",
+    );
+    expect(approvalResponseResult).toMatchObject({
+      id: "approval-response-accept-for-session",
+      approvalId: approvalEvent.approvalId,
+      success: true,
     });
 
     await harness.waitFor(
@@ -1680,6 +1692,89 @@ describe("claude-agent-sdk-server sidecar", () => {
     expect(observations[1]?.type).toBe("permission_result");
     expect(observations[1]?.result.behavior).toBe("allow");
     expect(observations[1]?.result.updatedPermissions).toEqual(suggestions);
+  });
+
+  it("rejects unknown approval IDs without releasing the pending query", async () => {
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "permission",
+          toolName: "Bash",
+          input: { command: "npm test" },
+          toolUseID: "permission-unknown-approval",
+        },
+      ],
+      emitObservationResult: true,
+      sessionId: "session-unknown-approval",
+    });
+
+    harness.send({
+      id: "query-unknown-approval",
+      method: "query",
+      params: {
+        prompt: "request approval with an unknown response first",
+        cwd: repoRoot,
+        approvalPolicy: "default",
+      },
+    });
+
+    const approvalEvent = await harness.waitFor(
+      (event) =>
+        event.id === "query-unknown-approval" && event.type === "approval_requested",
+    );
+    const unknownApprovalId = "approval-does-not-exist";
+    harness.send({
+      id: "approval-response-unknown",
+      method: "approval_response",
+      params: {
+        approvalId: unknownApprovalId,
+        response: { decision: "accept" },
+      },
+    });
+
+    const unknownResult = await harness.waitFor(
+      (event) =>
+        event.id === "approval-response-unknown" &&
+        event.type === "approval_response_result",
+    );
+    expect(unknownResult).toMatchObject({
+      id: "approval-response-unknown",
+      approvalId: unknownApprovalId,
+      success: false,
+    });
+    expect(String(unknownResult.error)).toContain(unknownApprovalId);
+    expect(
+      harness.events.some(
+        (event) => event.id === "query-unknown-approval" && event.type === "turn_completed",
+      ),
+    ).toBe(false);
+
+    harness.send({
+      id: "approval-response-unknown-correct",
+      method: "approval_response",
+      params: {
+        approvalId: approvalEvent.approvalId,
+        response: { decision: "accept" },
+      },
+    });
+    const validResult = await harness.waitFor(
+      (event) =>
+        event.id === "approval-response-unknown-correct" &&
+        event.type === "approval_response_result",
+    );
+    expect(validResult).toMatchObject({
+      id: "approval-response-unknown-correct",
+      approvalId: approvalEvent.approvalId,
+      success: true,
+    });
+
+    const completed = await harness.waitFor(
+      (event) => event.id === "query-unknown-approval" && event.type === "turn_completed",
+    );
+    expect(completed.status).toBe("completed");
+    const observations = parseObservationResults(harness, "query-unknown-approval");
+    expect(observations).toHaveLength(1);
+    expect(observations[0]?.result.behavior).toBe("allow");
   });
 
   it("routes AskUserQuestion approvals through updatedInput answers", async () => {
@@ -1810,6 +1905,7 @@ describe("claude-agent-sdk-server sidecar", () => {
       (event) => event.id === "query-invalid-approval" && event.type === "approval_requested",
     );
     harness.send({
+      id: "approval-response-invalid",
       method: "approval_response",
       params: {
         approvalId: approvalEvent.approvalId,
@@ -1820,6 +1916,17 @@ describe("claude-agent-sdk-server sidecar", () => {
     const errorEvent = await harness.waitFor(
       (event) => event.id === "query-invalid-approval" && event.type === "error",
     );
+    const approvalResponseResult = await harness.waitFor(
+      (event) =>
+        event.id === "approval-response-invalid" &&
+        event.type === "approval_response_result",
+    );
+    expect(approvalResponseResult).toMatchObject({
+      id: "approval-response-invalid",
+      approvalId: approvalEvent.approvalId,
+      success: false,
+    });
+    expect(String(approvalResponseResult.error)).toContain("explicit decision field");
     const completed = await harness.waitFor(
       (event) => event.id === "query-invalid-approval" && event.type === "turn_completed",
     );

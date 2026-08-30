@@ -134,6 +134,18 @@ enum SidecarEvent {
         summary: String,
         details: Option<serde_json::Value>,
     },
+    /// Sidecar 对审批响应命令的处理回执，用于让调用方确认审批是否真正结算。
+    ApprovalResponseResult {
+        /// 审批响应命令的顶层请求标识，用于过滤并发回执。
+        id: Option<String>,
+        /// 被处理的审批业务标识，用于确认回执对应的审批。
+        #[serde(rename = "approvalId")]
+        approval_id: Option<String>,
+        /// 标识 sidecar 是否成功处理该审批响应。
+        success: bool,
+        /// 审批处理失败时返回的原始错误信息。
+        error: Option<String>,
+    },
     TurnCompleted {
         id: Option<String>,
         status: String,
@@ -219,6 +231,7 @@ impl SidecarEvent {
             | SidecarEvent::ActionProgressUpdated { id, .. }
             | SidecarEvent::ActionCompleted { id, .. }
             | SidecarEvent::ApprovalRequested { id, .. }
+            | SidecarEvent::ApprovalResponseResult { id, .. }
             | SidecarEvent::TurnCompleted { id, .. }
             | SidecarEvent::Notice { id, .. }
             | SidecarEvent::UsageLimitsUpdated { id, .. }
@@ -2597,6 +2610,7 @@ impl Engine for ClaudeSidecarEngine {
                                         .ok();
                                 }
                                 SidecarEvent::Ready
+                                | SidecarEvent::ApprovalResponseResult { .. }
                                 | SidecarEvent::Models { .. }
                                 | SidecarEvent::Sessions { .. }
                                 | SidecarEvent::Version { .. } => {}
@@ -2691,6 +2705,7 @@ impl Engine for ClaudeSidecarEngine {
         anyhow::bail!("Claude does not support mid-turn steering")
     }
 
+    /// 向 Claude sidecar 发送审批响应并等待对应的处理回执，成功后才允许上层结算审批。
     async fn respond_to_approval(
         &self,
         approval_id: &str,
@@ -2699,18 +2714,74 @@ impl Engine for ClaudeSidecarEngine {
     ) -> Result<(), anyhow::Error> {
         let normalized_response = normalize_approval_response_for_engine("claude", response)
             .map_err(anyhow::Error::msg)?;
-        let state = self.state.lock().await;
-        if let Some(ref transport) = state.transport {
-            let approval_cmd = serde_json::json!({
-                "method": "approval_response",
-                "params": {
-                    "approvalId": approval_id,
-                    "response": normalized_response,
-                },
-            });
-            transport.send_command(&approval_cmd).await?;
-        }
-        Ok(())
+        let transport = {
+            let state = self.state.lock().await;
+            state
+                .transport
+                .clone()
+                .ok_or_else(|| anyhow::Error::msg("Claude sidecar transport is unavailable"))?
+        };
+        let request_id = Uuid::new_v4().to_string();
+        let mut receiver = transport.subscribe();
+        let approval_cmd = serde_json::json!({
+            "id": request_id,
+            "method": "approval_response",
+            "params": {
+                "approvalId": approval_id,
+                "response": normalized_response,
+            },
+        });
+        transport
+            .send_command(&approval_cmd)
+            .await
+            .context("failed to send Claude approval response command")?;
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match receiver.recv().await {
+                    Ok(SidecarEvent::ApprovalResponseResult {
+                        id,
+                        approval_id: response_approval_id,
+                        success,
+                        error,
+                    }) if id.as_deref() == Some(request_id.as_str()) => {
+                        if response_approval_id.as_deref() != Some(approval_id) {
+                            let received_approval_id =
+                                response_approval_id.as_deref().unwrap_or("<missing>");
+                            anyhow::bail!(
+                                "Claude approval response returned mismatched approval ID for request {request_id}: expected {approval_id}, received {received_approval_id}"
+                            );
+                        }
+                        if success {
+                            return Ok(());
+                        }
+                        let error = error.unwrap_or_else(|| {
+                            "Claude sidecar returned no approval error details.".to_string()
+                        });
+                        anyhow::bail!(
+                            "Claude approval response failed for approval {approval_id}: {error}"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        anyhow::bail!(
+                            "Claude approval response event stream lagged by {skipped} messages"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        anyhow::bail!(
+                            "Claude approval response event stream closed before approval {approval_id} was acknowledged"
+                        );
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::Error::msg(format!(
+                "Claude approval response timed out for approval {approval_id} after 10 seconds"
+            ))
+        })?
     }
 
     async fn interrupt(&self, engine_thread_id: &str) -> Result<(), anyhow::Error> {
@@ -2946,6 +3017,33 @@ mod tests {
                 assert_eq!(action_id, "action-1");
                 assert_eq!(stream, "stderr");
                 assert_eq!(content, "permission denied");
+            }
+            other => panic!("unexpected event variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserializes_approval_response_result_events() {
+        let event: SidecarEvent = serde_json::from_value(serde_json::json!({
+            "type": "approval_response_result",
+            "id": "approval-response-1",
+            "approvalId": "approval-1",
+            "success": false,
+            "error": "approval-1 is unknown",
+        }))
+        .expect("approval_response_result should deserialize");
+
+        assert_eq!(event.request_id(), Some("approval-response-1"));
+        match event {
+            SidecarEvent::ApprovalResponseResult {
+                approval_id,
+                success,
+                error,
+                ..
+            } => {
+                assert_eq!(approval_id.as_deref(), Some("approval-1"));
+                assert!(!success);
+                assert_eq!(error.as_deref(), Some("approval-1 is unknown"));
             }
             other => panic!("unexpected event variant: {other:?}"),
         }

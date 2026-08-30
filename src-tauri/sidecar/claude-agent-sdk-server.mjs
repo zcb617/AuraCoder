@@ -2647,14 +2647,56 @@ function assertClaudeApprovalResponseShape(response) {
   normalizeApprovalDecision(response.decision);
 }
 
-function handleApprovalResponse(params = {}) {
+/** 向 Rust 返回审批响应处理结果，确保调用方只依据明确回执判断审批是否成功。 */
+function emitApprovalResponseResult(requestId, approvalId, success, error) {
+  const result = {
+    // 将审批响应命令的顶层请求标识回传给等待方。
+    ...(requestId ? { id: requestId } : {}),
+    // 回传本次审批的业务标识，缺失时使用 null 以保持协议字段稳定。
+    approvalId: approvalId ?? null,
+    // 标识 sidecar 是否成功处理并结算了审批响应。
+    success,
+    // 失败时保留 sidecar 原始错误文本，便于 Rust 和前端展示。
+    ...(error ? { error } : {}),
+  };
+  traceClaudeSdk("approval_response_result", {
+    // 记录命令请求标识，便于关联 Rust 的审批等待日志。
+    requestId: requestId ?? null,
+    // 记录审批业务标识，便于定位未知或失效审批。
+    approvalId: approvalId ?? null,
+    // 记录本次审批处理结果。
+    success,
+    // 记录原始异常信息，不在 sidecar 日志层吞掉错误。
+    ...(error ? { error } : {}),
+  });
+  emit({
+    // 标识这是审批响应回执，而不是普通审批请求事件。
+    type: "approval_response_result",
+    ...result,
+  });
+}
+
+/** 处理客户端审批响应，结算 pending approval 并同步发送处理回执。 */
+function handleApprovalResponse(params = {}, requestId) {
   const approvalId = params.approvalId || params.approval_id;
   if (!approvalId) {
+    emitApprovalResponseResult(
+      requestId,
+      null,
+      false,
+      "Claude approval response is missing an approval ID.",
+    );
     return;
   }
 
   const pending = pendingApprovals.get(approvalId);
   if (!pending) {
+    emitApprovalResponseResult(
+      requestId,
+      approvalId,
+      false,
+      `Claude approval ID ${approvalId} is unknown or no longer pending.`,
+    );
     return;
   }
 
@@ -2671,10 +2713,12 @@ function handleApprovalResponse(params = {}) {
     const context = activeQueries.get(pending.queryId);
     context?.pendingApprovalIds.delete(approvalId);
     pending.resolve(permission);
+    emitApprovalResponseResult(requestId, approvalId, true);
   } catch (error) {
     pendingApprovals.delete(approvalId);
     const context = activeQueries.get(pending.queryId);
     context?.pendingApprovalIds.delete(approvalId);
+    const errorMessage = error.message || String(error);
     pending.resolve({
       behavior: "deny",
       message: "Claude approval response was invalid and was denied.",
@@ -2682,9 +2726,10 @@ function handleApprovalResponse(params = {}) {
     emit({
       id: pending.queryId,
       type: "error",
-      message: error.message || String(error),
+      message: errorMessage,
       recoverable: true,
     });
+    emitApprovalResponseResult(requestId, approvalId, false, errorMessage);
   }
 }
 
@@ -2723,7 +2768,7 @@ rl.on("line", (line) => {
   }
 
   if (req.method === "approval_response") {
-    handleApprovalResponse(req.params || {});
+    handleApprovalResponse(req.params || {}, req.id);
     return;
   }
 

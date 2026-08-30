@@ -1563,7 +1563,7 @@ function MessageRowView({
   const hasPendingApproval = (message.blocks ?? []).some(
     (block) => block.type === "approval" && block.status === "pending",
   );
-  const runningAction = (message.blocks ?? []).find(
+  const runningAction = [...(message.blocks ?? [])].reverse().find(
     (block) => block.type === "action" && block.status === "running",
   );
   const hasAcceptedSteer = (message.blocks ?? []).some(

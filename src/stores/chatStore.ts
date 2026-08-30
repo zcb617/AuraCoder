@@ -2567,6 +2567,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ error: String(error) });
     }
   },
+  // 业务说明：等待 sidecar 审批回执成功后，再结算可见线程中的审批状态。
   respondApproval: async (approvalId, response, threadIdOverride) => {
     const threadId = threadIdOverride ?? get().threadId;
     if (!threadId) {
@@ -2574,7 +2575,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return false;
     }
 
-    // Only mutate the visible transcript when it belongs to the target thread.
+    // Only inspect the visible transcript when it belongs to the target thread.
     const decision = resolveApprovalDecision(response);
     const responseData = typeof response === "object" && response !== null && !Array.isArray(response)
       ? response as Record<string, unknown>
@@ -2592,16 +2593,38 @@ export const useChatStore = create<ChatState>((set, get) => ({
             break;
           }
         }
-        const nextMessages = resolveApprovalInMessages(state.messages, approvalId, decision, responseData);
-        if (nextMessages === state.messages) {
-          return state;
-        }
-        return { ...state, messages: nextMessages };
+
+        // 旧逻辑会在 IPC 调用前乐观标记 answered，现保留迁移留痕但不再执行：
+        // const nextMessages = resolveApprovalInMessages(state.messages, approvalId, decision, responseData);
+        // if (nextMessages === state.messages) {
+        //   return state;
+        // }
+        // return { ...state, messages: nextMessages };
+        return state;
       });
     }
 
     try {
       await ipc.respondApproval(threadId, approvalId, response);
+      if (get().threadId === threadId) {
+        set((state) => {
+          if (state.threadId !== threadId) {
+            return state;
+          }
+          const nextMessages = resolveApprovalInMessages(
+            state.messages,
+            approvalId,
+            decision,
+            responseData,
+          );
+          return {
+            ...state,
+            messages: nextMessages,
+            status: "streaming",
+            streaming: true,
+          };
+        });
+      }
       return true;
     } catch (error) {
       set((state) => ({

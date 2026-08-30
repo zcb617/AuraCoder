@@ -1526,6 +1526,8 @@ describe("chatStore send", () => {
         decision: "accept_for_session",
       },
     ]);
+    expect(useChatStore.getState().status).toBe("streaming");
+    expect(useChatStore.getState().streaming).toBe(true);
   });
 
   it("treats 'none' permission values as a decline", async () => {
@@ -2587,7 +2589,7 @@ describe("chatStore send", () => {
     expect(mockIpc.getThreadMessagesWindow).toHaveBeenCalledWith("thread-1", null, 80);
   });
 
-  it("normalizes deny approvals to decline in optimistic state", async () => {
+  it("normalizes deny approvals to decline after IPC success", async () => {
     useChatStore.setState({
       threadId: "thread-1",
       messages: [
@@ -2641,6 +2643,8 @@ describe("chatStore send", () => {
         decision: "decline",
       },
     ]);
+    expect(useChatStore.getState().status).toBe("streaming");
+    expect(useChatStore.getState().streaming).toBe(true);
   });
 
   it("returns failure and rolls back when an approval response is rejected", async () => {
@@ -2683,7 +2687,7 @@ describe("chatStore send", () => {
     expect(useChatStore.getState().error).toContain("approval failed");
   });
 
-  it("preserves concurrent message updates when an approval response is rejected", async () => {
+  it("keeps approval pending during delayed IPC and preserves concurrent messages", async () => {
     const response = deferred<void>();
     mockIpc.respondApproval.mockReturnValueOnce(response.promise);
     useChatStore.setState({
@@ -2718,7 +2722,7 @@ describe("chatStore send", () => {
       .respondApproval("approval-1", { decision: "accept" }, "thread-1");
 
     expect(useChatStore.getState().messages[0]?.blocks).toMatchObject([
-      { approvalId: "approval-1", status: "answered" },
+      { approvalId: "approval-1", status: "pending" },
     ]);
 
     useChatStore.setState((state) => ({
@@ -2737,16 +2741,18 @@ describe("chatStore send", () => {
         },
       ],
     }));
-    response.reject(new Error("approval failed"));
+    response.resolve();
 
-    await expect(pendingResponse).resolves.toBe(false);
+    await expect(pendingResponse).resolves.toBe(true);
     expect(useChatStore.getState().messages).toHaveLength(2);
     expect(useChatStore.getState().messages[0]?.blocks).toMatchObject([
-      { approvalId: "approval-1", status: "pending" },
+      { approvalId: "approval-1", status: "answered" },
     ]);
     expect(useChatStore.getState().messages[1]?.blocks).toMatchObject([
       { type: "text", content: "Still working" },
     ]);
+    expect(useChatStore.getState().status).toBe("streaming");
+    expect(useChatStore.getState().streaming).toBe(true);
   });
 
   it("targets an explicit thread without mutating another visible transcript", async () => {
