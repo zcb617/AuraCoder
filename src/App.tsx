@@ -719,6 +719,12 @@ export function App() {
   // close behavior even without a native menubar.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
+      // Prevent the WebView's native refresh because a document reload does not restart Tauri startup listeners.
+      if (e.key === "F5") {
+        e.preventDefault();
+        return;
+      }
+
       if (e.key === "F11") {
         e.preventDefault();
         fireShortcut("toggle-fullscreen", () => {
