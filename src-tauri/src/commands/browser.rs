@@ -13,7 +13,7 @@ use tokio::fs as tokio_fs;
 use tokio::sync::oneshot;
 
 const BROWSER_WEBVIEW_LABEL_PREFIX: &str = "browser-annotation-webview";
-const DEFAULT_BROWSER_URL: &str = "https://www.qq.com/";
+const DEFAULT_BROWSER_URL: &str = "https://www.jxrjkf.cn/";
 const BROWSER_ANNOTATION_SELECTION_SCHEME: &str = "auracoder-browser-annotation";
 const MAX_BROWSER_URL_CHARS: usize = 4_096;
 const MAX_TARGET_LABEL_CHARS: usize = 600;
@@ -885,8 +885,8 @@ mod tests {
     #[test]
     fn annotation_navigation_recovers_the_submitted_comment_and_dom_node() {
         let selection = BrowserAnnotationSelection {
-            url: "https://www.qq.com/".to_string(),
-            title: "腾讯网".to_string(),
+            url: "https://www.jxrjkf.cn/".to_string(),
+            title: "云祥软件".to_string(),
             target_label: "div: 嘉兴市 雨 25℃".to_string(),
             rect: BrowserAnnotationRect {
                 x: 48.0,
@@ -914,7 +914,7 @@ mod tests {
 
     #[test]
     fn non_annotation_navigation_is_not_treated_as_a_selection() {
-        let url = tauri::Url::parse("https://www.qq.com/").unwrap();
+        let url = tauri::Url::parse("https://www.jxrjkf.cn/").unwrap();
         assert!(browser_annotation_submission_from_url(&url).is_none());
     }
 
@@ -922,8 +922,8 @@ mod tests {
     fn annotation_comment_limit_counts_characters_for_chinese_text() {
         let submission = BrowserAnnotationSubmission {
             selection: BrowserAnnotationSelection {
-                url: "https://www.qq.com/".to_string(),
-                title: "腾讯网".to_string(),
+                url: "https://www.jxrjkf.cn/".to_string(),
+                title: "云祥软件".to_string(),
                 target_label: "div: 嘉兴市 雨 25℃".to_string(),
                 rect: BrowserAnnotationRect {
                     x: 48.0,

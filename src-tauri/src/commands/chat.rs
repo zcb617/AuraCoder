@@ -6446,7 +6446,7 @@ mod tests {
             browser_annotation: Some(BrowserAnnotationMetadata {
                 comment: "文字太小了".to_string(),
                 number: Some(1),
-                source_url: Some("https://www.qq.com/".to_string()),
+                source_url: Some("https://www.jxrjkf.cn/".to_string()),
                 target_label: Some("div: 嘉兴市 雨 25℃".to_string()),
             }),
             is_remote: false,
@@ -6482,7 +6482,7 @@ mod tests {
         let annotation = BrowserAnnotationMetadata {
             comment: "   ".to_string(),
             number: Some(1),
-            source_url: Some("https://www.qq.com/".to_string()),
+            source_url: Some("https://www.jxrjkf.cn/".to_string()),
             target_label: Some("div: 嘉兴市 雨 25℃".to_string()),
         };
 

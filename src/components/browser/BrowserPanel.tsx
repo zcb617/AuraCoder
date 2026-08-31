@@ -28,7 +28,7 @@ import type {
   ChatAttachment,
 } from "../../types";
 
-const DEFAULT_BROWSER_URL = "https://www.qq.com/";
+const DEFAULT_BROWSER_URL = "https://www.jxrjkf.cn/";
 const EMPTY_CHAT_ATTACHMENTS: ChatAttachment[] = [];
 const browserAnnotationAttachmentsByScope = new Map<string, ChatAttachment[]>();
 const browserAddressByScope = new Map<string, string>();
