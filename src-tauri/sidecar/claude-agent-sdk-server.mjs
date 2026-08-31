@@ -532,6 +532,85 @@ function requiresApprovalLegacy(permissionMode, toolName) {
 }
 */
 
+/**
+ * 将 Claude SDK 的后台任务生命周期消息转换为 AuraCoder 可展示的状态通知。
+ * 该通知只传递任务元数据，不读取或解释后台任务输出文件。
+ */
+function emitClaudeBackgroundNotice(id, subtype, task = null, tasks = null) {
+  const taskId = typeof task?.task_id === "string" ? task.task_id : null;
+  const description = typeof task?.description === "string" ? task.description : "Claude 后台任务";
+  const status = typeof task?.status === "string" ? task.status : null;
+  const outputFile = typeof task?.output_file === "string" ? task.output_file : null;
+  const summary = typeof task?.summary === "string" ? task.summary : null;
+  const activeTasks = Array.isArray(tasks) ? tasks : null;
+  let message;
+
+  if (subtype === "background_tasks_changed") {
+    message = activeTasks?.length
+      ? `正在等待 ${activeTasks.length} 个 Claude 后台任务：${activeTasks
+          .map((candidate) => candidate?.description || candidate?.task_id || "Claude 后台任务")
+          .join("、")}`
+      : "Claude 后台任务已全部结束，正在等待最终结果。";
+  } else if (subtype === "task_started") {
+    message = `Claude 后台任务已启动：${description}`;
+  } else if (subtype === "task_updated") {
+    message = `Claude 后台任务状态已更新：${description}`;
+  } else if (subtype === "task_progress") {
+    message = `Claude 后台任务进行中：${summary || description}`;
+  } else {
+    message = `Claude 后台任务${status || "已完成"}：${summary || description}`;
+  }
+
+  emit({
+    // 关联当前 AuraCoder 查询，确保远端事件过滤不会丢失通知。
+    id,
+    // 使用既有 notice 协议向当前 assistant 消息展示后台任务状态。
+    type: "notice",
+    // 标识这是 Claude 后台任务业务通知。
+    kind: "claude_background_tasks",
+    // 后台任务生命周期属于进行中的信息提示。
+    level: "info",
+    // 为用户提供统一的后台任务标题。
+    title: "Claude 后台任务",
+    // 提示用户当前正在等待或继续处理后台任务。
+    message,
+    // 保留 SDK 生命周期子类型，避免后台消息被静默丢弃。
+    sdkSubtype: subtype,
+    // 传递任务稳定标识，供当前消息关联任务状态。
+    ...(taskId ? { taskId } : {}),
+    // 传递 SDK 提供的任务状态，不在 sidecar 解释状态含义。
+    ...(status ? { status } : {}),
+    // 传递输出文件路径元数据，但不读取输出文件内容。
+    ...(outputFile ? { outputFile } : {}),
+    // 传递 SDK 提供的任务摘要，供用户看到后台任务结果提示。
+    ...(summary ? { summary } : {}),
+    // 传递当前活动任务全集，遵守 SDK 的 REPLACE 语义。
+    ...(activeTasks ? { tasks: activeTasks } : {}),
+  });
+}
+
+/**
+ * 将一个 AuraCoder 用户输入写入 Claude SDK 的可持续输入流，供初始轮次和后续轮次复用。
+ */
+async function pushClaudePromptInput(messageInput, input, sessionId) {
+  if (typeof input === "string") {
+    messageInput.push({
+      type: "user",
+      message: {
+        role: "user",
+        content: input,
+      },
+      parent_tool_use_id: null,
+      session_id: sessionId || "",
+    });
+    return;
+  }
+
+  for await (const message of input) {
+    messageInput.push(message);
+  }
+}
+
 /** 创建一个查询上下文，并保存该查询当前可变的权限策略状态。 */
 function createQueryContext(id, approvalPolicy = null, planMode = false) {
   const normalizedApprovalPolicy = typeof approvalPolicy === "string" ? approvalPolicy : null;
@@ -539,6 +618,8 @@ function createQueryContext(id, approvalPolicy = null, planMode = false) {
   return {
     id,
     threadId: id,
+    // 当前查询使用的可持续输入流，后台任务完成后继续向同一查询注入通知。
+    messageInput: null,
     query: null,
     actionCounter: 0,
     actionIdsByToolUseId: new Map(),
@@ -546,7 +627,28 @@ function createQueryContext(id, approvalPolicy = null, planMode = false) {
     suppressedToolUseIds: new Set(),
     pendingApprovalIds: new Set(),
     cancelled: false,
+    // 当前逻辑轮次是否已经向 AuraCoder 发出最终完成事件。
     turnCompleted: false,
+    // 当前逻辑轮次是否已经收到 SDK result 消息。
+    sdkResultReceived: false,
+    // 当前逻辑轮次最近一个 SDK result 的终态，用于最终完成状态回传。
+    sdkTerminalStatus: "completed",
+    // 当前查询是否使用持久会话句柄，决定输入流在轮次完成后是否继续保留。
+    isPersistentSession: false,
+    // 当前仍在运行的 SDK 后台任务，按 task_id 维护最新任务元数据。
+    backgroundTasks: new Map(),
+    // 权威后台任务集合当前是否为空，只能随 background_tasks_changed 快照更新。
+    authoritativeBackgroundTasksEmpty: true,
+    // 当前权威任务集合中仍等待 task_notification 的任务标识。
+    pendingTaskNotificationIds: new Set(),
+    // 已收到 task_notification 的任务标识，避免快照重放时重新等待同一通知。
+    notifiedTaskIds: new Set(),
+    // 当前逻辑轮次是否仍在等待一个或多个 task_notification。
+    awaitingTaskNotification: false,
+    // 已向 SDK 输入流注入的 task notification synthetic continuation 数量。
+    backgroundContinuationInjectedCount: 0,
+    // 已收到对应 synthetic continuation result 的数量。
+    backgroundContinuationResultCount: 0,
     sessionId: null,
     tokenUsage: null,
     stopReason: null,
@@ -1169,7 +1271,11 @@ function buildPermissionHandler({
     }
 
     if (decisionMode === "read-only") {
-      if (["Read", "Glob", "Grep", "Agent", "ExitPlanMode", "EnterPlanMode"].includes(toolName)) {
+      if (
+        ["Read", "Glob", "Grep", "Agent", "ExitPlanMode", "EnterPlanMode", "TaskOutput"].includes(
+          toolName,
+        )
+      ) {
         return { behavior: "allow" };
       }
       const permission = {
@@ -2041,8 +2147,9 @@ async function handleQuery(req, persistentSession = null) {
   context.threadId = threadId || sessionId || resume || id;
   activeQueries.set(id, context);
 
-  const toolList = Array.isArray(allowedTools)
-    ? [...allowedTools]
+  const toolList = [];
+  const requestedTools = Array.isArray(allowedTools)
+    ? allowedTools
     : [
       "Read",
       "Write",
@@ -2053,6 +2160,17 @@ async function handleQuery(req, persistentSession = null) {
       "Agent",
       ...(allowNetwork ? ["WebFetch"] : []),
     ];
+  for (const toolName of requestedTools) {
+    // TaskOutput 是后台任务续跑所需的原生工具，只保留一次并保留首次出现的位置。
+    if (toolName === "TaskOutput" && toolList.includes("TaskOutput")) {
+      continue;
+    }
+    toolList.push(toolName);
+  }
+  if (!toolList.includes("TaskOutput")) {
+    // 无论调用方是否提供工具白名单，都必须允许 Claude 读取后台任务结果。
+    toolList.push("TaskOutput");
+  }
   const permissionOptions = context.permissionOptions;
 
   const sessionCwd = cwd || process.cwd();
@@ -2092,9 +2210,23 @@ async function handleQuery(req, persistentSession = null) {
     }
     const automaticallyAllowedTools = enforceApprovalRouting
       ? permissionOptions.decisionMode === "read-only"
-        ? toolList.filter((toolName) => ["Read", "Glob", "Grep", "Agent", "ExitPlanMode", "EnterPlanMode"].includes(toolName))
+        ? toolList.filter((toolName) =>
+            [
+              "Read",
+              "Glob",
+              "Grep",
+              "Agent",
+              "ExitPlanMode",
+              "EnterPlanMode",
+              "TaskOutput",
+            ].includes(toolName),
+          )
         : permissionOptions.decisionMode === "ask"
-          ? toolList.filter((toolName) => ["Read", "Glob", "Grep", "ExitPlanMode", "EnterPlanMode"].includes(toolName))
+          ? toolList.filter((toolName) =>
+              ["Read", "Glob", "Grep", "ExitPlanMode", "EnterPlanMode", "TaskOutput"].includes(
+                toolName,
+              ),
+            )
           : toolList
       : toolList;
 
@@ -2291,12 +2423,30 @@ async function handleQuery(req, persistentSession = null) {
 
     let sawTextDelta = false;
     let terminalStatus = "completed";
-    const promptInput = persistentSession?.messageInput ?? buildPromptInput(
-      prompt,
-      attachments,
-      sessionCwd,
-      sessionId || resume || "",
-    );
+    let promptInput;
+    if (persistentSession) {
+      context.isPersistentSession = true;
+      context.messageInput = persistentSession.messageInput;
+      promptInput = persistentSession.messageInput;
+    } else {
+      const messageInput = new Readable({
+        objectMode: true,
+        read() {},
+      });
+      context.messageInput = messageInput;
+      const initialInput = buildPromptInput(
+        prompt,
+        attachments,
+        sessionCwd,
+        sessionId || resume || "",
+      );
+      await pushClaudePromptInput(
+        messageInput,
+        initialInput,
+        sessionId || resume || "",
+      );
+      promptInput = messageInput;
+    }
     traceClaudeSdk("query_create", { requestId: id, promptInput, options });
     const query = queryFn({ prompt: promptInput, options });
     context.query = query;
@@ -2311,6 +2461,49 @@ async function handleQuery(req, persistentSession = null) {
         reused: false,
       });
     }
+
+    /**
+     * 根据 Claude 后台任务状态机统一判断当前逻辑轮次是否可以完成。
+     * 只有权威任务集合为空、无需等待任务通知且所有续跑结果均到达时，才发送 turn_completed。
+     */
+    const maybeCompleteTurn = ({
+      allowMissingSdkResult = false,
+      forceStatus = null,
+    } = {}) => {
+      if (context.turnCompleted) {
+        return true;
+      }
+      if (forceStatus) {
+        emitTurnCompleted(context, forceStatus);
+        return true;
+      }
+      if (context.cancelled || persistentSession?.interruptRequested) {
+        emitTurnCompleted(context, "interrupted");
+        return true;
+      }
+      if (!allowMissingSdkResult && !context.sdkResultReceived) {
+        return false;
+      }
+
+      const authoritativeBackgroundTasksEmpty =
+        context.authoritativeBackgroundTasksEmpty && context.backgroundTasks.size === 0;
+      const allInjectedContinuationsCompleted =
+        context.backgroundContinuationResultCount >= context.backgroundContinuationInjectedCount;
+      if (
+        !authoritativeBackgroundTasksEmpty ||
+        context.awaitingTaskNotification ||
+        !allInjectedContinuationsCompleted
+      ) {
+        return false;
+      }
+
+      emitTurnCompleted(context, context.sdkTerminalStatus || terminalStatus);
+      if (!persistentSession) {
+        context.messageInput?.push(null);
+      }
+      return true;
+    };
+
     void fetchClaudeUsageSnapshot().then((usage) => {
       if (usage && activeQueries.has(id)) {
         emit({ id, type: "usage_limits_updated", usage });
@@ -2407,6 +2600,125 @@ async function handleQuery(req, persistentSession = null) {
             ...notice,
           });
         }
+      } else if (
+        message.type === "system" &&
+        message.subtype === "background_tasks_changed"
+      ) {
+        const tasks = Array.isArray(message.tasks) ? message.tasks : [];
+        const currentTaskIds = new Set();
+        // 仅使用 SDK 的完整快照替换权威后台任务集合。
+        context.backgroundTasks.clear();
+        for (const task of tasks) {
+          const taskId = typeof task?.task_id === "string" ? task.task_id : "";
+          if (!taskId) {
+            continue;
+          }
+          currentTaskIds.add(taskId);
+          context.backgroundTasks.set(taskId, {
+            // 记录后台任务的稳定标识，用于后续通知关联。
+            task_id: taskId,
+            // 记录 SDK 提供的后台任务类型，供状态展示使用。
+            task_type: typeof task.task_type === "string" ? task.task_type : "",
+            // 记录 SDK 提供的任务描述，供当前 assistant 消息展示。
+            description:
+              typeof task.description === "string" ? task.description : "Claude 后台任务",
+          });
+        }
+        for (const taskId of context.notifiedTaskIds) {
+          if (!currentTaskIds.has(taskId)) {
+            context.notifiedTaskIds.delete(taskId);
+          }
+        }
+        for (const taskId of currentTaskIds) {
+          if (!context.notifiedTaskIds.has(taskId)) {
+            context.pendingTaskNotificationIds.add(taskId);
+          }
+        }
+        context.authoritativeBackgroundTasksEmpty = context.backgroundTasks.size === 0;
+        context.awaitingTaskNotification = context.pendingTaskNotificationIds.size > 0;
+        emitClaudeBackgroundNotice(id, message.subtype, null, tasks);
+        // 快照变为空时也必须检查此前已收到的 SDK result 是否可以完成。
+        maybeCompleteTurn();
+      } else if (message.type === "system" && message.subtype === "task_started") {
+        // task_started 只负责发送生命周期通知，权威任务集合仍由 background_tasks_changed 提供。
+        emitClaudeBackgroundNotice(id, message.subtype, message);
+      } else if (message.type === "system" && message.subtype === "task_updated") {
+        const taskId = typeof message.task_id === "string" ? message.task_id : "";
+        const patch = message.patch && typeof message.patch === "object"
+          ? message.patch
+          : {};
+        emitClaudeBackgroundNotice(id, message.subtype, {
+          // 传递 SDK 更新消息中的任务标识，供 notice 关联当前业务任务。
+          task_id: taskId,
+          // 优先展示 SDK 更新消息携带的描述，缺失时使用统一占位描述。
+          description:
+            typeof patch.description === "string"
+              ? patch.description
+              : "Claude 后台任务",
+          // 传递 SDK 更新消息中的状态，不写入权威任务集合。
+          status: typeof patch.status === "string" ? patch.status : undefined,
+          // 传递 SDK 更新消息中的错误摘要，不读取后台任务输出。
+          summary: typeof patch.error === "string" ? patch.error : undefined,
+        });
+      } else if (message.type === "system" && message.subtype === "task_progress") {
+        const taskId = typeof message.task_id === "string" ? message.task_id : "";
+        emitClaudeBackgroundNotice(id, message.subtype, {
+          // 传递 SDK 进度消息中的任务标识，供 notice 关联当前业务任务。
+          task_id: taskId,
+          // 传递 SDK 当前描述，仅用于展示进度信息。
+          description: message.description,
+          // 进度消息表示 SDK 报告任务仍在运行，仅作为 notice 元数据。
+          status: "running",
+          // 传递 SDK 最新摘要，避免进度消息被静默丢弃。
+          summary: message.summary,
+        });
+      } else if (message.type === "system" && message.subtype === "task_notification") {
+        const taskId = typeof message.task_id === "string" ? message.task_id : "";
+        if (taskId) {
+          // task_notification 只结算对应通知等待状态，不修改权威后台任务集合。
+          context.pendingTaskNotificationIds.delete(taskId);
+          context.notifiedTaskIds.add(taskId);
+          context.awaitingTaskNotification = context.pendingTaskNotificationIds.size > 0;
+        }
+        // task_notification 只发送最终通知和续跑输入，不修改权威任务集合。
+        emitClaudeBackgroundNotice(id, message.subtype, message);
+
+        const persistentSessionIsAlive =
+          !persistentSession || sessionHandles.get(persistentSession.threadId) === persistentSession;
+        const canInjectContinuation =
+          Boolean(taskId) &&
+          Boolean(context.messageInput) &&
+          !context.cancelled &&
+          !shuttingDown &&
+          !persistentSession?.interruptRequested &&
+          persistentSessionIsAlive;
+        if (canInjectContinuation) {
+          // 记录已注入的 synthetic continuation，等待对应 SDK result 到达。
+          context.backgroundContinuationInjectedCount += 1;
+          const syntheticTaskNotification = {
+            type: "user",
+            message: {
+              role: "user",
+              content: `Claude 后台任务通知：${JSON.stringify({
+                task_id: taskId,
+                status: message.status,
+                output_file: message.output_file,
+                summary: message.summary,
+              })}。请立即调用原生 TaskOutput 工具读取该任务结果，输入必须为 ${JSON.stringify({
+                task_id: taskId,
+                block: false,
+                timeout: 1000,
+              })}，读取后继续原任务；在完成此前未交付的原任务并给出最终结论/交付结果前，不得结束当前逻辑轮次。`,
+            },
+            parent_tool_use_id: null,
+            isSynthetic: true,
+            priority: "now",
+            shouldQuery: true,
+            session_id: context.sessionId || message.session_id || "",
+          };
+          context.messageInput.push(syntheticTaskNotification);
+        }
+        maybeCompleteTurn();
       } else if (message.type === "result") {
         traceClaudeSdk("sdk_result_before_processing", {
           requestId: id,
@@ -2439,27 +2751,24 @@ async function handleQuery(req, persistentSession = null) {
             recoverable: false,
           });
         }
-        if (persistentSession) {
-          traceClaudeSdk("emit_turn_completed_before", {
-            requestId: id,
-            context,
-            status: persistentSession.interruptRequested ? "interrupted" : terminalStatus,
-            sawTextDelta,
-            terminalStatus,
-            contextStopReason: context.stopReason,
-          });
-          emitTurnCompleted(
-            context,
-            persistentSession.interruptRequested ? "interrupted" : terminalStatus,
-          );
-          traceClaudeSdk("emit_turn_completed_after", {
-            requestId: id,
-            context,
-            sawTextDelta,
-            terminalStatus,
-            contextStopReason: context.stopReason,
-          });
-          persistentSession.interruptRequested = false;
+        const hadSdkResult = context.sdkResultReceived;
+        context.sdkResultReceived = true;
+        context.sdkTerminalStatus = terminalStatus;
+        if (
+          hadSdkResult &&
+          context.backgroundContinuationResultCount < context.backgroundContinuationInjectedCount
+        ) {
+          // 按输入流顺序消费一个已注入的 task notification continuation result。
+          context.backgroundContinuationResultCount += 1;
+        }
+        if (context.backgroundTasks.size > 0) {
+          context.awaitingTaskNotification = context.pendingTaskNotificationIds.size > 0;
+        }
+        // 初始 result 和续跑 result 都通过同一个状态机门控完成。
+        maybeCompleteTurn();
+
+        // 中间 result 只结束当前 SDK 子轮次，后台任务仍可通过同一输入流续跑。
+        if (!context.turnCompleted || context.isPersistentSession) {
           sawTextDelta = false;
           terminalStatus = "completed";
         }
@@ -2532,22 +2841,26 @@ async function handleQuery(req, persistentSession = null) {
     }
 
     setContextSessionId(context, actualSessionId);
-    traceClaudeSdk("emit_turn_completed_before_final", {
-      requestId: id,
-      context,
-      status: context.cancelled ? "interrupted" : terminalStatus,
-      sawTextDelta,
-      terminalStatus,
-      contextStopReason: context.stopReason,
-    });
-    emitTurnCompleted(context, context.cancelled ? "interrupted" : terminalStatus);
-    traceClaudeSdk("emit_turn_completed_after_final", {
-      requestId: id,
-      context,
-      sawTextDelta,
-      terminalStatus,
-      contextStopReason: context.stopReason,
-    });
+    const completedAfterIterator = maybeCompleteTurn({ allowMissingSdkResult: true });
+    const hasPendingBackgroundContinuation =
+      !context.authoritativeBackgroundTasksEmpty ||
+      context.awaitingTaskNotification ||
+      context.backgroundContinuationResultCount < context.backgroundContinuationInjectedCount;
+    if (!completedAfterIterator && !context.cancelled && hasPendingBackgroundContinuation) {
+      // SDK 查询异常结束时明确失败，避免后台任务待处理却让 UI 永久保持 streaming。
+      emit({
+        // 关联发生异常的 AuraCoder 查询。
+        id,
+        // 使用统一错误事件告知调用方当前轮次无法继续。
+        type: "error",
+        // 说明 SDK query 在后台任务待处理时意外结束，后台结果尚未返回。
+        message: "Claude SDK query 在后台任务待处理时意外结束，后台任务结果尚未返回。",
+        // 该错误无法由当前 query 自动恢复，必须由调用方重新发起处理。
+        recoverable: false,
+      });
+      // 通过唯一完成门控发出失败终态，避免异常路径再次重复完成。
+      maybeCompleteTurn({ forceStatus: "failed" });
+    }
   } catch (err) {
     traceClaudeSdk("handle_query_error", {
       requestId: id,
@@ -2567,6 +2880,9 @@ async function handleQuery(req, persistentSession = null) {
     traceClaudeSdk("handle_query_finally", { requestId: id, context });
     cleanupPendingApprovalsForQuery(id, "Claude query was canceled.");
     cleanupPendingComputerControlCalls(context, "Claude query was canceled.");
+    if (!context.isPersistentSession && context.messageInput && !context.messageInput.readableEnded) {
+      context.messageInput.push(null);
+    }
     activeQueries.delete(id);
   }
 }
@@ -2621,21 +2937,11 @@ async function createPersistentSessionHandle(req) {
       sessionCwd,
       params.sessionId || params.resume || "",
     );
-    if (typeof initialInput === "string") {
-      messageInput.push({
-        type: "user",
-        message: {
-          role: "user",
-          content: initialInput,
-        },
-        parent_tool_use_id: null,
-        session_id: params.sessionId || params.resume || "",
-      });
-    } else {
-      for await (const message of initialInput) {
-        messageInput.push(message);
-      }
-    }
+    await pushClaudePromptInput(
+      messageInput,
+      initialInput,
+      params.sessionId || params.resume || "",
+    );
 
     entry.runPromise = handleQuery(req, entry);
     await entry.runPromise;
@@ -2698,24 +3004,29 @@ async function sendPersistentSessionMessage(req) {
 
     entry.context.cancelled = false;
     entry.context.turnCompleted = false;
+    // 新逻辑轮次重新等待 SDK result，并恢复默认终态。
+    entry.context.sdkResultReceived = false;
+    entry.context.sdkTerminalStatus = "completed";
+    // 新轮次不重写权威任务 Map，只根据现有快照重建通知等待状态。
+    entry.context.pendingTaskNotificationIds.clear();
+    entry.context.notifiedTaskIds.clear();
+    for (const taskId of entry.context.backgroundTasks.keys()) {
+      entry.context.pendingTaskNotificationIds.add(taskId);
+    }
+    entry.context.authoritativeBackgroundTasksEmpty = entry.context.backgroundTasks.size === 0;
+    entry.context.awaitingTaskNotification = entry.context.pendingTaskNotificationIds.size > 0;
+    // 新轮次重新统计已注入和已收到的续跑结果。
+    entry.context.backgroundContinuationInjectedCount = 0;
+    entry.context.backgroundContinuationResultCount = 0;
     entry.context.tokenUsage = null;
     entry.context.stopReason = null;
+    entry.interruptRequested = false;
     emit({ id: entry.context.id, type: "turn_started" });
-    if (typeof input === "string") {
-      entry.messageInput.push({
-        type: "user",
-        message: {
-          role: "user",
-          content: input,
-        },
-        parent_tool_use_id: null,
-        session_id: entry.context.sessionId || params.sessionId || params.resume || "",
-      });
-    } else {
-      for await (const message of input) {
-        entry.messageInput.push(message);
-      }
-    }
+    await pushClaudePromptInput(
+      entry.messageInput,
+      input,
+      entry.context.sessionId || params.sessionId || params.resume || "",
+    );
     emit({
       id,
       type: "session_message_accepted",
@@ -2750,6 +3061,15 @@ async function interruptPersistentSessionHandle(req) {
 
   try {
     entry.interruptRequested = true;
+    entry.context.cancelled = true;
+    cleanupPendingApprovalsForQuery(
+      entry.context.id,
+      "Claude persistent session was interrupted before approval was answered.",
+    );
+    cleanupPendingComputerControlCalls(
+      entry.context,
+      "Claude persistent session was interrupted before the computer operation completed.",
+    );
     await entry.query.interrupt();
     emit({
       id,
@@ -2760,6 +3080,7 @@ async function interruptPersistentSessionHandle(req) {
     });
   } catch (error) {
     entry.interruptRequested = false;
+    entry.context.cancelled = false;
     emit({
       id,
       type: "error",
@@ -2798,6 +3119,18 @@ async function destroyPersistentSessionHandle(req) {
   }
 
   sessionHandles.delete(threadId);
+  entry.interruptRequested = true;
+  if (entry.context) {
+    entry.context.cancelled = true;
+    cleanupPendingApprovalsForQuery(
+      entry.context.id,
+      "Claude persistent session was destroyed before approval was answered.",
+    );
+    cleanupPendingComputerControlCalls(
+      entry.context,
+      "Claude persistent session was destroyed before the computer operation completed.",
+    );
+  }
   entry.messageInput.push(null);
   entry.query?.close?.();
   await entry.runPromise;
@@ -3014,6 +3347,13 @@ function handleShutdown(signal) {
       context.id,
       `Claude query was interrupted by ${signal}.`,
     );
+    cleanupPendingComputerControlCalls(
+      context,
+      `Claude query was interrupted by ${signal}.`,
+    );
+    if (context.messageInput && !context.messageInput.readableEnded) {
+      context.messageInput.push(null);
+    }
     context.query?.close?.();
     emitTurnCompleted(context, "interrupted");
   }

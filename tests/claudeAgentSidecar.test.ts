@@ -232,6 +232,107 @@ async function runStartupProbe(scriptPath: string, env: Record<string, string>) 
   }
 }
 
+/** 创建一个只记录合成用户消息的 SDK 测试模块，用于验证同一输入流续跑。 */
+async function createBackgroundTaskMockModule() {
+  const root = await mkdtemp(path.join(tmpdir(), "auracoder-claude-background-mock-"));
+  const supportModule = pathToFileURL(
+    path.join(repoRoot, "tests", "fixtures", "claude-agent-sdk-mock.mjs"),
+  ).href;
+  const moduleSource = `
+import { tool, createSdkMcpServer } from ${JSON.stringify(supportModule)};
+export { tool, createSdkMcpServer };
+
+function makeResult(partial = {}) {
+  return {
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    duration_ms: 0,
+    duration_api_ms: 0,
+    num_turns: 1,
+    result: "",
+    stop_reason: null,
+    total_cost_usd: 0,
+    usage: {},
+    modelUsage: {},
+    errors: [],
+    session_id: "background-session",
+    ...partial,
+  };
+}
+
+export function query({ prompt }) {
+  const scenario = JSON.parse(process.env.CLAUDE_AGENT_SDK_MOCK_SCENARIO || "{}");
+  const continuationBeforeBackgroundTasksChanged =
+    scenario.continuationBeforeBackgroundTasksChanged === true;
+  let closed = false;
+  const iterator = (async function* () {
+    yield {
+      type: "system",
+      subtype: "init",
+      session_id: "background-session",
+    };
+    yield {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "background-task-1", task_type: "bash", description: "执行后台命令" }],
+      session_id: "background-session",
+    };
+    yield makeResult({ result: "intermediate result" });
+    yield {
+      type: "system",
+      subtype: "task_notification",
+      task_id: "background-task-1",
+      status: scenario.status || "completed",
+      output_file: "/tmp/background-task-1.output",
+      summary: "后台命令已结束",
+      session_id: "background-session",
+    };
+    if (!continuationBeforeBackgroundTasksChanged) {
+      yield {
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [],
+        session_id: "background-session",
+      };
+    }
+    if (typeof prompt !== "string") {
+      for await (const userMessage of prompt) {
+        if (closed) {
+          return;
+        }
+        if (userMessage?.isSynthetic === true) {
+          yield makeResult({
+            result: JSON.stringify(userMessage),
+            session_id: "background-session",
+          });
+          if (continuationBeforeBackgroundTasksChanged) {
+            yield {
+              type: "system",
+              subtype: "background_tasks_changed",
+              tasks: [],
+              session_id: "background-session",
+            };
+          }
+          return;
+        }
+      }
+    }
+  })();
+  iterator.close = () => {
+    closed = true;
+  };
+  iterator.setModel = async () => undefined;
+  iterator.applyFlagSettings = async () => undefined;
+  iterator.interrupt = async () => undefined;
+  return iterator;
+}
+`;
+  const modulePath = path.join(root, "background-task-sdk-mock.mjs");
+  await writeFile(modulePath, moduleSource, "utf8");
+  return { root, modulePath: pathToFileURL(modulePath).href };
+}
+
 afterEach(async () => {
   await activeHarness?.close();
   activeHarness = null;
@@ -401,6 +502,524 @@ describe("claude-agent-sdk-server sidecar", () => {
         },
       ],
     });
+  });
+
+  it.each(["completed", "failed", "stopped"] as const)(
+    "keeps the turn open and resumes the same SDK input stream after a %s background task",
+    async (status) => {
+      const mock = await createBackgroundTaskMockModule();
+      try {
+        const harness = await spawnHarness(
+          { status },
+          { CLAUDE_AGENT_SDK_MODULE: mock.modulePath },
+        );
+        harness.send({
+          id: `query-background-${status}`,
+          method: "query",
+          params: {
+            prompt: "run a background task",
+            cwd: repoRoot,
+          },
+        });
+
+        const taskNotification = await harness.waitFor(
+          (event) =>
+            event.id === `query-background-${status}` &&
+            event.type === "notice" &&
+            event.sdkSubtype === "task_notification",
+        );
+        const taskNotificationIndex = harness.events.indexOf(taskNotification);
+        expect(
+          harness.events
+            .slice(0, taskNotificationIndex)
+            .some(
+              (event) =>
+                event.id === `query-background-${status}` &&
+                event.type === "turn_completed",
+            ),
+        ).toBe(false);
+
+        const completed = await harness.waitFor(
+          (event) =>
+            event.id === `query-background-${status}` &&
+            event.type === "turn_completed",
+        );
+        expect(completed).toMatchObject({
+          status: "completed",
+          sessionId: "background-session",
+        });
+
+        const completedEvents = harness.events.filter(
+          (event) =>
+            event.id === `query-background-${status}` &&
+            event.type === "turn_completed",
+        );
+        expect(completedEvents).toHaveLength(1);
+
+        const finalText = harness.events
+          .filter(
+            (event) =>
+              event.id === `query-background-${status}` &&
+              event.type === "text_delta",
+          )
+          .at(-1);
+        const syntheticMessage = JSON.parse(String(finalText?.content)) as {
+          type?: string;
+          isSynthetic?: boolean;
+          priority?: string;
+          shouldQuery?: boolean;
+          message?: { content?: string };
+        };
+        expect(syntheticMessage).toMatchObject({
+          type: "user",
+          isSynthetic: true,
+          priority: "now",
+          shouldQuery: true,
+        });
+        expect(syntheticMessage.message?.content).toContain("background-task-1");
+        expect(syntheticMessage.message?.content).toContain(status);
+        expect(syntheticMessage.message?.content).toContain("/tmp/background-task-1.output");
+        expect(syntheticMessage.message?.content).toContain("后台命令已结束");
+        expect(syntheticMessage.message?.content).toContain(
+          "在完成此前未交付的原任务并给出最终结论/交付结果前，不得结束当前逻辑轮次",
+        );
+        expect(syntheticMessage.message?.content).toContain("TaskOutput");
+        expect(syntheticMessage.message?.content).toContain(
+          JSON.stringify({ task_id: "background-task-1", block: false, timeout: 1000 }),
+        );
+      } finally {
+        await rm(mock.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("completes when the continuation result arrives before the empty task snapshot", async () => {
+    const mock = await createBackgroundTaskMockModule();
+    try {
+      const harness = await spawnHarness(
+        {
+          // 让 mock 按 task_notification、续跑 result、空集合快照的顺序发送消息。
+          continuationBeforeBackgroundTasksChanged: true,
+        },
+        { CLAUDE_AGENT_SDK_MODULE: mock.modulePath },
+      );
+      harness.send({
+        id: "query-background-continuation-first",
+        method: "query",
+        params: {
+          prompt: "verify continuation result before empty snapshot",
+          cwd: repoRoot,
+        },
+      });
+
+      const completed = await harness.waitFor(
+        (event) =>
+          event.id === "query-background-continuation-first" &&
+          event.type === "turn_completed",
+      );
+      expect(completed).toMatchObject({
+        // 两种 SDK 事件顺序最终都应以成功状态完成。
+        status: "completed",
+        // 保留 mock SDK 返回的会话标识，确认续跑 result 已被消费。
+        sessionId: "background-session",
+      });
+      expect(
+        harness.events.filter(
+          (event) =>
+            event.id === "query-background-continuation-first" &&
+            event.type === "turn_completed",
+        ),
+      ).toHaveLength(1);
+      expect(
+        harness.events.some(
+          (event) =>
+            event.id === "query-background-continuation-first" && event.type === "error",
+        ),
+      ).toBe(false);
+    } finally {
+      await rm(mock.root, { recursive: true, force: true });
+    }
+  });
+
+  it("forwards every Claude background-task SDK lifecycle message as a notice", async () => {
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "background_tasks_changed",
+            tasks: [
+              {
+                task_id: "edge-task-1",
+                task_type: "bash",
+                description: "edge task",
+              },
+            ],
+          },
+        },
+        {
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "task_started",
+            task_id: "edge-task-1",
+            task_type: "bash",
+            description: "edge task",
+          },
+        },
+        {
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "task_updated",
+            task_id: "edge-task-1",
+            patch: { status: "running", description: "edge task updated" },
+          },
+        },
+        {
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "task_progress",
+            task_id: "edge-task-1",
+            description: "edge task progress",
+            usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1 },
+            summary: "edge task is running",
+          },
+        },
+        {
+          type: "yield",
+          message: makeSuccessResult({ session_id: "edge-session" }),
+        },
+        {
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "task_notification",
+            task_id: "edge-task-1",
+            status: "completed",
+            output_file: "/tmp/edge-task.output",
+            summary: "edge task done",
+          },
+        },
+        {
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "background_tasks_changed",
+            tasks: [],
+          },
+        },
+        {
+          type: "yield",
+          message: makeSuccessResult({ session_id: "edge-session" }),
+        },
+      ],
+    });
+
+    harness.send({
+      id: "query-background-lifecycle",
+      method: "query",
+      params: {
+        prompt: "show background lifecycle",
+        cwd: repoRoot,
+      },
+    });
+
+    await harness.waitFor(
+      (event) =>
+        event.id === "query-background-lifecycle" &&
+        event.type === "turn_completed",
+    );
+    const lifecycleSubtypes = harness.events
+      .filter(
+        (event) =>
+          event.id === "query-background-lifecycle" &&
+          event.type === "notice" &&
+          event.kind === "claude_background_tasks",
+      )
+      .map((event) => event.sdkSubtype);
+    expect(lifecycleSubtypes).toEqual(
+      expect.arrayContaining([
+        "background_tasks_changed",
+        "task_started",
+        "task_updated",
+        "task_progress",
+        "task_notification",
+      ]),
+    );
+  });
+
+  it("completes an ordinary query immediately when no background task is active", async () => {
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "yield",
+          message: makeSuccessResult({ session_id: "ordinary-session" }),
+        },
+      ],
+    });
+
+    harness.send({
+      id: "query-ordinary-immediate",
+      method: "query",
+      params: {
+        prompt: "complete without background work",
+        cwd: repoRoot,
+      },
+    });
+
+    await expect(
+      harness.waitFor(
+        (event) =>
+          event.id === "query-ordinary-immediate" &&
+          event.type === "turn_completed",
+      ),
+    ).resolves.toMatchObject({
+      status: "completed",
+      sessionId: "ordinary-session",
+    });
+  });
+
+  // 验证边沿生命周期消息不会越过 SDK 的完整后台任务集合真相。
+  it.each(["task_started", "task_updated", "task_progress"] as const)(
+    "does not let %s change the authoritative background task collection",
+    async (subtype) => {
+      const lifecycleMessage =
+        subtype === "task_started"
+          ? {
+              // 标识这是 Claude system 生命周期消息。
+              type: "system",
+              // 保留本次参数化用例的生命周期子类型。
+              subtype,
+              // 使用仅由边沿消息携带的任务标识，检查其不会进入权威集合。
+              task_id: "edge-only-task",
+              // 提供启动事件的任务类型展示数据。
+              task_type: "bash",
+              // 提供启动事件的任务描述展示数据。
+              description: "边沿启动任务",
+            }
+          : subtype === "task_updated"
+            ? {
+                // 标识这是 Claude system 生命周期消息。
+                type: "system",
+                // 保留本次参数化用例的生命周期子类型。
+                subtype,
+                // 使用仅由边沿消息携带的任务标识，检查其不会进入权威集合。
+                task_id: "edge-only-task",
+                // 提供更新事件的状态补丁展示数据。
+                patch: { status: "running", description: "边沿更新任务" },
+              }
+            : {
+                // 标识这是 Claude system 生命周期消息。
+                type: "system",
+                // 保留本次参数化用例的生命周期子类型。
+                subtype,
+                // 使用仅由边沿消息携带的任务标识，检查其不会进入权威集合。
+                task_id: "edge-only-task",
+                // 提供进度事件的描述展示数据。
+                description: "边沿进度任务",
+                // 提供进度事件的摘要展示数据。
+                summary: "边沿任务正在运行",
+              };
+      const harness = await spawnHarness({
+        steps: [
+          {
+            type: "yield",
+            message: {
+              // 标识这是 SDK 后台任务集合快照消息。
+              type: "system",
+              // 只有该消息可以替换 sidecar 的权威任务集合。
+              subtype: "background_tasks_changed",
+              // 空集合确保后续边沿消息不能单独制造活动任务。
+              tasks: [],
+            },
+          },
+          {
+            type: "yield",
+            message: lifecycleMessage,
+          },
+          {
+            type: "yield",
+            message: makeSuccessResult({ session_id: "edge-only-session" }),
+          },
+        ],
+      });
+
+      harness.send({
+        id: `query-background-authority-${subtype}`,
+        method: "query",
+        params: {
+          prompt: "verify authoritative background task state",
+          cwd: repoRoot,
+        },
+      });
+
+      const completed = await harness.waitFor(
+        (event) =>
+          event.id === `query-background-authority-${subtype}` &&
+          event.type === "turn_completed",
+      );
+      expect(completed).toMatchObject({
+        // 权威集合为空时，普通 SDK result 必须正常完成当前轮次。
+        status: "completed",
+        // 保留 SDK 返回的会话标识，确认收到的是最终 result。
+        sessionId: "edge-only-session",
+      });
+    },
+  );
+
+  it("does not let task_notification remove an authoritative background task", async () => {
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "yield",
+          message: {
+            // 标识这是 SDK 后台任务集合快照消息。
+            type: "system",
+            // 该消息建立唯一权威活动任务。
+            subtype: "background_tasks_changed",
+            // 后续 task_notification 不得删除此集合成员。
+            tasks: [
+              {
+                // 提供权威任务的稳定标识。
+                task_id: "authoritative-task",
+                // 提供权威任务的类型展示数据。
+                task_type: "bash",
+                // 提供权威任务的描述展示数据。
+                description: "权威后台任务",
+              },
+            ],
+          },
+        },
+        {
+          type: "yield",
+          message: {
+            // 标识这是 SDK 后台任务最终通知消息。
+            type: "system",
+            // 该边沿消息只能发送通知和续跑输入。
+            subtype: "task_notification",
+            // 使用权威任务标识，验证边沿消息不得从集合中删除它。
+            task_id: "authoritative-task",
+            // 传递任务最终状态展示数据。
+            status: "completed",
+            // 传递结果文件路径元数据，不由测试或 sidecar 读取内容。
+            output_file: "/tmp/authoritative-task.output",
+            // 传递任务摘要展示数据。
+            summary: "权威后台任务已结束",
+          },
+        },
+        {
+          type: "yield",
+          message: makeSuccessResult({ session_id: "authoritative-session" }),
+        },
+      ],
+    });
+
+    harness.send({
+      id: "query-background-authority-notification",
+      method: "query",
+      params: {
+        prompt: "verify task notification authority",
+        cwd: repoRoot,
+      },
+    });
+
+    const errorEvent = await harness.waitFor(
+      (event) =>
+        event.id === "query-background-authority-notification" &&
+        event.type === "error" &&
+        event.recoverable === false &&
+        String(event.message).includes("后台任务待处理时意外结束"),
+    );
+    const completed = await harness.waitFor(
+      (event) =>
+        event.id === "query-background-authority-notification" &&
+        event.type === "turn_completed",
+    );
+
+    expect(errorEvent).toMatchObject({
+      // iterator 异常结束必须向调用方明确报告不可恢复错误。
+      recoverable: false,
+    });
+    expect(completed).toMatchObject({
+      // 权威任务仍在集合中时，query 必须以失败状态收口。
+      status: "failed",
+      // 保留 SDK 返回的会话标识，便于调用方关联失败轮次。
+      sessionId: "authoritative-session",
+    });
+  });
+
+  it("fails explicitly when the SDK iterator ends with an authoritative background task", async () => {
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "yield",
+          message: {
+            // 标识这是 SDK 后台任务集合快照消息。
+            type: "system",
+            // 该消息建立仍待处理的权威后台任务。
+            subtype: "background_tasks_changed",
+            // iterator 结束前任务集合保持非空。
+            tasks: [
+              {
+                // 提供权威任务的稳定标识。
+                task_id: "pending-task",
+                // 提供权威任务的类型展示数据。
+                task_type: "bash",
+                // 提供权威任务的描述展示数据。
+                description: "待处理后台任务",
+              },
+            ],
+          },
+        },
+        {
+          type: "yield",
+          message: makeSuccessResult({ session_id: "pending-session" }),
+        },
+      ],
+    });
+
+    harness.send({
+      id: "query-background-iterator-ended",
+      method: "query",
+      params: {
+        prompt: "verify unexpected iterator end",
+        cwd: repoRoot,
+      },
+    });
+
+    const errorEvent = await harness.waitFor(
+      (event) =>
+        event.id === "query-background-iterator-ended" &&
+        event.type === "error" &&
+        event.recoverable === false &&
+        String(event.message).includes("后台任务待处理时意外结束"),
+    );
+    const completed = await harness.waitFor(
+      (event) =>
+        event.id === "query-background-iterator-ended" &&
+        event.type === "turn_completed",
+    );
+
+    expect(errorEvent).toMatchObject({
+      // SDK iterator 异常结束必须产生明确不可恢复错误，而不是静默 hanging。
+      recoverable: false,
+    });
+    expect(completed).toMatchObject({
+      // 后台任务仍待处理时，轮次必须以失败状态收口。
+      status: "failed",
+      // 保留 SDK 返回的会话标识，便于调用方关联失败轮次。
+      sessionId: "pending-session",
+    });
+    expect(
+      harness.events.filter(
+        (event) =>
+          event.id === "query-background-iterator-ended" &&
+          event.type === "turn_completed",
+      ),
+    ).toHaveLength(1);
   });
 
   it("keeps a Claude session handle alive until the remote component destroys it", async () => {
@@ -1061,6 +1680,75 @@ describe("claude-agent-sdk-server sidecar", () => {
         (event) => event.id === "query-plan-bypass" && event.type === "approval_requested",
       ),
     ).toBe(false);
+  });
+
+  it("always exposes exactly one native TaskOutput in SDK allowedTools", async () => {
+    const harness = await spawnHarness({
+      steps: [],
+      emitObservationResult: true,
+      emitQueryOptions: true,
+      sessionId: "session-task-output-tools",
+    });
+    const queryCases = [
+      {
+        id: "query-task-output-default-tools",
+        params: {
+          prompt: "inspect default tools",
+          cwd: repoRoot,
+        },
+      },
+      {
+        id: "query-task-output-explicit-tools",
+        params: {
+          prompt: "inspect explicit tools",
+          cwd: repoRoot,
+          allowedTools: ["Read", "TaskOutput", "TaskOutput", "Bash"],
+        },
+      },
+      {
+        id: "query-task-output-read-only-routing",
+        params: {
+          prompt: "inspect read-only routing",
+          cwd: repoRoot,
+          allowedTools: ["Read", "TaskOutput", "Bash"],
+          approvalPolicy: "restricted",
+          enforceApprovalRouting: true,
+        },
+      },
+      {
+        id: "query-task-output-ask-routing",
+        params: {
+          prompt: "inspect ask routing",
+          cwd: repoRoot,
+          allowedTools: ["Read", "TaskOutput", "Bash"],
+          approvalPolicy: "default",
+          enforceApprovalRouting: true,
+        },
+      },
+    ];
+
+    for (const queryCase of queryCases) {
+      harness.send({ id: queryCase.id, method: "query", params: queryCase.params });
+      await harness.waitFor(
+        (event) => event.id === queryCase.id && event.type === "turn_completed",
+      );
+
+      const observations = parseObservationResults(harness, queryCase.id);
+      const queryOptions = observations.find((item) => item.type === "query_options");
+      const allowedTools = queryOptions?.result.allowedTools;
+      expect(Array.isArray(allowedTools)).toBe(true);
+      expect((allowedTools as unknown[]).filter((toolName) => toolName === "TaskOutput")).toHaveLength(1);
+
+      if (queryCase.id === "query-task-output-explicit-tools") {
+        expect(allowedTools).toEqual(["Read", "TaskOutput", "Bash"]);
+      }
+      if (
+        queryCase.id === "query-task-output-read-only-routing" ||
+        queryCase.id === "query-task-output-ask-routing"
+      ) {
+        expect(allowedTools).toEqual(["Read", "TaskOutput"]);
+      }
+    }
   });
 
   it("uses interactive default permission mode for non-plan queries", async () => {

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { stageClaudeSdkPlatformAssets } from "../scripts/claude-sidecar-staging.mjs";
+import { shouldBuildClaudeComponents } from "../scripts/tauri-development.mjs";
 
 const fixtureRoots = [];
 
@@ -150,5 +151,55 @@ describe("Claude sidecar SDK staging", () => {
         logger: () => {},
       }),
     ).rejects.toThrow("claude-agent-sdk-darwin-x64 is missing");
+  });
+
+  it("rebuilds when the generated version file is missing", () => {
+    expect(
+      shouldBuildClaudeComponents({
+        missingComponents: [],
+        sourceVersion: "source-version",
+        stagedVersion: undefined,
+      }),
+    ).toBe(true);
+  });
+
+  it("rebuilds when the generated version file is empty", () => {
+    expect(
+      shouldBuildClaudeComponents({
+        missingComponents: [],
+        sourceVersion: "source-version",
+        stagedVersion: "   ",
+      }),
+    ).toBe(true);
+  });
+
+  it("rebuilds when the source version command returns no version", () => {
+    expect(
+      shouldBuildClaudeComponents({
+        missingComponents: [],
+        sourceVersion: undefined,
+        stagedVersion: "staged-version",
+      }),
+    ).toBe(true);
+  });
+
+  it("rebuilds when the generated version differs from the source", () => {
+    expect(
+      shouldBuildClaudeComponents({
+        missingComponents: [],
+        sourceVersion: "source-version",
+        stagedVersion: "staged-version",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not rebuild when the generated version matches the source", () => {
+    expect(
+      shouldBuildClaudeComponents({
+        missingComponents: [],
+        sourceVersion: "same-version\n",
+        stagedVersion: " same-version ",
+      }),
+    ).toBe(false);
   });
 });
