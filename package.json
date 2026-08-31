@@ -30,7 +30,7 @@
     "typecheck": "tsc --noEmit",
     "check:codex-schema": "node scripts/check-codex-app-server-parity.mjs",
     "check:tauri-updater-config": "node scripts/verify-tauri-updater-config.mjs",
-    "tauri:dev": "node scripts/tauri-development.mjs",
+    "tauri:dev": "node scripts/check-tauri-architecture-references.mjs && node scripts/tauri-development.mjs",
     "tauri:build": "tauri build",
     "tauri:build:macos:development": "node scripts/build-macos-development-update.mjs",
     "release:check": "node scripts/should-release.mjs",

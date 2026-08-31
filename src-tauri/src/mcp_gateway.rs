@@ -1572,7 +1572,7 @@ mod tests {
     use super::{AuraCoderMcpGateway, GatewayState};
     use crate::{
         auracoder_thread_mcp_service::AuraCoderThreadMcpService,
-        cli_tools::{codex::CodexCli, CliTool},
+        cli_tools::{factory::CliToolFactory, CliTool},
         computer_control_service::ComputerControlService,
         config::app_config::AppConfig,
         db::Database,
@@ -1619,7 +1619,9 @@ mod tests {
     #[tokio::test]
     async fn gateway_registers_and_calls_current_cli_directly() {
         let state = test_app_state();
-        let cli: Arc<dyn CliTool> = Arc::new(CodexCli::new(state.clone()));
+        let cli: Arc<dyn CliTool> = CliToolFactory::new(state.clone())
+            .create("codex")
+            .expect("Codex CLI factory mapping must exist");
         let gateway = AuraCoderMcpGateway::new();
         assert_eq!(gateway.status().await, GatewayState::Stopped);
         gateway.start().await.expect("gateway should start");
@@ -1668,7 +1670,9 @@ mod tests {
         assert!(gateway.revoke_client(&lease.token).await);
         assert!(pending_cancellation.is_cancelled());
 
-        let cli: Arc<dyn CliTool> = Arc::new(CodexCli::new(state.clone()));
+        let cli: Arc<dyn CliTool> = CliToolFactory::new(state.clone())
+            .create("codex")
+            .expect("Codex CLI factory mapping must exist");
         let lease = gateway
             .register_client("codex", "test-instance", cli)
             .await

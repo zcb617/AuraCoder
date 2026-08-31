@@ -4,7 +4,8 @@ use anyhow::Context;
 use tauri::State;
 use tokio::process::Command;
 
-use crate::local_cli_service_lifecycle::LocalCliServiceLifecycle;
+// 旧实现曾直接读取本机 CLI 生命周期；现由 CliTool::is_service_ready 统一查询：
+// use crate::local_cli_service_lifecycle::LocalCliServiceLifecycle;
 
 use crate::runtime_env;
 use crate::{
@@ -18,24 +19,34 @@ use crate::{
     state::AppState,
 };
 
-/// 本机 CLI 目录统一从本地 CLI 生命周期取数：逐个 Ready 服务调用对应 CliTool 的
-/// get_engine_info，保证模型列表来自启动阶段已预热的引擎实例，而不是临时冷启动的实例。
+/// 本机 CLI 目录通过统一接口查询 Ready 服务，再读取对应 CLI 的引擎信息。
 /// 本机取数不依赖具体项目，因此使用仅标记 location_kind 的本机上下文。
 pub(crate) async fn list_local_engine_infos(
     state: &AppState,
 ) -> Result<Vec<EngineInfoDto>, String> {
-    let services = LocalCliServiceLifecycle::list_ready().await;
     let factory = CliToolFactory::new(state.clone());
+    let context = CliExecutionContext {
+        workspace_id: String::new(),
+        root_path: String::new(),
+        location_kind: CliLocationKind::Local,
+        ssh_connection_id: None,
+    };
     let mut engines = Vec::new();
-    for service in services {
-        let cli_id = service.cli_id();
+    for cli_id in ["codex", "opencode", "claude"] {
         let cli = factory.create(cli_id).map_err(err_to_string)?;
-        let context = CliExecutionContext {
-            workspace_id: String::new(),
-            root_path: String::new(),
-            location_kind: CliLocationKind::Local,
-            ssh_connection_id: None,
+        let ready = match cli.is_service_ready(&context).await {
+            Ok(ready) => ready,
+            Err(error) => {
+                log::warn!(
+                    "查询本机 CLI 服务状态失败，跳过引擎: cli_id={} error={error:#}",
+                    cli_id,
+                );
+                continue;
+            }
         };
+        if !ready {
+            continue;
+        }
         match cli.get_engine_info(&context).await {
             Ok(engine) => engines.push(engine),
             Err(error) => {
@@ -52,6 +63,7 @@ pub(crate) async fn list_local_engine_infos(
             }
         }
     }
+    engines.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(engines)
 }
 
@@ -132,35 +144,31 @@ pub async fn list_actived_clis(
     connection_id: Option<String>,
 ) -> Result<Vec<EngineInfoDto>, String> {
     if let Some(connection_id) = connection_id {
-        let services = crate::ssh::cli_service_lifecycle::list_ready(&connection_id).await;
-        if services.is_empty() {
-            return Err("SSH 远端机器没有已激活的 Codex、OpenCode 或 Claude CLI 工具".to_string());
-        }
-
         let factory = CliToolFactory::new(state.inner().clone());
+        let context = CliExecutionContext {
+            workspace_id: String::new(),
+            root_path: String::new(),
+            location_kind: CliLocationKind::Ssh,
+            ssh_connection_id: Some(connection_id.clone()),
+        };
         let mut engines = Vec::new();
-        for service in services {
-            let cli_id = service.cli_id();
+        for cli_id in ["codex", "opencode", "claude"] {
             let cli = factory.create(cli_id).map_err(err_to_string)?;
-            let discovered = match cli_id {
-                "codex" => {
-                    crate::remote_project_codex_runtime_service::engine_info(&connection_id, None)
-                        .await
+            let ready = match cli.is_service_ready(&context).await {
+                Ok(ready) => ready,
+                Err(error) => {
+                    log::warn!(
+                        "查询 SSH 远端 CLI 服务状态失败，跳过引擎: connection_id={} cli_id={} error={error:#}",
+                        connection_id,
+                        cli_id,
+                    );
+                    continue;
                 }
-                "opencode" => {
-                    crate::remote_project_opencode_runtime_service::engine_info(
-                        &connection_id,
-                        None,
-                    )
-                    .await
-                }
-                "claude" => {
-                    crate::remote_project_claude_runtime_service::engine_info(&connection_id, None)
-                        .await
-                }
-                _ => unreachable!(),
             };
-            match discovered {
+            if !ready {
+                continue;
+            }
+            match cli.get_engine_info(&context).await {
                 Ok(engine) => engines.push(engine),
                 Err(error) => {
                     log::warn!(
@@ -177,6 +185,10 @@ pub async fn list_actived_clis(
                 }
             }
         }
+        if engines.is_empty() {
+            return Err("SSH 远端机器没有已激活的 Codex、OpenCode 或 Claude CLI 工具".to_string());
+        }
+        engines.sort_by(|left, right| left.id.cmp(&right.id));
         return Ok(engines);
     }
 

@@ -45,17 +45,14 @@ use crate::{
         TurnInputItem,
         STREAMED_DIFF_MAX_CHARS,
     },
-    local_cli_service_lifecycle::LocalCliServiceLifecycle,
+    // 旧版 Controller 直接调用本机和 SSH CLI 生命周期的入口已停用，现由 CliTool Service 实现类承接。
     models::{
         ActionOutputDto, EngineInfoDto, EngineModelDto, MessageDto, MessageStatusDto,
         MessageWindowCursorDto, MessageWindowDto, SearchResultDto, SteerReceiptDto, ThreadDto,
         ThreadStatusDto, ThreadUpdateDto, TrustLevelDto,
     },
     runtime_env,
-    ssh::{
-        cli_service_lifecycle as ssh_cli_service_lifecycle,
-        remote_attachments::{self, RemoteAttachmentBatch},
-    },
+    ssh::remote_attachments::{self, RemoteAttachmentBatch},
     state::AppState,
 };
 
@@ -2302,15 +2299,16 @@ pub async fn restart_remote_cli_service(
     if !matches!(thread.engine_id.as_str(), "codex" | "opencode" | "claude") {
         return Err(format!("不支持重启该远端 CLI 服务: {}", thread.engine_id));
     }
-    let connection_id = workspace
+    let _connection_id = workspace
         .ssh_connection_id
         .as_deref()
         .ok_or_else(|| "SSH 远端项目未绑定连接".to_string())?;
 
-    crate::ssh::cli_service_lifecycle::terminate(connection_id, &thread.engine_id)
-        .await
+    let cli = CliToolFactory::new(state.inner().clone())
+        .create(&thread.engine_id)
         .map_err(err_to_string)?;
-    crate::ssh::cli_service_lifecycle::set(connection_id, &thread.engine_id)
+    let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
+    cli.restart_service(&context)
         .await
         .map_err(err_to_string)?;
     Ok(())
@@ -2780,32 +2778,14 @@ async fn run_turn(
     let assistant_message_id_for_engine = assistant_message_id.clone();
 
     let mut engine_task = tokio::spawn(async move {
-        if let Some((_, context)) = cli_turn_for_engine.as_ref() {
-            match context.location_kind {
-                CliLocationKind::Local => {
-                    LocalCliServiceLifecycle::register_mcp_context(
-                        &thread_for_engine.engine_id,
-                        &engine_thread_for_engine,
-                        &assistant_message_id_for_engine,
-                    )
-                    .await
-                    .context("当前CLI无法登记AuraCoder MCP调用上下文")?;
-                }
-                CliLocationKind::Ssh => {
-                    let connection_id = context
-                        .ssh_connection_id
-                        .as_deref()
-                        .context("SSH 远端项目未绑定连接")?;
-                    ssh_cli_service_lifecycle::register_mcp_context(
-                        connection_id,
-                        &thread_for_engine.engine_id,
-                        &engine_thread_for_engine,
-                        &assistant_message_id_for_engine,
-                    )
-                    .await
-                    .context("当前 SSH CLI 无法登记 AuraCoder MCP 调用上下文")?;
-                }
-            }
+        if let Some((cli, context)) = cli_turn_for_engine.as_ref() {
+            cli.register_mcp_context(
+                context,
+                &engine_thread_for_engine,
+                &assistant_message_id_for_engine,
+            )
+            .await
+            .context("当前CLI无法登记AuraCoder MCP调用上下文")?;
         }
         if let Some((cli, context)) = cli_turn_for_engine {
             let send_result = cli
@@ -3538,20 +3518,8 @@ async fn run_turn(
         }
     }
 
-    if let Some((_, context)) = cli_turn.as_ref() {
-        let clear_result = match context.location_kind {
-            CliLocationKind::Local => {
-                LocalCliServiceLifecycle::clear_mcp_context(&thread.engine_id).await
-            }
-            CliLocationKind::Ssh => match context.ssh_connection_id.as_deref() {
-                Some(connection_id) => {
-                    ssh_cli_service_lifecycle::clear_mcp_context(connection_id, &thread.engine_id)
-                        .await
-                }
-                None => Err(anyhow::anyhow!("SSH 远端项目未绑定连接")),
-            },
-        };
-        if let Err(error) = clear_result {
+    if let Some((cli, context)) = cli_turn.as_ref() {
+        if let Err(error) = cli.clear_mcp_context(context).await {
             log::error!(
                 "清理当前 CLI AuraCoder MCP 调用上下文失败: engine_id={}, thread_id={}, engine_thread_id={}, error={error:#}",
                 thread.engine_id,

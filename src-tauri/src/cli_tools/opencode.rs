@@ -160,8 +160,12 @@ fn raw_permission_value(thread: &ThreadDto, rules: &Value) -> Value {
 pub struct OpenCodeCli {
     /// 当前 OpenCode 共用的 MCP 业务实现。
     mcp: BaseCliMcp,
+    /// 当前 CLI 实现使用的应用状态。
     state: AppState,
+    /// SSH 当前回合持有的远端 OpenCode 协议客户端。
     remote_turn_use: Arc<Mutex<Option<Arc<OpenCodeEngine>>>>,
+    /// 按项目目录缓存本机纯协议 OpenCode 客户端及其服务生命周期代数。
+    local_engines: Arc<Mutex<HashMap<String, (u64, Arc<OpenCodeEngine>)>>>,
 }
 
 impl OpenCodeCli {
@@ -182,23 +186,41 @@ impl OpenCodeCli {
             mcp,
             state,
             remote_turn_use: Arc::new(Mutex::new(None)),
+            local_engines: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    async fn local_engine(&self) -> Result<Arc<OpenCodeEngine>> {
+    /// 从本机 CLI 生命周期获取 cwd 对应 endpoint，并缓存纯协议 OpenCode 客户端。
+    async fn local_engine(&self, cwd: &str) -> Result<Arc<OpenCodeEngine>> {
         let service = LocalCliServiceLifecycle::get("opencode").await?;
-        match service.handle() {
-            LocalCliHandle::OpenCode(engine) => Ok(engine.clone()),
+        let endpoint = match service.handle() {
+            LocalCliHandle::OpenCode(handle) => handle.endpoint_for_cwd(cwd).await?,
             _ => anyhow::bail!("本地 CLI 生命周期返回了错误的 OpenCode 句柄类型"),
+        };
+        let endpoint_generation = endpoint.generation;
+        let endpoint_version = endpoint.version.clone();
+        let mut engines = self.local_engines.lock().await;
+        if let Some((generation, engine)) = engines.get(cwd) {
+            if *generation == endpoint_generation {
+                return Ok(engine.clone());
+            }
         }
+        let engine = Arc::new(OpenCodeEngine::new_local_http(
+            endpoint.base_url,
+            endpoint.password,
+            endpoint_version,
+            cwd.to_string(),
+            endpoint_generation,
+        ));
+        engine.set_computer_control_service(self.state.computer_control_service.clone());
+        engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
+        engines.insert(cwd.to_string(), (endpoint_generation, engine.clone()));
+        Ok(engine)
     }
 
-    async fn configure_local_computer_control(&self) -> Result<Arc<OpenCodeEngine>> {
-        let engine = self.local_engine().await?;
-        // 旧版本机工具服务注入已由统一 MCP Gateway 接替，保留原调用但不再执行。
-        // engine.set_computer_control_service(self.state.computer_control_service.clone());
-        // engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
-        Ok(engine)
+    /// 配置本机 OpenCode 协议客户端的计算机控制和会话读取服务。
+    async fn configure_local_computer_control(&self, cwd: &str) -> Result<Arc<OpenCodeEngine>> {
+        self.local_engine(cwd).await
     }
 
     /// 根据 workspace 建立 OpenCode 操作目标。
@@ -336,8 +358,8 @@ impl OpenCodeCli {
             // service_use.release().await;
             result?;
         } else {
-            let engine = self.local_engine().await?;
             for cwd in roots.iter() {
+                let engine = self.local_engine(cwd).await?;
                 sessions.extend(engine.list_sessions(cwd, search_term, archived).await?);
             }
         }
@@ -453,6 +475,122 @@ impl CliTool for OpenCodeCli {
             .await
     }
 
+    /// 为当前 OpenCode 对话轮次登记可信 AuraCoder MCP 上下文，并按项目位置调用对应生命周期。
+    async fn register_mcp_context(
+        &self,
+        context: &CliExecutionContext,
+        engine_thread_id: &str,
+        turn_id: &str,
+    ) -> Result<()> {
+        match context.location_kind {
+            CliLocationKind::Local => {
+                LocalCliServiceLifecycle::register_mcp_context(
+                    self.id(),
+                    engine_thread_id,
+                    turn_id,
+                )
+                .await
+            }
+            CliLocationKind::Ssh => {
+                let connection_id = context
+                    .ssh_connection_id
+                    .as_deref()
+                    .context("SSH 远端项目未绑定连接")?;
+                ssh::cli_service_lifecycle::register_mcp_context(
+                    connection_id,
+                    self.id(),
+                    engine_thread_id,
+                    turn_id,
+                )
+                .await
+            }
+        }
+    }
+
+    /// 清理当前 OpenCode 对话轮次的可信 AuraCoder MCP 上下文，并保留生命周期原始错误链。
+    async fn clear_mcp_context(&self, context: &CliExecutionContext) -> Result<()> {
+        match context.location_kind {
+            CliLocationKind::Local => LocalCliServiceLifecycle::clear_mcp_context(self.id()).await,
+            CliLocationKind::Ssh => {
+                let connection_id = context
+                    .ssh_connection_id
+                    .as_deref()
+                    .context("SSH 远端项目未绑定连接")?;
+                ssh::cli_service_lifecycle::clear_mcp_context(connection_id, self.id()).await
+            }
+        }
+    }
+
+    /// 重启当前 OpenCode 的 SSH 远端 CLI 服务，严格按 terminate 后 set 的顺序执行。
+    async fn restart_service(&self, context: &CliExecutionContext) -> Result<()> {
+        anyhow::ensure!(
+            context.location_kind == CliLocationKind::Ssh,
+            "不支持重启本机 CLI 服务"
+        );
+        let connection_id = context
+            .ssh_connection_id
+            .as_deref()
+            .context("SSH 远端项目未绑定连接")?;
+        ssh::cli_service_lifecycle::terminate(connection_id, self.id()).await?;
+        ssh::cli_service_lifecycle::set(connection_id, self.id()).await?;
+        Ok(())
+    }
+
+    /// 查询当前 OpenCode 服务是否已经由本机或 SSH CLI 生命周期登记并处于 Ready 状态。
+    async fn is_service_ready(&self, context: &CliExecutionContext) -> Result<bool> {
+        match context.location_kind {
+            CliLocationKind::Local => Ok(LocalCliServiceLifecycle::get(self.id()).await.is_ok()),
+            CliLocationKind::Ssh => {
+                let connection_id = context
+                    .ssh_connection_id
+                    .as_deref()
+                    .context("SSH 远端 OpenCode 项目未绑定连接")?;
+                Ok(ssh::cli_service_lifecycle::get(connection_id, self.id())
+                    .await
+                    .is_ok())
+            }
+        }
+    }
+
+    /// 通过 OpenCode 对应 CLI 生命周期取得或确保当前运行位置的服务，不直接管理 SSH Tunnel。
+    async fn ensure_service(&self, context: &CliExecutionContext) -> Result<()> {
+        match context.location_kind {
+            CliLocationKind::Local => {
+                LocalCliServiceLifecycle::set(self.id()).await?;
+            }
+            CliLocationKind::Ssh => {
+                let connection_id = context
+                    .ssh_connection_id
+                    .as_deref()
+                    .context("SSH 远端 OpenCode 项目未绑定连接")?;
+                ssh::cli_service_lifecycle::set(connection_id, self.id()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// SSH 连接测试成功后，由 OpenCode CLI 生命周期建立 Tunnel 并登记、启动远端服务。
+    async fn register_remote_service(&self, context: &CliExecutionContext) -> Result<()> {
+        anyhow::ensure!(
+            context.location_kind == CliLocationKind::Ssh,
+            "本机 OpenCode CLI 不支持注册远端服务"
+        );
+        let connection_id = context
+            .ssh_connection_id
+            .as_deref()
+            .context("SSH 远端 OpenCode 注册服务未绑定连接")?;
+        let lookup_connection_id = connection_id.to_string();
+        let record = tokio::task::spawn_blocking({
+            let db = self.state.db.clone();
+            move || db::ssh_connections::find(&db, &lookup_connection_id)
+        })
+        .await
+        .context("读取 SSH OpenCode 连接记录任务失败")?
+        .context("读取 SSH OpenCode 连接记录数据库失败")?
+        .with_context(|| format!("SSH OpenCode 连接记录不存在: connection_id={connection_id}"))?;
+        ssh::cli_service_lifecycle::register_service(&record, self.id()).await
+    }
+
     async fn execution_context(&self, workspace_id: Option<&str>) -> Result<CliExecutionContext> {
         OpenCodeCli::execution_context(self, workspace_id).await
     }
@@ -495,7 +633,57 @@ impl CliTool for OpenCodeCli {
             });
         }
 
-        let models = self.local_engine().await?.list_models_runtime().await;
+        let models = if context.root_path.trim().is_empty() {
+            let service = LocalCliServiceLifecycle::get("opencode").await?;
+            let handle = match service.handle() {
+                LocalCliHandle::OpenCode(handle) => handle,
+                _ => anyhow::bail!("本地 CLI 生命周期返回了错误的 OpenCode 句柄类型"),
+            };
+            let verbose_models = match handle.run_command(None, &["models", "--verbose"]).await {
+                Ok(output) => match OpenCodeEngine::parse_cli_model_output(&output) {
+                    Ok(models) => models,
+                    Err(error) => {
+                        log::warn!(
+                            "解析本机 OpenCode verbose 模型目录失败，回退 basic 输出: {error:#}"
+                        );
+                        Vec::new()
+                    }
+                },
+                Err(error) => {
+                    log::warn!(
+                        "读取本机 OpenCode verbose 模型目录失败，回退 basic 输出: {error:#}"
+                    );
+                    Vec::new()
+                }
+            };
+            if !verbose_models.is_empty() {
+                verbose_models
+            } else {
+                let basic_models = match handle.run_command(None, &["models"]).await {
+                    Ok(output) => match OpenCodeEngine::parse_cli_model_output(&output) {
+                        Ok(models) => models,
+                        Err(error) => {
+                            log::warn!("解析本机 OpenCode basic 模型目录失败: {error:#}");
+                            Vec::new()
+                        }
+                    },
+                    Err(error) => {
+                        log::warn!("读取本机 OpenCode basic 模型目录失败: {error:#}");
+                        Vec::new()
+                    }
+                };
+                if basic_models.is_empty() {
+                    OpenCodeEngine::default().models()
+                } else {
+                    basic_models
+                }
+            }
+        } else {
+            self.local_engine(&context.root_path)
+                .await?
+                .list_models_runtime()
+                .await
+        };
         Ok(EngineInfoDto {
             id: "opencode".to_string(),
             name: "OpenCode".to_string(),
@@ -528,7 +716,7 @@ impl CliTool for OpenCodeCli {
                 .context("SSH 远端 OpenCode 未绑定连接")?;
             return remote_project_opencode_runtime_service::model_infos(connection_id, None).await;
         }
-        let engine = self.local_engine().await?;
+        let engine = self.local_engine(&context.root_path).await?;
         let cached_models = engine.runtime_model_fallback().await;
         if cached_models
             .iter()
@@ -550,7 +738,7 @@ impl CliTool for OpenCodeCli {
     async fn engine_health(&self, context: &CliExecutionContext) -> Result<EngineHealthDto> {
         let workspace = self.load_workspace(context).await?;
         if context.location_kind == CliLocationKind::Local {
-            let report = self.local_engine().await?.health_report().await;
+            let report = self.local_engine(&context.root_path).await?.health_report().await;
             return Ok(EngineHealthDto {
                 id: "opencode".to_string(),
                 available: report.available,
@@ -625,7 +813,7 @@ impl CliTool for OpenCodeCli {
                 .prewarm()
                 .await
         } else {
-            self.local_engine().await?.prewarm().await
+            self.local_engine(&context.root_path).await?.prewarm().await
         }
     }
 
@@ -672,9 +860,9 @@ impl CliTool for OpenCodeCli {
         if context.location_kind != CliLocationKind::Ssh {
             // 本机 OpenCode 允许 workspace 根目录和各仓库目录分别拥有会话；只有明确的
             // 404 才继续尝试下一个目录，其他错误必须原样返回，不能误报为“会话不存在”。
-            let engine = self.local_engine().await?;
             let roots = self.workspace_roots(&workspace).await?;
             for cwd in roots.iter() {
+                let engine = self.local_engine(cwd).await?;
                 match engine.read_session(cwd, engine_thread_id).await {
                     Ok(summary) => {
                         anyhow::ensure!(
@@ -906,7 +1094,7 @@ impl CliTool for OpenCodeCli {
                     .set_session_permission_rules(&cwd, engine_thread_id, &rules)
                     .await
             } else {
-                self.local_engine()
+                self.local_engine(&cwd)
                     .await?
                     .set_session_permission_rules(&cwd, engine_thread_id, &rules)
                     .await
@@ -1026,7 +1214,7 @@ impl CliTool for OpenCodeCli {
                     )
                 })
         } else {
-            self.local_engine()
+            self.local_engine(&cwd)
                 .await?
                 .set_session_permission_mode(&cwd, engine_thread_id, approval_policy)
                 .await
@@ -1098,7 +1286,7 @@ impl CliTool for OpenCodeCli {
             .await;
         }
 
-        let engine = self.configure_local_computer_control().await?;
+        let engine = self.configure_local_computer_control(scope_cwd).await?;
         Engine::start_thread(
             engine.as_ref(),
             scope,
@@ -1118,7 +1306,7 @@ impl CliTool for OpenCodeCli {
         event_tx: mpsc::Sender<EngineEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        self.load_workspace(context).await?;
+        let workspace = self.load_workspace(context).await?;
         Self::validate_thread(context, thread)?;
         if context.location_kind == CliLocationKind::Ssh {
             let engine = self.remote_turn_use.lock().await.take().ok_or_else(|| {
@@ -1135,7 +1323,8 @@ impl CliTool for OpenCodeCli {
             return result;
         }
 
-        let engine = self.configure_local_computer_control().await?;
+        let cwd = self.thread_cwd(&workspace, thread).await?;
+        let engine = self.configure_local_computer_control(&cwd).await?;
         Engine::send_message(
             engine.as_ref(),
             engine_thread_id,
@@ -1170,6 +1359,7 @@ impl CliTool for OpenCodeCli {
     ) -> Result<()> {
         let workspace = self.load_workspace(context).await?;
         Self::validate_thread(context, thread)?;
+        let cwd = self.thread_cwd(&workspace, thread).await?;
         if context.location_kind == CliLocationKind::Ssh {
             let engine = remote_project_opencode_runtime_service::runtime(&workspace).await?;
             Engine::respond_to_approval(engine.as_ref(), approval_id, response, route)
@@ -1182,7 +1372,7 @@ impl CliTool for OpenCodeCli {
                 })
         } else {
             Engine::respond_to_approval(
-                self.local_engine().await?.as_ref(),
+                self.local_engine(&cwd).await?.as_ref(),
                 approval_id,
                 response,
                 route,
@@ -1216,7 +1406,7 @@ impl CliTool for OpenCodeCli {
             let Some(engine_thread_id) = thread.engine_thread_id.as_deref() else {
                 return Ok(());
             };
-            Engine::interrupt(self.local_engine().await?.as_ref(), engine_thread_id).await
+            Engine::interrupt(self.local_engine(&cwd).await?.as_ref(), engine_thread_id).await
         }
     }
 
@@ -1235,7 +1425,7 @@ impl CliTool for OpenCodeCli {
                 .set_session_archived(&cwd, engine_thread_id, true)
                 .await
         } else {
-            self.local_engine()
+            self.local_engine(&cwd)
                 .await?
                 .set_session_archived(&cwd, engine_thread_id, true)
                 .await
@@ -1257,7 +1447,7 @@ impl CliTool for OpenCodeCli {
                 .set_session_archived(&cwd, engine_thread_id, false)
                 .await
         } else {
-            self.local_engine()
+            self.local_engine(&cwd)
                 .await?
                 .set_session_archived(&cwd, engine_thread_id, false)
                 .await
@@ -1272,6 +1462,7 @@ impl CliTool for OpenCodeCli {
     ) -> Result<()> {
         let workspace = self.load_workspace(context).await?;
         Self::validate_thread(context, thread)?;
+        let cwd = self.thread_cwd(&workspace, thread).await?;
         let _active_turn_engine = self.remote_turn_use.lock().await.take();
         if context.location_kind == CliLocationKind::Ssh {
             remote_project_opencode_runtime_service::runtime(&workspace)
@@ -1279,7 +1470,7 @@ impl CliTool for OpenCodeCli {
                 .forget_session(engine_thread_id)
                 .await;
         } else {
-            self.local_engine()
+            self.local_engine(&cwd)
                 .await?
                 .forget_session(engine_thread_id)
                 .await;
@@ -1313,7 +1504,7 @@ impl CliTool for OpenCodeCli {
                 .read_thread_sync_snapshot(&cwd, engine_thread_id)
                 .await?
         } else {
-            self.local_engine()
+            self.local_engine(&cwd)
                 .await?
                 .read_thread_sync_snapshot(&cwd, engine_thread_id)
                 .await?
@@ -1369,11 +1560,7 @@ impl CliTool for OpenCodeCli {
                 .runtime_catalog(&cwd)
                 .await
         } else {
-            let engine = self.local_engine().await?;
-            // 旧版本机工具服务注入已由统一 MCP Gateway 接替，保留原调用但不再执行。
-            // engine.set_computer_control_service(self.state.computer_control_service.clone());
-            // engine
-            //     .set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
+            let engine = self.local_engine(&cwd).await?;
             engine.runtime_catalog(&cwd).await
         }
     }
@@ -1387,21 +1574,32 @@ impl CliTool for OpenCodeCli {
         let workspace = self.load_workspace(context).await?;
         let cwd = self.resolve_workspace_cwd(&workspace, cwd).await?;
         if context.location_kind == CliLocationKind::Local {
-            self.state
-                .engines
-                .set_local_opencode_computer_control_service(
-                    self.state.computer_control_service.clone(),
-                );
             let mut results = Vec::new();
             for kind in requested_kinds {
-                results.push(
-                    extensions::opencode::refresh_kind(
-                        self.state.engines.as_ref(),
-                        Some(cwd.as_str()),
-                        kind,
-                    )
-                    .await,
-                );
+                if kind == "mcp" {
+                    let runtime_result = self
+                        .local_engine(&cwd)
+                        .await?
+                        .runtime_catalog(&cwd)
+                        .await;
+                    results.push(
+                        extensions::opencode::refresh_kind_with_runtime(
+                            Some(cwd.as_str()),
+                            kind,
+                            runtime_result,
+                        )
+                        .await,
+                    );
+                } else {
+                    results.push(
+                        extensions::opencode::refresh_kind(
+                            self.state.engines.as_ref(),
+                            Some(cwd.as_str()),
+                            kind,
+                        )
+                        .await,
+                    );
+                }
             }
             return Ok(results);
         }

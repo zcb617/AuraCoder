@@ -607,6 +607,122 @@ impl CliTool for CodexCli {
             .await
     }
 
+    /// 为当前 Codex 对话轮次登记可信 AuraCoder MCP 上下文，并按项目位置调用对应生命周期。
+    async fn register_mcp_context(
+        &self,
+        context: &CliExecutionContext,
+        engine_thread_id: &str,
+        turn_id: &str,
+    ) -> Result<()> {
+        match context.location_kind {
+            CliLocationKind::Local => {
+                LocalCliServiceLifecycle::register_mcp_context(
+                    self.id(),
+                    engine_thread_id,
+                    turn_id,
+                )
+                .await
+            }
+            CliLocationKind::Ssh => {
+                let connection_id = context
+                    .ssh_connection_id
+                    .as_deref()
+                    .context("SSH 远端项目未绑定连接")?;
+                ssh::cli_service_lifecycle::register_mcp_context(
+                    connection_id,
+                    self.id(),
+                    engine_thread_id,
+                    turn_id,
+                )
+                .await
+            }
+        }
+    }
+
+    /// 清理当前 Codex 对话轮次的可信 AuraCoder MCP 上下文，并保留生命周期原始错误链。
+    async fn clear_mcp_context(&self, context: &CliExecutionContext) -> Result<()> {
+        match context.location_kind {
+            CliLocationKind::Local => LocalCliServiceLifecycle::clear_mcp_context(self.id()).await,
+            CliLocationKind::Ssh => {
+                let connection_id = context
+                    .ssh_connection_id
+                    .as_deref()
+                    .context("SSH 远端项目未绑定连接")?;
+                ssh::cli_service_lifecycle::clear_mcp_context(connection_id, self.id()).await
+            }
+        }
+    }
+
+    /// 重启当前 Codex 的 SSH 远端 CLI 服务，严格按 terminate 后 set 的顺序执行。
+    async fn restart_service(&self, context: &CliExecutionContext) -> Result<()> {
+        anyhow::ensure!(
+            context.location_kind == CliLocationKind::Ssh,
+            "不支持重启本机 CLI 服务"
+        );
+        let connection_id = context
+            .ssh_connection_id
+            .as_deref()
+            .context("SSH 远端项目未绑定连接")?;
+        ssh::cli_service_lifecycle::terminate(connection_id, self.id()).await?;
+        ssh::cli_service_lifecycle::set(connection_id, self.id()).await?;
+        Ok(())
+    }
+
+    /// 查询当前 Codex 服务是否已经由本机或 SSH CLI 生命周期登记并处于 Ready 状态。
+    async fn is_service_ready(&self, context: &CliExecutionContext) -> Result<bool> {
+        match context.location_kind {
+            CliLocationKind::Local => Ok(LocalCliServiceLifecycle::get(self.id()).await.is_ok()),
+            CliLocationKind::Ssh => {
+                let connection_id = context
+                    .ssh_connection_id
+                    .as_deref()
+                    .context("SSH 远端 Codex 项目未绑定连接")?;
+                Ok(ssh::cli_service_lifecycle::get(connection_id, self.id())
+                    .await
+                    .is_ok())
+            }
+        }
+    }
+
+    /// 通过 Codex 对应 CLI 生命周期取得或确保当前运行位置的服务，不直接管理 SSH Tunnel。
+    async fn ensure_service(&self, context: &CliExecutionContext) -> Result<()> {
+        match context.location_kind {
+            CliLocationKind::Local => {
+                LocalCliServiceLifecycle::set(self.id()).await?;
+            }
+            CliLocationKind::Ssh => {
+                let connection_id = context
+                    .ssh_connection_id
+                    .as_deref()
+                    .context("SSH 远端 Codex 项目未绑定连接")?;
+                ssh::cli_service_lifecycle::set(connection_id, self.id()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// SSH 连接测试成功后，由 Codex CLI 生命周期建立 Tunnel 并登记、启动远端服务。
+    async fn register_remote_service(&self, context: &CliExecutionContext) -> Result<()> {
+        anyhow::ensure!(
+            context.location_kind == CliLocationKind::Ssh,
+            "本机 Codex CLI 不支持注册远端服务"
+        );
+        let connection_id = context
+            .ssh_connection_id
+            .as_deref()
+            .context("SSH 远端 Codex 注册服务未绑定连接")?;
+        let lookup_connection_id = connection_id.to_string();
+        let record = tokio::task::spawn_blocking({
+            let db = self.state.db.clone();
+            move || db::ssh_connections::find(&db, &lookup_connection_id)
+        })
+        .await
+        .context("读取 SSH Codex 连接记录任务失败")?
+        .context("读取 SSH Codex 连接记录数据库失败")?
+        .with_context(|| format!("SSH Codex 连接记录不存在: connection_id={connection_id}"))?;
+        ssh::cli_service_lifecycle::register_service(&record, self.id()).await
+    }
+
     async fn execution_context(&self, workspace_id: Option<&str>) -> Result<CliExecutionContext> {
         CodexCli::execution_context(self, workspace_id).await
     }

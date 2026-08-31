@@ -9,6 +9,9 @@ use std::{
 };
 
 use anyhow::Context;
+
+pub(crate) use crate::db::ssh_connections::SshConnectionRecord;
+
 #[allow(unused_imports)]
 use flate2::{write::GzEncoder, Compression};
 use tar::Builder;
@@ -17,7 +20,6 @@ use tokio::{process::Child, sync::Mutex, sync::RwLock};
 use uuid::Uuid;
 
 use crate::{
-    db::ssh_connections::SshConnectionRecord,
     mcp_gateway::AuraCoderMcpGateway,
     message_notify_helper::notify_app_startup_progress,
     runtime_env,

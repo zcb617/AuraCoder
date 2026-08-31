@@ -2,8 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     // 旧 executable_augmented_path 实现由 runtime_env::get 接替：
     // ffi::OsString,
-    net::TcpListener,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -19,9 +18,8 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener as AsyncTcpListener,
-    process::{Child, Command},
     sync::{broadcast, mpsc, Mutex},
     time::{sleep, timeout},
 };
@@ -32,10 +30,8 @@ use crate::models::{
     OpenCodeAgentDto, OpenCodeCommandDto, OpenCodeMcpServerDto, OpenCodeRuntimeCatalogDto,
 };
 use crate::{
-    computer_control_service::ComputerControlService,
     auracoder_thread_mcp_service::AuraCoderThreadMcpService,
-    process_utils,
-    runtime_env,
+    computer_control_service::ComputerControlService,
 };
 
 use super::{
@@ -46,8 +42,6 @@ use super::{
     TokenUsage, TurnCompletionStatus, TurnInput,
 };
 
-const OPENCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
-const OPENCODE_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const OPENCODE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const OPENCODE_RECONCILE_MESSAGE_LIMIT: usize = 128;
 // OpenCode 完整历史同步的单次请求上限；活动回合补偿仍使用上面的固定 128 条上限。
@@ -57,39 +51,64 @@ const OPENCODE_HISTORY_TIMEOUT: Duration = Duration::from_secs(60);
 const OPENCODE_EVENT_BUFFER_CAPACITY: usize = 1024;
 const OPENCODE_EVENT_QUEUE_CAPACITY: usize = OPENCODE_EVENT_BUFFER_CAPACITY;
 const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
-const SERVER_READY_PREFIX: &str = "opencode server listening";
-const DEFAULT_HOST: &str = "127.0.0.1";
 const OPENCODE_MESSAGE_ID_RANDOM_LEN: usize = 14;
 const OPENCODE_ID_COUNTER_STEP: u64 = 0x1000;
 const OPENCODE_ID_TIME_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 static LAST_OPENCODE_MESSAGE_SORT_VALUE: AtomicU64 = AtomicU64::new(0);
 
+/// OpenCode 协议客户端，只负责 HTTP 请求、会话状态和事件转换。
+///
+/// 本对象不创建、启动、复用、停止或释放本机 OpenCode 服务；本机 endpoint 必须由
+/// `LocalCliServiceLifecycle` 提供，远端 endpoint 必须由 SSH CLI 生命周期提供。
 pub struct OpenCodeEngine {
+    /// OpenCode 会话、协议连接和待处理请求状态。
     state: Arc<Mutex<OpenCodeState>>,
+    /// OpenCode HTTP 协议请求使用的客户端。
     http: reqwest::Client,
-    /// 本地 OpenCode 实例使用的 MCP Gateway Endpoint，仅在内存中保存。
-    mcp_gateway_endpoint: Arc<std::sync::Mutex<Option<String>>>,
-    /// 本地 OpenCode 实例使用的 MCP Gateway token，仅在内存中保存且不写入日志。
-    mcp_gateway_token: Arc<std::sync::Mutex<Option<String>>>,
+    /// 本机计算机控制服务，用于将 GUI 工具注入当前回合。
     computer_control_service: Arc<std::sync::Mutex<Option<Arc<ComputerControlService>>>>,
     /// AuraCoder 本地会话读取工具服务。
     auracoder_thread_mcp_service: Arc<std::sync::Mutex<Option<Arc<AuraCoderThreadMcpService>>>>,
+    /// 当前协议客户端绑定的传输 endpoint。
     target: OpenCodeTransportTarget,
 }
 
 #[derive(Clone)]
 enum OpenCodeTransportTarget {
+    /// 未绑定 endpoint 的能力对象，仅用于静态模型信息和兼容入口。
     Local,
+    /// 由本机 CLI 生命周期提供的 OpenCode HTTP endpoint。
+    LocalHttp(Arc<LocalOpenCodeEndpoint>),
+    /// 由 SSH CLI 生命周期提供的远端 OpenCode HTTP endpoint。
     Remote(Arc<RemoteOpenCodeEndpoint>),
 }
 
-struct RemoteOpenCodeEndpoint {
+/// OpenCode 协议连接的本机 endpoint 描述。
+struct LocalOpenCodeEndpoint {
+    /// 本机 OpenCode 服务绑定的项目目录。
+    cwd: String,
+    /// 本机 OpenCode HTTP 服务基础地址。
     base_url: String,
+    /// 本机 OpenCode HTTP 服务 Basic Auth 密码。
     password: String,
+    /// endpoint 对应的 OpenCode CLI 版本文本。
+    version: Option<String>,
+    /// endpoint 对应的本机服务生命周期代数。
+    generation: u64,
+}
+
+struct RemoteOpenCodeEndpoint {
+    /// 远端 OpenCode HTTP 服务基础地址。
+    base_url: String,
+    /// 远端 OpenCode HTTP 服务 Basic Auth 密码。
+    password: String,
+    /// 远端 OpenCode 事件广播总线。
     event_bus: broadcast::Sender<OpenCodeBusItem>,
+    /// 远端事件订阅任务的取消令牌。
     pump_cancel: CancellationToken,
     #[cfg(test)]
+    /// 测试是否启用工作区事件泵。
     workspace_event_pump_enabled: bool,
 }
 
@@ -99,38 +118,57 @@ impl Drop for RemoteOpenCodeEndpoint {
     }
 }
 
+/// OpenCode 协议客户端的共享运行状态。
 #[derive(Default)]
 struct OpenCodeState {
-    servers: HashMap<String, Arc<OpenCodeServer>>,
+    /// 按 cwd 缓存不含服务生命周期的协议连接。
+    connections: HashMap<String, Arc<OpenCodeConnection>>,
+    /// 当前引擎已知的 OpenCode 会话元数据。
     sessions: HashMap<String, OpenCodeSession>,
+    /// 等待审批或问题回答的协议请求。
     pending_requests: HashMap<String, PendingOpenCodeRequest>,
+    /// 运行时模型目录缓存。
     runtime_model_cache: Option<Vec<ModelInfo>>,
 }
 
+/// OpenCode 会话与其协议连接的关联信息。
 #[derive(Clone)]
 struct OpenCodeSession {
+    /// 会话所在的项目目录。
     cwd: String,
+    /// 会话使用的模型标识。
     model_id: String,
+    /// 会话使用的推理强度。
     reasoning_effort: Option<String>,
+    /// 会话使用的 OpenCode agent。
     agent: Option<String>,
+    /// 会话权限模式。
     permission_mode: OpenCodePermissionMode,
-    server: Arc<OpenCodeServer>,
+    /// 会话对应的协议连接。
+    connection: Arc<OpenCodeConnection>,
 }
 
-struct OpenCodeServer {
+/// OpenCode HTTP 协议连接及其事件泵状态。
+struct OpenCodeConnection {
+    /// 协议请求对应的项目目录。
     cwd: String,
+    /// OpenCode HTTP 服务基础地址。
     base_url: String,
+    /// OpenCode HTTP 服务 Basic Auth 密码。
     password: String,
-    child: Mutex<Option<Child>>,
+    /// OpenCode 事件广播总线。
     event_bus: broadcast::Sender<OpenCodeBusItem>,
+    /// OpenCode 事件泵取消令牌。
     pump_cancel: Option<CancellationToken>,
+    /// OpenCode 回调服务取消令牌。
     callback_cancel: Option<CancellationToken>,
-    run_dir: Option<PathBuf>,
+    /// 是否需要为请求附加项目目录头。
     include_directory_header: bool,
 }
 
-impl Drop for OpenCodeServer {
-    fn drop(&mut self) {
+impl OpenCodeConnection {
+    /// 停止协议事件和回调任务，但不触碰 OpenCode 服务进程。
+    fn cancel_event_pump(&self) {
         if let Some(pump_cancel) = self.pump_cancel.as_ref() {
             pump_cancel.cancel();
         }
@@ -140,16 +178,22 @@ impl Drop for OpenCodeServer {
     }
 }
 
+impl Drop for OpenCodeConnection {
+    fn drop(&mut self) {
+        self.cancel_event_pump();
+    }
+}
+
 #[derive(Clone)]
 enum PendingOpenCodeRequest {
     Permission {
         request_id: String,
-        server: Arc<OpenCodeServer>,
+        connection: Arc<OpenCodeConnection>,
     },
     Question {
         request_id: String,
         questions: Vec<OpenCodeQuestionInfo>,
-        server: Arc<OpenCodeServer>,
+        connection: Arc<OpenCodeConnection>,
     },
 }
 
@@ -742,8 +786,6 @@ impl Default for OpenCodeEngine {
         Self {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
-            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
-            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Local,
@@ -773,10 +815,7 @@ impl Engine for OpenCodeEngine {
     }
 
     async fn is_available(&self) -> bool {
-        match &self.target {
-            OpenCodeTransportTarget::Local => resolve_opencode_executable().is_some(),
-            OpenCodeTransportTarget::Remote(_) => true,
-        }
+        !matches!(&self.target, OpenCodeTransportTarget::Local)
     }
 
     async fn start_thread(
@@ -819,7 +858,7 @@ impl Engine for OpenCodeEngine {
                     state.sessions.remove(existing_id);
                     drop(state);
                     let engine_thread_id = self
-                        .create_session(existing.server.as_ref(), permission_mode)
+                        .create_session(existing.connection.as_ref(), permission_mode)
                         .await?;
                     self.state.lock().await.sessions.insert(
                         engine_thread_id.clone(),
@@ -829,7 +868,7 @@ impl Engine for OpenCodeEngine {
                             reasoning_effort,
                             agent,
                             permission_mode,
-                            server: existing.server,
+                            connection: existing.connection,
                         },
                     );
                     return Ok(EngineThread { engine_thread_id });
@@ -843,9 +882,9 @@ impl Engine for OpenCodeEngine {
             }
         }
 
-        let server = self.ensure_server(&cwd).await?;
+        let connection = self.connection_for_cwd(&cwd).await?;
         let engine_thread_id = match resume_engine_thread_id {
-            Some(existing_id) => match self.get_session(server.as_ref(), existing_id).await {
+            Some(existing_id) => match self.get_session(connection.as_ref(), existing_id).await {
                 Ok(session)
                     if session.directory == cwd
                         && (session_permission_matches(&session, permission_mode)
@@ -867,7 +906,7 @@ impl Engine for OpenCodeEngine {
                     log::warn!(
                         "opencode session {existing_id} permission rules differ from requested mode; creating a new session"
                     );
-                    self.create_session(server.as_ref(), permission_mode)
+                    self.create_session(connection.as_ref(), permission_mode)
                         .await?
                 }
                 Err(error) => {
@@ -879,19 +918,19 @@ impl Engine for OpenCodeEngine {
                     log::warn!(
                         "opencode session resume failed for {existing_id}, creating a new session: {error}"
                     );
-                    self.create_session(server.as_ref(), permission_mode)
+                    self.create_session(connection.as_ref(), permission_mode)
                         .await?
                 }
             },
             None => {
-                self.create_session(server.as_ref(), permission_mode)
+                self.create_session(connection.as_ref(), permission_mode)
                     .await?
             }
         };
 
-        let previous = {
+        {
             let mut state = self.state.lock().await;
-            state.sessions.insert(
+            let _ = state.sessions.insert(
                 engine_thread_id.clone(),
                 OpenCodeSession {
                     cwd: cwd.clone(),
@@ -899,12 +938,9 @@ impl Engine for OpenCodeEngine {
                     reasoning_effort,
                     agent,
                     permission_mode,
-                    server,
+                    connection,
                 },
-            )
-        };
-        if let Some(previous) = previous {
-            self.stop_server_if_unused(&previous.cwd).await;
+            );
         }
 
         Ok(EngineThread { engine_thread_id })
@@ -932,7 +968,7 @@ impl Engine for OpenCodeEngine {
         // that caused follow-up turns to immediately complete with no content
         // when a fresh `/event` HTTP connection delivered the prior turn's
         // buffered busy/idle events into the new turn's mapper.
-        let mut incoming_rx = spawn_opencode_incoming_pump(session.server.event_bus.clone());
+        let mut incoming_rx = spawn_opencode_incoming_pump(session.connection.event_bus.clone());
 
         let prompt = build_prompt_body(
             &session.model_id,
@@ -948,7 +984,7 @@ impl Engine for OpenCodeEngine {
             if self.is_remote_target() { "remote" } else { "local" },
         );
         let prompt_request =
-            self.prompt_message(engine_thread_id, session.server.as_ref(), prompt.body);
+            self.prompt_message(engine_thread_id, session.connection.as_ref(), prompt.body);
         tokio::pin!(prompt_request);
 
         let mut mapper = OpenCodeTurnMapper::new(prompt_message_id);
@@ -968,7 +1004,7 @@ impl Engine for OpenCodeEngine {
                                     engine_thread_id,
                                     &mut mapper,
                                     &event_tx,
-                                    session.server.as_ref(),
+                                    session.connection.as_ref(),
                                 )
                                 .await;
                                 self.complete_after_idle(&mut mapper, &event_tx).await;
@@ -1029,7 +1065,7 @@ impl Engine for OpenCodeEngine {
                             event.as_ref(),
                             &mut mapper,
                             &event_tx,
-                            session.server.clone(),
+                            session.connection.clone(),
                             matched,
                         )
                         .await;
@@ -1089,9 +1125,8 @@ impl Engine for OpenCodeEngine {
                 })?,
         };
 
-        let server_cwd = match pending {
-            PendingOpenCodeRequest::Permission { request_id, server } => {
-                let server_cwd = server.cwd.clone();
+        match pending {
+            PendingOpenCodeRequest::Permission { request_id, connection } => {
                 let decision = normalized
                     .get("decision")
                     .and_then(Value::as_str)
@@ -1103,7 +1138,7 @@ impl Engine for OpenCodeEngine {
                     _ => "reject",
                 };
                 self.request(
-                    server.as_ref(),
+                    connection.as_ref(),
                     reqwest::Method::POST,
                     &format!("/permission/{request_id}/reply"),
                 )
@@ -1112,17 +1147,15 @@ impl Engine for OpenCodeEngine {
                 .await?
                 .error_for_status()
                 .context("failed to reply to OpenCode permission request")?;
-                server_cwd
             }
             PendingOpenCodeRequest::Question {
                 request_id,
                 questions,
-                server,
+                connection,
             } => {
-                let server_cwd = server.cwd.clone();
                 if should_reject_question_response(&normalized) {
                     self.request(
-                        server.as_ref(),
+                        connection.as_ref(),
                         reqwest::Method::POST,
                         &format!("/question/{request_id}/reject"),
                     )
@@ -1133,7 +1166,7 @@ impl Engine for OpenCodeEngine {
                 } else {
                     let answers = build_question_answers(&questions, normalized.get("answers"));
                     self.request(
-                        server.as_ref(),
+                        connection.as_ref(),
                         reqwest::Method::POST,
                         &format!("/question/{request_id}/reply"),
                     )
@@ -1143,12 +1176,11 @@ impl Engine for OpenCodeEngine {
                     .error_for_status()
                     .context("failed to reply to OpenCode question request")?;
                 }
-                server_cwd
             }
-        };
+        }
 
         self.state.lock().await.pending_requests.remove(approval_id);
-        self.stop_server_if_unused(&server_cwd).await;
+        // OpenCode 服务由 CLI 生命周期持有，审批处理完成后不在协议客户端中停止。
         Ok(())
     }
 
@@ -1162,7 +1194,7 @@ impl Engine for OpenCodeEngine {
         };
 
         self.request(
-            session.server.as_ref(),
+            session.connection.as_ref(),
             reqwest::Method::POST,
             &format!("/session/{engine_thread_id}/abort"),
         )
@@ -1177,12 +1209,12 @@ impl Engine for OpenCodeEngine {
         let removed = self.state.lock().await.sessions.remove(engine_thread_id);
         if let Some(session) = removed {
             self.patch_session_archive(
-                session.server.as_ref(),
+                session.connection.as_ref(),
                 engine_thread_id,
                 Some(current_unix_time_millis()),
             )
             .await?;
-            self.stop_server_if_unused(&session.cwd).await;
+            // OpenCode 服务由 CLI 生命周期持有，归档业务完成后不在协议客户端中停止。
         }
         Ok(())
     }
@@ -1193,13 +1225,26 @@ impl Engine for OpenCodeEngine {
 }
 
 impl OpenCodeEngine {
-    /// 设置本地 OpenCode 实例连接 AuraCoder MCP Gateway 所需的 Endpoint 和 token。
-    pub fn set_mcp_gateway_connection(&self, endpoint: String, token: String) {
-        if let Ok(mut current) = self.mcp_gateway_endpoint.lock() {
-            *current = Some(endpoint);
-        }
-        if let Ok(mut current) = self.mcp_gateway_token.lock() {
-            *current = Some(token);
+    /// 创建绑定本机 CLI 生命周期 endpoint 的纯 OpenCode 协议客户端。
+    pub fn new_local_http(
+        base_url: String,
+        password: String,
+        version: Option<String>,
+        cwd: String,
+        generation: u64,
+    ) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(OpenCodeState::default())),
+            http: reqwest::Client::new(),
+            computer_control_service: Arc::new(std::sync::Mutex::new(None)),
+            auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
+            target: OpenCodeTransportTarget::LocalHttp(Arc::new(LocalOpenCodeEndpoint {
+                cwd,
+                base_url,
+                password,
+                version,
+                generation,
+            })),
         }
     }
 
@@ -1220,24 +1265,9 @@ impl OpenCodeEngine {
         let (event_bus, _) =
             broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
         let pump_cancel = CancellationToken::new();
-        /*
-        旧实现按 SSH 连接启动一条未携带项目目录的共享 SSE：
-        tokio::spawn(run_event_pump(
-            base_url.clone(),
-            password.clone(),
-            None,
-            reqwest::Client::new(),
-            event_bus.clone(),
-            pump_cancel.clone(),
-        ));
-        OpenCode 会把该订阅绑定到远端进程 cwd，无法收到其他项目目录的事件。
-        远端 SSE 改由 ensure_server 按项目目录创建并随 OpenCodeServer 释放。
-        */
         Self {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
-            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
-            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
@@ -1255,28 +1285,41 @@ impl OpenCodeEngine {
         matches!(&self.target, OpenCodeTransportTarget::Remote(_))
     }
 
-    async fn ensure_server(&self, cwd: &str) -> Result<Arc<OpenCodeServer>> {
-        if let Some(server) = self.state.lock().await.servers.get(cwd).cloned() {
-            return Ok(server);
+    /// 获取当前 cwd 对应的纯协议连接；本机服务必须已经由 CLI 生命周期提供。
+    async fn connection_for_cwd(&self, cwd: &str) -> Result<Arc<OpenCodeConnection>> {
+        if let Some(connection) = self.state.lock().await.connections.get(cwd).cloned() {
+            return Ok(connection);
         }
 
         let created = Arc::new(match &self.target {
             OpenCodeTransportTarget::Local => {
-                let endpoint = self
-                    .mcp_gateway_endpoint
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("OpenCode MCP Gateway Endpoint 状态已损坏"))?
-                    .clone();
-                let token = self
-                    .mcp_gateway_token
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("OpenCode MCP Gateway token 状态已损坏"))?
-                    .clone();
+                anyhow::bail!("OpenCode 本机服务 endpoint 尚未由 CLI 生命周期提供")
+            }
+            OpenCodeTransportTarget::LocalHttp(endpoint) => {
                 anyhow::ensure!(
-                    endpoint.is_some() == token.is_some(),
-                    "OpenCode 的 AuraCoder MCP 配置不完整"
+                    endpoint.cwd == cwd,
+                    "OpenCode 本机 endpoint 与请求项目目录不一致"
                 );
-                start_server(cwd, endpoint.as_deref(), token.as_deref()).await?
+                let (event_bus, _) =
+                    broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
+                let pump_cancel = CancellationToken::new();
+                tokio::spawn(run_event_pump(
+                    endpoint.base_url.clone(),
+                    endpoint.password.clone(),
+                    None,
+                    reqwest::Client::new(),
+                    event_bus.clone(),
+                    pump_cancel.clone(),
+                ));
+                OpenCodeConnection {
+                    cwd: cwd.to_string(),
+                    base_url: endpoint.base_url.clone(),
+                    password: endpoint.password.clone(),
+                    event_bus,
+                    pump_cancel: Some(pump_cancel),
+                    callback_cancel: None,
+                    include_directory_header: false,
+                }
             }
             OpenCodeTransportTarget::Remote(endpoint) => {
                 let include_directory_header = !cwd.is_empty();
@@ -1302,48 +1345,32 @@ impl OpenCodeEngine {
                     } else {
                         (endpoint.event_bus.clone(), None)
                     };
-                OpenCodeServer {
+                OpenCodeConnection {
                     cwd: cwd.to_string(),
                     base_url: endpoint.base_url.clone(),
                     password: endpoint.password.clone(),
-                    child: Mutex::new(None),
                     event_bus,
                     pump_cancel,
                     callback_cancel: None,
-                    run_dir: None,
                     include_directory_header,
                 }
             }
         });
         let existing = {
             let mut state = self.state.lock().await;
-            if let Some(server) = state.servers.get(cwd).cloned() {
-                Some(server)
+            if let Some(connection) = state.connections.get(cwd).cloned() {
+                Some(connection)
             } else {
-                state.servers.insert(cwd.to_string(), created.clone());
+                state.connections.insert(cwd.to_string(), created.clone());
                 None
             }
         };
 
         if let Some(existing) = existing {
-            created.stop().await;
+            created.cancel_event_pump();
             Ok(existing)
         } else {
             Ok(created)
-        }
-    }
-
-    async fn stop_server_if_unused(&self, cwd: &str) {
-        let server = {
-            let mut state = self.state.lock().await;
-            if state.sessions.values().any(|session| session.cwd == cwd) {
-                None
-            } else {
-                state.servers.remove(cwd)
-            }
-        };
-        if let Some(server) = server {
-            server.stop().await;
         }
     }
 
@@ -1365,10 +1392,10 @@ impl OpenCodeEngine {
             .get("cwd")
             .and_then(Value::as_str)
             .context("persisted OpenCode approval route is missing cwd")?;
-        let server = self.ensure_server(cwd).await?;
+        let connection = self.connection_for_cwd(cwd).await?;
 
         match route.server_method.as_str() {
-            "opencode/permission" => Ok(PendingOpenCodeRequest::Permission { request_id, server }),
+            "opencode/permission" => Ok(PendingOpenCodeRequest::Permission { request_id, connection }),
             "opencode/question" => {
                 let questions = details
                     .get("questions")
@@ -1380,78 +1407,177 @@ impl OpenCodeEngine {
                 Ok(PendingOpenCodeRequest::Question {
                     request_id,
                     questions,
-                    server,
+                    connection,
                 })
             }
             method => anyhow::bail!("unsupported OpenCode approval route `{method}`"),
         }
     }
 
+    /// 通过已绑定的 HTTP endpoint 检查 OpenCode 服务，不启动或探测本机进程。
     pub async fn prewarm(&self) -> Result<()> {
-        match &self.target {
+        let (base_url, password, label) = match &self.target {
             OpenCodeTransportTarget::Local => {
-                let executable =
-                    resolve_opencode_executable().context("`opencode` executable not found")?;
-                let _ = run_opencode_command(&executable, &["--version"]).await?;
-                Ok(())
+                anyhow::bail!("OpenCode 本机服务 endpoint 尚未由 CLI 生命周期提供")
             }
-            OpenCodeTransportTarget::Remote(endpoint) => {
-                let response = self
-                    .http
-                    .get(format!(
-                        "{}/global/health",
-                        endpoint.base_url.trim_end_matches('/')
-                    ))
-                    .headers(auth_headers(&endpoint.password))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json::<OpenCodeHealthResponse>()
-                    .await?;
-                anyhow::ensure!(response.healthy, "SSH 远端 OpenCode 服务健康检查失败");
-                Ok(())
-            }
-        }
+            OpenCodeTransportTarget::LocalHttp(endpoint) => (
+                endpoint.base_url.clone(),
+                endpoint.password.clone(),
+                "本机",
+            ),
+            OpenCodeTransportTarget::Remote(endpoint) => (
+                endpoint.base_url.clone(),
+                endpoint.password.clone(),
+                "SSH 远端",
+            ),
+        };
+        let response = self
+            .http
+            .get(format!("{}/global/health", base_url.trim_end_matches('/')))
+            .headers(auth_headers(&password))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<OpenCodeHealthResponse>()
+            .await?;
+        anyhow::ensure!(response.healthy, "{label} OpenCode 服务健康检查失败");
+        Ok(())
     }
 
+    /// 读取已绑定 OpenCode HTTP endpoint 的健康状态，不执行本机 CLI 命令。
     pub async fn health_report(&self) -> OpenCodeHealthReport {
-        let Some(executable) = resolve_opencode_executable() else {
-            return OpenCodeHealthReport {
-                available: false,
-                version: None,
-                details: Some("`opencode` executable not found in PATH".to_string()),
-                warnings: vec![],
-                checks: vec![],
-                fixes: vec!["npm install -g opencode-ai".to_string()],
-            };
-        };
-
-        let version = match run_opencode_command(&executable, &["--version"]).await {
-            Ok(output) => output.lines().next().map(str::trim).map(str::to_string),
-            Err(error) => {
+        let (base_url, password, version, details) = match &self.target {
+            OpenCodeTransportTarget::Local => {
                 return OpenCodeHealthReport {
                     available: false,
                     version: None,
-                    details: Some(format!("failed to run opencode --version: {error}")),
+                    details: Some("OpenCode 本机服务尚未由 CLI 生命周期提供 endpoint".to_string()),
                     warnings: vec![],
-                    checks: vec![],
-                    fixes: vec![],
-                }
+                    checks: vec!["OpenCode CLI 生命周期 endpoint".to_string()],
+                    fixes: vec!["先登记并预热本机 OpenCode CLI 服务".to_string()],
+                };
             }
+            OpenCodeTransportTarget::LocalHttp(endpoint) => (
+                endpoint.base_url.clone(),
+                endpoint.password.clone(),
+                endpoint.version.clone(),
+                format!("本机 OpenCode HTTP endpoint，generation={}", endpoint.generation),
+            ),
+            OpenCodeTransportTarget::Remote(endpoint) => (
+                endpoint.base_url.clone(),
+                endpoint.password.clone(),
+                None,
+                "SSH 远端 OpenCode HTTP endpoint".to_string(),
+            ),
         };
-
-        OpenCodeHealthReport {
-            available: true,
-            version,
-            details: Some(format!("OpenCode executable: {}", executable.display())),
-            warnings: vec![],
-            checks: vec!["opencode --version".to_string()],
-            fixes: vec![],
+        let response = self
+            .http
+            .get(format!("{}/global/health", base_url.trim_end_matches('/')))
+            .headers(auth_headers(&password))
+            .send()
+            .await;
+        match response {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => match response.json::<OpenCodeHealthResponse>().await {
+                    Ok(health) if health.healthy => OpenCodeHealthReport {
+                        available: true,
+                        version: version.clone(),
+                        details: Some(details),
+                        warnings: vec![],
+                        checks: vec!["GET /global/health".to_string()],
+                        fixes: vec![],
+                    },
+                    Ok(_) => OpenCodeHealthReport {
+                        available: false,
+                        version: version.clone(),
+                        details: Some("OpenCode HTTP 服务返回 unhealthy".to_string()),
+                        warnings: vec![],
+                        checks: vec!["GET /global/health".to_string()],
+                        fixes: vec![],
+                    },
+                    Err(error) => OpenCodeHealthReport {
+                        available: false,
+                        version: version.clone(),
+                        details: Some(format!("解析 OpenCode 健康响应失败: {error}")),
+                        warnings: vec![],
+                        checks: vec!["GET /global/health".to_string()],
+                        fixes: vec![],
+                    },
+                },
+                Err(error) => OpenCodeHealthReport {
+                    available: false,
+                    version: version.clone(),
+                    details: Some(format!("OpenCode 健康请求返回 HTTP 错误: {error}")),
+                    warnings: vec![],
+                    checks: vec!["GET /global/health".to_string()],
+                    fixes: vec![],
+                },
+            },
+            Err(error) => OpenCodeHealthReport {
+                available: false,
+                version: version.clone(),
+                details: Some(format!("连接 OpenCode 健康 endpoint 失败: {error}")),
+                warnings: vec![],
+                checks: vec!["GET /global/health".to_string()],
+                fixes: vec![],
+            },
         }
     }
 
     pub async fn list_models_runtime(&self) -> Vec<ModelInfo> {
-        self.list_models_runtime_for_cwd("").await
+        let cwd = match &self.target {
+            OpenCodeTransportTarget::LocalHttp(endpoint) => endpoint.cwd.as_str(),
+            OpenCodeTransportTarget::Local | OpenCodeTransportTarget::Remote(_) => "",
+        };
+        self.list_models_runtime_for_cwd(cwd).await
+    }
+
+    /// 将 OpenCode `models --verbose` 或 `models` 的纯文本输出解析为模型目录。
+    pub fn parse_cli_model_output(output: &str) -> Result<Vec<ModelInfo>> {
+        let records = parse_verbose_model_records(output)?;
+        if !records.is_empty() {
+            let mut models = Vec::new();
+            for (index, record) in records.into_iter().enumerate() {
+                if record.status.as_deref() == Some("deprecated") {
+                    continue;
+                }
+                let slug = format!("{}/{}", record.provider_id, record.id);
+                if parse_model_slug(&slug).is_none() {
+                    continue;
+                }
+                let modalities = model_modalities_from_capabilities(record.capabilities.as_ref());
+                let attachment_modalities =
+                    attachment_modalities_from_capabilities(record.capabilities.as_ref());
+                models.push(model_info_with_metadata(
+                    &slug,
+                    &record.name,
+                    "OpenCode model",
+                    index == 0,
+                    reasoning_efforts_from_variants(&record.variants),
+                    modalities,
+                    attachment_modalities,
+                    model_limits(record.limit.as_ref()),
+                ));
+            }
+            return Ok(models);
+        }
+
+        let mut models = Vec::new();
+        for (index, line) in output.lines().enumerate() {
+            let slug = line.trim();
+            if parse_model_slug(slug).is_none() {
+                continue;
+            }
+            models.push(model_info(
+                slug,
+                slug,
+                "OpenCode model",
+                index == 0,
+                Vec::new(),
+                vec!["text".to_string()],
+            ));
+        }
+        Ok(models)
     }
 
     pub async fn list_models_runtime_for_cwd(&self, cwd: &str) -> Vec<ModelInfo> {
@@ -1462,43 +1588,18 @@ impl OpenCodeEngine {
             }
         }
 
-        let models = if self.is_remote_target() {
-            match self.ensure_server(cwd).await {
-                Ok(server) => {
-                    let result = self
-                        .load_models_from_provider_endpoint(server.as_ref())
-                        .await;
-                    self.stop_server_if_unused(cwd).await;
-                    match result {
-                        Ok(models) if !models.is_empty() => models,
-                        Ok(_) => Vec::new(),
-                        Err(error) => {
-                            log::warn!("failed to load SSH remote OpenCode models: {error:#}");
-                            Vec::new()
-                        }
-                    }
-                }
-                Err(error) => {
-                    log::warn!("failed to connect SSH remote OpenCode for models: {error:#}");
-                    Vec::new()
-                }
-            }
-        } else {
-            match self.load_models_from_verbose_command().await {
+        let models = match self.connection_for_cwd(cwd).await {
+            Ok(connection) => match self.load_models_from_provider_endpoint(connection.as_ref()).await {
                 Ok(models) if !models.is_empty() => models,
-                Ok(_) => match self.load_models_from_command().await {
-                    Ok(models) if !models.is_empty() => models,
-                    Ok(_) | Err(_) => self.models(),
-                },
+                Ok(_) => self.models(),
                 Err(error) => {
-                    log::warn!(
-                        "failed to load verbose opencode models; falling back to basic list: {error}"
-                    );
-                    match self.load_models_from_command().await {
-                        Ok(models) if !models.is_empty() => models,
-                        Ok(_) | Err(_) => self.models(),
-                    }
+                    log::warn!("读取 OpenCode provider 模型目录失败: {error:#}");
+                    self.models()
                 }
+            },
+            Err(error) => {
+                log::debug!("OpenCode endpoint 未绑定，使用静态模型目录: {error:#}");
+                self.models()
             }
         };
 
@@ -1522,10 +1623,10 @@ impl OpenCodeEngine {
     }
 
     pub async fn runtime_catalog(&self, cwd: &str) -> Result<OpenCodeRuntimeCatalogDto> {
-        let server = self.ensure_server(cwd).await?;
+        let connection = self.connection_for_cwd(cwd).await?;
         let result = async {
             let agents = self
-                .request(server.as_ref(), reqwest::Method::GET, "/agent")
+                .request(connection.as_ref(), reqwest::Method::GET, "/agent")
                 .send()
                 .await?
                 .error_for_status()
@@ -1535,7 +1636,7 @@ impl OpenCodeEngine {
                 .context("failed to parse OpenCode agents")?;
 
             let commands = self
-                .request(server.as_ref(), reqwest::Method::GET, "/command")
+                .request(connection.as_ref(), reqwest::Method::GET, "/command")
                 .send()
                 .await?
                 .error_for_status()
@@ -1545,7 +1646,7 @@ impl OpenCodeEngine {
                 .context("failed to parse OpenCode commands")?;
 
             let mcp = self
-                .request(server.as_ref(), reqwest::Method::GET, "/mcp")
+                .request(connection.as_ref(), reqwest::Method::GET, "/mcp")
                 .send()
                 .await?
                 .error_for_status()
@@ -1557,11 +1658,11 @@ impl OpenCodeEngine {
             Ok(OpenCodeRuntimeCatalogDto {
                 agents: map_runtime_agents(agents),
                 commands: map_runtime_commands(commands),
-                mcp_servers: map_runtime_mcp_servers(mcp),
+                mcp_servers: map_runtime_mcp_connections(mcp),
             })
         }
         .await;
-        self.stop_server_if_unused(cwd).await;
+        // OpenCode 服务由 CLI 生命周期持有，协议查询完成后不在客户端中停止。
         result
     }
 
@@ -1571,7 +1672,7 @@ impl OpenCodeEngine {
         search_term: Option<&str>,
         archived: Option<bool>,
     ) -> Result<Vec<OpenCodeRemoteSessionSummary>> {
-        let server = self.ensure_server(cwd).await?;
+        let connection = self.connection_for_cwd(cwd).await?;
         let result = async {
             let mut query = vec![
                 ("directory", cwd.to_string()),
@@ -1584,7 +1685,7 @@ impl OpenCodeEngine {
             }
 
             let sessions = self
-                .request(server.as_ref(), reqwest::Method::GET, "/session")
+                .request(connection.as_ref(), reqwest::Method::GET, "/session")
                 .query(&query)
                 .send()
                 .await?
@@ -1607,7 +1708,7 @@ impl OpenCodeEngine {
             Ok(summaries)
         }
         .await;
-        self.stop_server_if_unused(cwd).await;
+        // OpenCode 服务由 CLI 生命周期持有，协议查询完成后不在客户端中停止。
         result
     }
 
@@ -1616,12 +1717,12 @@ impl OpenCodeEngine {
         cwd: &str,
         session_id: &str,
     ) -> Result<OpenCodeRemoteSessionSummary> {
-        let server = self.ensure_server(cwd).await?;
+        let connection = self.connection_for_cwd(cwd).await?;
         let result = async {
             // 旧实现仅作架构迁移留痕，禁止恢复执行：
             // let session = self
             //     .request(
-            //         server.as_ref(),
+            //         connection.as_ref(),
             //         reqwest::Method::GET,
             //         &format!("/session/{session_id}"),
             //     )
@@ -1636,12 +1737,12 @@ impl OpenCodeEngine {
             // OpenCode 按 ID 查询只需要路径和现有 Basic 认证；这里不能附加目录头或 query。
             let url = format!(
                 "{}/session/{session_id}",
-                server.base_url.trim_end_matches('/')
+                connection.base_url.trim_end_matches('/')
             );
             let session = self
                 .http
                 .request(reqwest::Method::GET, url)
-                .headers(auth_headers(&server.password))
+                .headers(auth_headers(&connection.password))
                 .send()
                 .await?
                 .error_for_status()
@@ -1652,15 +1753,15 @@ impl OpenCodeEngine {
             Ok(map_session_record(session))
         }
         .await;
-        self.stop_server_if_unused(cwd).await;
+        // OpenCode 服务由 CLI 生命周期持有，协议查询完成后不在客户端中停止。
         result
     }
 
     pub async fn abort_session(&self, cwd: &str, session_id: &str) -> Result<()> {
-        let server = self.ensure_server(cwd).await?;
+        let connection = self.connection_for_cwd(cwd).await?;
         let result = self
             .request(
-                server.as_ref(),
+                connection.as_ref(),
                 reqwest::Method::POST,
                 &format!("/session/{session_id}/abort"),
             )
@@ -1669,7 +1770,7 @@ impl OpenCodeEngine {
             .error_for_status()
             .context("failed to abort OpenCode session")
             .map(|_| ());
-        self.stop_server_if_unused(cwd).await;
+        // OpenCode 服务由 CLI 生命周期持有，协议查询完成后不在客户端中停止。
         result
     }
 
@@ -1679,10 +1780,10 @@ impl OpenCodeEngine {
         session_id: &str,
         archived: bool,
     ) -> Result<()> {
-        let server = self.ensure_server(cwd).await?;
+        let connection = self.connection_for_cwd(cwd).await?;
         let result = self
             .patch_session_archive(
-                server.as_ref(),
+                connection.as_ref(),
                 session_id,
                 Some(if archived {
                     current_unix_time_millis()
@@ -1693,20 +1794,14 @@ impl OpenCodeEngine {
             .await;
 
         if result.is_ok() {
-            let removed = self.state.lock().await.sessions.remove(session_id);
-            if let Some(session) = removed {
-                self.stop_server_if_unused(&session.cwd).await;
-            }
+            let _ = self.state.lock().await.sessions.remove(session_id);
         }
-        self.stop_server_if_unused(cwd).await;
+        // OpenCode 服务由 CLI 生命周期持有，协议查询完成后不在客户端中停止。
         result
     }
 
     pub async fn forget_session(&self, session_id: &str) {
-        let removed = self.state.lock().await.sessions.remove(session_id);
-        if let Some(session) = removed {
-            self.stop_server_if_unused(&session.cwd).await;
-        }
+        let _ = self.state.lock().await.sessions.remove(session_id);
     }
 
     async fn resolve_session_reasoning_effort(
@@ -1720,69 +1815,26 @@ impl OpenCodeEngine {
         resolve_model_reasoning_effort(model, requested_effort)
     }
 
+    /*
+    旧实现通过本机 `opencode models` 命令读取模型目录，现由 HTTP provider 协议替代：
     async fn load_models_from_verbose_command(&self) -> Result<Vec<ModelInfo>> {
-        let executable =
-            resolve_opencode_executable().context("`opencode` executable not found")?;
-        let output = run_opencode_command(&executable, &["models", "--verbose"]).await?;
-        let records = parse_verbose_model_records(&output)?;
-        let mut models = Vec::new();
-
-        for (index, record) in records.into_iter().enumerate() {
-            if record.status.as_deref() == Some("deprecated") {
-                continue;
-            }
-            let slug = format!("{}/{}", record.provider_id, record.id);
-            if parse_model_slug(&slug).is_none() {
-                continue;
-            }
-            let modalities = model_modalities_from_capabilities(record.capabilities.as_ref());
-            let attachment_modalities =
-                attachment_modalities_from_capabilities(record.capabilities.as_ref());
-            models.push(model_info_with_metadata(
-                &slug,
-                &record.name,
-                "OpenCode model",
-                index == 0,
-                reasoning_efforts_from_variants(&record.variants),
-                modalities,
-                attachment_modalities,
-                model_limits(record.limit.as_ref()),
-            ));
-        }
-
-        Ok(models)
+        // 迁移留痕：不得在 OpenCodeEngine 中执行本机 CLI 命令。
+        anyhow::bail!("OpenCode 模型目录必须通过 HTTP provider 协议读取")
     }
 
     async fn load_models_from_command(&self) -> Result<Vec<ModelInfo>> {
-        let executable =
-            resolve_opencode_executable().context("`opencode` executable not found")?;
-        let output = run_opencode_command(&executable, &["models"]).await?;
-        let mut models = Vec::new();
-        for (index, line) in output.lines().enumerate() {
-            let slug = line.trim();
-            if parse_model_slug(slug).is_none() {
-                continue;
-            }
-            models.push(model_info(
-                slug,
-                slug,
-                "OpenCode model",
-                index == 0,
-                Vec::new(),
-                vec!["text".to_string()],
-            ));
-        }
-
-        Ok(models)
+        // 迁移留痕：不得在 OpenCodeEngine 中执行本机 CLI 命令。
+        anyhow::bail!("OpenCode 模型目录必须通过 HTTP provider 协议读取")
     }
+    */
 
     #[allow(dead_code)]
     async fn load_models_from_provider_endpoint(
         &self,
-        server: &OpenCodeServer,
+        connection: &OpenCodeConnection,
     ) -> Result<Vec<ModelInfo>> {
         let list = self
-            .request(server, reqwest::Method::GET, "/provider")
+            .request(connection, reqwest::Method::GET, "/provider")
             .send()
             .await?
             .error_for_status()?
@@ -1823,11 +1875,11 @@ impl OpenCodeEngine {
 
     async fn create_session(
         &self,
-        server: &OpenCodeServer,
+        connection: &OpenCodeConnection,
         permission_mode: OpenCodePermissionMode,
     ) -> Result<String> {
         let session = self
-            .request(server, reqwest::Method::POST, "/session")
+            .request(connection, reqwest::Method::POST, "/session")
             .json(&json!({
                 "permission": permission_rules(permission_mode),
             }))
@@ -1843,12 +1895,12 @@ impl OpenCodeEngine {
 
     async fn get_session(
         &self,
-        server: &OpenCodeServer,
+        connection: &OpenCodeConnection,
         session_id: &str,
     ) -> Result<OpenCodeSessionRecord> {
         let session = self
             .request(
-                server,
+                connection,
                 reqwest::Method::GET,
                 &format!("/session/{session_id}"),
             )
@@ -1864,12 +1916,12 @@ impl OpenCodeEngine {
 
     async fn patch_session_archive(
         &self,
-        server: &OpenCodeServer,
+        connection: &OpenCodeConnection,
         session_id: &str,
         archived: Option<i64>,
     ) -> Result<()> {
         self.request(
-            server,
+            connection,
             reqwest::Method::PATCH,
             &format!("/session/{session_id}"),
         )
@@ -1920,9 +1972,9 @@ impl OpenCodeEngine {
             let action = action.context("OpenCode 权限规则缺少最后匹配的全局规则")?;
             anyhow::ensure!(matches!(action, "allow" | "ask" | "deny"), "OpenCode 全局权限 action 无效");
         }
-        let server = self.ensure_server(cwd).await?;
+        let connection = self.connection_for_cwd(cwd).await?;
         self.request(
-            server.as_ref(),
+            connection.as_ref(),
             reqwest::Method::PATCH,
             &format!("/session/{session_id}"),
         )
@@ -1953,12 +2005,12 @@ impl OpenCodeEngine {
     async fn prompt_message(
         &self,
         engine_thread_id: &str,
-        server: &OpenCodeServer,
+        connection: &OpenCodeConnection,
         body: Value,
     ) -> Result<()> {
         let response = self
             .request(
-                server,
+                connection,
                 reqwest::Method::POST,
                 &opencode_prompt_message_path(engine_thread_id),
             )
@@ -1980,17 +2032,17 @@ impl OpenCodeEngine {
 
     fn request(
         &self,
-        server: &OpenCodeServer,
+        connection: &OpenCodeConnection,
         method: reqwest::Method,
         path: &str,
     ) -> reqwest::RequestBuilder {
-        let url = format!("{}{}", server.base_url.trim_end_matches('/'), path);
+        let url = format!("{}{}", connection.base_url.trim_end_matches('/'), path);
         let request = self
             .http
             .request(method, url)
-            .headers(auth_headers(&server.password));
-        if server.include_directory_header {
-            request.header("X-OpenCode-Directory", &server.cwd)
+            .headers(auth_headers(&connection.password));
+        if connection.include_directory_header {
+            request.header("X-OpenCode-Directory", &connection.cwd)
         } else {
             request
         }
@@ -2002,7 +2054,7 @@ impl OpenCodeEngine {
         event: &OpenCodeBusEvent,
         mapper: &mut OpenCodeTurnMapper,
         event_tx: &mpsc::Sender<EngineEvent>,
-        server: Arc<OpenCodeServer>,
+        connection: Arc<OpenCodeConnection>,
         matched: bool,
     ) {
         if event.event_type == "permission.asked" {
@@ -2098,7 +2150,7 @@ impl OpenCodeEngine {
                             engine_thread_id,
                             mapper,
                             event_tx,
-                            server.as_ref(),
+                            connection.as_ref(),
                         )
                         .await;
                         self.complete_after_idle(mapper, event_tx).await;
@@ -2111,7 +2163,7 @@ impl OpenCodeEngine {
                     engine_thread_id,
                     mapper,
                     event_tx,
-                    server.as_ref(),
+                    connection.as_ref(),
                 )
                 .await;
                 self.complete_after_idle(mapper, event_tx).await;
@@ -2143,7 +2195,7 @@ impl OpenCodeEngine {
             }
             "permission.asked" => {
                 mapper.content_seen = true;
-                self.handle_permission_asked(&event.properties, event_tx, server)
+                self.handle_permission_asked(&event.properties, event_tx, connection)
                     .await;
                 log::info!(
                     "OpenCode permission.asked handed to approval handler: engine_thread_id={}, request_id={:?}, permission={:?}, matched={}",
@@ -2155,7 +2207,7 @@ impl OpenCodeEngine {
             }
             "question.asked" => {
                 mapper.content_seen = true;
-                self.handle_question_asked(&event.properties, event_tx, server)
+                self.handle_question_asked(&event.properties, event_tx, connection)
                     .await;
             }
             _ => {}
@@ -2241,7 +2293,7 @@ impl OpenCodeEngine {
     /// 读取 OpenCode 单页消息；该请求同时兼容当前数组响应和带 cursor 的 data 响应。
     async fn fetch_session_message_page(
         &self,
-        server: &OpenCodeServer,
+        connection: &OpenCodeConnection,
         engine_thread_id: &str,
         limit: usize,
         order: Option<&str>,
@@ -2256,7 +2308,7 @@ impl OpenCodeEngine {
         }
         let response = self
             .request(
-                server,
+                connection,
                 reqwest::Method::GET,
                 &format!("/session/{engine_thread_id}/message"),
             )
@@ -2293,7 +2345,7 @@ impl OpenCodeEngine {
         cwd: &str,
         engine_thread_id: &str,
     ) -> Result<ThreadSyncSnapshot> {
-        let server = self.ensure_server(cwd).await?;
+        let connection = self.connection_for_cwd(cwd).await?;
         let result = timeout(OPENCODE_HISTORY_TIMEOUT, async {
             let mut all_messages = HashMap::<String, OpenCodeMessageWithParts>::new();
             let mut cursor = None::<String>;
@@ -2302,7 +2354,7 @@ impl OpenCodeEngine {
             loop {
                 let page = self
                     .fetch_session_message_page(
-                        server.as_ref(),
+                        connection.as_ref(),
                         engine_thread_id,
                         OPENCODE_HISTORY_PAGE_LIMIT,
                         cursor.is_none().then_some("asc"),
@@ -2669,7 +2721,7 @@ impl OpenCodeEngine {
         })
         .await
         .context("读取 OpenCode 会话历史超时")?;
-        self.stop_server_if_unused(cwd).await;
+        // OpenCode 服务由 CLI 生命周期持有，协议查询完成后不在客户端中停止。
         result
     }
 
@@ -2679,12 +2731,12 @@ impl OpenCodeEngine {
         engine_thread_id: &str,
         mapper: &mut OpenCodeTurnMapper,
         event_tx: &mpsc::Sender<EngineEvent>,
-        server: &OpenCodeServer,
+        connection: &OpenCodeConnection,
     ) {
         let result = timeout(
             OPENCODE_COMMAND_TIMEOUT,
             self.fetch_session_message_page(
-                server,
+                connection,
                 engine_thread_id,
                 OPENCODE_RECONCILE_MESSAGE_LIMIT,
                 None,
@@ -2857,7 +2909,7 @@ impl OpenCodeEngine {
         &self,
         properties: &Value,
         event_tx: &mpsc::Sender<EngineEvent>,
-        server: Arc<OpenCodeServer>,
+        connection: Arc<OpenCodeConnection>,
     ) {
         let session_id = properties.get("sessionID").and_then(Value::as_str);
         let permission = properties
@@ -2900,7 +2952,7 @@ impl OpenCodeEngine {
         if let Some(reply) = automatic_reply {
             let result = async {
                 self.request(
-                    server.as_ref(),
+                    connection.as_ref(),
                     reqwest::Method::POST,
                     &format!("/permission/{request_id}/reply"),
                 )
@@ -2944,13 +2996,13 @@ impl OpenCodeEngine {
             .get("patterns")
             .cloned()
             .unwrap_or_else(|| json!([]));
-        let cwd = server.cwd.clone();
+        let cwd = connection.cwd.clone();
 
         self.state.lock().await.pending_requests.insert(
             approval_id.clone(),
             PendingOpenCodeRequest::Permission {
                 request_id: request_id.to_string(),
-                server,
+                connection,
             },
         );
         log::info!(
@@ -3007,7 +3059,7 @@ impl OpenCodeEngine {
         &self,
         properties: &Value,
         event_tx: &mpsc::Sender<EngineEvent>,
-        server: Arc<OpenCodeServer>,
+        connection: Arc<OpenCodeConnection>,
     ) {
         let Some(request_id) = properties.get("id").and_then(Value::as_str) else {
             return;
@@ -3018,14 +3070,14 @@ impl OpenCodeEngine {
             .and_then(|value| serde_json::from_value::<Vec<OpenCodeQuestionInfo>>(value).ok())
             .unwrap_or_default();
         let approval_id = format!("opencode-question-{request_id}");
-        let cwd = server.cwd.clone();
+        let cwd = connection.cwd.clone();
 
         self.state.lock().await.pending_requests.insert(
             approval_id.clone(),
             PendingOpenCodeRequest::Question {
                 request_id: request_id.to_string(),
                 questions: questions.clone(),
-                server,
+                connection,
             },
         );
 
@@ -3055,7 +3107,8 @@ impl OpenCodeEngine {
     }
 }
 
-impl OpenCodeServer {
+impl OpenCodeConnection {
+    /// 取消当前协议连接的事件泵和回调任务，不触碰 CLI 服务进程生命周期。
     async fn stop(&self) {
         if let Some(pump_cancel) = self.pump_cancel.as_ref() {
             pump_cancel.cancel();
@@ -3063,12 +3116,14 @@ impl OpenCodeServer {
         if let Some(callback_cancel) = self.callback_cancel.as_ref() {
             callback_cancel.cancel();
         }
+        /*
+        旧实现曾在协议连接中停止本机 OpenCode 进程并清理运行目录：
         let mut child = self.child.lock().await;
         let Some(mut process) = child.take() else {
             return;
         };
         if let Err(error) = process.kill().await {
-            log::debug!("failed to stop OpenCode server process: {error}");
+            log::debug!("failed to stop OpenCode connection process: {error}");
         }
         if let Some(run_dir) = self.run_dir.as_ref() {
             if let Err(error) = std::fs::remove_dir_all(run_dir) {
@@ -3080,6 +3135,8 @@ impl OpenCodeServer {
                 }
             }
         }
+        该职责已迁移到 LocalCliServiceLifecycle，协议客户端只取消自己的事件任务。
+        */
     }
 }
 
@@ -3259,8 +3316,8 @@ fn map_runtime_commands(commands: Vec<OpenCodeRuntimeCommand>) -> Vec<OpenCodeCo
         .collect()
 }
 
-fn map_runtime_mcp_servers(mcp: HashMap<String, Value>) -> Vec<OpenCodeMcpServerDto> {
-    let mut servers = mcp
+fn map_runtime_mcp_connections(mcp: HashMap<String, Value>) -> Vec<OpenCodeMcpServerDto> {
+    let mut connections = mcp
         .into_iter()
         .map(|(name, raw)| {
             let status = raw
@@ -3282,8 +3339,8 @@ fn map_runtime_mcp_servers(mcp: HashMap<String, Value>) -> Vec<OpenCodeMcpServer
             }
         })
         .collect::<Vec<_>>();
-    servers.sort_by(|a, b| a.name.cmp(&b.name));
-    servers
+    connections.sort_by(|a, b| a.name.cmp(&b.name));
+    connections
 }
 
 fn map_session_record(session: OpenCodeSessionRecord) -> OpenCodeRemoteSessionSummary {
@@ -4275,11 +4332,13 @@ async fn write_opencode_http_response(stream: &mut tokio::net::TcpStream, status
     let _ = stream.write_all(&payload).await;
 }
 
+/*
+旧实现由 LocalCliServiceLifecycle 接管，保留源码作为迁移留痕：
 async fn start_server(
     cwd: &str,
     mcp_gateway_endpoint: Option<&str>,
     mcp_gateway_token: Option<&str>,
-) -> Result<OpenCodeServer> {
+) -> Result<OpenCodeConnection> {
     let executable = resolve_opencode_executable().context("`opencode` executable not found")?;
     let port = allocate_loopback_port()?;
     let password = Uuid::new_v4().to_string();
@@ -4365,7 +4424,7 @@ async fn start_server(
 
     let mut child = command.spawn().with_context(|| {
         format!(
-            "failed to spawn OpenCode server at {}",
+            "failed to spawn OpenCode connection at {}",
             executable.display()
         )
     })?;
@@ -4406,15 +4465,15 @@ async fn start_server(
 
     let base_url = timeout(OPENCODE_STARTUP_TIMEOUT, ready_rx)
         .await
-        .context("timed out waiting for OpenCode server startup")?
-        .context("OpenCode server exited before startup completed")?;
+        .context("timed out waiting for OpenCode connection startup")?
+        .context("OpenCode connection exited before startup completed")?;
 
     let (event_bus, _) =
         broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
     let pump_cancel = CancellationToken::new();
     // 保留服务器结构中的取消令牌；旧 callback 服务器已停用，不再启动额外回调任务。
     let callback_cancel = CancellationToken::new();
-    let server = OpenCodeServer {
+    let connection = OpenCodeConnection {
         cwd: cwd.to_string(),
         base_url,
         password,
@@ -4426,10 +4485,10 @@ async fn start_server(
         include_directory_header: false,
     };
 
-    wait_for_server_health(&server).await?;
+    wait_for_server_health(&connection).await?;
 
-    let pump_url = server.base_url.clone();
-    let pump_password = server.password.clone();
+    let pump_url = connection.base_url.clone();
+    let pump_password = connection.password.clone();
     let pump_http = reqwest::Client::new();
     tokio::spawn(async move {
         run_event_pump(
@@ -4445,9 +4504,9 @@ async fn start_server(
 
     // 旧 callback 工具服务器和动态工具文件已停用，MCP 请求统一经过 Gateway。
 
-    Ok(server)
+    Ok(connection)
 }
-
+*/
 async fn run_event_pump(
     base_url: String,
     password: String,
@@ -4585,16 +4644,18 @@ async fn run_event_pump(
     }
 }
 
-async fn wait_for_server_health(server: &OpenCodeServer) -> Result<()> {
+/*
+旧实现中的本机健康等待、端口分配、可执行文件解析和命令执行均已迁移到 LocalCliServiceLifecycle：
+async fn wait_for_server_health(connection: &OpenCodeConnection) -> Result<()> {
     let client = reqwest::Client::new();
     let started = Instant::now();
     loop {
         let result = client
             .get(format!(
                 "{}/global/health",
-                server.base_url.trim_end_matches('/')
+                connection.base_url.trim_end_matches('/')
             ))
-            .headers(auth_headers(&server.password))
+            .headers(auth_headers(&connection.password))
             .send()
             .await;
         if let Ok(response) = result {
@@ -4606,7 +4667,7 @@ async fn wait_for_server_health(server: &OpenCodeServer) -> Result<()> {
             }
         }
         if started.elapsed() > OPENCODE_HEALTH_TIMEOUT {
-            anyhow::bail!("OpenCode server did not become healthy");
+            anyhow::bail!("OpenCode connection did not become healthy");
         }
         sleep(Duration::from_millis(100)).await;
     }
@@ -4616,7 +4677,7 @@ fn allocate_loopback_port() -> Result<u16> {
     let listener = TcpListener::bind((DEFAULT_HOST, 0))?;
     Ok(listener.local_addr()?.port())
 }
-
+*/
 fn auth_headers(password: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let token = general_purpose::STANDARD.encode(format!("opencode:{password}"));
@@ -4626,6 +4687,8 @@ fn auth_headers(password: &str) -> HeaderMap {
     headers
 }
 
+/*
+旧实现中的本机可执行文件解析和命令执行已迁移到 LocalCliServiceLifecycle：
 fn resolve_opencode_executable() -> Option<PathBuf> {
     runtime_env::resolve_executable("opencode")
 }
@@ -4654,7 +4717,7 @@ async fn run_opencode_command(executable: &Path, args: &[&str]) -> Result<String
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
-
+*/
 fn parse_verbose_model_records(output: &str) -> Result<Vec<OpenCodeVerboseModel>> {
     let mut records = Vec::new();
     let mut pending_slug: Option<String> = None;
@@ -5056,6 +5119,8 @@ fn opencode_sort_prefix_for_millis(now_ms: u64, counter: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::engines::TurnAttachment;
 
@@ -5065,8 +5130,6 @@ mod tests {
         OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
-            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
-            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
@@ -5127,7 +5190,7 @@ mod tests {
         };
 
         let engine = test_remote_engine(base_url);
-        let server = engine.ensure_server("/var/work/project-a").await.unwrap();
+        let connection = engine.connection_for_cwd("/var/work/project-a").await.unwrap();
         engine.state.lock().await.sessions.insert(
             "ses_test".to_string(),
             OpenCodeSession {
@@ -5136,7 +5199,7 @@ mod tests {
                 reasoning_effort: None,
                 agent: None,
                 permission_mode: mode,
-                server: server.clone(),
+                connection: connection.clone(),
             },
         );
 
@@ -5150,7 +5213,7 @@ mod tests {
                     "patterns": ["*"]
                 }),
                 &event_tx,
-                server,
+                connection,
             )
             .await;
         drop(event_tx);
@@ -5195,9 +5258,9 @@ mod tests {
         );
         assert!(engine.is_available().await);
 
-        let server = engine.ensure_server("/var/work/project-a").await.unwrap();
+        let connection = engine.connection_for_cwd("/var/work/project-a").await.unwrap();
         let request = engine
-            .request(server.as_ref(), reqwest::Method::GET, "/provider")
+            .request(connection.as_ref(), reqwest::Method::GET, "/provider")
             .build()
             .unwrap();
 
@@ -5210,7 +5273,7 @@ mod tests {
         );
         assert!(request.headers().contains_key(AUTHORIZATION));
 
-        let machine_server = engine.ensure_server("").await.unwrap();
+        let machine_server = engine.connection_for_cwd("").await.unwrap();
         let machine_model_request = engine
             .request(machine_server.as_ref(), reqwest::Method::GET, "/provider")
             .build()
@@ -5287,8 +5350,6 @@ mod tests {
         let engine = OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
-            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
-            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
@@ -5300,14 +5361,14 @@ mod tests {
             })),
         };
 
-        let project_a = engine.ensure_server("/var/work/project-a").await.unwrap();
-        let project_b = engine.ensure_server("/var/work/project-b").await.unwrap();
+        let project_a = engine.connection_for_cwd("/var/work/project-a").await.unwrap();
+        let project_b = engine.connection_for_cwd("/var/work/project-b").await.unwrap();
         let mut directories = timeout(Duration::from_secs(2), server_task)
             .await
             .expect("workspace event pumps did not connect")
             .unwrap();
-        project_a.stop().await;
-        project_b.stop().await;
+        project_a.cancel_event_pump();
+        project_b.cancel_event_pump();
 
         directories.sort();
         assert_eq!(
@@ -5361,8 +5422,6 @@ mod tests {
         let engine = OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
-            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
-            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
@@ -5401,8 +5460,6 @@ mod tests {
         let engine = OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
-            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
-            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
@@ -5472,8 +5529,6 @@ mod tests {
         let engine = OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
-            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
-            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
@@ -5484,7 +5539,7 @@ mod tests {
                 workspace_event_pump_enabled: false,
             })),
         };
-        let server = engine.ensure_server("/var/work/project-a").await.unwrap();
+        let connection = engine.connection_for_cwd("/var/work/project-a").await.unwrap();
         engine.state.lock().await.sessions.insert(
             "ses_test".to_string(),
             OpenCodeSession {
@@ -5493,7 +5548,7 @@ mod tests {
                 reasoning_effort: None,
                 agent: None,
                 permission_mode: OpenCodePermissionMode::Ask,
-                server,
+                connection,
             },
         );
         engine
@@ -5562,7 +5617,7 @@ mod tests {
         });
 
         let engine = test_remote_engine(format!("http://{address}"));
-        let server = engine.ensure_server("/var/work/project-a").await.unwrap();
+        let connection = engine.connection_for_cwd("/var/work/project-a").await.unwrap();
         engine.state.lock().await.sessions.insert(
             "ses_empty".to_string(),
             OpenCodeSession {
@@ -5571,7 +5626,7 @@ mod tests {
                 reasoning_effort: None,
                 agent: None,
                 permission_mode: initial_mode,
-                server,
+                connection,
             },
         );
         engine
@@ -5619,8 +5674,6 @@ mod tests {
         let engine = OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
-            mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
-            mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
             auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
@@ -5631,7 +5684,7 @@ mod tests {
                 workspace_event_pump_enabled: false,
             })),
         };
-        let server = engine.ensure_server("/var/work/project-a").await.unwrap();
+        let connection = engine.connection_for_cwd("/var/work/project-a").await.unwrap();
         engine.state.lock().await.sessions.insert(
             "ses_test".to_string(),
             OpenCodeSession {
@@ -5640,7 +5693,7 @@ mod tests {
                 reasoning_effort: None,
                 agent: None,
                 permission_mode: OpenCodePermissionMode::Ask,
-                server,
+                connection,
             },
         );
         assert!(engine
@@ -6354,6 +6407,8 @@ opencode/gpt-5-nano
         shutdown.expect("CUA SDK should shut down");
     }
 
+    /*
+    旧集成测试依赖 Engine 内部启动 OpenCode 服务，现由 LocalCliServiceLifecycle 负责，保留源码作为迁移留痕：
     #[cfg(target_os = "windows")]
     #[tokio::test]
     #[ignore = "requires CUA and OpenCode runtime"]
@@ -6368,7 +6423,7 @@ opencode/gpt-5-nano
             "auracoder-opencode-tool-ids-{}",
             Uuid::new_v4()
         ));
-        let mut server = None;
+        let mut connection = None;
 
         let result = async {
             sdk.initialize().map_err(anyhow::Error::msg)?;
@@ -6376,10 +6431,10 @@ opencode/gpt-5-nano
             let specs = service.sdk_tool_specs().map_err(anyhow::Error::msg)?;
             anyhow::ensure!(!specs.is_empty(), "CUA tool catalog is empty");
             std::fs::create_dir_all(&run_dir)?;
-            server = Some(start_server(&run_dir.to_string_lossy(), None, None).await?);
-            let active_server = server
+            connection = Some(start_server(&run_dir.to_string_lossy(), None, None).await?);
+            let active_server = connection
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("OpenCode server was not created"))?;
+                .ok_or_else(|| anyhow::anyhow!("OpenCode connection was not created"))?;
             let response = reqwest::Client::new()
                 .get(format!(
                     "{}/experimental/tool/ids",
@@ -6444,8 +6499,8 @@ opencode/gpt-5-nano
         }
         .await;
 
-        if let Some(active_server) = server.as_ref() {
-            active_server.stop().await;
+        if let Some(active_server) = connection.as_ref() {
+            active_server.cancel_event_pump();
         }
         let shutdown = sdk.shutdown();
         let cleanup = std::fs::remove_dir_all(&run_dir);
@@ -6455,7 +6510,7 @@ opencode/gpt-5-nano
         shutdown.expect("CUA SDK should shut down");
         cleanup.expect("temporary OpenCode cwd should be removed");
     }
-
+    */
     #[test]
     fn opencode_schema_source_supports_zod_types_constraints_and_errors() {
         let schema = json!({

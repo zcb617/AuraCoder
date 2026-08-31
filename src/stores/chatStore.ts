@@ -1969,6 +1969,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       // Clean up any background listener for this thread before re-subscribing
       cleanupBackgroundListener(threadId);
+      if (bindSeq !== activeThreadBindSeq) {
+        return;
+      }
+      set({
+        threadId,
+        messages: [],
+        olderCursor: null,
+        hasOlderMessages: false,
+        loadingOlderMessages: false,
+        olderLoadBlockedUntil: 0,
+        unlisten: undefined,
+        streaming: false,
+        preparingEngineId: null,
+        preparingAttachments: false,
+        turnStartedAt: null,
+        status: "idle",
+        usageLimits: null,
+        usageLimitsLoading: false,
+        error: undefined,
+      });
 
       const threadState = useThreadStore.getState();
       let activeThread = threadState.threads.find((thread) => thread.id === threadId);

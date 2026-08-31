@@ -7,7 +7,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+// 旧 OpenCode Tunnel HTTP 会话读取函数仅保留在下方注释中：
+// use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures::{SinkExt, StreamExt};
 use rusqlite::{params_from_iter, types::Value as SqlValue};
 use serde_json::{json, Value};
@@ -23,11 +24,13 @@ use crate::{
         SshRemoteProjectSessionsRefreshedEvent,
     },
     models::{ThreadStatusDto, WorkspaceDto},
-    path_utils, runtime_env,
-    ssh::{
-        cli_service_lifecycle,
-        cli_tunnel_registry::{self, SshCliTunnel},
-    },
+    path_utils,
+    runtime_env,
+    // 旧会话刷新入口曾直接使用 SSH CLI 生命周期和 Tunnel；现由 CliTool 统一接口负责：
+    // ssh::{
+    //     cli_service_lifecycle,
+    //     cli_tunnel_registry::{self, SshCliTunnel},
+    // },
     state::AppState,
 };
 
@@ -134,30 +137,57 @@ pub async fn refresh_ssh_remote_project_sessions(
         .as_deref()
         .context("SSH workspace has no connection id")?
         .to_string();
-    let tunnels = cli_tunnel_registry::list_by_host(&connection_id).await;
-    let mut cli_ids = tunnels.keys().cloned().collect::<Vec<_>>();
-    cli_ids.sort();
+    let state = app.state::<AppState>();
+    let factory = CliToolFactory::new(state.inner().clone());
+    let context = CliExecutionContext::from_workspace(&workspace)?;
+    let mut cli_ids = Vec::new();
     let mut report = SshRemoteProjectSessionRefreshReport {
         workspace_id: workspace_id.to_string(),
         succeeded_cli_ids: Vec::new(),
         failed_cli_ids: Vec::new(),
     };
-    for cli_id in cli_ids {
-        match cli_id.as_str() {
-            "codex" | "opencode" | "claude" => {
-                match sync_cli(app, &workspace, Some(&connection_id), &cli_id, db.clone()).await {
-                    Ok(()) => report.succeeded_cli_ids.push(cli_id),
-                    Err(error) => {
-                        log::warn!(
-                            "同步 SSH 远端 CLI 失败: workspace_id={} cli_id={} error={error:#}",
-                            workspace_id,
-                            cli_id
-                        );
-                        report.failed_cli_ids.push(cli_id);
-                    }
-                }
+
+    for cli_id in ["codex", "opencode", "claude"] {
+        let cli = match factory.create(cli_id) {
+            Ok(cli) => cli,
+            Err(error) => {
+                log::warn!(
+                    "创建 SSH 远端 CLI 统一接口失败: connection_id={} cli_id={} error={error:#}",
+                    connection_id,
+                    cli_id,
+                );
+                report.failed_cli_ids.push(cli_id.to_string());
+                continue;
             }
-            other => log::debug!("跳过未支持 SSH 远端 CLI: {other}"),
+        };
+        match cli.ensure_service(&context).await {
+            Ok(()) => cli_ids.push(cli_id.to_string()),
+            Err(error) => {
+                log::warn!(
+                    "确保 SSH 远端 CLI 服务失败: connection_id={} cli_id={} error={error:#}",
+                    connection_id,
+                    cli_id,
+                );
+            }
+        }
+    }
+
+    for cli_id in cli_ids {
+        if let Err(error) =
+            notify_app_startup_progress(app, "syncing-remote-sessions", "正在同步远端会话……")
+        {
+            log::warn!("发送启动进度失败: {error:#}");
+        }
+        match sync_cli(app, &workspace, &cli_id, db.clone()).await {
+            Ok(()) => report.succeeded_cli_ids.push(cli_id),
+            Err(error) => {
+                log::warn!(
+                    "同步 SSH 远端 CLI 失败: workspace_id={} cli_id={} error={error:#}",
+                    workspace_id,
+                    cli_id
+                );
+                report.failed_cli_ids.push(cli_id);
+            }
         }
     }
     if let Err(error) = notify_ssh_remote_project_sessions_refreshed(
@@ -223,7 +253,7 @@ pub async fn refresh_local_project_sessions(
         failed_cli_ids: Vec::new(),
     };
     for cli_id in ["codex", "opencode", "claude"] {
-        match sync_cli(app, &workspace, None, cli_id, db.clone()).await {
+        match sync_cli(app, &workspace, cli_id, db.clone()).await {
             Ok(()) => report.succeeded_cli_ids.push(cli_id.to_string()),
             Err(error) => {
                 log::warn!(
@@ -241,13 +271,13 @@ pub async fn refresh_local_project_sessions(
 async fn sync_cli(
     app: &AppHandle,
     workspace: &WorkspaceDto,
-    connection_id: Option<&str>,
     cli_id: &str,
     db: Arc<Database>,
 ) -> Result<()> {
+    /*
+    旧实现会在会话扫描前直接登记 SSH 常驻服务，现由外层 refresh_ssh_remote_project_sessions
+    通过 CliTool::ensure_service 完成，避免同步业务绕过 CLI 实现和生命周期边界：
     if let Some(connection_id) = connection_id {
-        // 会话扫描前先登记常驻服务。应用启动时首次建立服务并写入 Map，后续刷新复用
-        // 已登记的服务；CLI 实现仍走各自的读取逻辑，但服务不会因一次扫描结束而关闭。
         cli_service_lifecycle::set(connection_id, cli_id)
             .await
             .with_context(|| {
@@ -255,13 +285,13 @@ async fn sync_cli(
                     "启动并登记 SSH 远端 CLI 服务失败: connection_id={connection_id} cli_id={cli_id}"
                 )
             })?;
-
         if let Err(error) =
             notify_app_startup_progress(app, "syncing-remote-sessions", "正在同步远端会话……")
         {
             log::warn!("发送启动进度失败: {error:#}");
         }
     }
+    */
 
     if cli_id == "codex" {
         let state = app.state::<AppState>();
@@ -678,6 +708,9 @@ fn parse_codex_session(value: &Value, expected_cwd: &str) -> Option<(RemoteSessi
     ))
 }
 
+/*
+旧 OpenCode 会话读取直接访问 Tunnel 和 HTTP 服务，现由 OpenCodeCli::list_sessions
+统一处理；保留旧实现作为迁移留痕，不参与编译。
 async fn list_opencode_sessions(
     tunnel: &SshCliTunnel,
     cwd: &str,
@@ -703,6 +736,7 @@ async fn list_opencode_sessions(
         .filter_map(|value| parse_opencode_session(value, cwd))
         .collect())
 }
+*/
 
 fn parse_opencode_session(value: &Value, expected_cwd: &str) -> Option<RemoteSessionSnapshot> {
     let cwd = string_field(value, &["directory", "cwd"])?;

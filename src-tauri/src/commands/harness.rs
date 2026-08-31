@@ -6,6 +6,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
+use crate::cli_tools::{factory::CliToolFactory, CliExecutionContext, CliLocationKind};
 use crate::config::app_config::AppConfig;
 use crate::models::{HarnessInfo, HarnessReport, InstallProgressEvent, InstallResult};
 use crate::process_utils;
@@ -179,10 +180,15 @@ async fn detect_harnesses() -> Result<HarnessReport, String> {
 }
 
 #[tauri::command]
-pub async fn check_harnesses() -> Result<HarnessReport, String> {
+pub async fn check_harnesses(state: State<'_, AppState>) -> Result<HarnessReport, String> {
     let mut report = detect_harnesses().await?;
-    let local_services =
-        crate::local_cli_service_lifecycle::LocalCliServiceLifecycle::list_ready().await;
+    let factory = CliToolFactory::new(state.inner().clone());
+    let context = CliExecutionContext {
+        workspace_id: String::new(),
+        root_path: String::new(),
+        location_kind: CliLocationKind::Local,
+        ssh_connection_id: None,
+    };
 
     for harness in &mut report.harnesses {
         let lifecycle_cli_id = match harness.id.as_str() {
@@ -191,11 +197,28 @@ pub async fn check_harnesses() -> Result<HarnessReport, String> {
             "claude-code" => Some("claude"),
             _ => None,
         };
-        if let Some(cli_id) = lifecycle_cli_id {
-            harness.found = local_services
-                .iter()
-                .any(|service| service.cli_id() == cli_id);
-        }
+        let Some(cli_id) = lifecycle_cli_id else {
+            continue;
+        };
+        harness.found = match factory.create(cli_id) {
+            Ok(cli) => match cli.is_service_ready(&context).await {
+                Ok(ready) => ready,
+                Err(error) => {
+                    log::warn!(
+                        "查询本机 CLI 服务状态失败，按未找到处理: cli_id={} error={error:#}",
+                        cli_id,
+                    );
+                    false
+                }
+            },
+            Err(error) => {
+                log::warn!(
+                    "创建本机 CLI 统一接口失败，按未找到处理: cli_id={} error={error:#}",
+                    cli_id,
+                );
+                false
+            }
+        };
     }
 
     Ok(report)

@@ -2,7 +2,7 @@ use std::{
     // 旧实现把各 CLI 的客户端 Engine 缓存在远端服务生命周期中，造成客户端层与
     // 远端服务端生命周期层混合。客户端对象现在由各 CLI 实现自己的运行服务管理。
     // any::Any,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, LazyLock,
@@ -16,7 +16,7 @@ use crate::{
     cli_tools::{factory::CliToolFactory, CliLocationKind, CliMcpRuntime, CliTool},
     mcp_gateway::AuraCoderMcpGateway,
     message_notify_helper::CliHealthReconcileResult,
-    ssh::cli_tunnel_registry::{self, SshCliTunnel},
+    ssh::cli_tunnel_registry::{self, SshCliTunnel, SshConnectionRecord},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,6 +189,32 @@ pub async fn list_ready(connection_id: &str) -> Vec<Arc<SshCliService>> {
 /// 启动并登记一个远端 CLI 服务。相同“连接配置 ID + CLI ID”重复调用时复用已有服务。
 pub async fn set(connection_id: &str, cli_id: &str) -> anyhow::Result<Arc<SshCliService>> {
     SSH_CLI_SERVICES.set(connection_id, cli_id).await
+}
+
+/// 根据 SSH 连接记录建立当前 CLI Tunnel，并登记、启动对应远端 CLI 服务。
+pub(crate) async fn register_service(
+    record: &SshConnectionRecord,
+    cli_id: &str,
+) -> anyhow::Result<()> {
+    let versions = BTreeMap::from([(cli_id.to_string(), String::new())]);
+    let (restored_cli_ids, errors) =
+        cli_tunnel_registry::register_cli_tunnels(record, &versions).await;
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "注册 SSH CLI Tunnel 失败: connection_id={} cli_id={} errors={}",
+            record.dto.id,
+            cli_id,
+            errors.join("; ")
+        );
+    }
+    anyhow::ensure!(
+        restored_cli_ids.iter().any(|restored| restored == cli_id),
+        "SSH CLI Tunnel 注册结果缺少当前 CLI: connection_id={} cli_id={}",
+        record.dto.id,
+        cli_id
+    );
+    set(&record.dto.id, cli_id).await?;
+    Ok(())
 }
 
 /// 为 SSH CLI 当前轮次登记 AuraCoder MCP Gateway 可信上下文。

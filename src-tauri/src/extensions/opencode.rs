@@ -16,7 +16,7 @@ use super::cli;
 const PROVIDER_ID: &str = "opencode";
 
 pub async fn refresh_kind(
-    manager: &EngineManager,
+    _manager: &EngineManager,
     cwd: Option<&str>,
     kind: &str,
 ) -> ExtensionCatalogKindRefreshDto {
@@ -44,27 +44,34 @@ pub async fn refresh_kind(
             }
         }
         "mcp" => {
-            let config_args = vec!["debug".to_string(), "config".to_string()];
-            let runtime_future = async {
-                match cwd {
-                    Some(cwd) => manager.opencode_runtime_catalog(cwd).await,
-                    None => Ok(OpenCodeRuntimeCatalogDto::default()),
-                }
-            };
-            let (config_result, runtime_result) =
-                tokio::join!(cli::run_json("opencode", &config_args, cwd), runtime_future,);
-            match (config_result, runtime_result) {
-                (Ok(config), Ok(runtime)) => {
-                    let mut items = parse_config(&config)
-                        .into_iter()
-                        .filter(|item| item.kind == "mcp")
-                        .map(|item| (item_key(&item), item))
-                        .collect::<BTreeMap<_, _>>();
-                    merge_runtime_mcp(&mut items, runtime);
-                    ExtensionCatalogKindRefreshDto::success(kind, items.into_values().collect())
-                }
-                _ => ExtensionCatalogKindRefreshDto::failure(kind),
-            }
+            refresh_kind_with_runtime(cwd, kind, Ok(OpenCodeRuntimeCatalogDto::default())).await
+        }
+        _ => ExtensionCatalogKindRefreshDto::failure(kind),
+    }
+}
+
+/// 使用调用方已经从 OpenCode 协议客户端取得的运行时目录刷新 MCP 扩展。
+///
+/// 扩展模块只负责配置解析和目录合并，不获取 CLI 生命周期或 EngineManager 运行时句柄。
+pub async fn refresh_kind_with_runtime(
+    cwd: Option<&str>,
+    kind: &str,
+    runtime_result: Result<OpenCodeRuntimeCatalogDto>,
+) -> ExtensionCatalogKindRefreshDto {
+    if kind != "mcp" {
+        return ExtensionCatalogKindRefreshDto::failure(kind);
+    }
+    let config_args = vec!["debug".to_string(), "config".to_string()];
+    let config_result = cli::run_json("opencode", &config_args, cwd).await;
+    match (config_result, runtime_result) {
+        (Ok(config), Ok(runtime)) => {
+            let mut items = parse_config(&config)
+                .into_iter()
+                .filter(|item| item.kind == "mcp")
+                .map(|item| (item_key(&item), item))
+                .collect::<BTreeMap<_, _>>();
+            merge_runtime_mcp(&mut items, runtime);
+            ExtensionCatalogKindRefreshDto::success(kind, items.into_values().collect())
         }
         _ => ExtensionCatalogKindRefreshDto::failure(kind),
     }

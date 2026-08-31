@@ -1,23 +1,436 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    net::TcpListener,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, LazyLock,
     },
+    time::{Duration, Instant},
 };
 
-use anyhow::Context;
-use tokio::sync::{Mutex, RwLock};
-
-use crate::engines::{
-    claude_sidecar::ClaudeSidecarEngine, codex::CodexEngine, opencode::OpenCodeEngine,
+use anyhow::{Context, Result};
+use serde_json::Value;
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::{Child, Command},
+    sync::{Mutex, RwLock},
+    time::{sleep, timeout},
 };
+use uuid::Uuid;
+
+use crate::engines::{claude_sidecar::ClaudeSidecarEngine, codex::CodexEngine};
 use crate::{
     cli_tools::{factory::CliToolFactory, CliLocationKind, CliMcpRuntime, CliTool},
     commands::harness::detect_via_login_shell, mcp_gateway::AuraCoderMcpGateway,
-    message_notify_helper::CliHealthReconcileResult, runtime_env,
+    message_notify_helper::CliHealthReconcileResult, process_utils, runtime_env,
 };
+
+/// OpenCode 本机服务启动后提供给协议客户端的连接信息。
+///
+/// 该对象只携带 HTTP 连接参数和生命周期代数，不向业务层暴露子进程或运行目录。
+#[derive(Clone, Debug)]
+pub(crate) struct LocalOpenCodeEndpoint {
+    /// 本机 OpenCode HTTP 服务的基础地址。
+    pub(crate) base_url: String,
+    /// 本机 OpenCode HTTP 服务的 Basic Auth 密码。
+    pub(crate) password: String,
+    /// 启动服务对应的 OpenCode CLI 版本文本。
+    pub(crate) version: Option<String>,
+    /// 本机 OpenCode 服务实例的生命周期代数。
+    pub(crate) generation: u64,
+}
+
+/// 一个按项目目录登记的本机 OpenCode 服务进程。
+///
+/// 该类型只在本机 CLI 生命周期内部使用，负责子进程、隔离运行目录和终止清理。
+struct LocalOpenCodeService {
+    /// 服务启动时绑定的项目目录。
+    cwd: String,
+    /// 服务 HTTP 基础地址。
+    base_url: String,
+    /// 服务 Basic Auth 密码。
+    password: String,
+    /// 启动服务对应的 OpenCode CLI 版本文本。
+    version: Option<String>,
+    /// 服务生命周期代数，用于识别重启后的新实例。
+    generation: u64,
+    /// 服务子进程句柄。
+    child: Mutex<Option<Child>>,
+    /// 服务隔离配置和运行文件所在目录。
+    run_dir: PathBuf,
+}
+
+impl LocalOpenCodeService {
+    /// 将内部服务状态转换为不含进程句柄的协议连接信息。
+    fn endpoint(&self) -> LocalOpenCodeEndpoint {
+        LocalOpenCodeEndpoint {
+            base_url: self.base_url.clone(),
+            password: self.password.clone(),
+            version: self.version.clone(),
+            generation: self.generation,
+        }
+    }
+
+    /// 终止本机 OpenCode 服务并清理其任务与隔离运行目录。
+    async fn terminate(&self) -> Result<()> {
+        let mut child = self.child.lock().await;
+        if let Some(mut process) = child.take() {
+            if let Err(error) = process.kill().await {
+                log::warn!("停止本机 OpenCode 服务进程失败: {error}");
+            }
+        }
+        drop(child);
+        if let Err(error) = std::fs::remove_dir_all(&self.run_dir) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(
+                    "清理本机 OpenCode 隔离运行目录失败: path={} error={error}",
+                    self.run_dir.display()
+                );
+                return Err(error).with_context(|| {
+                    format!("清理本机 OpenCode 隔离运行目录失败: {}", self.run_dir.display())
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 本机 OpenCode CLI 生命周期句柄。
+///
+/// 该句柄按 cwd 复用已经启动的服务，并在生命周期终止时统一结束全部服务；
+/// 协议解析和会话业务仍由 OpenCodeEngine 负责。
+pub(crate) struct LocalOpenCodeServiceHandle {
+    /// 按项目目录登记的本机 OpenCode 服务表。
+    services: Mutex<HashMap<String, Arc<LocalOpenCodeService>>>,
+    /// 保护服务创建、复用和终止的并发互斥锁。
+    mutation_lock: Mutex<()>,
+    /// MCP Gateway 的 HTTP 地址，用于写入隔离 OpenCode 配置。
+    mcp_gateway_endpoint: String,
+    /// MCP Gateway 的本地 CLI 私有租约 Token。
+    mcp_gateway_token: String,
+}
+
+static NEXT_OPENCODE_SERVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// OpenCode 服务启动和就绪检查使用的最长等待时间。
+const OPENCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+/// OpenCode 服务健康检查使用的最长等待时间。
+const OPENCODE_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// OpenCode stdout 宣布 HTTP 服务已监听时使用的前缀。
+const SERVER_READY_PREFIX: &str = "opencode server listening";
+/// OpenCode CLI 版本和模型目录命令使用的最长等待时间。
+const OPENCODE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// OpenCode 本机服务只绑定回环地址，避免暴露到外部网络。
+const DEFAULT_HOST: &str = "127.0.0.1";
+
+impl LocalOpenCodeServiceHandle {
+    /// 创建一个绑定 MCP Gateway 配置的本机 OpenCode 生命周期句柄。
+    pub(crate) fn new(mcp_gateway_endpoint: String, mcp_gateway_token: String) -> Self {
+        Self {
+            services: Mutex::new(HashMap::new()),
+            mutation_lock: Mutex::new(()),
+            mcp_gateway_endpoint,
+            mcp_gateway_token,
+        }
+    }
+
+    /// 取得指定 cwd 已就绪的 OpenCode HTTP endpoint；首次访问时启动并登记服务。
+    pub(crate) async fn endpoint_for_cwd(&self, cwd: &str) -> Result<LocalOpenCodeEndpoint> {
+        let cwd = cwd.trim();
+        anyhow::ensure!(!cwd.is_empty(), "本机 OpenCode 服务缺少项目目录");
+        if let Some(service) = self.services.lock().await.get(cwd).cloned() {
+            return Ok(service.endpoint());
+        }
+
+        let _mutation_guard = self.mutation_lock.lock().await;
+        if let Some(service) = self.services.lock().await.get(cwd).cloned() {
+            return Ok(service.endpoint());
+        }
+
+        let service = start_local_opencode_service(
+            cwd,
+            &self.mcp_gateway_endpoint,
+            &self.mcp_gateway_token,
+        )
+        .await
+        .with_context(|| format!("启动本机 OpenCode 服务失败: cwd={cwd}"))?;
+        let service = Arc::new(service);
+        let endpoint = service.endpoint();
+        self.services
+            .lock()
+            .await
+            .insert(cwd.to_string(), service);
+        Ok(endpoint)
+    }
+
+    /// 通过本机 OpenCode CLI 生命周期执行纯文本命令并返回标准输出。
+    ///
+    /// 该方法只负责解析可执行文件、创建进程和收集输出，不解析模型或其它业务数据。
+    pub(crate) async fn run_command(
+        &self,
+        cwd: Option<&str>,
+        args: &[&str],
+    ) -> Result<String> {
+        let executable = runtime_env::resolve_executable("opencode")
+            .context("`opencode` executable not found")?;
+        run_local_opencode_command(&executable, cwd, args)
+            .await
+            .with_context(|| format!("执行本机 OpenCode 命令失败: args={args:?}"))
+    }
+
+    /// 终止指定 cwd 的本机 OpenCode 服务并移除生命周期登记。
+    pub(crate) async fn terminate_cwd(&self, cwd: &str) -> Result<bool> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let service = self.services.lock().await.remove(cwd.trim());
+        let Some(service) = service else {
+            return Ok(false);
+        };
+        service.terminate().await?;
+        Ok(true)
+    }
+
+    /// 终止并清理该句柄登记的全部本机 OpenCode 服务。
+    pub(crate) async fn terminate_all(&self) -> Result<()> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let services = self
+            .services
+            .lock()
+            .await
+            .drain()
+            .map(|(_, service)| service)
+            .collect::<Vec<_>>();
+        let mut errors = Vec::new();
+        for service in services {
+            if let Err(error) = service.terminate().await {
+                errors.push(format!("cwd={} error={error:#}", service.cwd));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("停止本机 OpenCode 服务失败: {}", errors.join("; "));
+        }
+    }
+}
+
+/// 通过已解析的 OpenCode 可执行文件运行本机 CLI 文本命令。
+///
+/// 该函数只负责进程生命周期和原始文本输出，不解析任何 CLI 业务语义。
+async fn run_local_opencode_command(
+    executable: &Path,
+    cwd: Option<&str>,
+    args: &[&str],
+) -> Result<String> {
+    let mut command = Command::new(executable);
+    process_utils::configure_tokio_command(&mut command);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) {
+        command.current_dir(cwd);
+    }
+    command.envs(runtime_env::get(executable).await);
+
+    let output = timeout(OPENCODE_COMMAND_TIMEOUT, command.output())
+        .await
+        .context("执行本机 OpenCode CLI 命令超时")?
+        .context("创建本机 OpenCode CLI 命令进程失败")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "本机 OpenCode CLI 命令执行失败: status={:?}, stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// 启动一个按 cwd 隔离配置的本机 OpenCode 服务，并等待其 HTTP endpoint 就绪。
+async fn start_local_opencode_service(
+    cwd: &str,
+    mcp_gateway_endpoint: &str,
+    mcp_gateway_token: &str,
+) -> Result<LocalOpenCodeService> {
+    let executable = runtime_env::resolve_executable("opencode")
+        .context("`opencode` executable not found")?;
+    let version = match run_local_opencode_command(&executable, Some(cwd), &["--version"]).await {
+        Ok(output) => output
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        Err(error) => {
+            log::warn!(
+                "读取本机 OpenCode CLI 版本失败，继续启动服务: cwd={cwd}, error={error:#}"
+            );
+            None
+        }
+    };
+    let port = allocate_loopback_port()?;
+    let password = Uuid::new_v4().to_string();
+    let run_dir = runtime_env::app_data_dir()
+        .join("computer-control")
+        .join("opencode-runs")
+        .join(Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&run_dir)
+        .with_context(|| format!("创建本机 OpenCode 运行目录失败: {}", run_dir.display()))?;
+    let config_dir = run_dir.join(".opencode");
+    std::fs::create_dir_all(&config_dir)
+        .with_context(|| format!("创建本机 OpenCode 隔离配置目录失败: {}", config_dir.display()))?;
+    anyhow::ensure!(
+        !mcp_gateway_endpoint.trim().is_empty() && !mcp_gateway_token.trim().is_empty(),
+        "OpenCode 的 AuraCoder MCP 配置不完整"
+    );
+
+    let config_path = config_dir.join("opencode.json");
+    let mut config = if config_path.is_file() {
+        let raw = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("读取本机 OpenCode 配置失败: {}", config_path.display()))?;
+        serde_json::from_str::<Value>(&raw)
+            .with_context(|| format!("本机 OpenCode 配置不是有效 JSON: {}", config_path.display()))?
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+    let config_object = config
+        .as_object_mut()
+        .context("本机 OpenCode 配置必须是 JSON 对象")?;
+    let mcp_object = config_object
+        .entry("mcp".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .context("本机 OpenCode MCP 配置必须是 JSON 对象")?;
+    let gateway_config = runtime_env::opencode_mcp_gateway_authenticated_config(
+        mcp_gateway_endpoint,
+        &format!("Bearer {mcp_gateway_token}"),
+    );
+    let gateway_entry = gateway_config
+        .get("mcp")
+        .and_then(Value::as_object)
+        .and_then(|mcp| mcp.get("auracoder"))
+        .cloned()
+        .context("OpenCode MCP Gateway 配置生成失败")?;
+    mcp_object.insert("auracoder".to_string(), gateway_entry);
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).context("序列化本机 OpenCode 配置失败")?,
+    )
+    .with_context(|| format!("写入本机 OpenCode 配置失败: {}", config_path.display()))?;
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<String>();
+    let mut command = Command::new(&executable);
+    process_utils::configure_tokio_command(&mut command);
+    command
+        .arg("serve")
+        .arg("--hostname")
+        .arg(DEFAULT_HOST)
+        .arg("--port")
+        .arg(port.to_string())
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    command.envs(runtime_env::get_opencode_env(&executable, &password, &run_dir).await);
+
+    let mut child = command.spawn().with_context(|| {
+        format!("启动本机 OpenCode 服务进程失败: executable={}", executable.display())
+    })?;
+    let stdout = child.stdout.take().context("OpenCode stdout 不可用")?;
+    let stderr = child.stderr.take().context("OpenCode stderr 不可用")?;
+    tokio::spawn(async move {
+        let mut ready_tx = Some(ready_tx);
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            log::debug!("opencode stdout: {line}");
+            if line.starts_with(SERVER_READY_PREFIX) {
+                if let Some(tx) = ready_tx.take() {
+                    let url = line
+                        .split_whitespace()
+                        .last()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("http://{DEFAULT_HOST}:{port}"));
+                    let _ = tx.send(url);
+                }
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            log::debug!("opencode stderr: {line}");
+        }
+    });
+
+    let base_url = timeout(OPENCODE_STARTUP_TIMEOUT, ready_rx)
+        .await
+        .context("等待本机 OpenCode 服务启动超时")?
+        .context("本机 OpenCode 服务在启动完成前退出")?;
+    let service = LocalOpenCodeService {
+        cwd: cwd.to_string(),
+        base_url,
+        password,
+        version,
+        generation: NEXT_OPENCODE_SERVICE_GENERATION.fetch_add(1, Ordering::Relaxed),
+        child: Mutex::new(Some(child)),
+        run_dir,
+    };
+    if let Err(error) = wait_for_local_opencode_health(&service).await {
+        service.terminate().await.ok();
+        return Err(error);
+    }
+    Ok(service)
+}
+
+/// 为本机 OpenCode 生命周期分配尚未占用的回环端口。
+fn allocate_loopback_port() -> Result<u16> {
+    let listener = TcpListener::bind((DEFAULT_HOST, 0))?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// 轮询本机 OpenCode HTTP 健康接口，确认服务已经能够接收协议请求。
+async fn wait_for_local_opencode_health(service: &LocalOpenCodeService) -> Result<()> {
+    let client = reqwest::Client::new();
+    let started = Instant::now();
+    loop {
+        let result = client
+            .get(format!(
+                "{}/global/health",
+                service.base_url.trim_end_matches('/')
+            ))
+            .headers(local_opencode_auth_headers(&service.password))
+            .send()
+            .await;
+        if let Ok(response) = result {
+            if let Ok(response) = response.error_for_status() {
+                let health = response.json::<Value>().await?;
+                if health.get("healthy").and_then(Value::as_bool) == Some(true) {
+                    return Ok(());
+                }
+            }
+        }
+        if started.elapsed() > OPENCODE_HEALTH_TIMEOUT {
+            anyhow::bail!("本机 OpenCode HTTP 服务未达到健康状态");
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// 生成本机 OpenCode 健康检查使用的 Basic Auth 请求头。
+fn local_opencode_auth_headers(password: &str) -> reqwest::header::HeaderMap {
+    use base64::{engine::general_purpose, Engine as _};
+    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+
+    let mut headers = HeaderMap::new();
+    let token = general_purpose::STANDARD.encode(format!("opencode:{password}"));
+    if let Ok(value) = HeaderValue::from_str(&format!("Basic {token}")) {
+        headers.insert(AUTHORIZATION, value);
+    }
+    headers
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalCliServiceEntryState {
@@ -26,8 +439,11 @@ enum LocalCliServiceEntryState {
 }
 
 pub(crate) enum LocalCliHandle {
+    /// 本机 Codex CLI 的生命周期句柄。
     Codex(Arc<CodexEngine>),
-    OpenCode(Arc<OpenCodeEngine>),
+    /// 本机 OpenCode CLI 服务的生命周期句柄。
+    OpenCode(Arc<LocalOpenCodeServiceHandle>),
+    /// 本机 Claude Code CLI 的生命周期句柄。
     Claude(Arc<ClaudeSidecarEngine>),
 }
 
@@ -351,10 +767,10 @@ impl LocalCliServiceLifecycleRegistry {
                     LocalCliHandle::Codex(engine)
                 }
                 "opencode" => {
-                    let engine = Arc::new(OpenCodeEngine::default());
-                    engine.set_mcp_gateway_connection(endpoint.clone(), mcp_lease.token.clone());
-                    engine.prewarm().await?;
-                    LocalCliHandle::OpenCode(engine)
+                    LocalCliHandle::OpenCode(Arc::new(LocalOpenCodeServiceHandle::new(
+                        endpoint.clone(),
+                        mcp_lease.token.clone(),
+                    )))
                 }
                 "claude" => {
                     let engine = Arc::new(ClaudeSidecarEngine::default());
@@ -432,6 +848,12 @@ impl LocalCliServiceLifecycleRegistry {
         }
         drop(services);
         if remove_service {
+            if let LocalCliHandle::OpenCode(handle) = service.handle() {
+                handle
+                    .terminate_all()
+                    .await
+                    .with_context(|| format!("终止本机 OpenCode 服务失败: cli_id={cli_id}"))?;
+            }
             if let Some(gateway) = self.mcp_gateway.read().await.clone() {
                 gateway.revoke_client(&service.mcp_token).await;
             }
@@ -464,181 +886,5 @@ impl LocalCliServiceLifecycleRegistry {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        LocalCliHandle, LocalCliService, LocalCliServiceEntryState,
-        LocalCliServiceLifecycleRegistry,
-    };
-    use crate::{
-        auracoder_thread_mcp_service::AuraCoderThreadMcpService,
-        computer_control_service::ComputerControlService,
-        config::app_config::AppConfig,
-        db::Database,
-        engines::EngineManager,
-        engines::opencode::OpenCodeEngine,
-        git::{repo::FileTreeCache, watcher::GitWatcherManager},
-        mcp_gateway::AuraCoderMcpGateway,
-        power::KeepAwakeManager,
-        scheduled_tasks::ScheduledTaskManager,
-        state::{AppState, TurnManager},
-        terminal::TerminalManager,
-        terminal_notifications::TerminalNotificationManager,
-    };
-    use std::sync::Arc;
-    use tokio::sync::{Mutex, RwLock};
-
-    /// 构造生命周期登记测试所需的已启动 MCP Gateway。
-    async fn test_gateway() -> Arc<AuraCoderMcpGateway> {
-        let path = std::env::temp_dir().join(format!(
-            "auracoder-local-cli-lifecycle-{}.db",
-            uuid::Uuid::new_v4()
-        ));
-        let _db = Database::open(path).expect("test database should open");
-        let gateway = Arc::new(AuraCoderMcpGateway::new());
-        gateway.start().await.expect("test gateway should start");
-        gateway
-    }
-
-    /// 构造本地生命周期测试使用的完整应用状态。
-    fn test_app_state() -> AppState {
-        let root = std::env::temp_dir().join(format!("auracoder-local-state-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).expect("failed to create local state root");
-        let db = Database::open(root.join("workspaces.db")).expect("failed to create local state db");
-        AppState {
-            db: db.clone(),
-            config: Arc::new(AppConfig::default()),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            engines: Arc::new(EngineManager::new()),
-            git_watchers: Arc::new(GitWatcherManager::default()),
-            terminals: Arc::new(TerminalManager::default()),
-            notifications: Arc::new(TerminalNotificationManager::default()),
-            keep_awake: Arc::new(KeepAwakeManager::new()),
-            turns: Arc::new(TurnManager::default()),
-            file_tree_cache: Arc::new(FileTreeCache::new()),
-            extension_catalog_refreshes: Arc::new(
-                crate::extensions::refresh::ExtensionCatalogRefreshManager::default(),
-            ),
-            scheduled_tasks: Arc::new(ScheduledTaskManager::new()),
-            computer_control_service: Arc::new(ComputerControlService::default()),
-            auracoder_thread_mcp_service: Arc::new(AuraCoderThreadMcpService::new(db)),
-            mcp_gateway: Arc::new(AuraCoderMcpGateway::new()),
-            remote_access: Arc::new(crate::remote::RemoteTunnelManager::default()),
-            ssh_monitor: Arc::new(crate::ssh::monitor::SshConnectionMonitor::default()),
-        }
-    }
-
-    /// 将测试用 Ready OpenCode 服务放入独立生命周期 Registry，隔离全局服务状态。
-    async fn test_registry(
-        gateway: Arc<AuraCoderMcpGateway>,
-        token: String,
-    ) -> LocalCliServiceLifecycleRegistry {
-        let registry = LocalCliServiceLifecycleRegistry {
-            services: RwLock::new(std::collections::HashMap::new()),
-            resource_dir: RwLock::new(None),
-            mutation_lock: Mutex::new(()),
-            mcp_gateway: RwLock::new(Some(gateway)),
-            factory: RwLock::new(None),
-        };
-        registry.services.write().await.insert(
-            "opencode".to_string(),
-            Arc::new(LocalCliService {
-                cli_id: "opencode".to_string(),
-                generation: 1,
-                handle: LocalCliHandle::OpenCode(Arc::new(OpenCodeEngine::default())),
-                cli: Arc::new(crate::cli_tools::opencode::OpenCodeCli::new(test_app_state())),
-                mcp_token: token,
-                state: Mutex::new(LocalCliServiceEntryState::Ready),
-            }),
-        );
-        registry
-    }
-
-    /// 验证 Ready OpenCode 服务可通过私有 Token 登记并清理可信上下文。
-    #[tokio::test]
-    async fn ready_opencode_service_registers_and_clears_mcp_context() {
-        let gateway = test_gateway().await;
-        let lease = gateway
-            .register_client(
-                "opencode",
-                "opencode",
-                Arc::new(crate::cli_tools::opencode::OpenCodeCli::new(test_app_state())),
-            )
-            .await
-            .expect("OpenCode test lease should be issued");
-        let token = lease.token.clone();
-        let registry = test_registry(gateway.clone(), token.clone()).await;
-
-        registry
-            .register_mcp_context("opencode", "engine-thread", "assistant-message")
-            .await
-            .expect("OpenCode context should register");
-        registry
-            .clear_mcp_context("opencode")
-            .await
-            .expect("OpenCode context should clear");
-
-        registry
-            .clear_mcp_context("opencode")
-            .await
-            .expect("clearing an already empty context should remain idempotent");
-
-        gateway.shutdown().await;
-    }
-
-    /// 验证不存在 Ready 服务、未绑定 Gateway 和失效租约均返回业务错误且不泄露 Token。
-    #[tokio::test]
-    async fn mcp_context_errors_preserve_business_boundary_without_token() {
-        let missing_registry = LocalCliServiceLifecycleRegistry::default();
-        let missing_service_error = missing_registry
-            .register_mcp_context("opencode", "engine-thread", "assistant-message")
-            .await
-            .expect_err("missing service should fail");
-        assert!(missing_service_error
-            .to_string()
-            .contains("服务未在 AuraCoder 启动阶段登记"));
-
-        let gateway = test_gateway().await;
-        let lease = gateway
-            .register_client(
-                "opencode",
-                "opencode",
-                Arc::new(crate::cli_tools::opencode::OpenCodeCli::new(test_app_state())),
-            )
-            .await
-            .expect("OpenCode test lease should be issued");
-        let token = lease.token.clone();
-        let registry = test_registry(gateway.clone(), token.clone()).await;
-        gateway.revoke_client(&token).await;
-
-        let revoked_error = registry
-            .register_mcp_context("opencode", "engine-thread", "assistant-message")
-            .await
-            .expect_err("revoked lease should fail");
-        let revoked_error_chain = format!("{revoked_error:#}");
-        assert!(revoked_error_chain.contains("client lease 不存在或已撤销"));
-        assert!(!revoked_error_chain.contains(&token));
-
-        let unbound_registry = LocalCliServiceLifecycleRegistry::default();
-        let service = registry
-            .services
-            .read()
-            .await
-            .get("opencode")
-            .cloned()
-            .expect("test service should exist");
-        unbound_registry
-            .services
-            .write()
-            .await
-            .insert("opencode".to_string(), service);
-        let unbound_error = unbound_registry
-            .clear_mcp_context("opencode")
-            .await
-            .expect_err("unbound gateway should fail");
-        assert!(unbound_error
-            .to_string()
-            .contains("尚未绑定 MCP Gateway"));
-
-        gateway.shutdown().await;
-    }
-}
+#[path = "../tests/unit/local_cli_service_lifecycle_tests.rs"]
+mod tests;

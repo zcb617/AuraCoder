@@ -2,12 +2,13 @@ use tauri::State;
 use uuid::Uuid;
 
 use crate::{
+    cli_tools::{factory::CliToolFactory, CliExecutionContext, CliLocationKind},
     db,
     models::{
         SshConfigHostDto, SshConnectionDto, SshConnectionImportResultDto, SshConnectionInput,
         SshConnectionTestDto,
     },
-    ssh::{cli_tunnel_registry, config, gateway, known_hosts},
+    ssh::{config, gateway, known_hosts},
     state::AppState,
 };
 
@@ -277,10 +278,32 @@ async fn test_and_register_cli_tunnels(
     })
     .await?;
     if result.ok {
-        let (_, errors) =
-            cli_tunnel_registry::register_cli_tunnels(record, &result.cli_versions).await;
-        for error in errors {
-            log::warn!("{error}");
+        let factory = CliToolFactory::new(state.clone());
+        for cli_id in result.cli_versions.keys() {
+            let cli = match factory.create(cli_id) {
+                Ok(cli) => cli,
+                Err(error) => {
+                    log::warn!(
+                        "创建 SSH CLI 统一接口失败，继续处理其他 CLI: connection_id={} cli_id={} error={error:#}",
+                        record.dto.id,
+                        cli_id,
+                    );
+                    continue;
+                }
+            };
+            let context = CliExecutionContext {
+                workspace_id: String::new(),
+                root_path: String::new(),
+                location_kind: CliLocationKind::Ssh,
+                ssh_connection_id: Some(record.dto.id.clone()),
+            };
+            if let Err(error) = cli.register_remote_service(&context).await {
+                log::warn!(
+                    "注册 SSH 远端 CLI 服务失败，继续处理其他 CLI: connection_id={} cli_id={} error={error:#}",
+                    record.dto.id,
+                    cli_id,
+                );
+            }
         }
     }
     Ok(result)

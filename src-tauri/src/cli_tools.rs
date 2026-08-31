@@ -323,6 +323,29 @@ pub trait CliTool: Send + Sync {
     /// 用户准备发送一轮消息时，在模型校验、附件处理和会话启动之前取得当前 CLI 的整轮使用权，保证同一轮业务始终使用同一个本机或 SSH 运行目标。`context` 用于锁定本机或 SSH 项目，`thread` 用于锁定会话及其持续占用标识；该操作以异步 Rust 方法返回 `Result<()>`，失败时必须终止本轮发送，不能回退到其他运行目标。
     async fn acquire_turn(&self, context: &CliExecutionContext, thread: &ThreadDto) -> Result<()>;
 
+    /// 当前 CLI Service 为一轮对话登记可信 AuraCoder MCP 上下文，具体运行位置由实现类处理。
+    async fn register_mcp_context(
+        &self,
+        context: &CliExecutionContext,
+        engine_thread_id: &str,
+        turn_id: &str,
+    ) -> Result<()>;
+
+    /// 当前 CLI Service 清理该 CLI 本轮可信 AuraCoder MCP 上下文，并向调用方返回原始错误链。
+    async fn clear_mcp_context(&self, context: &CliExecutionContext) -> Result<()>;
+
+    /// 当前 CLI Service 重启自身对应的远端服务；本机 CLI 服务不支持该业务操作。
+    async fn restart_service(&self, context: &CliExecutionContext) -> Result<()>;
+
+    /// 查询当前运行位置的 CLI 服务是否已经由对应生命周期登记并处于 Ready 状态，不创建或启动服务。
+    async fn is_service_ready(&self, context: &CliExecutionContext) -> Result<bool>;
+
+    /// 通过当前 CLI 对应的生命周期取得或确保已经登记的服务，SSH 运行位置只复用既有 Tunnel。
+    async fn ensure_service(&self, context: &CliExecutionContext) -> Result<()>;
+
+    /// SSH 连接测试成功后，由当前 CLI 生命周期建立 Tunnel 并登记、启动该 CLI 远端服务；本机不支持。
+    async fn register_remote_service(&self, context: &CliExecutionContext) -> Result<()>;
+
     /// 读取当前 CLI 原始权限并转换为前端统一权限组件 JSON。
     async fn get_permissions(
         &self,
