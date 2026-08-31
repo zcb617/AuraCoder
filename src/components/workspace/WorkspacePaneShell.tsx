@@ -546,7 +546,7 @@ export function WorkspacePaneShell({
               order={2}
               defaultSize={gitPanelSize}
               minSize={18}
-              maxSize={40}
+              maxSize={60}
               onResize={onGitPanelResize}
             >
               <div className="content-panel" style={{ height: "100%" }}>
