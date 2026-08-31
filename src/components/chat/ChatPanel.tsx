@@ -7288,6 +7288,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
             )}
             <div
               ref={viewportRef}
+              className="chat-message-viewport"
               onMouseUp={(event: ReactMouseEvent<HTMLDivElement>) => {
                 if (!activeWorkspaceId || event.button !== 0) {
                   return;

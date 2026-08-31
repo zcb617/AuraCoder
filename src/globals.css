@@ -943,6 +943,9 @@ button, input, textarea, select {
   width: 6px;
   height: 6px;
 }
+.chat-message-viewport::-webkit-scrollbar {
+  width: 12px;
+}
 ::-webkit-scrollbar-track {
   background: transparent;
 }
