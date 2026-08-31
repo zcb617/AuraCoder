@@ -406,6 +406,39 @@ impl ClaudeCodeSessionHandleRegistry {
         Ok(result)
     }
 
+    /// relay 持续轮次失败时移除本地句柄并立即销毁远端持续会话，避免失效句柄进入空闲复用。
+    pub(super) async fn discard_failed_turn(&self, thread_id: &str) -> Result<()> {
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            let error = anyhow::anyhow!("Claude Code 会话编号不能为空");
+            log::error!(
+                "Claude Code 失败轮次会话销毁失败: event=claude_code_failed_turn_discard thread_id=<empty> handle_id=<unknown> endpoint=<unknown> status=<unavailable> response_body=<none> request_error={error:#}",
+            );
+            return Err(error);
+        }
+
+        let slot = {
+            let mut handles = self.handles.lock().await;
+            match handles.remove(thread_id) {
+                Some(slot) => slot,
+                None => {
+                    let error = anyhow::anyhow!(
+                        "Claude Code 失败轮次会话句柄不存在: thread_id={thread_id}"
+                    );
+                    log::error!(
+                        "Claude Code 失败轮次会话销毁失败: event=claude_code_failed_turn_discard thread_id={} handle_id=<unknown> endpoint=<unknown> status=<unavailable> response_body=<none> request_error={error:#}",
+                        thread_id,
+                    );
+                    return Err(error);
+                }
+            }
+        };
+
+        self.destroy_remote_handle(thread_id, slot.as_ref(), "claude_code_failed_turn_discard")
+            .await
+            .map(|_| ())
+    }
+
     /// 一轮对话完成后开始独立的五分钟空闲计时。
     pub async fn mark_turn_completed(self: &Arc<Self>, thread_id: &str) -> Result<()> {
         let (slot, generation) = {
@@ -455,6 +488,155 @@ impl ClaudeCodeSessionHandleRegistry {
         Ok(endpoint)
     }
 
+    /// 在给定持续会话句柄上执行远端 DELETE，读取原始响应并校验销毁结果。
+    async fn destroy_remote_handle(
+        &self,
+        thread_id: &str,
+        slot: &ClaudeCodeSessionSlot,
+        event: &str,
+    ) -> Result<(Url, reqwest::StatusCode, ClaudeCodeSessionDestroyResult)> {
+        let handle_id = match slot.handle.get() {
+            Some(handle) => handle.handle_id.clone(),
+            None => {
+                let error = anyhow::anyhow!(
+                    "Claude Code 会话句柄尚未建立: thread_id={thread_id}"
+                );
+                log::error!(
+                    "Claude Code 远端会话销毁失败: event={} thread_id={} handle_id=<unknown> endpoint=<unknown> status=<unavailable> response_body=<none> request_error={error:#}",
+                    event,
+                    thread_id,
+                );
+                return Err(error);
+            }
+        };
+        let endpoint = match Self::endpoint(&slot.remote_base_url, &["session-handles", thread_id])
+        {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                let error = error.context(format!(
+                    "构造 Claude Code 远端会话销毁地址失败: thread_id={thread_id} handle_id={handle_id} endpoint=<unavailable>"
+                ));
+                log::error!(
+                    "Claude Code 远端会话销毁失败: event={} thread_id={} handle_id={} endpoint=<unavailable> status=<unavailable> response_body=<none> request_error={error:#}",
+                    event,
+                    thread_id,
+                    handle_id,
+                );
+                return Err(error);
+            }
+        };
+
+        let response = match self.client.delete(endpoint.clone()).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                let error = anyhow::Error::new(error).context(format!(
+                    "调用 Claude Code 远端会话销毁接口失败: thread_id={thread_id} handle_id={handle_id} endpoint={endpoint} request_error"
+                ));
+                log::error!(
+                    "Claude Code 远端会话销毁失败: event={} thread_id={} handle_id={} endpoint={} status=<unavailable> response_body=<none> request_error={error:#}",
+                    event,
+                    thread_id,
+                    handle_id,
+                    endpoint,
+                );
+                return Err(error);
+            }
+        };
+        let status = response.status();
+        let response_body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                let error_text = error.to_string();
+                let error = anyhow::Error::new(error).context(format!(
+                    "读取 Claude Code 远端会话销毁响应失败: thread_id={thread_id} handle_id={handle_id} endpoint={endpoint} status={status} response_body=<读取失败> response_body_read_error={error_text}"
+                ));
+                log::error!(
+                    "Claude Code 远端会话销毁失败: event={} thread_id={} handle_id={} endpoint={} status={} response_body=<读取失败> response_body_read_error={}",
+                    event,
+                    thread_id,
+                    handle_id,
+                    endpoint,
+                    status,
+                    error_text,
+                );
+                return Err(error);
+            }
+        };
+        if !status.is_success() {
+            let error = anyhow::anyhow!(
+                "Claude Code 远端会话销毁失败: thread_id={} handle_id={} endpoint={} status={} response_body={}",
+                thread_id,
+                handle_id,
+                endpoint,
+                status,
+                response_body,
+            );
+            log::error!(
+                "Claude Code 远端会话销毁失败: event={} thread_id={} handle_id={} endpoint={} status={} response_body={}",
+                event,
+                thread_id,
+                handle_id,
+                endpoint,
+                status,
+                response_body,
+            );
+            return Err(error);
+        }
+
+        let destroy_result = match serde_json::from_str::<ClaudeCodeSessionDestroyResult>(
+            &response_body,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let error_text = error.to_string();
+                let error = anyhow::Error::new(error).context(format!(
+                    "解析 Claude Code 远端会话销毁结果失败: thread_id={thread_id} handle_id={handle_id} endpoint={endpoint} status={status} response_body={response_body} response_parse_error={error_text}"
+                ));
+                log::error!(
+                    "Claude Code 远端会话销毁失败: event={} thread_id={} handle_id={} endpoint={} status={} response_body={} response_parse_error={}",
+                    event,
+                    thread_id,
+                    handle_id,
+                    endpoint,
+                    status,
+                    response_body,
+                    error_text,
+                );
+                return Err(error);
+            }
+        };
+        if destroy_result.handle_id.as_deref() != Some(handle_id.as_str())
+            || !destroy_result.success
+        {
+            let error = anyhow::anyhow!(
+                "Claude Code 远端会话销毁返回无效结果: thread_id={} handle_id={} endpoint={} status={} returned_handle_id={:?} success={} error={:?} response_body={}",
+                thread_id,
+                handle_id,
+                endpoint,
+                status,
+                destroy_result.handle_id,
+                destroy_result.success,
+                destroy_result.error,
+                response_body,
+            );
+            log::error!(
+                "Claude Code 远端会话销毁失败: event={} thread_id={} handle_id={} endpoint={} status={} returned_handle_id={:?} success={} error={:?} response_body={}",
+                event,
+                thread_id,
+                handle_id,
+                endpoint,
+                status,
+                destroy_result.handle_id,
+                destroy_result.success,
+                destroy_result.error,
+                response_body,
+            );
+            return Err(error);
+        }
+
+        Ok((endpoint, status, destroy_result))
+    }
+
     async fn close_if_still_idle(
         &self,
         thread_id: &str,
@@ -478,6 +660,8 @@ impl ClaudeCodeSessionHandleRegistry {
             handles.remove(thread_id);
         }
 
+        /*
+        // 原有空闲会话直接 DELETE 实现保留为迁移留痕，现由统一远端销毁辅助逻辑接替：
         let result = async {
             let response = self
                 .client
@@ -496,22 +680,27 @@ impl ClaudeCodeSessionHandleRegistry {
             Ok::<_, anyhow::Error>((status, body))
         }
         .await;
+        */
+        let result = self
+            .destroy_remote_handle(thread_id, slot.as_ref(), "claude_code_idle_session_destroy")
+            .await;
 
         match result {
-            Ok((status, body)) => {
+            Ok((endpoint, status, body)) => {
                 log::info!(
-                    "Claude Code 空闲会话销毁结果: thread_id={} handle_id={:?} returned_thread_id={:?} success={} status={} error={:?}",
+                    "Claude Code 空闲会话销毁结果: event=claude_code_idle_session_destroy thread_id={} handle_id={:?} returned_thread_id={:?} success={} endpoint={} status={} error={:?}",
                     thread_id,
                     body.handle_id,
                     body.thread_id,
                     body.success,
+                    endpoint,
                     status,
                     body.error,
                 );
             }
             Err(error) => {
                 log::warn!(
-                    "Claude Code 空闲会话销毁结果: thread_id={} request_error={error:#}",
+                    "Claude Code 空闲会话销毁结果: event=claude_code_idle_session_destroy thread_id={} request_error={error:#}",
                     thread_id,
                 );
             }
@@ -795,5 +984,239 @@ mod tests {
         assert!(error_text.contains("interrupt failed"));
 
         server.await.expect("finish interrupt test server");
+    }
+
+    /// 验证失败轮次会移除本地句柄、销毁远端句柄，并携带既有 Claude sessionId 重建下一轮。
+    #[tokio::test]
+    async fn discard_failed_turn_removes_local_handle_and_destroys_remote_handle() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind discard test server");
+        let address = listener
+            .local_addr()
+            .expect("read discard test server address");
+        let create_count = Arc::new(AtomicUsize::new(0));
+        let destroy_count = Arc::new(AtomicUsize::new(0));
+        let server_create_count = create_count.clone();
+        let server_destroy_count = destroy_count.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.expect("accept discard request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .await
+                        .expect("read discard request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length: ")
+                                    .or_else(|| line.strip_prefix("Content-Length: "))
+                            })
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= header_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let request_line = request.lines().next().unwrap_or_default();
+                let (status, body) = if request_line.starts_with("POST /session-handles ") {
+                    let create_index = server_create_count.fetch_add(1, Ordering::SeqCst);
+                    assert!(
+                        request.contains("\"resume\":\"session-previous\""),
+                        "create request must preserve Claude session resume parameter"
+                    );
+                    let handle_id = if create_index == 0 {
+                        "handle-1"
+                    } else {
+                        "handle-2"
+                    };
+                    (
+                        "201 Created",
+                        json!({
+                            "threadId": "thread-1",
+                            "handleId": handle_id,
+                            "sessionId": "session-previous",
+                            "reused": false,
+                        }),
+                    )
+                } else if request_line.starts_with("DELETE /session-handles/thread-1 ") {
+                    server_destroy_count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        "200 OK",
+                        json!({
+                            "threadId": "thread-1",
+                            "handleId": "handle-1",
+                            "success": true,
+                            "error": null,
+                        }),
+                    )
+                } else {
+                    ("404 Not Found", json!({ "error": "not found" }))
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write discard response");
+            }
+        });
+
+        let base_url: reqwest::Url = format!("http://{address}")
+            .parse()
+            .expect("parse discard test url");
+        let registry = ClaudeCodeSessionHandleRegistry::with_idle_timeout(Duration::from_secs(60));
+        let first = registry
+            .create_or_get(
+                "thread-1",
+                base_url.clone(),
+                None,
+                json!({ "resume": "session-previous" }),
+            )
+            .await
+            .expect("create first discard test handle");
+        assert_eq!(first.handle_id, "handle-1");
+        assert!(registry.contains("thread-1").await);
+
+        registry
+            .discard_failed_turn("thread-1")
+            .await
+            .expect("destroy failed-turn handle");
+        assert!(!registry.contains("thread-1").await);
+        assert_eq!(destroy_count.load(Ordering::SeqCst), 1);
+
+        let second = registry
+            .create_or_get(
+                "thread-1",
+                base_url,
+                None,
+                json!({ "resume": "session-previous" }),
+            )
+            .await
+            .expect("create replacement discard test handle");
+        assert_eq!(second.handle_id, "handle-2");
+        assert_eq!(create_count.load(Ordering::SeqCst), 2);
+
+        server.await.expect("finish discard test server");
+    }
+
+    /// 验证远端失败轮次句柄销毁失败时，原始响应仍返回且本地句柄已移除。
+    #[tokio::test]
+    async fn discard_failed_turn_removes_local_handle_when_remote_destroy_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failed discard test server");
+        let address = listener
+            .local_addr()
+            .expect("read failed discard test server address");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept failed discard request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .await
+                        .expect("read failed discard request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length: ")
+                                    .or_else(|| line.strip_prefix("Content-Length: "))
+                            })
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= header_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let request_line = request.lines().next().unwrap_or_default();
+                let (status, body) = if request_line.starts_with("POST /session-handles ") {
+                    assert!(
+                        request.contains("\"resume\":\"session-previous\""),
+                        "create request must preserve Claude session resume parameter"
+                    );
+                    (
+                        "201 Created",
+                        json!({
+                            "threadId": "thread-1",
+                            "handleId": "handle-1",
+                            "sessionId": "session-previous",
+                            "reused": false,
+                        }),
+                    )
+                } else if request_line.starts_with("DELETE /session-handles/thread-1 ") {
+                    (
+                        "500 Internal Server Error",
+                        json!({ "error": "destroy failed" }),
+                    )
+                } else {
+                    ("404 Not Found", json!({ "error": "not found" }))
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write failed discard response");
+            }
+        });
+
+        let base_url: reqwest::Url = format!("http://{address}")
+            .parse()
+            .expect("parse failed discard test url");
+        let registry = ClaudeCodeSessionHandleRegistry::with_idle_timeout(Duration::from_secs(60));
+        registry
+            .create_or_get(
+                "thread-1",
+                base_url,
+                None,
+                json!({ "resume": "session-previous" }),
+            )
+            .await
+            .expect("create failed discard test handle");
+
+        let error = registry
+            .discard_failed_turn("thread-1")
+            .await
+            .expect_err("reject failed remote destroy");
+        let error_text = format!("{error:#}");
+        assert!(error_text.contains("destroy failed"));
+        assert!(!registry.contains("thread-1").await);
+
+        server.await.expect("finish failed discard test server");
     }
 }

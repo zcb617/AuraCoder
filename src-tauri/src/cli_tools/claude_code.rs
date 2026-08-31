@@ -2054,6 +2054,23 @@ impl CliTool for ClaudeCodeCli {
                         .await?
                         .handle_id
                 };
+                /*
+                // 旧实现预先构造独立销毁地址，现由 discard_failed_turn 返回完整清理错误信息接替：
+                let destroy_endpoint = match ClaudeCodeSessionHandleRegistry::endpoint(
+                    &remote_base_url,
+                    &["session-handles", thread.id.as_str()],
+                ) {
+                    Ok(endpoint) => endpoint.to_string(),
+                    Err(error) => {
+                        log::error!(
+                            "SSH 远端 Claude 失败轮次销毁地址构造失败: event=claude_code_failed_turn_discard thread_id={} handle_id={} endpoint=<unavailable> status=<unavailable> response_body=<none> request_error={error:#}",
+                            thread.id,
+                            handle_id,
+                        );
+                        format!("<endpoint构造失败: {error:#}>")
+                    }
+                };
+                */
 
                 let session_handles = self.session_handles.clone();
                 let cancel_thread_id = thread.id.clone();
@@ -2071,12 +2088,35 @@ impl CliTool for ClaudeCodeCli {
                     .relay_persistent_turn(engine_thread_id, &handle_id, persistent_turn, event_tx)
                     .await;
                 cancel_task.abort();
+                /*
+                // 原有 relay 成功与失败都进入五分钟空闲倒计时的逻辑保留为迁移留痕：
                 let idle_result = self.session_handles.mark_turn_completed(&thread.id).await;
                 if let Err(error) = result {
                     let _ = idle_result;
                     return Err(error);
                 }
                 return idle_result;
+                */
+                return match result {
+                    Ok(()) => self.session_handles.mark_turn_completed(&thread.id).await,
+                    Err(relay_error) => {
+                        match self.session_handles.discard_failed_turn(&thread.id).await {
+                            Ok(()) => Err(relay_error),
+                            Err(cleanup_error) => {
+                                log::error!(
+                                    "SSH 远端 Claude 失败轮次句柄清理失败: event=claude_code_failed_turn_discard thread_id={} handle_id={} relay_error={relay_error:#} cleanup_error={cleanup_error:#}",
+                                    thread.id,
+                                    handle_id,
+                                );
+                                Err(anyhow::anyhow!(
+                                    "SSH 远端 Claude 持续轮次失败且句柄清理失败: thread_id={} handle_id={} relay_error={relay_error:#} cleanup_error={cleanup_error:#}",
+                                    thread.id,
+                                    handle_id,
+                                ))
+                            }
+                        }
+                    }
+                };
             } else {
                 let service_use = self.remote_turn_use.lock().await.take().ok_or_else(|| {
                     anyhow::anyhow!("当前 SSH 远端 Claude 会话尚未建立持续使用关系")
