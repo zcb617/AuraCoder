@@ -200,6 +200,59 @@ describe("Claude SSH remote session server", () => {
     });
   });
 
+  it("replaces an existing persistent Claude session handle through HTTP", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "auracoder-claude-session-replace-"));
+    tempRoots.push(home);
+    const port = await availablePort();
+    await startServer(home, port, {
+      CLAUDE_AGENT_SDK_MODULE: mockSdkModulePath,
+      CLAUDE_AGENT_SDK_MOCK_SCENARIO: JSON.stringify({
+        persistentInput: true,
+        sessionId: "http-persistent-replace-session",
+      }),
+      PANES_DISABLE_CLAUDE_USAGE_FETCH: "1",
+    });
+
+    const requestBody = {
+      // 固定远端持续会话的业务线程标识，供两次创建请求关联同一旧句柄。
+      threadId: "thread-http-replace",
+      // 两次请求使用相同初始提示，验证替换路径不依赖提示变化。
+      prompt: "same persistent prompt",
+      // 两次请求使用相同工作目录，验证 requestParams 原样转发。
+      cwd: "/work/project-http-replace",
+    };
+    const firstResponse = await fetch(`http://127.0.0.1:${port}/session-handles`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+    expect(firstResponse.status).toBe(201);
+    const first = await firstResponse.json();
+    expect(first).toMatchObject({
+      threadId: requestBody.threadId,
+      reused: false,
+    });
+    expect(first.handleId).toEqual(expect.any(String));
+
+    const secondResponse = await fetch(`http://127.0.0.1:${port}/session-handles`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...requestBody,
+        // 明确要求 sidecar 先清理同 threadId 的旧远端句柄。
+        replaceExisting: true,
+      }),
+    });
+    expect(secondResponse.status).toBe(201);
+    const second = await secondResponse.json();
+    expect(second).toMatchObject({
+      threadId: requestBody.threadId,
+      reused: false,
+    });
+    expect(second.handleId).toEqual(expect.any(String));
+    expect(second.handleId).not.toBe(first.handleId);
+  });
+
   it("logs original persistent message errors with HTTP context", async () => {
     const home = await mkdtemp(path.join(tmpdir(), "auracoder-claude-session-error-"));
     tempRoots.push(home);

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -26,9 +26,14 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// 后续由 ClaudeCodeCli 根据系统运行模式选择是否操作该类。
 #[allow(dead_code)]
 pub(super) struct ClaudeCodeSessionHandleRegistry {
+    // 负责调用远端 Claude 会话服务的 HTTP 客户端。
     client: Client,
+    // 负责控制本地会话句柄的空闲回收时长。
     idle_timeout: Duration,
+    // 负责按 threadId 保存本地持续会话句柄。
     handles: Mutex<HashMap<String, Arc<ClaudeCodeSessionSlot>>>,
+    // 负责记录远端销毁失败后下次创建必须替换旧句柄的 threadId。
+    replacement_required_thread_ids: Mutex<HashSet<String>>,
 }
 
 #[allow(dead_code)]
@@ -109,6 +114,7 @@ impl ClaudeCodeSessionHandleRegistry {
             client: Client::new(),
             idle_timeout,
             handles: Mutex::new(HashMap::new()),
+            replacement_required_thread_ids: Mutex::new(HashSet::new()),
         }
     }
 
@@ -174,6 +180,12 @@ impl ClaudeCodeSessionHandleRegistry {
                 .clone()
         };
 
+        // 读取当前 threadId 的恢复标记，只有标记存在时才请求远端替换旧句柄。
+        let replace_existing = self
+            .replacement_required_thread_ids
+            .lock()
+            .await
+            .contains(thread_id);
         let result = slot
             .handle
             .get_or_try_init(|| async {
@@ -182,14 +194,62 @@ impl ClaudeCodeSessionHandleRegistry {
                     _ => Map::new(),
                 };
                 body.insert("threadId".to_string(), Value::String(thread_id.to_string()));
-                self.client
-                    .post(Self::endpoint(&slot.remote_base_url, &["session-handles"])?)
+                if replace_existing {
+                    body.insert("replaceExisting".to_string(), Value::Bool(true));
+                } else {
+                    // 未设置恢复标记时禁止发送替换控制字段，保持正常创建请求语义。
+                    body.remove("replaceExisting");
+                }
+                let endpoint = Self::endpoint(&slot.remote_base_url, &["session-handles"])?;
+                let response = self
+                    .client
+                    .post(endpoint.clone())
                     .json(&body)
                     .send()
                     .await
-                    .context("调用 Claude Code 远端会话建立接口失败")?
-                    .error_for_status()
-                    .context("Claude Code 远端会话建立失败")?
+                    .context("调用 Claude Code 远端会话建立接口失败")?;
+                let status = response.status();
+                if !status.is_success() {
+                    let response_body = match response.text().await {
+                        Ok(body) => body,
+                        Err(error) => {
+                            let error_text = error.to_string();
+                            log::error!(
+                                "Claude Code 远端会话建立失败: event=claude_code_remote_session_create_failed thread_id={} endpoint={} status={} replace_existing={} response_body=<读取失败> response_body_read_error={}",
+                                thread_id,
+                                endpoint,
+                                status,
+                                replace_existing,
+                                error_text,
+                            );
+                            return Err(anyhow::Error::new(error).context(format!(
+                                "Claude Code 远端会话建立失败: thread_id={} endpoint={} status={} replace_existing={} response_body=<读取失败> response_body_read_error={}",
+                                thread_id,
+                                endpoint,
+                                status,
+                                replace_existing,
+                                error_text,
+                            )));
+                        }
+                    };
+                    log::error!(
+                        "Claude Code 远端会话建立失败: event=claude_code_remote_session_create_failed thread_id={} endpoint={} status={} replace_existing={} response_body={}",
+                        thread_id,
+                        endpoint,
+                        status,
+                        replace_existing,
+                        response_body,
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Claude Code 远端会话建立失败: thread_id={} endpoint={} status={} replace_existing={} response_body={}",
+                        thread_id,
+                        endpoint,
+                        status,
+                        replace_existing,
+                        response_body,
+                    ));
+                }
+                response
                     .json::<ClaudeCodeSessionHandle>()
                     .await
                     .context("解析 Claude Code 远端会话句柄失败")
@@ -206,6 +266,13 @@ impl ClaudeCodeSessionHandleRegistry {
             {
                 handles.remove(thread_id);
             }
+        }
+        if result.is_ok() && replace_existing {
+            // 远端新句柄已成功建立，本地恢复标记不再需要继续触发替换。
+            self.replacement_required_thread_ids
+                .lock()
+                .await
+                .remove(thread_id);
         }
 
         result
@@ -434,9 +501,33 @@ impl ClaudeCodeSessionHandleRegistry {
             }
         };
 
+        /*
+        // 原有失败轮次直接返回远端销毁结果的实现保留为迁移留痕；远端销毁失败时现需登记恢复标记。
         self.destroy_remote_handle(thread_id, slot.as_ref(), "claude_code_failed_turn_discard")
             .await
             .map(|_| ())
+        */
+        let result = self
+            .destroy_remote_handle(thread_id, slot.as_ref(), "claude_code_failed_turn_discard")
+            .await;
+        match result {
+            Ok(_) => {
+                // 远端旧句柄已确认销毁，清除该 threadId 的替换恢复标记。
+                self.replacement_required_thread_ids
+                    .lock()
+                    .await
+                    .remove(thread_id);
+                Ok(())
+            }
+            Err(error) => {
+                // 远端销毁失败时保留原始错误，并登记下次创建必须替换旧句柄。
+                self.replacement_required_thread_ids
+                    .lock()
+                    .await
+                    .insert(thread_id.to_string());
+                Err(error)
+            }
+        }
     }
 
     /// 一轮对话完成后开始独立的五分钟空闲计时。
@@ -1125,8 +1216,10 @@ mod tests {
         let address = listener
             .local_addr()
             .expect("read failed discard test server address");
+        let create_count = Arc::new(AtomicUsize::new(0));
+        let server_create_count = create_count.clone();
         let server = tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (mut stream, _) = listener
                     .accept()
                     .await
@@ -1162,15 +1255,25 @@ mod tests {
                 let request = String::from_utf8_lossy(&request);
                 let request_line = request.lines().next().unwrap_or_default();
                 let (status, body) = if request_line.starts_with("POST /session-handles ") {
+                    let create_index = server_create_count.fetch_add(1, Ordering::SeqCst);
                     assert!(
                         request.contains("\"resume\":\"session-previous\""),
                         "create request must preserve Claude session resume parameter"
                     );
+                    let handle_id = if create_index == 0 {
+                        "handle-1"
+                    } else {
+                        assert!(
+                            request.contains("\"replaceExisting\":true"),
+                            "replacement create request must include replaceExisting=true"
+                        );
+                        "handle-2"
+                    };
                     (
                         "201 Created",
                         json!({
                             "threadId": "thread-1",
-                            "handleId": "handle-1",
+                            "handleId": handle_id,
                             "sessionId": "session-previous",
                             "reused": false,
                         }),
@@ -1202,7 +1305,7 @@ mod tests {
         registry
             .create_or_get(
                 "thread-1",
-                base_url,
+                base_url.clone(),
                 None,
                 json!({ "resume": "session-previous" }),
             )
@@ -1217,6 +1320,176 @@ mod tests {
         assert!(error_text.contains("destroy failed"));
         assert!(!registry.contains("thread-1").await);
 
+        let second = registry
+            .create_or_get(
+                "thread-1",
+                base_url,
+                None,
+                json!({ "resume": "session-previous" }),
+            )
+            .await
+            .expect("create replacement after failed discard");
+        assert_eq!(second.handle_id, "handle-2");
+        assert_eq!(create_count.load(Ordering::SeqCst), 2);
+
         server.await.expect("finish failed discard test server");
+    }
+
+    /// 验证替换创建失败时保留恢复标记，后续创建继续请求替换并成功取得新句柄。
+    #[tokio::test]
+    async fn replacement_create_failure_keeps_remote_handle_replacement_marker() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind replacement failure test server");
+        let address = listener
+            .local_addr()
+            .expect("read replacement failure test server address");
+        let create_count = Arc::new(AtomicUsize::new(0));
+        let server_create_count = create_count.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept replacement failure request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .await
+                        .expect("read replacement failure request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length: ")
+                                    .or_else(|| line.strip_prefix("Content-Length: "))
+                            })
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= header_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let request_line = request.lines().next().unwrap_or_default();
+                let (status, body) = if request_line.starts_with("POST /session-handles ") {
+                    let create_index = server_create_count.fetch_add(1, Ordering::SeqCst);
+                    assert!(
+                        request.contains("\"resume\":\"session-previous\""),
+                        "create request must preserve Claude session resume parameter"
+                    );
+                    if create_index == 0 {
+                        (
+                            "201 Created",
+                            json!({
+                                "threadId": "thread-replacement-failure",
+                                "handleId": "handle-1",
+                                "sessionId": "session-previous",
+                                "reused": false,
+                            }),
+                        )
+                    } else if create_index == 1 {
+                        assert!(
+                            request.contains("\"replaceExisting\":true"),
+                            "failed replacement request must include replaceExisting=true"
+                        );
+                        (
+                            "500 Internal Server Error",
+                            json!({ "error": "replacement cleanup failed" }),
+                        )
+                    } else {
+                        assert!(
+                            request.contains("\"replaceExisting\":true"),
+                            "retry replacement request must include replaceExisting=true"
+                        );
+                        (
+                            "201 Created",
+                            json!({
+                                "threadId": "thread-replacement-failure",
+                                "handleId": "handle-2",
+                                "sessionId": "session-previous",
+                                "reused": false,
+                            }),
+                        )
+                    }
+                } else if request_line
+                    .starts_with("DELETE /session-handles/thread-replacement-failure ")
+                {
+                    (
+                        "500 Internal Server Error",
+                        json!({ "error": "destroy failed" }),
+                    )
+                } else {
+                    ("404 Not Found", json!({ "error": "not found" }))
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write replacement failure response");
+            }
+        });
+
+        let base_url: reqwest::Url = format!("http://{address}")
+            .parse()
+            .expect("parse replacement failure test url");
+        let registry = ClaudeCodeSessionHandleRegistry::with_idle_timeout(Duration::from_secs(60));
+        let first = registry
+            .create_or_get(
+                "thread-replacement-failure",
+                base_url.clone(),
+                None,
+                json!({ "resume": "session-previous" }),
+            )
+            .await
+            .expect("create initial replacement failure test handle");
+        assert_eq!(first.handle_id, "handle-1");
+
+        let destroy_error = registry
+            .discard_failed_turn("thread-replacement-failure")
+            .await
+            .expect_err("reject failed remote destroy before replacement");
+        assert!(format!("{destroy_error:#}").contains("destroy failed"));
+        assert!(!registry.contains("thread-replacement-failure").await);
+
+        let replacement_error = registry
+            .create_or_get(
+                "thread-replacement-failure",
+                base_url.clone(),
+                None,
+                json!({ "resume": "session-previous" }),
+            )
+            .await
+            .expect_err("reject failed replacement create");
+        assert!(format!("{replacement_error:#}").contains("replacement cleanup failed"));
+        assert!(!registry.contains("thread-replacement-failure").await);
+
+        let second = registry
+            .create_or_get(
+                "thread-replacement-failure",
+                base_url,
+                None,
+                json!({ "resume": "session-previous" }),
+            )
+            .await
+            .expect("create replacement after failed replacement create");
+        assert_eq!(second.handle_id, "handle-2");
+        assert_eq!(create_count.load(Ordering::SeqCst), 3);
+
+        server.await.expect("finish replacement failure test server");
     }
 }

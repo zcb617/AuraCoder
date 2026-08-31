@@ -3075,6 +3075,34 @@ async function handleQuery(req, persistentSession = null) {
   }
 }
 
+/** 关闭并移除指定 persistent session，保证替换和销毁共用同一生命周期清理语义。 */
+async function closeAndRemovePersistentSessionEntry(threadId, entry) {
+  // 只有 map 仍指向当前 entry 时才允许移除，避免误删已完成替换的新会话。
+  if (sessionHandles.get(threadId) !== entry) {
+    return;
+  }
+  sessionHandles.delete(threadId);
+  entry.interruptRequested = true;
+  if (entry.context) {
+    // 关闭持久会话时清除当前 assistant 卡片中的任务行。
+    entry.context.backgroundTaskDisplay.clear();
+    entry.context.cancelled = true;
+    cleanupPendingApprovalsForQuery(
+      entry.context.id,
+      "Claude persistent session was destroyed before approval was answered.",
+    );
+    cleanupPendingComputerControlCalls(
+      entry.context,
+      "Claude persistent session was destroyed before the computer operation completed.",
+    );
+  }
+  if (!entry.messageInput.readableEnded) {
+    entry.messageInput.push(null);
+  }
+  entry.query?.close?.();
+  await entry.runPromise;
+}
+
 async function createPersistentSessionHandle(req) {
   const { id, params = {} } = req;
   const threadId = typeof params.threadId === "string" ? params.threadId.trim() : "";
@@ -3091,15 +3119,46 @@ async function createPersistentSessionHandle(req) {
 
   const existing = sessionHandles.get(threadId);
   if (existing) {
-    emit({
-      id,
-      type: "session_handle_created",
-      threadId,
-      handleId: existing.handleId,
-      sessionId: existing.context?.sessionId ?? null,
-      reused: true,
-    });
-    return;
+    if (params.replaceExisting === true) {
+      try {
+        await closeAndRemovePersistentSessionEntry(threadId, existing);
+      } catch (error) {
+        // 保留旧 session 清理失败的原始消息，由当前 create 命令向 HTTP 调用方上报。
+        emit({
+          // 关联当前请求，确保 cleanup 失败作为当前 create 命令返回。
+          id,
+          // 使用统一错误事件表示旧 session 清理未完成。
+          type: "error",
+          // 保留旧 session cleanup 的原始错误消息。
+          message: error instanceof Error ? error.message : String(error),
+          // 清理失败不可由当前命令自动恢复。
+          recoverable: false,
+        });
+        return;
+      }
+    } else {
+      /*
+      // 无 replaceExisting 标记时原有复用行为保留为迁移留痕。
+      emit({
+        id,
+        type: "session_handle_created",
+        threadId,
+        handleId: existing.handleId,
+        sessionId: existing.context?.sessionId ?? null,
+        reused: true,
+      });
+      return;
+      */
+      emit({
+        id,
+        type: "session_handle_created",
+        threadId,
+        handleId: existing.handleId,
+        sessionId: existing.context?.sessionId ?? null,
+        reused: true,
+      });
+      return;
+    }
   }
 
   const messageInput = new Readable({
@@ -3308,6 +3367,8 @@ async function destroyPersistentSessionHandle(req) {
     return;
   }
 
+  /*
+  // 原有 destroy 直接执行清理的实现保留为迁移留痕，实际改由统一 helper 执行。
   sessionHandles.delete(threadId);
   entry.interruptRequested = true;
   if (entry.context) {
@@ -3326,6 +3387,8 @@ async function destroyPersistentSessionHandle(req) {
   entry.messageInput.push(null);
   entry.query?.close?.();
   await entry.runPromise;
+  */
+  await closeAndRemovePersistentSessionEntry(threadId, entry);
   emit({
     id,
     type: "session_handle_destroyed",
