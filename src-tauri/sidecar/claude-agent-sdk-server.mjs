@@ -1169,7 +1169,7 @@ function buildPermissionHandler({
     }
 
     if (decisionMode === "read-only") {
-      if (["Read", "Glob", "Grep", "ExitPlanMode", "EnterPlanMode"].includes(toolName)) {
+      if (["Read", "Glob", "Grep", "Agent", "ExitPlanMode", "EnterPlanMode"].includes(toolName)) {
         return { behavior: "allow" };
       }
       const permission = {
@@ -2050,6 +2050,7 @@ async function handleQuery(req, persistentSession = null) {
       "Bash",
       "Glob",
       "Grep",
+      "Agent",
       ...(allowNetwork ? ["WebFetch"] : []),
     ];
   const permissionOptions = context.permissionOptions;
@@ -2091,7 +2092,7 @@ async function handleQuery(req, persistentSession = null) {
     }
     const automaticallyAllowedTools = enforceApprovalRouting
       ? permissionOptions.decisionMode === "read-only"
-        ? toolList.filter((toolName) => ["Read", "Glob", "Grep", "ExitPlanMode", "EnterPlanMode"].includes(toolName))
+        ? toolList.filter((toolName) => ["Read", "Glob", "Grep", "Agent", "ExitPlanMode", "EnterPlanMode"].includes(toolName))
         : permissionOptions.decisionMode === "ask"
           ? toolList.filter((toolName) => ["Read", "Glob", "Grep", "ExitPlanMode", "EnterPlanMode"].includes(toolName))
           : toolList

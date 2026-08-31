@@ -736,7 +736,7 @@ describe("claude-agent-sdk-server sidecar", () => {
     expect(newEvents.some((event) => event.type === "text_delta")).toBe(false);
   });
 
-  it("allows read-only subagent reads and directly denies writes without approval", async () => {
+  it("allows read-only subagent delegation and reads but directly denies writes", async () => {
     const harness = await spawnHarness({
       steps: [
         {
@@ -759,6 +759,13 @@ describe("claude-agent-sdk-server sidecar", () => {
           input: { pattern: "content", path: repoRoot },
           toolUseID: "grep-read-only",
           options: { agentID: "coder-1", requestId: "request-read-only-grep" },
+        },
+        {
+          type: "permission",
+          toolName: "Agent",
+          input: { subagent_type: "finder", prompt: "inspect the workspace" },
+          toolUseID: "agent-read-only",
+          options: { agentID: "coder-1", requestId: "request-read-only-agent" },
         },
         {
           type: "permission",
@@ -791,10 +798,11 @@ describe("claude-agent-sdk-server sidecar", () => {
     const observations = parseObservationResults(harness, "query-read-only");
     expect(observations[0]?.type).toBe("query_options");
     expect(observations[0]?.result.permissionMode).toBe("dontAsk");
+    expect(observations[0]?.result.allowedTools).toContain("Agent");
     expect(observations.slice(1).map((item) => item.result.behavior)).toEqual([
-      "allow", "allow", "allow", "deny",
+      "allow", "allow", "allow", "allow", "deny",
     ]);
-    expect(observations[4]?.result.message).toBe("File writes are disabled for this Claude thread.");
+    expect(observations[5]?.result.message).toBe("File writes are disabled for this Claude thread.");
     expect(harness.events.some((event) => event.id === "query-read-only" && event.type === "approval_requested")).toBe(false);
   });
 
