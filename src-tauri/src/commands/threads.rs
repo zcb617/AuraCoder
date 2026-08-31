@@ -2231,9 +2231,7 @@ async fn sync_empty_cli_thread_from_engine(
             let snapshot = match cli.read_session(&context, engine_thread_id).await {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    log::debug!(
-                        "failed to sync OpenCode session {engine_thread_id}: {error}"
-                    );
+                    log::debug!("failed to sync OpenCode session {engine_thread_id}: {error}");
                     return Ok(thread.clone());
                 }
             };
@@ -2301,11 +2299,7 @@ async fn sync_empty_cli_thread_from_engine(
         .map_err(|error| format!("unsupported CLI engine {}: {error}", thread.engine_id))?;
     let cli: &dyn CliTool = cli_tool.as_ref();
     let snapshot = match cli
-        .read_thread_sync_snapshot(
-            &context,
-            thread,
-            engine_thread_id,
-        )
+        .read_thread_sync_snapshot(&context, thread, engine_thread_id)
         .await
     {
         Ok(Some(snapshot)) => snapshot,
@@ -3458,6 +3452,10 @@ async fn build_codex_branch_context(
         .runtime_permissions(&cli_context, thread)
         .await
         .map_err(err_to_string)?;
+    let auto_approve_mcp_elicitations = codex
+        .auto_approve_mcp_elicitations(&cli_context, thread)
+        .await
+        .map_err(err_to_string)?;
     let sandbox_mode_override = runtime_permissions.sandbox_mode.clone();
     let sandbox_mode = sandbox_mode_override
         .clone()
@@ -3496,6 +3494,7 @@ async fn build_codex_branch_context(
         SandboxPolicy {
             writable_roots,
             allow_network,
+            auto_approve_mcp_elicitations,
             approval_policy: Some(approval_policy_override.unwrap_or_else(|| {
                 Value::String(
                     approval_policy_for_engine_and_trust_level(

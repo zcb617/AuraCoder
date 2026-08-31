@@ -1,8 +1,8 @@
 use std::{
     collections::BTreeSet,
+    collections::VecDeque,
     // 旧逻辑保留，不执行，已由子代理来源分支替代：collections::HashMap,
     collections::{HashMap, HashSet},
-    collections::VecDeque,
     env,
     // 旧 codex_augmented_path 实现保留在注释中：
     // ffi::OsString,
@@ -147,8 +147,8 @@ impl CodexThreadSubscription {
             return false;
         }
 
-        let Some(source_thread_id) = extract_thread_id_from_params(params)
-            .filter(|value| !value.trim().is_empty())
+        let Some(source_thread_id) =
+            extract_thread_id_from_params(params).filter(|value| !value.trim().is_empty())
         else {
             return false;
         };
@@ -176,9 +176,8 @@ fn spawn_codex_incoming_pump(
 
     tokio::spawn(async move {
         let mut last_received_sequence: Option<u64> = None;
-        let mut local_thread_subscription = thread_filter
-            .as_ref()
-            .map(|filter| filter.borrow().clone());
+        let mut local_thread_subscription =
+            thread_filter.as_ref().map(|filter| filter.borrow().clone());
 
         loop {
             tokio::select! {
@@ -320,8 +319,11 @@ pub struct CodexEngine {
     computer_control_service:
         Arc<std::sync::Mutex<Option<Arc<crate::computer_control_service::ComputerControlService>>>>,
     /// AuraCoder 本地会话读取工具服务。
-    auracoder_thread_mcp_service:
-        Arc<std::sync::Mutex<Option<Arc<crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService>>>>,
+    auracoder_thread_mcp_service: Arc<
+        std::sync::Mutex<
+            Option<Arc<crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService>>,
+        >,
+    >,
     transport_target: CodexTransportTarget,
 }
 
@@ -344,6 +346,8 @@ struct ThreadRuntime {
     approval_policy: serde_json::Value,
     permission_profile: Option<serde_json::Value>,
     approvals_reviewer: Option<String>,
+    /// 当前线程是否由 AuraCoder 自动批准 MCP elicitation 请求。
+    auto_approve_mcp_elicitations: bool,
     sandbox_policy: serde_json::Value,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
@@ -666,6 +670,7 @@ impl Engine for CodexEngine {
             approval_policy: approval_policy.clone(),
             permission_profile: sandbox.permission_profile.clone(),
             approvals_reviewer: sandbox.approvals_reviewer.clone(),
+            auto_approve_mcp_elicitations: sandbox.auto_approve_mcp_elicitations,
             sandbox_policy: sandbox_policy.clone(),
             reasoning_effort: sandbox.reasoning_effort.clone(),
             service_tier: sandbox.service_tier.clone(),
@@ -790,6 +795,7 @@ impl Engine for CodexEngine {
             requested_runtime.service_tier.clone(),
             requested_runtime.personality.clone(),
             requested_runtime.output_schema.clone(),
+            requested_runtime.auto_approve_mcp_elicitations,
         );
         self.store_thread_runtime(&engine_thread_id, runtime).await;
 
@@ -820,6 +826,9 @@ impl Engine for CodexEngine {
             spawn_codex_incoming_pump(transport.clone(), "turn", Some(thread_filter));
 
         let runtime = self.thread_runtime(&thread_id).await;
+        let auto_approve_mcp_elicitations = runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.auto_approve_mcp_elicitations);
         let plan_mode_activation = self
             .resolve_turn_plan_mode_activation(runtime.as_ref(), &input)
             .await;
@@ -1183,6 +1192,27 @@ impl Engine for CodexEngine {
                     }
                     if !belongs_to_turn(&params, expected_turn_id.as_deref()) {
                       log::warn!("codex server request dropped by belongs_to_turn: method={method}");
+                      continue;
+                    }
+                    if let Some(response) = build_auto_mcp_elicitation_response(
+                      auto_approve_mcp_elicitations,
+                      &method,
+                      &params,
+                    ) {
+                      if let Err(error) = transport.respond_success(&raw_id, response).await {
+                        log::error!(
+                          "Codex MCP elicitation automatic approval respond_success failed: {error:#}"
+                        );
+                        send_engine_event_with_diagnostics(
+                          &event_tx,
+                          EngineEvent::Error {
+                            message: "自动批准 MCP 服务授权失败，请重试。".to_string(),
+                            recoverable: true,
+                          },
+                          &thread_id,
+                          "mcp_elicitation_auto_approval_error",
+                        ).await;
+                      }
                       continue;
                     }
                     let normalized_method = normalize_method(&method);
@@ -1865,6 +1895,7 @@ impl CodexEngine {
             approval_policy: approval_policy.clone(),
             permission_profile: sandbox.permission_profile.clone(),
             approvals_reviewer: sandbox.approvals_reviewer.clone(),
+            auto_approve_mcp_elicitations: sandbox.auto_approve_mcp_elicitations,
             sandbox_policy: sandbox_policy.clone(),
             reasoning_effort: sandbox.reasoning_effort.clone(),
             service_tier: sandbox.service_tier.clone(),
@@ -1903,6 +1934,7 @@ impl CodexEngine {
             requested_runtime.service_tier.clone(),
             requested_runtime.personality.clone(),
             requested_runtime.output_schema.clone(),
+            requested_runtime.auto_approve_mcp_elicitations,
         );
         self.store_thread_runtime(&new_engine_thread_id, runtime)
             .await;
@@ -1982,8 +2014,7 @@ impl CodexEngine {
         // 旧逻辑保留，不执行，已由子代理来源分支替代：
         // let (review_thread_filter_tx, review_thread_filter) =
         //     watch::channel(source_thread_id.clone());
-        let (review_thread_filter_tx, review_thread_filter) =
-            watch::channel(review_subscription);
+        let (review_thread_filter_tx, review_thread_filter) = watch::channel(review_subscription);
         let mut mapper = TurnEventMapper::default();
         let mut incoming_rx = spawn_codex_incoming_pump(
             transport.clone(),
@@ -1991,6 +2022,10 @@ impl CodexEngine {
             Some(review_thread_filter.clone()),
         );
         let mut active_thread_id = source_thread_id.clone();
+        let auto_approve_mcp_elicitations = self
+            .thread_runtime(&source_thread_id)
+            .await
+            .is_some_and(|runtime| runtime.auto_approve_mcp_elicitations);
         let requested_delivery = delivery.map(str::to_string);
 
         let transport_for_rate_limits = transport.clone();
@@ -2270,6 +2305,27 @@ impl CodexEngine {
                     // }
                     if !belongs_to_turn(&params, expected_turn_id.as_deref()) {
                       log::warn!("codex review server request dropped by belongs_to_turn: method={method}");
+                      continue;
+                    }
+                    if let Some(response) = build_auto_mcp_elicitation_response(
+                      auto_approve_mcp_elicitations,
+                      &method,
+                      &params,
+                    ) {
+                      if let Err(error) = transport.respond_success(&raw_id, response).await {
+                        log::error!(
+                          "Codex MCP elicitation automatic approval respond_success failed during review: {error:#}"
+                        );
+                        send_engine_event_with_diagnostics(
+                          &event_tx,
+                          EngineEvent::Error {
+                            message: "自动批准 MCP 服务授权失败，请重试。".to_string(),
+                            recoverable: true,
+                          },
+                          &active_thread_id,
+                          "review_mcp_elicitation_auto_approval_error",
+                        ).await;
+                      }
                       continue;
                     }
                     let normalized_method = normalize_method(&method);
@@ -5131,7 +5187,10 @@ fn build_thread_start_params(
         "persistExtendedHistory".to_string(),
         serde_json::Value::Bool(false),
     );
-    if !dynamic_tools.as_array().is_some_and(|tools| tools.is_empty()) {
+    if !dynamic_tools
+        .as_array()
+        .is_some_and(|tools| tools.is_empty())
+    {
         params.insert("dynamicTools".to_string(), dynamic_tools.clone());
     }
     serde_json::Value::Object(params)
@@ -5590,6 +5649,7 @@ fn thread_runtime_from_start_response(
     fallback_service_tier: Option<String>,
     fallback_personality: Option<String>,
     fallback_output_schema: Option<serde_json::Value>,
+    fallback_auto_approve_mcp_elicitations: bool,
 ) -> ThreadRuntime {
     let mut runtime = ThreadRuntime {
         cwd: extract_any_string(response, &["cwd"]).unwrap_or_else(|| fallback_cwd.to_string()),
@@ -5623,6 +5683,7 @@ fn thread_runtime_from_start_response(
         service_tier: extract_any_string(response, &["serviceTier", "service_tier"]),
         personality: extract_any_string(response, &["personality"]),
         output_schema: fallback_output_schema,
+        auto_approve_mcp_elicitations: fallback_auto_approve_mcp_elicitations,
         native_plan_mode_active: false,
     };
 
@@ -5656,6 +5717,7 @@ fn thread_runtime_from_resume_response(
         requested_runtime.service_tier.clone(),
         requested_runtime.personality.clone(),
         requested_runtime.output_schema.clone(),
+        requested_runtime.auto_approve_mcp_elicitations,
     );
 
     // `thread/resume` can echo the previous thread preview, including stale model or effort.
@@ -5670,6 +5732,7 @@ fn thread_runtime_from_resume_response(
     runtime.service_tier = requested_runtime.service_tier.clone();
     runtime.personality = requested_runtime.personality.clone();
     runtime.output_schema = requested_runtime.output_schema.clone();
+    runtime.auto_approve_mcp_elicitations = requested_runtime.auto_approve_mcp_elicitations;
 
     runtime
 }
@@ -8008,6 +8071,57 @@ fn method_signature(method: &str) -> String {
     normalize_method(method).replace('/', "")
 }
 
+/// 按前端人工批准规则构造 Codex MCP elicitation 的本地自动接受响应。
+fn build_auto_mcp_elicitation_response(
+    enabled: bool,
+    method: &str,
+    params: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if !enabled || method_signature(method) != "mcpserverelicitationrequest" {
+        return None;
+    }
+
+    let mut response = serde_json::json!({"action": "accept"});
+    if params.get("mode").and_then(serde_json::Value::as_str) == Some("form") {
+        let content = params
+            .get("requestedSchema")
+            .or_else(|| params.get("requested_schema"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|schema| schema.get("properties"))
+            .and_then(serde_json::Value::as_object)
+            .map(|properties| {
+                let mut content = serde_json::Map::new();
+                for (field, raw_schema) in properties {
+                    let value = if let Some(property_schema) = raw_schema.as_object() {
+                        if let Some(default) = property_schema.get("default") {
+                            default.clone()
+                        } else {
+                            match property_schema
+                                .get("type")
+                                .and_then(serde_json::Value::as_str)
+                            {
+                                Some("boolean") => serde_json::json!(false),
+                                Some("number" | "integer") => serde_json::json!(0),
+                                Some("array") => serde_json::json!([]),
+                                _ => serde_json::json!(""),
+                            }
+                        }
+                    } else {
+                        serde_json::json!("")
+                    };
+                    content.insert(field.clone(), value);
+                }
+                serde_json::Value::Object(content)
+            })
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(object) = response.as_object_mut() {
+            object.insert("content".to_string(), content);
+        }
+    }
+
+    Some(response)
+}
+
 fn is_known_codex_notification_method(normalized_method: &str) -> bool {
     matches!(
         normalized_method,
@@ -8064,6 +8178,10 @@ fn is_known_codex_notification_method(normalized_method: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[path = "../../../../tests/unit/codex_mcp_elicitation_tests.rs"]
+    mod codex_mcp_elicitation_tests;
+
     use crate::engines::ActionResult;
     use serde_json::{json, Value};
 
@@ -8138,7 +8256,8 @@ mod tests {
     async fn remote_text_attachment_uses_remote_path_without_local_file_read() {
         let attachment = TurnAttachment {
             file_name: "说明.md".to_string(),
-            file_path: "/home/tester/.cache/auracoder/attachments/workspace/thread/file.md".to_string(),
+            file_path: "/home/tester/.cache/auracoder/attachments/workspace/thread/file.md"
+                .to_string(),
             preview_file_path: None,
             size_bytes: 128,
             mime_type: Some("text/markdown".to_string()),
@@ -8184,6 +8303,7 @@ mod tests {
         SandboxPolicy {
             writable_roots: vec!["/tmp/workspace".to_string()],
             allow_network,
+            auto_approve_mcp_elicitations: false,
             approval_policy: None,
             permission_profile: None,
             approvals_reviewer: None,
@@ -8389,6 +8509,7 @@ mod tests {
             &SandboxPolicy {
                 writable_roots: Vec::new(),
                 allow_network: false,
+                auto_approve_mcp_elicitations: false,
                 approval_policy: None,
                 permission_profile: None,
                 approvals_reviewer: None,
@@ -8401,7 +8522,10 @@ mod tests {
             },
             &dynamic_tools,
         );
-        assert_eq!(params["dynamicTools"][0]["name"], "auracoder_computer_control");
+        assert_eq!(
+            params["dynamicTools"][0]["name"],
+            "auracoder_computer_control"
+        );
     }
 
     #[tokio::test]
@@ -8421,6 +8545,7 @@ mod tests {
             service_tier: Some("fast".to_string()),
             personality: Some("friendly".to_string()),
             output_schema: Some(json!({"type":"object"})),
+            auto_approve_mcp_elicitations: false,
             native_plan_mode_active: false,
         };
         let input = TurnInput {
@@ -8484,6 +8609,7 @@ mod tests {
             service_tier: Some("fast".to_string()),
             personality: Some("friendly".to_string()),
             output_schema: Some(json!({"type":"object"})),
+            auto_approve_mcp_elicitations: false,
             native_plan_mode_active: true,
         };
         let input = TurnInput {
@@ -8544,6 +8670,7 @@ mod tests {
             service_tier: Some("fast".to_string()),
             personality: Some("friendly".to_string()),
             output_schema: Some(json!({"type":"object"})),
+            auto_approve_mcp_elicitations: false,
             native_plan_mode_active: false,
         };
         let input = TurnInput {
@@ -9066,6 +9193,7 @@ mod tests {
             Some("flex".to_string()),
             Some("friendly".to_string()),
             Some(json!({"type":"object"})),
+            false,
         );
 
         assert_eq!(runtime.cwd, "/tmp/effective");
@@ -9101,6 +9229,7 @@ mod tests {
             Some("fast".to_string()),
             Some("pragmatic".to_string()),
             Some(json!(true)),
+            false,
         );
 
         assert_eq!(runtime.cwd, "/tmp/fallback");
@@ -9133,6 +9262,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
 
         assert_eq!(runtime.reasoning_effort, None);
@@ -9155,6 +9285,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let input = TurnInput {
             message: "Inspect the repo".to_string(),
@@ -9188,6 +9319,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let params_without_requested_effort = build_turn_start_params(
             "thread-123",
@@ -9198,7 +9330,10 @@ mod tests {
         .await
         .expect("turn/start params without effort");
 
-        assert!(!params_without_requested_effort.as_object().unwrap().contains_key("effort"));
+        assert!(!params_without_requested_effort
+            .as_object()
+            .unwrap()
+            .contains_key("effort"));
     }
 
     #[test]
@@ -9218,6 +9353,7 @@ mod tests {
             service_tier: Some("flex".to_string()),
             personality: Some("friendly".to_string()),
             output_schema: Some(json!({"type":"object"})),
+            auto_approve_mcp_elicitations: false,
             native_plan_mode_active: false,
         };
         let response = json!({
@@ -9252,6 +9388,7 @@ mod tests {
             service_tier: Some("default".to_string()),
             personality: Some("friendly".to_string()),
             output_schema: Some(json!({"type":"object"})),
+            auto_approve_mcp_elicitations: false,
             native_plan_mode_active: true,
         };
         let requested_runtime = ThreadRuntime {
@@ -9269,6 +9406,7 @@ mod tests {
             service_tier: Some("flex".to_string()),
             personality: Some("precise".to_string()),
             output_schema: None,
+            auto_approve_mcp_elicitations: false,
             native_plan_mode_active: false,
         };
 

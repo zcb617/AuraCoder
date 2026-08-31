@@ -1113,27 +1113,45 @@ pub(crate) async fn send_message_inner(
     } else {
         configured_reasoning_effort.clone()
     };
-    let cli_permissions = if let (Some(codex), Some(context)) =
+    let (cli_permissions, auto_approve_mcp_elicitations) = if let (Some(codex), Some(context)) =
         (codex_cli.as_ref(), codex_context.as_ref())
     {
         let cli: &dyn CliTool = codex.as_ref();
-        cli.runtime_permissions(context, &thread)
+        let permissions = cli
+            .runtime_permissions(context, &thread)
             .await
-            .map_err(err_to_string)?
+            .map_err(err_to_string)?;
+        let auto_approve_mcp_elicitations = cli
+            .auto_approve_mcp_elicitations(context, &thread)
+            .await
+            .map_err(err_to_string)?;
+        (permissions, auto_approve_mcp_elicitations)
     } else if let (Some(opencode), Some(context)) =
         (opencode_cli.as_ref(), opencode_context.as_ref())
     {
         let cli: &dyn CliTool = opencode.as_ref();
-        cli.runtime_permissions(context, &thread)
+        let permissions = cli
+            .runtime_permissions(context, &thread)
             .await
-            .map_err(err_to_string)?
+            .map_err(err_to_string)?;
+        let auto_approve_mcp_elicitations = cli
+            .auto_approve_mcp_elicitations(context, &thread)
+            .await
+            .map_err(err_to_string)?;
+        (permissions, auto_approve_mcp_elicitations)
     } else if let (Some(claude), Some(context)) = (claude_cli.as_ref(), claude_context.as_ref()) {
         let cli: &dyn CliTool = claude.as_ref();
-        cli.runtime_permissions(context, &thread)
+        let permissions = cli
+            .runtime_permissions(context, &thread)
             .await
-            .map_err(err_to_string)?
+            .map_err(err_to_string)?;
+        let auto_approve_mcp_elicitations = cli
+            .auto_approve_mcp_elicitations(context, &thread)
+            .await
+            .map_err(err_to_string)?;
+        (permissions, auto_approve_mcp_elicitations)
     } else {
-        CliRuntimePermissions::default()
+        (CliRuntimePermissions::default(), false)
     };
     let sandbox_mode_override = cli_permissions.sandbox_mode.clone();
     let supports_auracoder_sandbox = thread.engine_id != "opencode";
@@ -1249,6 +1267,7 @@ pub(crate) async fn send_message_inner(
     let sandbox = SandboxPolicy {
         writable_roots,
         allow_network,
+        auto_approve_mcp_elicitations,
         approval_policy: Some(approval_policy_override.unwrap_or_else(|| {
             Value::String(
                 approval_policy_for_engine_and_trust_level(thread.engine_id.as_str(), &trust_level)
@@ -2311,9 +2330,7 @@ pub async fn restart_remote_cli_service(
         .create(&thread.engine_id)
         .map_err(err_to_string)?;
     let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
-    cli.restart_service(&context)
-        .await
-        .map_err(err_to_string)?;
+    cli.restart_service(&context).await.map_err(err_to_string)?;
     Ok(())
 }
 

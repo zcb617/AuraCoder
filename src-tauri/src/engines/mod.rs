@@ -54,6 +54,8 @@ pub enum ThreadScope {
 pub struct SandboxPolicy {
     pub writable_roots: Vec<String>,
     pub allow_network: bool,
+    /// 当前 Codex 线程是否由 AuraCoder 本地自动响应 MCP elicitation 请求。
+    pub auto_approve_mcp_elicitations: bool,
     pub approval_policy: Option<Value>,
     pub permission_profile: Option<Value>,
     pub approvals_reviewer: Option<String>,

@@ -368,6 +368,16 @@ pub trait CliTool: Send + Sync {
         thread: &ThreadDto,
     ) -> Result<CliRuntimePermissions>;
 
+    /// 判断当前线程是否由 AuraCoder 自动批准 Codex MCP elicitation 请求。
+    /// 非 Codex CLI 默认不启用该本地运行时能力。
+    async fn auto_approve_mcp_elicitations(
+        &self,
+        _context: &CliExecutionContext,
+        _thread: &ThreadDto,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// 将通用执行权限补丁交给当前 CLI 实现转换并持久化。
     async fn patch_runtime_permissions(
         &self,

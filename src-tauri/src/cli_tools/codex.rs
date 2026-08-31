@@ -8,9 +8,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
-    CliReviewStarted,
-    CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError, CliSessionSnapshot,
-    CliTool, McpInvocationContext, McpToolResult,
+    CliReviewStarted, CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError,
+    CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult,
 };
 use crate::{
     db,
@@ -121,6 +120,7 @@ fn raw_permissions_value(
     approval_raw: Option<&str>,
     sandbox_raw: Option<&str>,
     network_raw: Option<bool>,
+    auto_approve_mcp_elicitations: Option<bool>,
 ) -> Value {
     let mut raw_object = thread
         .permission_mode
@@ -142,6 +142,11 @@ fn raw_permissions_value(
         &mut raw_object,
         "allowNetwork",
         network_raw.map(|value| json!(value)),
+    );
+    set_or_remove(
+        &mut raw_object,
+        "autoApproveMcpElicitations",
+        auto_approve_mcp_elicitations.map(|value| json!(value)),
     );
     if approval_raw.is_some() || sandbox_raw.is_some() || network_raw.is_some() {
         // permissionProfile 与显式三字段冲突时清理该旧聚合字段，其余未知字段原样保留。
@@ -426,11 +431,24 @@ impl CodexCli {
             "当前会话不属于该 workspace"
         );
         validate_permission_component(&values)?;
+        let preset = permission_choice(&values, "autonomyPreset")?;
+        let auto_approve_mcp_elicitations = (preset == Some("auto")).then_some(true);
         let current = <Self as CliTool>::get_permissions(self, context, thread).await?;
+        let stored_auto_approve_mcp_elicitations = thread
+            .permission_mode
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|value| value.as_object().cloned())
+            .and_then(|object| {
+                object
+                    .get("autoApproveMcpElicitations")
+                    .and_then(Value::as_bool)
+            });
         if current.get("autonomyPreset") == values.get("autonomyPreset")
             && current.get("approval") == values.get("approval")
             && current.get("sandbox") == values.get("sandbox")
             && current.get("network") == values.get("network")
+            && stored_auto_approve_mcp_elicitations == auto_approve_mcp_elicitations
         {
             let mut result = current;
             if let Some(value) = values.get("trust") {
@@ -441,7 +459,6 @@ impl CodexCli {
             }
             return Ok(result);
         }
-        let preset = permission_choice(&values, "autonomyPreset")?;
         let approval = permission_choice(&values, "approval")?;
         let sandbox = permission_choice(&values, "sandbox")?;
         let network = permission_choice(&values, "network")?;
@@ -488,7 +505,13 @@ impl CodexCli {
         if external_sandbox && matches!(sandbox_raw, Some("read-only" | "workspace-write")) {
             sandbox_raw = None;
         }
-        let raw_value = raw_permissions_value(thread, approval_raw, sandbox_raw, network_raw);
+        let raw_value = raw_permissions_value(
+            thread,
+            approval_raw,
+            sandbox_raw,
+            network_raw,
+            auto_approve_mcp_elicitations,
+        );
         let raw = raw_value.to_string();
         let saved = db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw))?;
         let mut result = Self::permissions_from_thread(&saved, external_sandbox)?;
@@ -616,12 +639,8 @@ impl CliTool for CodexCli {
     ) -> Result<()> {
         match context.location_kind {
             CliLocationKind::Local => {
-                LocalCliServiceLifecycle::register_mcp_context(
-                    self.id(),
-                    engine_thread_id,
-                    turn_id,
-                )
-                .await
+                LocalCliServiceLifecycle::register_mcp_context(self.id(), engine_thread_id, turn_id)
+                    .await
             }
             CliLocationKind::Ssh => {
                 let connection_id = context
@@ -1141,6 +1160,31 @@ impl CliTool for CodexCli {
         })
     }
 
+    /// 判断 Codex 当前线程是否处于工作区内自动模式，从而自动批准 MCP elicitation。
+    async fn auto_approve_mcp_elicitations(
+        &self,
+        _context: &CliExecutionContext,
+        thread: &ThreadDto,
+    ) -> Result<bool> {
+        let object = thread
+            .permission_mode
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        if let Some(marker) = object.get("autoApproveMcpElicitations") {
+            return Ok(marker.as_bool().unwrap_or(false));
+        }
+        Ok(matches!(
+            (
+                object.get("approvalPolicy").and_then(Value::as_str),
+                object.get("sandboxMode").and_then(Value::as_str),
+                object.get("allowNetwork").and_then(Value::as_bool),
+            ),
+            (Some("on-request"), Some("workspace-write"), Some(true))
+        ))
+    }
+
     /// 将统一权限补丁转换为 Codex 原始权限 JSON 并持久化到线程。
     async fn patch_runtime_permissions(
         &self,
@@ -1149,6 +1193,7 @@ impl CliTool for CodexCli {
         patch: CliRuntimePermissionPatch,
     ) -> Result<ThreadDto> {
         self.load_workspace(context).await?;
+        let updates_approval = patch.approval_policy.is_some();
         let updates_sandbox = patch.sandbox_mode.is_some();
         let updates_network = patch.allow_network.is_some();
         let updates_permission_profile = patch.permission_profile.is_some();
@@ -1158,6 +1203,9 @@ impl CliTool for CodexCli {
             .and_then(|value| serde_json::from_str::<Value>(value).ok())
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
+        if updates_approval || updates_sandbox || updates_network || updates_permission_profile {
+            raw.remove("autoApproveMcpElicitations");
+        }
         if let Some(value) = patch.approval_policy {
             if let Some(value) = value.as_ref() {
                 anyhow::ensure!(
@@ -1906,6 +1954,9 @@ impl CliTool for CodexCli {
 mod tests {
     use super::*;
 
+    #[path = "../../../../tests/unit/codex_cli_permissions_tests.rs"]
+    mod codex_cli_permissions_tests;
+
     fn thread(permission_mode: Option<&str>, metadata: Option<Value>) -> ThreadDto {
         ThreadDto {
             id: "thread".to_string(),
@@ -1993,6 +2044,7 @@ mod tests {
             Some("never"),
             Some("danger-full-access"),
             Some(true),
+            None,
         );
         assert_eq!(raw["approvalPolicy"], json!("never"));
         assert_eq!(raw["sandboxMode"], json!("danger-full-access"));
