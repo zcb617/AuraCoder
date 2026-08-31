@@ -1467,6 +1467,87 @@ describe("claude-agent-sdk-server sidecar", () => {
     });
   });
 
+  it("turns SDK permission_denied into a failed action with rejection metadata", async () => {
+    const permissionMessage = "Read was denied by the Claude permission policy.";
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "init",
+            session_id: "session-permission-denied",
+          },
+        },
+        {
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "permission_denied",
+            session_id: "session-permission-denied",
+            tool_name: "Read",
+            tool_use_id: "tool-permission-denied",
+            decision_reason_type: "permission_mode",
+            decision_reason: "Read is not allowed in the current permission mode.",
+            message: permissionMessage,
+          },
+        },
+        {
+          type: "yield",
+          message: makeSuccessResult({ session_id: "session-permission-denied" }),
+        },
+      ],
+    });
+
+    harness.send({
+      id: "query-permission-denied",
+      method: "query",
+      params: {
+        prompt: "read a protected file",
+        cwd: repoRoot,
+      },
+    });
+
+    const started = await harness.waitFor(
+      (event) =>
+        event.id === "query-permission-denied" && event.type === "action_started",
+    );
+    const completed = await harness.waitFor(
+      (event) =>
+        event.id === "query-permission-denied" && event.type === "action_completed",
+    );
+    const turnCompleted = await harness.waitFor(
+      (event) =>
+        event.id === "query-permission-denied" && event.type === "turn_completed",
+    );
+
+    expect(started).toMatchObject({
+      id: "query-permission-denied",
+      actionType: "file_read",
+      toolName: "Read",
+      summary: expect.stringContaining("permission denied"),
+      details: {
+        toolName: "Read",
+        toolUseId: "tool-permission-denied",
+        decisionReasonType: "permission_mode",
+        decisionReason: "Read is not allowed in the current permission mode.",
+        message: permissionMessage,
+      },
+    });
+    expect(completed).toMatchObject({
+      id: "query-permission-denied",
+      actionId: started.actionId,
+      success: false,
+      error: permissionMessage,
+      durationMs: 0,
+    });
+    expect(turnCompleted).toMatchObject({
+      id: "query-permission-denied",
+      status: "completed",
+      sessionId: "session-permission-denied",
+    });
+  });
+
   it("keeps the Fable weekly limit separate and reports Fable context", async () => {
     const harness = await spawnHarness({
       steps: [

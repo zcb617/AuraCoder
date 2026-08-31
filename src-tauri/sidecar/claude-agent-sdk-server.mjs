@@ -2326,6 +2326,57 @@ async function handleQuery(req, persistentSession = null) {
         actualSessionId = message.session_id;
         setContextSessionId(context, actualSessionId);
         emit({ id, type: "session_init", sessionId: actualSessionId });
+      } else if (message.type === "system" && message.subtype === "permission_denied") {
+        // 将 SDK 权限拒绝保留为可展示、可持久化的失败动作，避免丢失原始拒绝元数据。
+        const rawToolName =
+          typeof message.tool_name === "string" && message.tool_name.length > 0
+            ? message.tool_name
+            : null;
+        const permissionToolName = rawToolName ?? "unknown";
+        const toolUseId =
+          typeof message.tool_use_id === "string" && message.tool_use_id.length > 0
+            ? message.tool_use_id
+            : null;
+        const decisionReasonType =
+          typeof message.decision_reason_type === "string" &&
+          message.decision_reason_type.length > 0
+            ? message.decision_reason_type
+            : null;
+        const decisionReason =
+          typeof message.decision_reason === "string" && message.decision_reason.length > 0
+            ? message.decision_reason
+            : null;
+        const permissionMessage =
+          typeof message.message === "string" && message.message.length > 0
+            ? message.message
+            : null;
+        const actionId = `claude-action-${++context.actionCounter}-permission-denied${
+          toolUseId ? `-${toolUseId}` : ""
+        }`;
+
+        emit({
+          id,
+          type: "action_started",
+          actionId,
+          actionType: mapToolNameToActionType(permissionToolName),
+          toolName: permissionToolName,
+          summary: `${permissionToolName} permission denied`,
+          details: {
+            toolName: rawToolName,
+            toolUseId,
+            decisionReasonType,
+            decisionReason,
+            message: permissionMessage,
+          },
+        });
+        emit({
+          id,
+          type: "action_completed",
+          actionId,
+          success: false,
+          error: permissionMessage,
+          durationMs: 0,
+        });
       } else if (message.type === "assistant" && typeof message.error === "string") {
         const assistantError = formatAssistantMessageError(message);
         terminalStatus = "failed";
