@@ -7,13 +7,12 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    BaseCliMcp,
     claude_code_session_lifecycle::{
         shared_claude_code_session_handles, ClaudeCodeSessionHandleRegistry,
     },
-    CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime, CliReviewStarted,
-    CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError, CliSessionSnapshot,
-    CliTool, McpInvocationContext, McpToolResult,
+    BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
+    CliReviewStarted, CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError,
+    CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult,
 };
 use crate::{
     config::app_config::ClaudeCodeSessionMode,
@@ -349,7 +348,11 @@ fn build_claude_thread_sync_snapshot(
             .get("timestamp")
             .or_else(|| record.get("createdAt"))
             .or_else(|| record.get("created_at"))
-            .or_else(|| record.get("message").and_then(|message| message.get("timestamp")))?;
+            .or_else(|| {
+                record
+                    .get("message")
+                    .and_then(|message| message.get("timestamp"))
+            })?;
         if let Some(value) = timestamp.as_str() {
             return Some(value.to_string());
         }
@@ -418,7 +421,12 @@ fn build_claude_thread_sync_snapshot(
                     let output = block
                         .get("content")
                         .and_then(value_to_text)
-                        .or_else(|| block.get("text").and_then(Value::as_str).map(str::to_string))
+                        .or_else(|| {
+                            block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
                         .unwrap_or_default();
                     let is_error = block
                         .get("is_error")
@@ -491,7 +499,11 @@ fn build_claude_thread_sync_snapshot(
             let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
             match block_type {
                 "text" => {
-                    if let Some(text) = block.get("text").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+                    if let Some(text) = block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    {
                         content_parts.push(text.to_string());
                         blocks.push(json!({ "type": "text", "content": text }));
                     }
@@ -523,7 +535,8 @@ fn build_claude_thread_sync_snapshot(
                         details
                     });
                     // actionId 同时包含记录和内容块位置，避免重复 tool id 或缺失 id 时发生合并。
-                    let action_id = format!("claude-import-{session_id}-{tool_id}-{index}-{block_index}");
+                    let action_id =
+                        format!("claude-import-{session_id}-{tool_id}-{index}-{block_index}");
                     let result = tool_results.get(tool_id.as_str());
                     let status = match result {
                         Some((_, true)) => "error",
@@ -547,7 +560,9 @@ fn build_claude_thread_sync_snapshot(
                         let output_chunks = if output.is_empty() {
                             Vec::<Value>::new()
                         } else {
-                            vec![json!({ "stream": if *is_error { "stderr" } else { "stdout" }, "content": output })]
+                            vec![
+                                json!({ "stream": if *is_error { "stderr" } else { "stdout" }, "content": output }),
+                            ]
                         };
                         action["outputChunks"] = Value::Array(output_chunks);
                         action["result"] = json!({
@@ -667,11 +682,19 @@ fn build_claude_thread_sync_snapshot(
             let usage = message.and_then(|message| message.get("usage"));
             (
                 usage
-                    .and_then(|usage| usage.get("input_tokens").or_else(|| usage.get("inputTokens")))
+                    .and_then(|usage| {
+                        usage
+                            .get("input_tokens")
+                            .or_else(|| usage.get("inputTokens"))
+                    })
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
                 usage
-                    .and_then(|usage| usage.get("output_tokens").or_else(|| usage.get("outputTokens")))
+                    .and_then(|usage| {
+                        usage
+                            .get("output_tokens")
+                            .or_else(|| usage.get("outputTokens"))
+                    })
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
             )
@@ -1119,12 +1142,8 @@ impl CliTool for ClaudeCodeCli {
     ) -> Result<()> {
         match context.location_kind {
             CliLocationKind::Local => {
-                LocalCliServiceLifecycle::register_mcp_context(
-                    self.id(),
-                    engine_thread_id,
-                    turn_id,
-                )
-                .await
+                LocalCliServiceLifecycle::register_mcp_context(self.id(), engine_thread_id, turn_id)
+                    .await
             }
             CliLocationKind::Ssh => {
                 let connection_id = context
@@ -2303,9 +2322,7 @@ impl CliTool for ClaudeCodeCli {
                 .read_remote_session_history(engine_thread_id)
                 .await
                 .with_context(|| {
-                    format!(
-                        "读取 SSH 远端 Claude 完整历史失败: session_id={engine_thread_id}"
-                    )
+                    format!("读取 SSH 远端 Claude 完整历史失败: session_id={engine_thread_id}")
                 })?;
             anyhow::ensure!(
                 history.id == engine_thread_id && history.session_id == engine_thread_id,

@@ -1126,7 +1126,10 @@ impl Engine for OpenCodeEngine {
         };
 
         match pending {
-            PendingOpenCodeRequest::Permission { request_id, connection } => {
+            PendingOpenCodeRequest::Permission {
+                request_id,
+                connection,
+            } => {
                 let decision = normalized
                     .get("decision")
                     .and_then(Value::as_str)
@@ -1262,8 +1265,7 @@ impl OpenCodeEngine {
     }
 
     pub fn new_remote_http(base_url: String, password: String) -> Self {
-        let (event_bus, _) =
-            broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
+        let (event_bus, _) = broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
         let pump_cancel = CancellationToken::new();
         Self {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
@@ -1329,9 +1331,8 @@ impl OpenCodeEngine {
                 let workspace_event_pump_enabled = true;
                 let (event_bus, pump_cancel) =
                     if include_directory_header && workspace_event_pump_enabled {
-                        let (event_bus, _) = broadcast::channel::<OpenCodeBusItem>(
-                            OPENCODE_EVENT_BUFFER_CAPACITY,
-                        );
+                        let (event_bus, _) =
+                            broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
                         let pump_cancel = CancellationToken::new();
                         tokio::spawn(run_event_pump(
                             endpoint.base_url.clone(),
@@ -1395,7 +1396,10 @@ impl OpenCodeEngine {
         let connection = self.connection_for_cwd(cwd).await?;
 
         match route.server_method.as_str() {
-            "opencode/permission" => Ok(PendingOpenCodeRequest::Permission { request_id, connection }),
+            "opencode/permission" => Ok(PendingOpenCodeRequest::Permission {
+                request_id,
+                connection,
+            }),
             "opencode/question" => {
                 let questions = details
                     .get("questions")
@@ -1420,11 +1424,9 @@ impl OpenCodeEngine {
             OpenCodeTransportTarget::Local => {
                 anyhow::bail!("OpenCode 本机服务 endpoint 尚未由 CLI 生命周期提供")
             }
-            OpenCodeTransportTarget::LocalHttp(endpoint) => (
-                endpoint.base_url.clone(),
-                endpoint.password.clone(),
-                "本机",
-            ),
+            OpenCodeTransportTarget::LocalHttp(endpoint) => {
+                (endpoint.base_url.clone(), endpoint.password.clone(), "本机")
+            }
             OpenCodeTransportTarget::Remote(endpoint) => (
                 endpoint.base_url.clone(),
                 endpoint.password.clone(),
@@ -1461,7 +1463,10 @@ impl OpenCodeEngine {
                 endpoint.base_url.clone(),
                 endpoint.password.clone(),
                 endpoint.version.clone(),
-                format!("本机 OpenCode HTTP endpoint，generation={}", endpoint.generation),
+                format!(
+                    "本机 OpenCode HTTP endpoint，generation={}",
+                    endpoint.generation
+                ),
             ),
             OpenCodeTransportTarget::Remote(endpoint) => (
                 endpoint.base_url.clone(),
@@ -1589,7 +1594,10 @@ impl OpenCodeEngine {
         }
 
         let models = match self.connection_for_cwd(cwd).await {
-            Ok(connection) => match self.load_models_from_provider_endpoint(connection.as_ref()).await {
+            Ok(connection) => match self
+                .load_models_from_provider_endpoint(connection.as_ref())
+                .await
+            {
                 Ok(models) if !models.is_empty() => models,
                 Ok(_) => self.models(),
                 Err(error) => {
@@ -1959,18 +1967,19 @@ impl OpenCodeEngine {
         session_id: &str,
         rules: &Value,
     ) -> Result<()> {
-        let rules_array = rules
-            .as_array()
-            .context("OpenCode 权限规则必须是数组")?;
+        let rules_array = rules.as_array().context("OpenCode 权限规则必须是数组")?;
         let action = rules_array.iter().rev().find_map(|rule| {
             (rule.get("permission").and_then(Value::as_str) == Some("*")
                 && rule.get("pattern").and_then(Value::as_str) == Some("*"))
-                .then(|| rule.get("action").and_then(Value::as_str))
-                .flatten()
+            .then(|| rule.get("action").and_then(Value::as_str))
+            .flatten()
         });
         if !rules_array.is_empty() {
             let action = action.context("OpenCode 权限规则缺少最后匹配的全局规则")?;
-            anyhow::ensure!(matches!(action, "allow" | "ask" | "deny"), "OpenCode 全局权限 action 无效");
+            anyhow::ensure!(
+                matches!(action, "allow" | "ask" | "deny"),
+                "OpenCode 全局权限 action 无效"
+            );
         }
         let connection = self.connection_for_cwd(cwd).await?;
         self.request(
@@ -3015,22 +3024,22 @@ impl OpenCodeEngine {
         );
 
         let approval_event = EngineEvent::ApprovalRequested {
-                approval_id,
-                action_type,
-                summary: format!("OpenCode requests {permission} permission"),
-                details: json!({
-                    "_serverMethod": "item/permissions/requestApproval",
-                    "permission": permission,
-                    "patterns": patterns,
-                    "metadata": properties.get("metadata").cloned().unwrap_or_else(|| json!({})),
-                    "always": properties.get("always").cloned().unwrap_or_else(|| json!([])),
-                    "tool": properties.get("tool").cloned(),
-                    "_opencodeRequestKind": "permission",
-                    "_opencodeRequestID": request_id,
-                    "_opencodeSessionID": properties.get("sessionID").cloned().unwrap_or_else(|| json!(null)),
-                    "_opencodeCwd": cwd,
-                }),
-            };
+            approval_id,
+            action_type,
+            summary: format!("OpenCode requests {permission} permission"),
+            details: json!({
+                "_serverMethod": "item/permissions/requestApproval",
+                "permission": permission,
+                "patterns": patterns,
+                "metadata": properties.get("metadata").cloned().unwrap_or_else(|| json!({})),
+                "always": properties.get("always").cloned().unwrap_or_else(|| json!([])),
+                "tool": properties.get("tool").cloned(),
+                "_opencodeRequestKind": "permission",
+                "_opencodeRequestID": request_id,
+                "_opencodeSessionID": properties.get("sessionID").cloned().unwrap_or_else(|| json!(null)),
+                "_opencodeCwd": cwd,
+            }),
+        };
         match event_tx.send(approval_event).await {
             Ok(()) => {
                 log::info!(
@@ -3588,9 +3597,9 @@ fn opencode_zod_schema_source(schema: &Value) -> Result<String> {
     let type_value = match schema.get("type") {
         Some(type_value) => type_value,
         None => {
-            let object = schema.as_object().ok_or_else(|| {
-                anyhow::anyhow!("JSON Schema 缺少 type 且 schema 必须是对象")
-            })?;
+            let object = schema
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("JSON Schema 缺少 type 且 schema 必须是对象"))?;
             let unsupported_keywords = object
                 .keys()
                 .filter(|key| *key != "description" && *key != "default")
@@ -3616,10 +3625,7 @@ fn opencode_zod_schema_source(schema: &Value) -> Result<String> {
                 ));
             }
             if let Some(default) = schema.get("default") {
-                expression.push_str(&format!(
-                    ".default({})",
-                    serde_json::to_string(default)?
-                ));
+                expression.push_str(&format!(".default({})", serde_json::to_string(default)?));
             }
             return Ok(expression);
 
@@ -3643,21 +3649,15 @@ fn opencode_zod_schema_source(schema: &Value) -> Result<String> {
                     .ok_or_else(|| anyhow::anyhow!("JSON Schema type 数组元素必须是字符串"))?;
                 if item_type == "null" {
                     if has_null {
-                        return Err(anyhow::anyhow!(
-                            "JSON Schema type 数组不能重复声明 null"
-                        ));
+                        return Err(anyhow::anyhow!("JSON Schema type 数组不能重复声明 null"));
                     }
                     has_null = true;
                 } else if base_type.replace(item_type).is_some() {
-                    return Err(anyhow::anyhow!(
-                        "JSON Schema type 数组只能包含一个基础类型"
-                    ));
+                    return Err(anyhow::anyhow!("JSON Schema type 数组只能包含一个基础类型"));
                 }
             }
             if !has_null {
-                return Err(anyhow::anyhow!(
-                    "JSON Schema type 数组必须包含 null"
-                ));
+                return Err(anyhow::anyhow!("JSON Schema type 数组必须包含 null"));
             }
             (
                 base_type.ok_or_else(|| anyhow::anyhow!("JSON Schema type 数组缺少基础类型"))?,
@@ -3706,8 +3706,7 @@ fn opencode_zod_schema_source(schema: &Value) -> Result<String> {
                 Value::Bool(_) => type_name == "boolean",
                 Value::Number(number) => {
                     (type_name == "number")
-                        || (type_name == "integer"
-                            && (number.is_i64() || number.is_u64()))
+                        || (type_name == "integer" && (number.is_i64() || number.is_u64()))
                 }
                 Value::Null => nullable,
                 Value::Array(_) | Value::Object(_) => false,
@@ -3753,19 +3752,14 @@ fn opencode_zod_schema_source(schema: &Value) -> Result<String> {
                 if !items.is_object() {
                     return Err(anyhow::anyhow!("array schema 的 items 必须是对象"));
                 }
-                format!(
-                    "tool.schema.array({})",
-                    opencode_zod_schema_source(items)?
-                )
+                format!("tool.schema.array({})", opencode_zod_schema_source(items)?)
             }
             "object" => format!(
                 "tool.schema.object({})",
                 opencode_object_shape_source(schema)?
             ),
             other => {
-                return Err(anyhow::anyhow!(
-                    "JSON Schema 不支持 type: {other}"
-                ));
+                return Err(anyhow::anyhow!("JSON Schema 不支持 type: {other}"));
             }
         }
     };
@@ -3775,9 +3769,7 @@ fn opencode_zod_schema_source(schema: &Value) -> Result<String> {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("JSON Schema format 必须是字符串"))?;
         if format_name != "double" {
-            return Err(anyhow::anyhow!(
-                "JSON Schema 不支持 format: {format_name}"
-            ));
+            return Err(anyhow::anyhow!("JSON Schema 不支持 format: {format_name}"));
         }
         if type_name != "number" {
             return Err(anyhow::anyhow!(
@@ -3798,25 +3790,15 @@ fn opencode_zod_schema_source(schema: &Value) -> Result<String> {
                 }
                 if let Some(minimum) = schema.get("minimum") {
                     if !minimum.is_number() {
-                        return Err(anyhow::anyhow!(
-                            "JSON Schema minimum 必须是 number"
-                        ));
+                        return Err(anyhow::anyhow!("JSON Schema minimum 必须是 number"));
                     }
-                    expression.push_str(&format!(
-                        ".min({})",
-                        serde_json::to_string(minimum)?
-                    ));
+                    expression.push_str(&format!(".min({})", serde_json::to_string(minimum)?));
                 }
                 if let Some(maximum) = schema.get("maximum") {
                     if !maximum.is_number() {
-                        return Err(anyhow::anyhow!(
-                            "JSON Schema maximum 必须是 number"
-                        ));
+                        return Err(anyhow::anyhow!("JSON Schema maximum 必须是 number"));
                     }
-                    expression.push_str(&format!(
-                        ".max({})",
-                        serde_json::to_string(maximum)?
-                    ));
+                    expression.push_str(&format!(".max({})", serde_json::to_string(maximum)?));
                 }
             }
             "string" => {
@@ -3829,25 +3811,15 @@ fn opencode_zod_schema_source(schema: &Value) -> Result<String> {
                 }
                 if let Some(min_length) = schema.get("minLength") {
                     if !min_length.is_u64() {
-                        return Err(anyhow::anyhow!(
-                            "JSON Schema minLength 必须是非负整数"
-                        ));
+                        return Err(anyhow::anyhow!("JSON Schema minLength 必须是非负整数"));
                     }
-                    expression.push_str(&format!(
-                        ".min({})",
-                        serde_json::to_string(min_length)?
-                    ));
+                    expression.push_str(&format!(".min({})", serde_json::to_string(min_length)?));
                 }
                 if let Some(max_length) = schema.get("maxLength") {
                     if !max_length.is_u64() {
-                        return Err(anyhow::anyhow!(
-                            "JSON Schema maxLength 必须是非负整数"
-                        ));
+                        return Err(anyhow::anyhow!("JSON Schema maxLength 必须是非负整数"));
                     }
-                    expression.push_str(&format!(
-                        ".max({})",
-                        serde_json::to_string(max_length)?
-                    ));
+                    expression.push_str(&format!(".max({})", serde_json::to_string(max_length)?));
                 }
                 if let Some(pattern) = schema.get("pattern") {
                     let pattern = pattern
@@ -3869,25 +3841,15 @@ fn opencode_zod_schema_source(schema: &Value) -> Result<String> {
                 }
                 if let Some(min_items) = schema.get("minItems") {
                     if !min_items.is_u64() {
-                        return Err(anyhow::anyhow!(
-                            "JSON Schema minItems 必须是非负整数"
-                        ));
+                        return Err(anyhow::anyhow!("JSON Schema minItems 必须是非负整数"));
                     }
-                    expression.push_str(&format!(
-                        ".min({})",
-                        serde_json::to_string(min_items)?
-                    ));
+                    expression.push_str(&format!(".min({})", serde_json::to_string(min_items)?));
                 }
                 if let Some(max_items) = schema.get("maxItems") {
                     if !max_items.is_u64() {
-                        return Err(anyhow::anyhow!(
-                            "JSON Schema maxItems 必须是非负整数"
-                        ));
+                        return Err(anyhow::anyhow!("JSON Schema maxItems 必须是非负整数"));
                     }
-                    expression.push_str(&format!(
-                        ".max({})",
-                        serde_json::to_string(max_items)?
-                    ));
+                    expression.push_str(&format!(".max({})", serde_json::to_string(max_items)?));
                 }
             }
             "boolean" | "object" => {
@@ -3940,10 +3902,7 @@ fn opencode_zod_schema_source(schema: &Value) -> Result<String> {
         ));
     }
     if let Some(default) = schema.get("default") {
-        expression.push_str(&format!(
-            ".default({})",
-            serde_json::to_string(default)?
-        ));
+        expression.push_str(&format!(".default({})", serde_json::to_string(default)?));
     }
     Ok(expression)
 }
@@ -4033,18 +3992,15 @@ fn write_opencode_computer_control_tool(
             .and_then(Value::as_str)
             .unwrap_or("<缺少名称>");
         let generated = (|| -> Result<String> {
-            let name = spec["name"].as_str().ok_or_else(|| {
-                anyhow::anyhow!("CUA SDK 工具缺少可用于 OpenCode 导出的 name")
-            })?;
+            let name = spec["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("CUA SDK 工具缺少可用于 OpenCode 导出的 name"))?;
             if name.is_empty()
-                || !name
-                    .chars()
-                    .enumerate()
-                    .all(|(index, character)| {
-                        character == '_'
-                            || character.is_ascii_alphanumeric()
-                                && (index > 0 || character.is_ascii_alphabetic())
-                    })
+                || !name.chars().enumerate().all(|(index, character)| {
+                    character == '_'
+                        || character.is_ascii_alphanumeric()
+                            && (index > 0 || character.is_ascii_alphabetic())
+                })
             {
                 return Err(anyhow::anyhow!(
                     "CUA SDK 返回了不能作为 OpenCode 工具导出的名称：{name}"
@@ -4078,8 +4034,12 @@ fn write_opencode_computer_control_tool(
     }
 
     let tools_dir = run_dir.join(".opencode").join("tools");
-    std::fs::create_dir_all(&tools_dir)
-        .with_context(|| format!("failed to create OpenCode tools directory {}", tools_dir.display()))?;
+    std::fs::create_dir_all(&tools_dir).with_context(|| {
+        format!(
+            "failed to create OpenCode tools directory {}",
+            tools_dir.display()
+        )
+    })?;
     let mut source = format!(
         "import {{ tool }} from \"@opencode-ai/plugin\";\n\nconst endpoint = {endpoint};\nconst token = {token};\nasync function invoke(toolName, args, context) {{\n  const response = await fetch(endpoint, {{\n    method: \"POST\",\n    headers: {{ \"content-type\": \"application/json\", \"x-auracoder-computer-control-token\": token }},\n    body: JSON.stringify({{\n      tool: toolName,\n      arguments: args ?? {{}},\n      threadId: context?.sessionID ?? context?.sessionId ?? context?.session_id,\n      turnId: context?.messageID ?? context?.messageId ?? context?.callID ?? context?.callId,\n      callId: context?.callID ?? context?.callId,\n    }}),\n  }});\n  const result = await response.json();\n  if (!response.ok || result?.isError) {{\n    throw new Error(result?.error || `AuraCoder computer control callback failed (HTTP ${{response.status}})`);\n  }}\n  return JSON.stringify(result);\n}}\n\n",
     );
@@ -4102,8 +4062,12 @@ fn write_opencode_auracoder_thread_mcp_tool(
     tool_specs: &[Value],
 ) -> Result<()> {
     let tools_dir = run_dir.join(".opencode").join("tools");
-    std::fs::create_dir_all(&tools_dir)
-        .with_context(|| format!("failed to create OpenCode tools directory {}", tools_dir.display()))?;
+    std::fs::create_dir_all(&tools_dir).with_context(|| {
+        format!(
+            "failed to create OpenCode tools directory {}",
+            tools_dir.display()
+        )
+    })?;
     let endpoint = serde_json::to_string(callback_url)?;
     let token = serde_json::to_string(callback_token)?;
 
@@ -4149,8 +4113,9 @@ fn write_opencode_auracoder_thread_mcp_tool(
             "import {{ tool }} from \"@opencode-ai/plugin\";\n\nconst endpoint = {endpoint};\nconst token = {token};\nasync function invoke(toolName, args, context) {{\n  const response = await fetch(endpoint, {{\n    method: \"POST\",\n    headers: {{ \"content-type\": \"application/json\", \"x-auracoder-computer-control-token\": token }},\n    body: JSON.stringify({{\n      tool: toolName,\n      toolKind: \"auracoder_thread\",\n      arguments: args ?? {{}},\n      threadId: context?.sessionID ?? context?.sessionId ?? context?.session_id,\n      turnId: context?.messageID ?? context?.messageId ?? context?.callID ?? context?.callId,\n      callId: context?.callID ?? context?.callId,\n    }}),\n  }});\n  const result = await response.json();\n  if (!response.ok || result?.isError) {{\n    throw new Error(result?.error || `AuraCoder thread callback failed (HTTP ${{response.status}})`);\n  }}\n  return JSON.stringify(result);\n}}\n\nexport default tool({{\n  description: {description},\n  args: {args},\n  async execute(args, context) {{\n    return invoke({tool_name}, args, context);\n  }},\n}});\n",
         );
         let tool_file = tools_dir.join(format!("{name}.ts"));
-        std::fs::write(&tool_file, source)
-            .with_context(|| format!("failed to write OpenCode tool file {}", tool_file.display()))?;
+        std::fs::write(&tool_file, source).with_context(|| {
+            format!("failed to write OpenCode tool file {}", tool_file.display())
+        })?;
     }
     Ok(())
 }
@@ -4193,7 +4158,8 @@ async fn handle_opencode_callback(
         };
         buffer.extend_from_slice(&chunk[..read]);
         if buffer.len() > 1024 * 1024 {
-            write_opencode_http_response(&mut stream, 413, json!({"error":"request too large"})).await;
+            write_opencode_http_response(&mut stream, 413, json!({"error":"request too large"}))
+                .await;
             return;
         }
         if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -4228,18 +4194,21 @@ async fn handle_opencode_callback(
         };
         buffer.extend_from_slice(&chunk[..read]);
         if buffer.len() > 1024 * 1024 {
-            write_opencode_http_response(&mut stream, 413, json!({"error":"request too large"})).await;
+            write_opencode_http_response(&mut stream, 413, json!({"error":"request too large"}))
+                .await;
             return;
         }
     }
 
-    let request: Value = match serde_json::from_slice(&buffer[body_start..body_start + content_length]) {
-        Ok(value) => value,
-        Err(error) => {
-            write_opencode_http_response(&mut stream, 400, json!({"error": error.to_string()})).await;
-            return;
-        }
-    };
+    let request: Value =
+        match serde_json::from_slice(&buffer[body_start..body_start + content_length]) {
+            Ok(value) => value,
+            Err(error) => {
+                write_opencode_http_response(&mut stream, 400, json!({"error": error.to_string()}))
+                    .await;
+                return;
+            }
+        };
     let tool_kind = request
         .get("toolKind")
         .and_then(Value::as_str)
@@ -4269,27 +4238,34 @@ async fn handle_opencode_callback(
         .get("callId")
         .and_then(Value::as_str)
         .unwrap_or(turn_id);
-    let arguments = request.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let arguments = request
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let result = if tool_kind == "auracoder_thread" {
         match auracoder_thread_mcp_service.as_ref() {
-            Some(service) => service
-                .invoke_for_engine("opencode", thread_id, tool, arguments)
-                .await,
+            Some(service) => {
+                service
+                    .invoke_for_engine("opencode", thread_id, tool, arguments)
+                    .await
+            }
             None => Err("AuraCoder 会话 MCP 服务尚未绑定到 OpenCode 引擎".to_string()),
         }
     } else {
         match computer_control_service.as_ref() {
-            Some(service) => service
-                .invoke_for_engine(
-                    "opencode",
-                    thread_id,
-                    turn_id,
-                    tool,
-                    call_id,
-                    arguments,
-                    CancellationToken::new(),
-                )
-                .await,
+            Some(service) => {
+                service
+                    .invoke_for_engine(
+                        "opencode",
+                        thread_id,
+                        turn_id,
+                        tool,
+                        call_id,
+                        arguments,
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
             None => Err("AuraCoder 电脑操作服务尚未绑定到 OpenCode 引擎".to_string()),
         }
     };
@@ -4311,11 +4287,17 @@ async fn handle_opencode_callback(
 }
 
 fn normalize_opencode_tool_name(tool: &str) -> &str {
-    tool.strip_prefix("auracoder_computer_control_").unwrap_or(tool)
+    tool.strip_prefix("auracoder_computer_control_")
+        .unwrap_or(tool)
 }
 
-async fn write_opencode_http_response(stream: &mut tokio::net::TcpStream, status: u16, body: Value) {
-    let payload = serde_json::to_vec(&body).unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec());
+async fn write_opencode_http_response(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    body: Value,
+) {
+    let payload = serde_json::to_vec(&body)
+        .unwrap_or_else(|_| b"{\"error\":\"serialization failed\"}".to_vec());
     let status_text = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -5125,8 +5107,7 @@ mod tests {
     use crate::engines::TurnAttachment;
 
     fn test_remote_engine(base_url: String) -> OpenCodeEngine {
-        let (event_bus, _) =
-            broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
+        let (event_bus, _) = broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
         OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
@@ -5160,8 +5141,9 @@ mod tests {
                     let read = stream.read(&mut buffer).await.unwrap();
                     assert!(read > 0, "mock client closed before permission reply");
                     request_bytes.extend_from_slice(&buffer[..read]);
-                    if let Some(header_end) =
-                        request_bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                    if let Some(header_end) = request_bytes
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
                     {
                         let body_start = header_end + 4;
                         let headers = String::from_utf8_lossy(&request_bytes[..header_end])
@@ -5180,8 +5162,7 @@ mod tests {
                     String::from_utf8_lossy(&request_bytes[..body_start + content_length]);
                 assert!(request.starts_with("POST /permission/request-1/reply HTTP/1.1"));
                 assert!(request.contains(&format!("\"reply\":\"{expected_reply}\"")));
-                let response =
-                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 stream.write_all(response.as_bytes()).await.unwrap();
             });
             (format!("http://{address}"), Some(task))
@@ -5190,7 +5171,10 @@ mod tests {
         };
 
         let engine = test_remote_engine(base_url);
-        let connection = engine.connection_for_cwd("/var/work/project-a").await.unwrap();
+        let connection = engine
+            .connection_for_cwd("/var/work/project-a")
+            .await
+            .unwrap();
         engine.state.lock().await.sessions.insert(
             "ses_test".to_string(),
             OpenCodeSession {
@@ -5231,11 +5215,9 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn listener_failure_is_forwarded_to_the_active_turn() {
-        let (event_bus, _) =
-            broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
+        let (event_bus, _) = broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
         let mut incoming = spawn_opencode_incoming_pump(event_bus.clone());
 
         event_bus
@@ -5258,7 +5240,10 @@ mod tests {
         );
         assert!(engine.is_available().await);
 
-        let connection = engine.connection_for_cwd("/var/work/project-a").await.unwrap();
+        let connection = engine
+            .connection_for_cwd("/var/work/project-a")
+            .await
+            .unwrap();
         let request = engine
             .request(connection.as_ref(), reqwest::Method::GET, "/provider")
             .build()
@@ -5321,9 +5306,8 @@ mod tests {
                 let request = String::from_utf8_lossy(&request_bytes[..length]);
                 assert!(request.starts_with("GET /event HTTP/1.1"));
                 assert!(request.lines().any(|line| {
-                    line.split_once(':').is_some_and(|(name, _)| {
-                        name.eq_ignore_ascii_case("authorization")
-                    })
+                    line.split_once(':')
+                        .is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization"))
                 }));
                 let directory = request
                     .lines()
@@ -5345,8 +5329,7 @@ mod tests {
             directories
         });
 
-        let (event_bus, _) =
-            broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
+        let (event_bus, _) = broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
         let engine = OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
@@ -5361,8 +5344,14 @@ mod tests {
             })),
         };
 
-        let project_a = engine.connection_for_cwd("/var/work/project-a").await.unwrap();
-        let project_b = engine.connection_for_cwd("/var/work/project-b").await.unwrap();
+        let project_a = engine
+            .connection_for_cwd("/var/work/project-a")
+            .await
+            .unwrap();
+        let project_b = engine
+            .connection_for_cwd("/var/work/project-b")
+            .await
+            .unwrap();
         let mut directories = timeout(Duration::from_secs(2), server_task)
             .await
             .expect("workspace event pumps did not connect")
@@ -5497,9 +5486,13 @@ mod tests {
                 let read = stream.read(&mut buffer).await.unwrap();
                 assert!(read > 0, "mock client closed before sending PATCH request");
                 request_bytes.extend_from_slice(&buffer[..read]);
-                if let Some(header_end) = request_bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                if let Some(header_end) = request_bytes
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                {
                     let body_start = header_end + 4;
-                    let headers = String::from_utf8_lossy(&request_bytes[..header_end]).to_ascii_lowercase();
+                    let headers =
+                        String::from_utf8_lossy(&request_bytes[..header_end]).to_ascii_lowercase();
                     let content_length = headers
                         .lines()
                         .find_map(|line| line.strip_prefix("content-length:"))
@@ -5524,8 +5517,7 @@ mod tests {
             stream.write_all(response.as_bytes()).await.unwrap();
         });
 
-        let (event_bus, _) =
-            broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
+        let (event_bus, _) = broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
         let engine = OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
@@ -5539,7 +5531,10 @@ mod tests {
                 workspace_event_pump_enabled: false,
             })),
         };
-        let connection = engine.connection_for_cwd("/var/work/project-a").await.unwrap();
+        let connection = engine
+            .connection_for_cwd("/var/work/project-a")
+            .await
+            .unwrap();
         engine.state.lock().await.sessions.insert(
             "ses_test".to_string(),
             OpenCodeSession {
@@ -5552,11 +5547,7 @@ mod tests {
             },
         );
         engine
-            .set_session_permission_mode(
-                "/var/work/project-a",
-                "ses_test",
-                &json!("allow"),
-            )
+            .set_session_permission_mode("/var/work/project-a", "ses_test", &json!("allow"))
             .await
             .unwrap();
         assert_eq!(
@@ -5586,14 +5577,18 @@ mod tests {
             let mut buffer = [0_u8; 4096];
             let (body_start, content_length) = loop {
                 let read = stream.read(&mut buffer).await.unwrap();
-                assert!(read > 0, "mock client closed before sending empty PATCH request");
+                assert!(
+                    read > 0,
+                    "mock client closed before sending empty PATCH request"
+                );
                 request_bytes.extend_from_slice(&buffer[..read]);
-                if let Some(header_end) =
-                    request_bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                if let Some(header_end) = request_bytes
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
                 {
                     let body_start = header_end + 4;
-                    let headers = String::from_utf8_lossy(&request_bytes[..header_end])
-                        .to_ascii_lowercase();
+                    let headers =
+                        String::from_utf8_lossy(&request_bytes[..header_end]).to_ascii_lowercase();
                     let content_length = headers
                         .lines()
                         .find_map(|line| line.strip_prefix("content-length:"))
@@ -5607,17 +5602,16 @@ mod tests {
             let request = String::from_utf8_lossy(&request_bytes[..body_start + content_length]);
             assert!(request.starts_with("PATCH /session/ses_empty HTTP/1.1"));
             let body = &request_bytes[body_start..body_start + content_length];
-            assert_eq!(
-                std::str::from_utf8(body).unwrap(),
-                r#"{"permission":[]}"#
-            );
-            let response =
-                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            assert_eq!(std::str::from_utf8(body).unwrap(), r#"{"permission":[]}"#);
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             stream.write_all(response.as_bytes()).await.unwrap();
         });
 
         let engine = test_remote_engine(format!("http://{address}"));
-        let connection = engine.connection_for_cwd("/var/work/project-a").await.unwrap();
+        let connection = engine
+            .connection_for_cwd("/var/work/project-a")
+            .await
+            .unwrap();
         engine.state.lock().await.sessions.insert(
             "ses_empty".to_string(),
             OpenCodeSession {
@@ -5630,11 +5624,7 @@ mod tests {
             },
         );
         engine
-            .set_session_permission_rules(
-                "/var/work/project-a",
-                "ses_empty",
-                &json!([]),
-            )
+            .set_session_permission_rules("/var/work/project-a", "ses_empty", &json!([]))
             .await
             .unwrap();
         assert_eq!(
@@ -5669,8 +5659,7 @@ mod tests {
                 "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             stream.write_all(response.as_bytes()).await.unwrap();
         });
-        let (event_bus, _) =
-            broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
+        let (event_bus, _) = broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
         let engine = OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
@@ -5684,7 +5673,10 @@ mod tests {
                 workspace_event_pump_enabled: false,
             })),
         };
-        let connection = engine.connection_for_cwd("/var/work/project-a").await.unwrap();
+        let connection = engine
+            .connection_for_cwd("/var/work/project-a")
+            .await
+            .unwrap();
         engine.state.lock().await.sessions.insert(
             "ses_test".to_string(),
             OpenCodeSession {
@@ -5697,11 +5689,7 @@ mod tests {
             },
         );
         assert!(engine
-            .set_session_permission_mode(
-                "/var/work/project-a",
-                "ses_test",
-                &json!("allow"),
-            )
+            .set_session_permission_mode("/var/work/project-a", "ses_test", &json!("allow"),)
             .await
             .is_err());
         assert_eq!(
@@ -5828,8 +5816,9 @@ opencode/gpt-5-nano
                 message: "读取附件".to_string(),
                 attachments: vec![TurnAttachment {
                     file_name: "说明.txt".to_string(),
-                    file_path: "/home/tester/.cache/auracoder/attachments/workspace/thread/file.txt"
-                        .to_string(),
+                    file_path:
+                        "/home/tester/.cache/auracoder/attachments/workspace/thread/file.txt"
+                            .to_string(),
                     preview_file_path: None,
                     size_bytes: 12,
                     mime_type: Some("text/plain".to_string()),
@@ -6192,69 +6181,71 @@ opencode/gpt-5-nano
 
     #[test]
     fn generated_computer_control_tools_use_isolated_callback_contract() {
-        let run_dir = std::env::temp_dir().join(format!(
-            "auracoder-opencode-tools-test-{}",
-            Uuid::new_v4()
-        ));
+        let run_dir =
+            std::env::temp_dir().join(format!("auracoder-opencode-tools-test-{}", Uuid::new_v4()));
         write_opencode_computer_control_tool(
             &run_dir,
             "http://127.0.0.1:45678/invoke",
             "one-time-token",
-            &[json!({
-                "name": "click",
-                "description": "SDK supplied click tool",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "pid": { "type": "integer", "description": "Process id" },
-                        "button": { "type": "string" }
-                    },
-                    "required": ["pid"]
-                }
-            }), json!({
-                "name": "verify_state",
-                "description": "SDK supplied verify_state tool",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "pid": { "type": "integer" },
-                        "expect": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "element": {
-                                        "type": ["object", "null"],
-                                        "properties": {
-                                            "exists": { "type": "boolean", "enum": [true] }
-                                        },
-                                        "required": ["exists"],
-                                        "additionalProperties": false
-                                    }
-                                },
-                                "required": ["element"],
-                                "additionalProperties": false
+            &[
+                json!({
+                    "name": "click",
+                    "description": "SDK supplied click tool",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pid": { "type": "integer", "description": "Process id" },
+                            "button": { "type": "string" }
+                        },
+                        "required": ["pid"]
+                    }
+                }),
+                json!({
+                    "name": "verify_state",
+                    "description": "SDK supplied verify_state tool",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pid": { "type": "integer" },
+                            "expect": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "element": {
+                                            "type": ["object", "null"],
+                                            "properties": {
+                                                "exists": { "type": "boolean", "enum": [true] }
+                                            },
+                                            "required": ["exists"],
+                                            "additionalProperties": false
+                                        }
+                                    },
+                                    "required": ["element"],
+                                    "additionalProperties": false
+                                }
                             }
-                        }
-                    },
-                    "required": ["pid", "expect"],
-                    "additionalProperties": false
-                }
-            }), json!({
-                "name": "set_config",
-                "description": "SDK supplied set_config tool",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "key": { "type": "string" },
-                        "value": {
-                            "description": "New value for `key`. JSON type depends on the key."
-                        }
-                    },
-                    "required": ["key"],
-                    "additionalProperties": true
-                }
-            })],
+                        },
+                        "required": ["pid", "expect"],
+                        "additionalProperties": false
+                    }
+                }),
+                json!({
+                    "name": "set_config",
+                    "description": "SDK supplied set_config tool",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "key": { "type": "string" },
+                            "value": {
+                                "description": "New value for `key`. JSON type depends on the key."
+                            }
+                        },
+                        "required": ["key"],
+                        "additionalProperties": true
+                    }
+                }),
+            ],
         )
         .expect("OpenCode tool source should be generated");
 
@@ -6286,10 +6277,8 @@ opencode/gpt-5-nano
 
     #[test]
     fn computer_control_tool_generation_aggregates_schema_errors_without_partial_write() {
-        let run_dir = std::env::temp_dir().join(format!(
-            "auracoder-opencode-tools-error-{}",
-            Uuid::new_v4()
-        ));
+        let run_dir =
+            std::env::temp_dir().join(format!("auracoder-opencode-tools-error-{}", Uuid::new_v4()));
         let tools_dir = run_dir.join(".opencode").join("tools");
         std::fs::create_dir_all(&tools_dir).expect("test tools directory should be created");
         let tool_file = tools_dir.join("auracoder_computer_control.ts");
@@ -6343,13 +6332,10 @@ opencode/gpt-5-nano
         let sdk = Arc::new(crate::computer_control_sdk::CuaDriverSdk::new());
         let manifest_key = concat!("CAR", "G", "O_MANIFEST_DIR");
         sdk.set_resource_dir(Some(
-            PathBuf::from(std::env::var(manifest_key).expect("manifest path"))
-                .join("resources"),
+            PathBuf::from(std::env::var(manifest_key).expect("manifest path")).join("resources"),
         ));
-        let run_dir = std::env::temp_dir().join(format!(
-            "auracoder-opencode-cua-catalog-{}",
-            Uuid::new_v4()
-        ));
+        let run_dir =
+            std::env::temp_dir().join(format!("auracoder-opencode-cua-catalog-{}", Uuid::new_v4()));
 
         let conversion = (|| -> Result<()> {
             sdk.initialize().map_err(anyhow::Error::msg)?;
@@ -6571,12 +6557,15 @@ opencode/gpt-5-nano
             "additionalProperties": false
         });
         let source = opencode_tool_args_source(&schema).expect("schema should convert");
-        assert!(source.contains("tool.schema.enum([\"one\", \"two\"]).describe(\"Name\").default(\"one\")"));
+        assert!(source
+            .contains("tool.schema.enum([\"one\", \"two\"]).describe(\"Name\").default(\"one\")"));
         assert!(source.contains("tool.schema.number().int().min(1).max(3)"));
         assert!(source.contains("tool.schema.number()"));
         assert!(source.contains("tool.schema.boolean()"));
         assert!(source.contains("tool.schema.array(tool.schema.string()).min(1).max(2)"));
-        assert!(source.contains("tool.schema.string().min(2).max(4).regex(new RegExp(\"^[a-z]+$\")).nullable()"));
+        assert!(source.contains(
+            "tool.schema.string().min(2).max(4).regex(new RegExp(\"^[a-z]+$\")).nullable()"
+        ));
         assert!(source.contains("\"name\": tool.schema.enum"));
         assert!(source.contains("\"exists\": tool.schema.literal(true)"));
 
@@ -6759,14 +6748,12 @@ opencode/gpt-5-nano
         .expect("AuraCoder thread tool sources should be generated");
 
         let tools_dir = run_dir.join(".opencode").join("tools");
-        let count_source = std::fs::read_to_string(
-            tools_dir.join("get_auracoder_thread_message_count.ts"),
-        )
-        .expect("message count tool source should exist");
-        let page_source = std::fs::read_to_string(
-            tools_dir.join("get_auracoder_thread_messages_page.ts"),
-        )
-        .expect("message page tool source should exist");
+        let count_source =
+            std::fs::read_to_string(tools_dir.join("get_auracoder_thread_message_count.ts"))
+                .expect("message count tool source should exist");
+        let page_source =
+            std::fs::read_to_string(tools_dir.join("get_auracoder_thread_messages_page.ts"))
+                .expect("message page tool source should exist");
         for source in [&count_source, &page_source] {
             assert!(source.contains("import { tool } from \"@opencode-ai/plugin\""));
             assert!(source.contains("export default tool({"));
@@ -6781,15 +6768,13 @@ opencode/gpt-5-nano
             assert!(source.contains("throw new Error"));
         }
         assert!(count_source.contains("\"thread_id\": tool.schema.string()"));
-        assert!(count_source.contains(
-            "return invoke(\"get_auracoder_thread_message_count\", args, context);"
-        ));
+        assert!(count_source
+            .contains("return invoke(\"get_auracoder_thread_message_count\", args, context);"));
         assert!(page_source.contains("\"thread_id\": tool.schema.string()"));
         assert!(page_source.contains("\"page\": tool.schema.number().int().min(1)"));
         assert!(page_source.contains("\"page_size\": tool.schema.number().int().min(1)"));
-        assert!(page_source.contains(
-            "return invoke(\"get_auracoder_thread_messages_page\", args, context);"
-        ));
+        assert!(page_source
+            .contains("return invoke(\"get_auracoder_thread_messages_page\", args, context);"));
         assert!(!tools_dir.join("auracoder_thread_mcp.ts").exists());
 
         let _ = std::fs::remove_dir_all(run_dir);

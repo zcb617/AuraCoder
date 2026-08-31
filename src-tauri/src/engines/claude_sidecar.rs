@@ -472,8 +472,10 @@ impl ClaudeTransport {
                             match serde_json::from_str::<SidecarEvent>(&line) {
                                 Ok(event) => {
                                     let event = trim_sidecar_event_for_buffer(event);
-                                    if matches!(event, SidecarEvent::Ready | SidecarEvent::Error { .. })
-                                    {
+                                    if matches!(
+                                        event,
+                                        SidecarEvent::Ready | SidecarEvent::Error { .. }
+                                    ) {
                                         if let Some(sender) = startup_tx.take() {
                                             let _ = sender.send(event.clone());
                                         }
@@ -2354,7 +2356,9 @@ impl Engine for ClaudeSidecarEngine {
                 mcp_gateway_token.is_some()
             );
             log::error!("Claude MCP 配置异常：{internal_error:#}");
-            return Err(anyhow::anyhow!("AuraCoder MCP 配置不完整，Claude 会话无法启动"));
+            return Err(anyhow::anyhow!(
+                "AuraCoder MCP 配置不完整，Claude 会话无法启动"
+            ));
         }
 
         let request_id = Uuid::new_v4().to_string();

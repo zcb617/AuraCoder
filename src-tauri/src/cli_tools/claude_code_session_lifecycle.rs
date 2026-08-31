@@ -589,9 +589,7 @@ impl ClaudeCodeSessionHandleRegistry {
         let handle_id = match slot.handle.get() {
             Some(handle) => handle.handle_id.clone(),
             None => {
-                let error = anyhow::anyhow!(
-                    "Claude Code 会话句柄尚未建立: thread_id={thread_id}"
-                );
+                let error = anyhow::anyhow!("Claude Code 会话句柄尚未建立: thread_id={thread_id}");
                 log::error!(
                     "Claude Code 远端会话销毁失败: event={} thread_id={} handle_id=<unknown> endpoint=<unknown> status=<unavailable> response_body=<none> request_error={error:#}",
                     event,
@@ -1490,6 +1488,8 @@ mod tests {
         assert_eq!(second.handle_id, "handle-2");
         assert_eq!(create_count.load(Ordering::SeqCst), 3);
 
-        server.await.expect("finish replacement failure test server");
+        server
+            .await
+            .expect("finish replacement failure test server");
     }
 }

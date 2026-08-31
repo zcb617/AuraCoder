@@ -7,8 +7,7 @@ use super::{CliLocationKind, McpInvocationContext, McpToolResult};
 use crate::{
     computer_control_service::{
         is_known_mcp_computer_tool, mcp_operation_kind, mcp_request_targets_current_process,
-        resolve_mcp_target,
-        ComputerControlAuthorization, ComputerControlTool,
+        resolve_mcp_target, ComputerControlAuthorization, ComputerControlTool,
     },
     config::app_config::AppConfig,
     state::AppState,
@@ -50,8 +49,7 @@ impl BaseCliMcp {
         );
         let mut tools = self.state.auracoder_thread_mcp_service.tool_specs();
         if self.runtime.location == CliLocationKind::Local {
-            let computer_tool =
-                ComputerControlTool::new(self.state.computer_control_service.sdk());
+            let computer_tool = ComputerControlTool::new(self.state.computer_control_service.sdk());
             match computer_tool.tool_specs() {
                 Ok(computer_tools) => tools.extend(computer_tools),
                 Err(error) => {
@@ -224,7 +222,7 @@ impl BaseCliMcp {
                         source_workspace,
                         started_at.elapsed().as_millis(),
                     );
-                    return McpToolResult::error("tool_not_found", "指定的 AuraCoder 会话不存在")
+                    return McpToolResult::error("tool_not_found", "指定的 AuraCoder 会话不存在");
                 }
                 Err(error) => {
                     log::warn!(
@@ -498,9 +496,10 @@ impl BaseCliMcp {
                 return McpToolResult::error("tool_not_found", "电脑操作工具当前不可用");
             }
         };
-        if !computer_specs.iter().any(|tool| {
-            tool.get("name").and_then(Value::as_str) == Some(tool_name)
-        }) {
+        if !computer_specs
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+        {
             log::warn!(
                 "BaseCliMcp unknown computer tool rejected: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, result_code=tool_not_found, is_error=true, duration_ms={}",
                 self.runtime.cli_id,
@@ -526,7 +525,10 @@ impl BaseCliMcp {
                 }
                 Err(error) => {
                     log::warn!("BaseCliMcp 解析电脑工具 arguments 失败，原始错误：{error}");
-                    return McpToolResult::error("invalid_request", "电脑操作 arguments 不是有效 JSON");
+                    return McpToolResult::error(
+                        "invalid_request",
+                        "电脑操作 arguments 不是有效 JSON",
+                    );
                 }
             },
             _ => {
@@ -540,7 +542,10 @@ impl BaseCliMcp {
             return McpToolResult::error("invalid_request", "电脑操作 arguments 必须是 JSON 对象");
         };
         if mcp_request_targets_current_process(&arguments) {
-            return McpToolResult::error("tool_not_allowed", "AuraCoder 不允许把自身窗口作为电脑操作目标");
+            return McpToolResult::error(
+                "tool_not_allowed",
+                "AuraCoder 不允许把自身窗口作为电脑操作目标",
+            );
         }
         let target = match resolve_mcp_target(tool_name, &arguments) {
             Ok(target) => target,

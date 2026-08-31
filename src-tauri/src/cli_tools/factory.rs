@@ -3,12 +3,8 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use super::{
-    claude_code::ClaudeCodeCli,
-    codex::CodexCli,
-    opencode::OpenCodeCli,
-    CliLocationKind,
-    CliMcpRuntime,
-    CliTool,
+    claude_code::ClaudeCodeCli, codex::CodexCli, opencode::OpenCodeCli, CliLocationKind,
+    CliMcpRuntime, CliTool,
 };
 use crate::state::AppState;
 
@@ -44,7 +40,10 @@ impl CliToolFactory {
             runtime.cli_id
         );
         anyhow::ensure!(
-            matches!(runtime.location, CliLocationKind::Local | CliLocationKind::Ssh),
+            matches!(
+                runtime.location,
+                CliLocationKind::Local | CliLocationKind::Ssh
+            ),
             "不支持的 MCP CLI 运行位置"
         );
         match cli_id {

@@ -11,9 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
-    CliReviewStarted,
-    CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError, CliSessionSnapshot,
-    CliTool, McpInvocationContext, McpToolResult,
+    CliReviewStarted, CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError,
+    CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult,
 };
 use crate::{
     db,
@@ -484,12 +483,8 @@ impl CliTool for OpenCodeCli {
     ) -> Result<()> {
         match context.location_kind {
             CliLocationKind::Local => {
-                LocalCliServiceLifecycle::register_mcp_context(
-                    self.id(),
-                    engine_thread_id,
-                    turn_id,
-                )
-                .await
+                LocalCliServiceLifecycle::register_mcp_context(self.id(), engine_thread_id, turn_id)
+                    .await
             }
             CliLocationKind::Ssh => {
                 let connection_id = context
@@ -738,7 +733,11 @@ impl CliTool for OpenCodeCli {
     async fn engine_health(&self, context: &CliExecutionContext) -> Result<EngineHealthDto> {
         let workspace = self.load_workspace(context).await?;
         if context.location_kind == CliLocationKind::Local {
-            let report = self.local_engine(&context.root_path).await?.health_report().await;
+            let report = self
+                .local_engine(&context.root_path)
+                .await?
+                .health_report()
+                .await;
             return Ok(EngineHealthDto {
                 id: "opencode".to_string(),
                 available: report.available,
@@ -1577,11 +1576,7 @@ impl CliTool for OpenCodeCli {
             let mut results = Vec::new();
             for kind in requested_kinds {
                 if kind == "mcp" {
-                    let runtime_result = self
-                        .local_engine(&cwd)
-                        .await?
-                        .runtime_catalog(&cwd)
-                        .await;
+                    let runtime_result = self.local_engine(&cwd).await?.runtime_catalog(&cwd).await;
                     results.push(
                         extensions::opencode::refresh_kind_with_runtime(
                             Some(cwd.as_str()),
