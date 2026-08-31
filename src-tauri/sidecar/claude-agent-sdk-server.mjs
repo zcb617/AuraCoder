@@ -473,6 +473,13 @@ function resolvePermissionMode(approvalPolicy, allowNetwork) {
 
 /** 将 AuraCoder 权限策略映射为 Claude SDK 原生权限选项和审批决策模式。 */
 function resolveClaudeSdkPermissionOptions(approvalPolicy, planMode) {
+  if (approvalPolicy === "bypassPermissions") {
+    return {
+      sdkPermissionMode: "bypassPermissions",
+      decisionMode: "full",
+      allowDangerouslySkipPermissions: true,
+    };
+  }
   if (planMode) {
     return {
       sdkPermissionMode: "plan",
@@ -525,7 +532,10 @@ function requiresApprovalLegacy(permissionMode, toolName) {
 }
 */
 
-function createQueryContext(id) {
+/** 创建一个查询上下文，并保存该查询当前可变的权限策略状态。 */
+function createQueryContext(id, approvalPolicy = null, planMode = false) {
+  const normalizedApprovalPolicy = typeof approvalPolicy === "string" ? approvalPolicy : null;
+  const normalizedPlanMode = planMode === true;
   return {
     id,
     threadId: id,
@@ -541,6 +551,15 @@ function createQueryContext(id) {
     tokenUsage: null,
     stopReason: null,
     pendingComputerControlCalls: new Map(),
+    // 当前查询正在使用的 AuraCoder 权限策略，可由活动查询命令更新。
+    approvalPolicy: normalizedApprovalPolicy,
+    // 当前查询是否处于计划模式，影响非完全自主策略的 SDK 权限模式。
+    planMode: normalizedPlanMode,
+    // 当前查询每次工具调用读取的可变权限决策状态。
+    permissionOptions: resolveClaudeSdkPermissionOptions(
+      normalizedApprovalPolicy,
+      normalizedPlanMode,
+    ),
   };
 }
 
@@ -1062,24 +1081,22 @@ function emitToolOutputChunks(id, actionId, output) {
   }
 }
 
+/** 为 Claude SDK 构建权限回调，每次工具调用读取查询当前权限状态。 */
 function buildPermissionHandler({
   context,
   cwd,
   writableRoots,
   sandboxMode,
   allowNetwork,
-  approvalPolicy,
 }) {
   const normalizedRoots = writableRoots.map((root) => path.resolve(root));
-  const resolvedApprovalPolicy = approvalPolicy ?? (sandboxMode === "read-only" ? "restricted" : undefined);
-  const permissionOptions = resolveClaudeSdkPermissionOptions(resolvedApprovalPolicy, false);
-  const { decisionMode } = permissionOptions;
 
   return async (toolName, input, options) => {
     const toolInput = input ?? {};
     const toolUseId = options?.toolUseID;
     const agentId = options?.agentID;
     const requestId = options?.requestId;
+    const { decisionMode } = context.permissionOptions;
 
     if (toolName === "AskUserQuestion") {
       const permission = await requestAskUserQuestionApproval(context, toolInput);
@@ -2019,7 +2036,8 @@ async function handleQuery(req, persistentSession = null) {
     enforceApprovalRouting,
   } = params;
 
-  const context = createQueryContext(id);
+  const resolvedApprovalPolicy = approvalPolicy ?? (sandboxMode === "read-only" ? "restricted" : null);
+  const context = createQueryContext(id, resolvedApprovalPolicy, planMode);
   context.threadId = threadId || sessionId || resume || id;
   activeQueries.set(id, context);
 
@@ -2034,8 +2052,7 @@ async function handleQuery(req, persistentSession = null) {
       "Grep",
       ...(allowNetwork ? ["WebFetch"] : []),
     ];
-  const resolvedApprovalPolicy = approvalPolicy ?? (sandboxMode === "read-only" ? "restricted" : undefined);
-  const permissionOptions = resolveClaudeSdkPermissionOptions(resolvedApprovalPolicy, planMode);
+  const permissionOptions = context.permissionOptions;
 
   const sessionCwd = cwd || process.cwd();
   let actualSessionId = null;
@@ -2099,7 +2116,6 @@ async function handleQuery(req, persistentSession = null) {
         writableRoots: normalizedWritableRoots,
         sandboxMode: normalizedSandboxMode,
         allowNetwork: Boolean(allowNetwork),
-        approvalPolicy: resolvedApprovalPolicy,
       }),
       settingSources: Array.isArray(settingSources)
         ? settingSources.filter((source) => ["user", "project", "local"].includes(source))
@@ -2810,6 +2826,77 @@ function emitApprovalResponseResult(requestId, approvalId, success, error) {
   });
 }
 
+/** 向 Rust 返回活动查询权限策略更新回执，保留命令和查询关联标识。 */
+function emitPermissionPolicyUpdateResult(requestId, queryId, success, error) {
+  const result = {
+    ...(requestId ? { id: requestId } : {}),
+    queryId: queryId ?? null,
+    success,
+    ...(error ? { error } : {}),
+  };
+  traceClaudeSdk("permission_policy_update_result", result);
+  emit({
+    type: "permission_policy_update_result",
+    ...result,
+  });
+}
+
+/** 更新活动 Claude 查询的权限策略，并明确返回更新成功或失败回执。 */
+function handlePermissionPolicyUpdate(params = {}, requestId) {
+  const queryId = typeof params.queryId === "string" ? params.queryId.trim() : "";
+  if (!queryId) {
+    emitPermissionPolicyUpdateResult(
+      requestId,
+      null,
+      false,
+      "Claude permission policy update is missing a query ID.",
+    );
+    return;
+  }
+
+  const context = activeQueries.get(queryId);
+  if (!context) {
+    emitPermissionPolicyUpdateResult(
+      requestId,
+      queryId,
+      false,
+      `Claude query ${queryId} is unknown or no longer active.`,
+    );
+    return;
+  }
+
+  const approvalPolicy = params.approvalPolicy;
+  if (approvalPolicy !== null && typeof approvalPolicy !== "string") {
+    emitPermissionPolicyUpdateResult(
+      requestId,
+      queryId,
+      false,
+      "Claude permission policy update requires approvalPolicy to be a string or null.",
+    );
+    return;
+  }
+
+  const hasPlanMode = Object.prototype.hasOwnProperty.call(params, "planMode");
+  if (hasPlanMode && typeof params.planMode !== "boolean") {
+    emitPermissionPolicyUpdateResult(
+      requestId,
+      queryId,
+      false,
+      "Claude permission policy update requires planMode to be a boolean when provided.",
+    );
+    return;
+  }
+
+  const nextPlanMode = hasPlanMode ? params.planMode : context.planMode;
+  context.approvalPolicy = approvalPolicy;
+  context.planMode = nextPlanMode;
+  context.permissionOptions = resolveClaudeSdkPermissionOptions(
+    context.approvalPolicy,
+    context.planMode,
+  );
+  emitPermissionPolicyUpdateResult(requestId, queryId, true);
+}
+
 /** 处理客户端审批响应，结算 pending approval 并同步发送处理回执。 */
 function handleApprovalResponse(params = {}, requestId) {
   const approvalId = params.approvalId || params.approval_id;
@@ -2903,6 +2990,11 @@ rl.on("line", (line) => {
 
   if (req.method === "approval_response") {
     handleApprovalResponse(req.params || {}, req.id);
+    return;
+  }
+
+  if (req.method === "update_permission_policy") {
+    handlePermissionPolicyUpdate(req.params || {}, req.id);
     return;
   }
 

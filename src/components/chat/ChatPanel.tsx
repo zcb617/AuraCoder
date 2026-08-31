@@ -6525,11 +6525,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     try {
       for (const approval of batchApprovableRows) {
         const details = approval.details ?? {};
+        const decision = stopAsking ? "accept_for_session" : "accept";
         const accepted = await respondApproval(
           approval.approvalId,
           isPermissionsRequestApproval(details)
-            ? buildPermissionApprovalResponseForEngine(engineId, details, "accept")
-            : { decision: "accept" },
+            ? buildPermissionApprovalResponseForEngine(engineId, details, decision)
+            : { decision },
           targetThreadId,
         );
         if (!accepted) {

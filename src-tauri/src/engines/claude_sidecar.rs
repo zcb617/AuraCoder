@@ -148,6 +148,18 @@ enum SidecarEvent {
         /// 审批处理失败时返回的原始错误信息。
         error: Option<String>,
     },
+    /// Sidecar 对活动查询权限策略更新命令的处理回执。
+    PermissionPolicyUpdateResult {
+        /// 权限策略更新命令的顶层请求标识，用于过滤并发回执。
+        id: Option<String>,
+        /// 接收权限策略更新的活动查询原始标识。
+        #[serde(rename = "queryId")]
+        query_id: Option<String>,
+        /// 标识 sidecar 是否成功更新活动查询权限策略。
+        success: bool,
+        /// 权限策略更新失败时返回的原始错误信息。
+        error: Option<String>,
+    },
     TurnCompleted {
         id: Option<String>,
         status: String,
@@ -241,6 +253,7 @@ impl SidecarEvent {
             | SidecarEvent::ActionCompleted { id, .. }
             | SidecarEvent::ApprovalRequested { id, .. }
             | SidecarEvent::ApprovalResponseResult { id, .. }
+            | SidecarEvent::PermissionPolicyUpdateResult { id, .. }
             | SidecarEvent::TurnCompleted { id, .. }
             | SidecarEvent::Notice { id, .. }
             | SidecarEvent::UsageLimitsUpdated { id, .. }
@@ -1475,6 +1488,128 @@ impl ClaudeSidecarEngine {
             fixes,
         }
     }
+
+    /// 将当前活动 Claude 查询的权限策略同步到 sidecar，未活动时不创建新查询。
+    pub async fn sync_thread_execution_policy(
+        &self,
+        engine_thread_id: &str,
+        approval_policy: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let (transport, active_request_id) = {
+            let state = self.state.lock().await;
+            let Some(active_request_id) = state
+                .threads
+                .get(engine_thread_id)
+                .and_then(|config| config.active_request_id.clone())
+            else {
+                return Ok(());
+            };
+            let transport = state.transport.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Claude sidecar transport unavailable while syncing permission policy: engine_thread_id={} active_request_id={}",
+                    engine_thread_id,
+                    active_request_id
+                )
+            })?;
+            (transport, active_request_id)
+        };
+
+        let approval_policy = match approval_policy {
+            serde_json::Value::Null => serde_json::Value::Null,
+            serde_json::Value::String(value) => serde_json::Value::String(value.clone()),
+            value => {
+                anyhow::bail!(
+                    "Claude permission policy must be a string or null: engine_thread_id={} active_request_id={} value={}",
+                    engine_thread_id,
+                    active_request_id,
+                    value
+                )
+            }
+        };
+        let command_id = Uuid::new_v4().to_string();
+        let mut receiver = transport.subscribe();
+        let command = serde_json::json!({
+            "id": command_id,
+            "method": "update_permission_policy",
+            "params": {
+                "queryId": active_request_id.clone(),
+                "approvalPolicy": approval_policy,
+            },
+        });
+        transport
+            .send_command(&command)
+            .await
+            .with_context(|| {
+                format!(
+                    "发送 Claude 活动查询权限策略更新命令失败: engine_thread_id={} active_request_id={}",
+                    engine_thread_id, active_request_id
+                )
+            })?;
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match receiver.recv().await {
+                    Ok(SidecarEvent::PermissionPolicyUpdateResult {
+                        id,
+                        query_id,
+                        success,
+                        error,
+                    }) if id.as_deref() == Some(command_id.as_str()) => {
+                        if query_id.as_deref() != Some(active_request_id.as_str()) {
+                            let received_query_id = query_id.as_deref().unwrap_or("<missing>");
+                            anyhow::bail!(
+                                "Claude permission policy update returned mismatched query ID: engine_thread_id={} command_id={} expected={} received={}",
+                                engine_thread_id,
+                                command_id,
+                                active_request_id,
+                                received_query_id
+                            );
+                        }
+                        if success {
+                            return Ok(());
+                        }
+                        let error = error.unwrap_or_else(|| {
+                            "Claude sidecar returned no permission policy update error details."
+                                .to_string()
+                        });
+                        anyhow::bail!(
+                            "Claude permission policy update failed: engine_thread_id={} active_request_id={} command_id={} error={}",
+                            engine_thread_id,
+                            active_request_id,
+                            command_id,
+                            error
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        anyhow::bail!(
+                            "Claude permission policy update event stream lagged by {} messages: engine_thread_id={} active_request_id={} command_id={}",
+                            skipped,
+                            engine_thread_id,
+                            active_request_id,
+                            command_id
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        anyhow::bail!(
+                            "Claude permission policy update event stream closed: engine_thread_id={} active_request_id={} command_id={}",
+                            engine_thread_id,
+                            active_request_id,
+                            command_id
+                        );
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::Error::msg(format!(
+                "Claude permission policy update timed out after 10 seconds: engine_thread_id={} active_request_id={} command_id={}",
+                engine_thread_id, active_request_id, command_id
+            ))
+        })??;
+        Ok(())
+    }
 }
 
 async fn resolve_node_executable() -> NodeExecutableResolution {
@@ -2687,6 +2822,7 @@ impl Engine for ClaudeSidecarEngine {
                                 }
                                 SidecarEvent::Ready
                                 | SidecarEvent::ApprovalResponseResult { .. }
+                                | SidecarEvent::PermissionPolicyUpdateResult { .. }
                                 | SidecarEvent::Models { .. }
                                 | SidecarEvent::Sessions { .. }
                                 | SidecarEvent::SessionHistory { .. }

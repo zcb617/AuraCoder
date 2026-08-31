@@ -917,6 +917,144 @@ describe("claude-agent-sdk-server sidecar", () => {
     expect(harness.events.some((event) => event.id === "query-full" && event.type === "approval_requested")).toBe(false);
   });
 
+  it("updates an active query to bypass permissions for later tools", async () => {
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "permission",
+          toolName: "Bash",
+          input: { command: "printf first" },
+          toolUseID: "permission-policy-first",
+          options: { agentID: "coder-1", requestId: "request-policy-first" },
+        },
+        {
+          type: "delay",
+          durationMs: 100,
+        },
+        {
+          type: "permission",
+          toolName: "Bash",
+          input: { command: "printf second" },
+          toolUseID: "permission-policy-second",
+          options: { agentID: "coder-1", requestId: "request-policy-second" },
+        },
+      ],
+      emitObservationResult: true,
+      sessionId: "session-policy-update",
+    });
+
+    harness.send({
+      id: "query-policy-update",
+      method: "query",
+      params: {
+        prompt: "update active query permissions",
+        cwd: repoRoot,
+        approvalPolicy: "default",
+      },
+    });
+
+    const firstApproval = await harness.waitFor(
+      (event) =>
+        event.id === "query-policy-update" && event.type === "approval_requested",
+    );
+    harness.send({
+      id: "approval-policy-first",
+      method: "approval_response",
+      params: {
+        approvalId: firstApproval.approvalId,
+        response: { decision: "accept" },
+      },
+    });
+
+    await expect(
+      harness.waitFor(
+        (event) =>
+          event.id === "approval-policy-first" &&
+          event.type === "approval_response_result",
+      ),
+    ).resolves.toMatchObject({
+      approvalId: firstApproval.approvalId,
+      success: true,
+    });
+
+    harness.send({
+      id: "permission-policy-update",
+      method: "update_permission_policy",
+      params: {
+        queryId: "query-policy-update",
+        approvalPolicy: "bypassPermissions",
+      },
+    });
+
+    await expect(
+      harness.waitFor(
+        (event) =>
+          event.id === "permission-policy-update" &&
+          event.type === "permission_policy_update_result",
+      ),
+    ).resolves.toMatchObject({
+      id: "permission-policy-update",
+      queryId: "query-policy-update",
+      success: true,
+    });
+
+    await harness.waitFor(
+      (event) => event.id === "query-policy-update" && event.type === "turn_completed",
+    );
+
+    const observations = parseObservationResults(harness, "query-policy-update");
+    expect(observations.map((item) => item.result.behavior)).toEqual(["allow", "allow"]);
+    expect(
+      harness.events.filter(
+        (event) => event.id === "query-policy-update" && event.type === "approval_requested",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("keeps bypassPermissions precedence when planMode is enabled", async () => {
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "permission",
+          toolName: "Bash",
+          input: { command: "printf plan-bypass" },
+          toolUseID: "permission-plan-bypass",
+          options: { agentID: "coder-1", requestId: "request-plan-bypass" },
+        },
+      ],
+      emitObservationResult: true,
+      emitQueryOptions: true,
+      sessionId: "session-plan-bypass",
+    });
+
+    harness.send({
+      id: "query-plan-bypass",
+      method: "query",
+      params: {
+        prompt: "run with plan mode and full autonomy",
+        cwd: repoRoot,
+        approvalPolicy: "bypassPermissions",
+        planMode: true,
+      },
+    });
+
+    await harness.waitFor(
+      (event) => event.id === "query-plan-bypass" && event.type === "turn_completed",
+    );
+
+    const observations = parseObservationResults(harness, "query-plan-bypass");
+    expect(observations[0]?.type).toBe("query_options");
+    expect(observations[0]?.result.permissionMode).toBe("bypassPermissions");
+    expect(observations[0]?.result.allowDangerouslySkipPermissions).toBe(true);
+    expect(observations[1]?.type).toBe("permission_result");
+    expect(observations[1]?.result.behavior).toBe("allow");
+    expect(
+      harness.events.some(
+        (event) => event.id === "query-plan-bypass" && event.type === "approval_requested",
+      ),
+    ).toBe(false);
+  });
+
   it("uses interactive default permission mode for non-plan queries", async () => {
     const harness = await spawnHarness({
       steps: [],

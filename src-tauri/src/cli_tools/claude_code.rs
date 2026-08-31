@@ -1049,6 +1049,24 @@ impl ClaudeCodeCli {
     //     }
     // }
 
+    /// 从线程当前持久化权限读取运行时策略，并同步本机 Claude 活动查询。
+    async fn sync_thread_execution_policy_from_runtime(
+        &self,
+        context: &CliExecutionContext,
+        thread: &ThreadDto,
+    ) -> Result<()> {
+        if thread.engine_thread_id.is_none() {
+            return Ok(());
+        }
+        let approval_policy = self
+            .runtime_permissions(context, thread)
+            .await?
+            .approval_policy
+            .unwrap_or(Value::Null);
+        self.sync_thread_execution_policy(context, thread, &approval_policy)
+            .await
+    }
+
     fn uses_reuse_session(&self, context: &CliExecutionContext) -> bool {
         context.location_kind == CliLocationKind::Ssh
             && self.state.config.claude_code.session_mode() == ClaudeCodeSessionMode::ReuseSession
@@ -1673,6 +1691,8 @@ impl CliTool for ClaudeCodeCli {
             if let Some(value) = values.get("defaultForNewThreads") {
                 result.insert("defaultForNewThreads".to_string(), value.clone());
             }
+            self.sync_thread_execution_policy_from_runtime(context, thread)
+                .await?;
             return Ok(result);
         }
         let preset = permission_choice(&values, "autonomyPreset")?;
@@ -1727,8 +1747,32 @@ impl CliTool for ClaudeCodeCli {
         };
         let raw_value = raw_permissions_value(thread, mode, sandbox_mode, allow_network);
         let raw_string = raw_value.to_string();
+        let original_permission_mode = thread.permission_mode.clone();
         let saved =
             db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw_string))?;
+        if let Err(sync_error) = self
+            .sync_thread_execution_policy_from_runtime(context, &saved)
+            .await
+        {
+            if let Err(rollback_error) = db::threads::update_thread_permissions(
+                &self.state.db,
+                &thread.id,
+                original_permission_mode.as_deref(),
+            ) {
+                log::error!(
+                    "Claude 权限同步失败且数据库回滚失败: thread_id={} sync_error={sync_error:#} rollback_error={rollback_error:#}",
+                    thread.id
+                );
+                return Err(anyhow::anyhow!(
+                    "Claude 权限同步失败，数据库回滚也失败: thread_id={} sync_error={sync_error:#} rollback_error={rollback_error:#}",
+                    thread.id
+                ));
+            }
+            return Err(sync_error.context(format!(
+                "Claude 活动会话权限同步失败，已回滚线程权限: thread_id={}",
+                thread.id
+            )));
+        }
         let mut result = self.get_permissions(context, &saved).await?;
         for key in ["trust", "defaultForNewThreads"] {
             if let Some(value) = values.get(key) {
@@ -1736,6 +1780,36 @@ impl CliTool for ClaudeCodeCli {
             }
         }
         Ok(result)
+    }
+
+    /// 将本机 Claude 活动会话的权限策略同步到 sidecar，SSH 和未启动线程不发送同步命令。
+    async fn sync_thread_execution_policy(
+        &self,
+        context: &CliExecutionContext,
+        thread: &ThreadDto,
+        approval_policy: &Value,
+    ) -> Result<()> {
+        if context.location_kind == CliLocationKind::Ssh {
+            return Ok(());
+        }
+        anyhow::ensure!(thread.engine_id == "claude", "当前会话不属于 Claude Code");
+        anyhow::ensure!(
+            thread.workspace_id == context.workspace_id,
+            "当前会话不属于该 workspace"
+        );
+        let Some(engine_thread_id) = thread.engine_thread_id.as_deref() else {
+            return Ok(());
+        };
+        let engine = self.local_engine().await?;
+        engine
+            .sync_thread_execution_policy(engine_thread_id, approval_policy)
+            .await
+            .with_context(|| {
+                format!(
+                    "同步本机 Claude 活动会话权限失败: thread_id={} engine_thread_id={}",
+                    thread.id, engine_thread_id
+                )
+            })
     }
 
     /// 将 Claude Code 的原始权限字段转换为统一运行时权限结构。
