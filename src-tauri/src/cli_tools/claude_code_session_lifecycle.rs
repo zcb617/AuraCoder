@@ -244,19 +244,63 @@ impl ClaudeCodeSessionHandleRegistry {
             Value::Object(object) => Value::Object(object),
             _ => Value::Object(Map::new()),
         };
+        let endpoint = Self::endpoint(
+            &slot.remote_base_url,
+            &["session-handles", thread_id, "messages"],
+        )?;
         let result = async {
-            let result = self
+            // 原有直接 error_for_status 调用保留为注释，避免非 2xx 响应体被丢弃。
+            // .error_for_status()
+            // .context("Claude Code 远端连续消息发送失败")?
+            let response = self
                 .client
-                .post(Self::endpoint(
-                    &slot.remote_base_url,
-                    &["session-handles", thread_id, "messages"],
-                )?)
+                .post(endpoint.clone())
                 .json(&body)
                 .send()
                 .await
-                .context("调用 Claude Code 远端连续消息接口失败")?
-                .error_for_status()
-                .context("Claude Code 远端连续消息发送失败")?
+                .context("调用 Claude Code 远端连续消息接口失败")?;
+            let status = response.status();
+            if !status.is_success() {
+                let response_body = match response.text().await {
+                    Ok(body) => body,
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        log::error!(
+                            "Claude Code 远端连续消息发送失败: event=claude_code_remote_session_message_failed thread_id={} expected_handle_id={} endpoint={} status={} response_body=<读取失败> response_body_read_error={}",
+                            thread_id,
+                            expected_handle_id,
+                            endpoint,
+                            status,
+                            error_text,
+                        );
+                        return Err(anyhow::Error::new(error).context(format!(
+                            "Claude Code 远端连续消息发送失败: thread_id={} handle_id={} endpoint={} status={} response_body=<读取失败> response_body_read_error={}",
+                            thread_id,
+                            expected_handle_id,
+                            endpoint,
+                            status,
+                            error_text,
+                        )));
+                    }
+                };
+                log::error!(
+                    "Claude Code 远端连续消息发送失败: event=claude_code_remote_session_message_failed thread_id={} expected_handle_id={} endpoint={} status={} response_body={}",
+                    thread_id,
+                    expected_handle_id,
+                    endpoint,
+                    status,
+                    response_body,
+                );
+                return Err(anyhow::anyhow!(
+                    "Claude Code 远端连续消息发送失败: thread_id={} handle_id={} endpoint={} status={} response_body={}",
+                    thread_id,
+                    expected_handle_id,
+                    endpoint,
+                    status,
+                    response_body,
+                ));
+            }
+            let result = response
                 .json::<ClaudeCodeSessionMessageResult>()
                 .await
                 .context("解析 Claude Code 远端连续消息结果失败")?;
@@ -297,17 +341,61 @@ impl ClaudeCodeSessionHandleRegistry {
             .handle
             .get()
             .with_context(|| format!("Claude Code 会话句柄尚未建立: thread_id={thread_id}"))?;
-        let result = self
+        let endpoint = Self::endpoint(
+            &slot.remote_base_url,
+            &["session-handles", thread_id, "interrupt"],
+        )?;
+        // 原有直接 error_for_status 调用保留为注释，避免非 2xx 响应体被丢弃。
+        // .error_for_status()
+        // .context("Claude Code 远端会话中断失败")?
+        let response = self
             .client
-            .post(Self::endpoint(
-                &slot.remote_base_url,
-                &["session-handles", thread_id, "interrupt"],
-            )?)
+            .post(endpoint.clone())
             .send()
             .await
-            .context("调用 Claude Code 远端会话中断接口失败")?
-            .error_for_status()
-            .context("Claude Code 远端会话中断失败")?
+            .context("调用 Claude Code 远端会话中断接口失败")?;
+        let status = response.status();
+        if !status.is_success() {
+            let response_body = match response.text().await {
+                Ok(body) => body,
+                Err(error) => {
+                    let error_text = error.to_string();
+                    log::error!(
+                        "Claude Code 远端会话中断失败: event=claude_code_remote_session_interrupt_failed thread_id={} handle_id={} endpoint={} status={} response_body=<读取失败> response_body_read_error={}",
+                        thread_id,
+                        handle.handle_id,
+                        endpoint,
+                        status,
+                        error_text,
+                    );
+                    return Err(anyhow::Error::new(error).context(format!(
+                        "Claude Code 远端会话中断失败: thread_id={} handle_id={} endpoint={} status={} response_body=<读取失败> response_body_read_error={}",
+                        thread_id,
+                        handle.handle_id,
+                        endpoint,
+                        status,
+                        error_text,
+                    )));
+                }
+            };
+            log::error!(
+                "Claude Code 远端会话中断失败: event=claude_code_remote_session_interrupt_failed thread_id={} handle_id={} endpoint={} status={} response_body={}",
+                thread_id,
+                handle.handle_id,
+                endpoint,
+                status,
+                response_body,
+            );
+            return Err(anyhow::anyhow!(
+                "Claude Code 远端会话中断失败: thread_id={} handle_id={} endpoint={} status={} response_body={}",
+                thread_id,
+                handle.handle_id,
+                endpoint,
+                status,
+                response_body,
+            ));
+        }
+        let result = response
             .json::<ClaudeCodeSessionInterruptResult>()
             .await
             .context("解析 Claude Code 远端会话中断结果失败")?;
@@ -596,10 +684,19 @@ mod tests {
             .await
             .expect("start replacement idle countdown");
         sleep(Duration::from_millis(80)).await;
-        registry
+        // 原有只验证请求失败的断言保留为注释，新增原始错误内容断言。
+        // registry
+        //     .send_message("thread-1", json!({ "prompt": "fail" }))
+        //     .await
+        //     .expect_err("reject failed message");
+        let send_error = registry
             .send_message("thread-1", json!({ "prompt": "fail" }))
             .await
             .expect_err("reject failed message");
+        let send_error_text = format!("{send_error:#}");
+        assert!(send_error_text.contains("Claude Code 远端连续消息发送失败"));
+        assert!(send_error_text.contains("500 Internal Server Error"));
+        assert!(send_error_text.contains("send failed"));
         sleep(Duration::from_millis(100)).await;
         assert_eq!(destroy_count.load(Ordering::SeqCst), 1);
         sleep(Duration::from_millis(160)).await;
@@ -607,5 +704,96 @@ mod tests {
         assert_eq!(destroy_count.load(Ordering::SeqCst), 2);
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn preserves_interrupt_failure_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind interrupt test server");
+        let address = listener
+            .local_addr()
+            .expect("read interrupt test server address");
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept interrupt request");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .await
+                        .expect("read interrupt request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length: ")
+                                    .or_else(|| line.strip_prefix("Content-Length: "))
+                            })
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= header_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let request_line = request.lines().next().unwrap_or_default();
+                let (status, body) = if request_line.starts_with("POST /session-handles ") {
+                    (
+                        "201 Created",
+                        json!({
+                            "threadId": "thread-1",
+                            "handleId": "handle-1",
+                            "sessionId": "session-1",
+                            "reused": false,
+                        }),
+                    )
+                } else if request_line.starts_with("POST /session-handles/thread-1/interrupt ") {
+                    (
+                        "500 Internal Server Error",
+                        json!({ "error": "interrupt failed" }),
+                    )
+                } else {
+                    ("404 Not Found", json!({ "error": "not found" }))
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write interrupt response");
+            }
+        });
+
+        let base_url: reqwest::Url = format!("http://{address}")
+            .parse()
+            .expect("parse interrupt test url");
+        let registry = ClaudeCodeSessionHandleRegistry::with_idle_timeout(Duration::from_secs(1));
+        registry
+            .create_or_get("thread-1", base_url, None, json!({ "prompt": "first" }))
+            .await
+            .expect("create interrupt test handle");
+        let error = registry
+            .interrupt("thread-1")
+            .await
+            .expect_err("reject failed interrupt");
+        let error_text = format!("{error:#}");
+        assert!(error_text.contains("Claude Code 远端会话中断失败"));
+        assert!(error_text.contains("500 Internal Server Error"));
+        assert!(error_text.contains("interrupt failed"));
+
+        server.await.expect("finish interrupt test server");
     }
 }

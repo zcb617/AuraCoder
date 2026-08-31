@@ -33,14 +33,23 @@ async function availablePort() {
 async function startServer(home, port, env = {}) {
   const child = spawn(process.execPath, [serverScript, "--port", String(port)], {
     env: { ...process.env, HOME: home, USERPROFILE: home, ...env },
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr = `${stderr}${chunk.toString("utf8")}`.slice(-4000);
   });
   children.push(child);
   for (let attempt = 0; attempt < 30; attempt += 1) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/health`);
       if (response.ok) {
-        return;
+        return {
+          // 返回启动的远端服务进程，供测试生命周期管理保持现有行为。
+          child,
+          // 返回最近保留的 stderr 内容，供异常日志断言读取。
+          getStderr: () => stderr,
+        };
       }
     } catch {
       // 服务尚未开始监听。
@@ -189,6 +198,67 @@ describe("Claude SSH remote session server", () => {
       handleId: created.handleId,
       success: true,
     });
+  });
+
+  it("logs original persistent message errors with HTTP context", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "auracoder-claude-session-error-"));
+    tempRoots.push(home);
+    const port = await availablePort();
+    const server = await startServer(home, port, {
+      CLAUDE_AGENT_SDK_MODULE: mockSdkModulePath,
+      CLAUDE_AGENT_SDK_MOCK_SCENARIO: JSON.stringify({
+        persistentInput: true,
+        sessionId: "http-persistent-error-session",
+        failSetModel: true,
+      }),
+      PANES_DISABLE_CLAUDE_USAGE_FETCH: "1",
+    });
+
+    // 创建接口等待首轮完成后才返回句柄，确保下一次消息进入 setModel 失败路径。
+    const createResponse = await fetch(`http://127.0.0.1:${port}/session-handles`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        threadId: "thread-http-error",
+        prompt: "first message",
+        cwd: "/work/project-http-error",
+      }),
+    });
+    expect(createResponse.status).toBe(201);
+    const created = await createResponse.json();
+    expect(created).toMatchObject({
+      threadId: "thread-http-error",
+      reused: false,
+    });
+
+    const messagesPath =
+      `/session-handles/${encodeURIComponent("thread-http-error")}/messages`;
+    const messageResponse = await fetch(`http://127.0.0.1:${port}${messagesPath}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        prompt: "second message",
+        cwd: "/work/project-http-error",
+      }),
+    });
+    expect(messageResponse.status).toBe(500);
+    const messageBody = await messageResponse.json();
+    expect(messageBody.error).toContain("Mock Claude query setModel failed.");
+
+    let stderr = "";
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      stderr = server.getStderr();
+      if (stderr.includes("claude_remote_session_http_error")) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect(stderr).toContain("claude_remote_session_http_error");
+    expect(stderr).toContain("POST");
+    expect(stderr).toContain(messagesPath);
+    expect(stderr).toContain("Mock Claude query setModel failed.");
+    expect(stderr).toContain('"status":500');
+    expect(stderr).toContain('"stack":"');
   });
 
   it("only returns the requested project's remote Claude sessions", async () => {

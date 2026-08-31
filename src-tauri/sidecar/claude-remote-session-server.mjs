@@ -45,6 +45,32 @@ function writeJson(response, status, payload) {
   response.end(JSON.stringify(payload));
 }
 
+/** 记录远端 HTTP 路由返回异常状态前的原始错误和请求上下文。 */
+function logHttpError(request, requestUrl, operation, status, error) {
+  const isError = error instanceof Error;
+  const errorContext = {
+    // 固定事件名，用于开发日志检索远端 HTTP 异常。
+    event: "claude_remote_session_http_error",
+    // 标识发生异常的远端业务操作。
+    operation,
+    // 记录触发异常请求使用的 HTTP 方法。
+    method: request.method ?? "",
+    // 记录请求传入的原始 URL，保留路径和查询参数。
+    url: request.url ?? requestUrl.pathname,
+    // 记录解析后的请求路径，便于按路由关联异常。
+    pathname: requestUrl.pathname,
+    // 记录即将返回给客户端的 HTTP 状态码。
+    status,
+    // 记录原始异常类型；非 Error 值使用其 JavaScript 类型。
+    name: isError ? error.name : typeof error,
+    // 记录未经改写的原始异常消息；非 Error 值转为原始字符串。
+    message: isError ? error.message : String(error),
+    // 记录原始异常堆栈；非 Error 值明确记录为空字符串。
+    stack: isError ? error.stack ?? "" : "",
+  };
+  console.error(JSON.stringify(errorContext));
+}
+
 function projectDirectoryName(cwd) {
   return path.posix.resolve(cwd).replace(/[^a-zA-Z0-9-]/g, "-");
 }
@@ -453,6 +479,7 @@ const server = http.createServer(async (request, response) => {
         reused: event.reused === true,
       });
     } catch (error) {
+      logHttpError(request, requestUrl, "create_session_handle", 500, error);
       writeJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
     }
     return;
@@ -498,6 +525,7 @@ const server = http.createServer(async (request, response) => {
         accepted: event.accepted === true,
       });
     } catch (error) {
+      logHttpError(request, requestUrl, "send_session_message", 500, error);
       writeJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
     }
     return;
@@ -536,6 +564,7 @@ const server = http.createServer(async (request, response) => {
         interrupted: event.interrupted === true,
       });
     } catch (error) {
+      logHttpError(request, requestUrl, "interrupt_session_handle", 500, error);
       writeJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
     }
     return;
@@ -566,6 +595,7 @@ const server = http.createServer(async (request, response) => {
         error: event.error,
       });
     } catch (error) {
+      logHttpError(request, requestUrl, "destroy_session_handle", 500, error);
       writeJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
     }
     return;
@@ -616,6 +646,7 @@ const server = http.createServer(async (request, response) => {
       });
       writeJson(response, 202, { accepted: true });
     } catch (error) {
+      logHttpError(request, requestUrl, "command", 400, error);
       writeJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
     }
     return;
@@ -644,6 +675,7 @@ const server = http.createServer(async (request, response) => {
         throw new Error("session_id is not a valid Claude session ID");
       }
     } catch (error) {
+      logHttpError(request, requestUrl, "read_session_history_validate", 400, error);
       writeJson(response, 400, {
         error:
           error instanceof URIError
@@ -668,6 +700,7 @@ const server = http.createServer(async (request, response) => {
       }
       writeJson(response, 200, await readSessionHistory(files[0], sessionId));
     } catch (error) {
+      logHttpError(request, requestUrl, "read_session_history", 500, error);
       writeJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
     }
     return;
@@ -690,6 +723,7 @@ const server = http.createServer(async (request, response) => {
         throw new Error("session_id is not a valid Claude session ID");
       }
     } catch (error) {
+      logHttpError(request, requestUrl, "read_session_summary_validate", 400, error);
       writeJson(response, 400, {
         error:
           error instanceof URIError
@@ -745,6 +779,7 @@ const server = http.createServer(async (request, response) => {
         sessionId: summary.id,
       });
     } catch (error) {
+      logHttpError(request, requestUrl, "read_session_summary", 500, error);
       writeJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
     }
     return;
@@ -758,6 +793,7 @@ const server = http.createServer(async (request, response) => {
     try {
       writeJson(response, 200, await listSessions(cwd));
     } catch (error) {
+      logHttpError(request, requestUrl, "list_sessions", 500, error);
       writeJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
     }
     return;
