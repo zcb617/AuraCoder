@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
+  type WheelEvent as ReactWheelEvent,
 } from "react";
 import { Check, Crosshair, Loader2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -27,7 +28,20 @@ import {
 } from "./imageAttachmentAnnotations";
 
 type PreviewRatio = "original" | "16:9" | "4:3" | "1:1";
-type PreviewZoom = "fit" | 50 | 75 | 100 | 125 | 150 | 200;
+type PreviewZoom = "fit" | number;
+const PRESET_ZOOM_VALUES = [50, 75, 100, 125, 150, 200] as const;
+const MIN_PREVIEW_ZOOM = 10;
+const MAX_PREVIEW_ZOOM = 800;
+
+/**
+ * 将图片预览缩放比例规范为有限的整数百分比，并限制在业务允许的缩放范围内。
+ */
+function clampPreviewZoom(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 100;
+  }
+  return Math.min(MAX_PREVIEW_ZOOM, Math.max(MIN_PREVIEW_ZOOM, Math.round(value)));
+}
 
 const RATIO_VALUE: Record<Exclude<PreviewRatio, "original">, number> = {
   "16:9": 16 / 9,
@@ -193,6 +207,9 @@ export function ImageAttachmentPreviewPanel() {
     frameSize.height,
     naturalRatio,
   );
+  const fittedZoom = naturalSize.width > 0
+    ? (fittedImageSize.width / naturalSize.width) * 100
+    : 100;
   const imageSize = zoom === "fit"
     ? fittedImageSize
     : {
@@ -307,6 +324,23 @@ export function ImageAttachmentPreviewPanel() {
     });
   };
 
+  /**
+   * 仅处理图片预览区域内的 Ctrl+滚轮缩放，保留普通滚轮的原有浏览行为。
+   */
+  const handlePreviewWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
+    if (!event.ctrlKey) {
+      return;
+    }
+    if (event.deltaY === 0) {
+      return;
+    }
+    event.preventDefault();
+    const currentZoom = zoom === "fit" ? fittedZoom : zoom;
+    const step = Math.max(1, Math.round(currentZoom * 0.1));
+    const nextZoom = currentZoom + (event.deltaY < 0 ? step : -step);
+    setZoom(clampPreviewZoom(nextZoom));
+  };
+
   return (
     <section className="image-attachment-preview-panel" aria-label={t("imagePreview.title")}>
       <header className="image-attachment-preview-toolbar">
@@ -343,11 +377,14 @@ export function ImageAttachmentPreviewPanel() {
             value={String(zoom)}
             onChange={(event) => {
               const value = event.target.value;
-              setZoom(value === "fit" ? "fit" : Number(value) as PreviewZoom);
+              setZoom(value === "fit" ? "fit" : clampPreviewZoom(Number(value)));
             }}
           >
             <option value="fit">{t("imagePreview.fit")}</option>
-            {[50, 75, 100, 125, 150, 200].map((value) => (
+            {zoom !== "fit" && !PRESET_ZOOM_VALUES.includes(zoom as (typeof PRESET_ZOOM_VALUES)[number]) ? (
+              <option value={zoom}>{zoom}%</option>
+            ) : null}
+            {PRESET_ZOOM_VALUES.map((value) => (
               <option key={value} value={value}>{value}%</option>
             ))}
           </select>
@@ -370,6 +407,7 @@ export function ImageAttachmentPreviewPanel() {
           <div
             className="image-attachment-preview-frame"
             style={{ width: frameSize.width, height: frameSize.height }}
+            onWheel={handlePreviewWheel}
           >
             <div
               className="image-attachment-preview-stage"

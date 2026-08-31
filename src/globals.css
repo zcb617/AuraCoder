@@ -2594,10 +2594,9 @@ button.linux-window-update-control:hover {
 .image-attachment-preview-frame {
   flex: none;
   overflow: auto;
-  border: 1px solid var(--divider);
   border-radius: var(--radius-sm);
   background: var(--bg-2);
-  box-shadow: var(--shadow-sm);
+  box-shadow: inset 0 0 0 1px var(--divider), var(--shadow-sm);
 }
 
 .image-attachment-preview-stage {
