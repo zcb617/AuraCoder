@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [string]$KeyPath = "D:\work\auracoder-updater.key"
+  [string]$KeyPath = "$PSScriptRoot\..\.tauri-signing\auracoder-updater.key"
 )
 
 $ErrorActionPreference = "Stop"
