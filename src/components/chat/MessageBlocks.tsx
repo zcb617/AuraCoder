@@ -41,6 +41,8 @@ import type {
   ApprovalBlock,
   ApprovalResponse,
   AttachmentBlock,
+  ClaudeBackgroundTask,
+  ClaudeBackgroundTaskMetadata,
   ContentBlock,
   DiffBlock,
   MessageStatus,
@@ -765,7 +767,202 @@ function ThinkingBlockView({ block, isStreaming }: { block: ThinkingBlock; isStr
   );
 }
 
+/** 判断 Notice 元数据是否符合 Claude 后台任务卡片的数据契约。 */
+function isClaudeBackgroundTaskMetadata(
+  value: unknown,
+): value is ClaudeBackgroundTaskMetadata {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const metadata = value as Record<string, unknown>;
+  const activeTaskCount = metadata.activeTaskCount;
+  if (
+    !Array.isArray(metadata.backgroundTasks) ||
+    typeof activeTaskCount !== "number" ||
+    !Number.isInteger(activeTaskCount) ||
+    activeTaskCount < 0
+  ) {
+    return false;
+  }
+
+  return metadata.backgroundTasks.every((candidate) => {
+    if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
+      return false;
+    }
+    const task = candidate as Record<string, unknown>;
+    const validStatus =
+      task.status === "running" ||
+      task.status === "completed" ||
+      task.status === "failed" ||
+      task.status === "stopped";
+    return (
+      typeof task.taskId === "string" &&
+      typeof task.taskType === "string" &&
+      typeof task.description === "string" &&
+      validStatus &&
+      typeof task.startedAt === "number" &&
+      Number.isFinite(task.startedAt) &&
+      (task.summary === undefined || typeof task.summary === "string") &&
+      (task.finishedAt === undefined ||
+        (typeof task.finishedAt === "number" && Number.isFinite(task.finishedAt)))
+    );
+  });
+}
+
+/** 将后台任务持续时间格式化为用户可读的分钟和秒。 */
+function formatClaudeBackgroundElapsed(startedAt: number, endedAt: number): string {
+  const elapsedSeconds = Math.max(0, Math.floor((endedAt - startedAt) / 1000));
+  const minutes = Math.floor(elapsedSeconds / 60);
+  const seconds = String(elapsedSeconds % 60).padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
+
+/** 渲染 Claude 后台任务生命周期卡片，并保留用户手动控制的折叠状态。 */
+function ClaudeBackgroundTasksCard({
+  metadata,
+}: {
+  /** Claude 后台任务卡片的结构化展示数据。 */
+  metadata: ClaudeBackgroundTaskMetadata;
+}) {
+  const tasks = metadata.backgroundTasks;
+  const hasRunningTask = tasks.some((task) => task.status === "running");
+  const hasFailedTask = tasks.some((task) => task.status === "failed");
+  const hasStoppedTask = tasks.some((task) => task.status === "stopped");
+  const [now, setNow] = useState(() => Date.now());
+  const [expanded, setExpanded] = useState(hasRunningTask || hasFailedTask);
+  const previousStatusesRef = useRef(
+    new Map<string, ClaudeBackgroundTask["status"]>(
+      tasks.map((task) => [task.taskId, task.status]),
+    ),
+  );
+
+  useEffect(() => {
+    if (!hasRunningTask) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasRunningTask]);
+
+  useEffect(() => {
+    const previousStatuses = previousStatusesRef.current;
+    const newlyFailed = tasks.some(
+      (task) =>
+        task.status === "failed" &&
+        previousStatuses.has(task.taskId) &&
+        previousStatuses.get(task.taskId) !== "failed",
+    );
+    if (newlyFailed) {
+      setExpanded(true);
+    }
+    previousStatusesRef.current = new Map(
+      tasks.map((task) => [task.taskId, task.status]),
+    );
+  }, [tasks]);
+
+  const statusMeta = metadata.activeTaskCount > 0
+    ? (
+      <span className="claude-background-tasks-status claude-background-tasks-status--running">
+        <Loader2 size={11} style={{ animation: "spin 1s linear infinite" }} />
+        执行中 · {metadata.activeTaskCount} 项
+      </span>
+    )
+    : (
+      <span
+        className={`claude-background-tasks-status${hasFailedTask
+          ? " claude-background-tasks-status--failed"
+          : hasStoppedTask
+            ? " claude-background-tasks-status--stopped"
+            : ""}`}
+      >
+        {hasFailedTask ? "有失败任务" : hasStoppedTask ? "已停止" : "已完成"}
+      </span>
+    );
+
+  return (
+    <div className="msg-action-card claude-background-tasks-card">
+      <MessageBlockHeader
+        icon={<Layers size={11} />}
+        label="Claude 后台任务"
+        tileTone="info"
+        expanded={expanded}
+        onToggle={() => setExpanded((current) => !current)}
+        meta={statusMeta}
+      />
+      {expanded && (
+        <div className="claude-background-tasks-body">
+          {tasks.map((task) => {
+            const taskStatusLabel = task.status === "running"
+              ? "执行中"
+              : task.status === "completed"
+                ? "已完成"
+                : task.status === "failed"
+                  ? "失败"
+                  : "已停止";
+            const taskStatusIcon = task.status === "running"
+              ? <Loader2 size={11} style={{ animation: "spin 1s linear infinite" }} />
+              : task.status === "completed"
+                ? <CheckCircle2 size={11} />
+                : task.status === "failed"
+                  ? <XCircle size={11} />
+                  : <Circle size={11} />;
+            const taskStatusClass = task.status === "running"
+              ? "claude-background-task-status--running"
+              : task.status === "completed"
+                ? "claude-background-task-status--completed"
+                : task.status === "failed"
+                  ? "claude-background-task-status--failed"
+                  : "claude-background-task-status--stopped";
+            const elapsedEnd = task.status === "running"
+              ? now
+              : task.finishedAt ?? now;
+            return (
+              <div className="claude-background-task-row" key={task.taskId}>
+                <span className="claude-background-task-icon" aria-hidden="true">
+                  {taskStatusIcon}
+                </span>
+                <div className="claude-background-task-content">
+                  <div className="claude-background-task-heading">
+                    <span
+                      className="claude-background-task-description"
+                      title={task.description}
+                    >
+                      {task.description}
+                    </span>
+                    <span className={`claude-background-task-status ${taskStatusClass}`}>
+                      {taskStatusIcon}
+                      {taskStatusLabel}
+                    </span>
+                  </div>
+                  {task.summary && (
+                    <div
+                      className="claude-background-task-summary"
+                      title={task.summary}
+                    >
+                      {task.summary}
+                    </div>
+                  )}
+                </div>
+                <span className="claude-background-task-elapsed">
+                  {formatClaudeBackgroundElapsed(task.startedAt, elapsedEnd)}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function NoticeBlockView({ block }: { block: NoticeBlock }) {
+  if (
+    block.kind === "claude_background_tasks" &&
+    isClaudeBackgroundTaskMetadata(block.metadata)
+  ) {
+    return <ClaudeBackgroundTasksCard metadata={block.metadata} />;
+  }
+
   return (
     <div className="msg-notice">
       <span className="msg-block-tile msg-block-tile--info">

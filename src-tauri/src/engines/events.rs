@@ -179,6 +179,9 @@ pub enum EngineEvent {
         level: String,
         title: String,
         message: String,
+        /// Notice 业务附带的可选结构化元数据，例如 Claude 后台任务展示状态。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
     },
     Error {
         message: String,

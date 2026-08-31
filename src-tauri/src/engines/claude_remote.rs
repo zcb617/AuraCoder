@@ -103,6 +103,9 @@ enum RemoteClaudeEvent {
         level: String,
         title: String,
         message: String,
+        /// 远端 Claude Notice 携带的可选结构化元数据。
+        #[serde(default)]
+        metadata: Option<serde_json::Value>,
     },
     UsageLimitsUpdated {
         id: Option<String>,
@@ -550,6 +553,7 @@ impl ClaudeRemoteEngine {
                     level,
                     title,
                     message,
+                    metadata,
                     ..
                 } => {
                     let _ = event_tx
@@ -558,6 +562,8 @@ impl ClaudeRemoteEngine {
                             level,
                             title,
                             message,
+                            // 透传远端 sidecar 提供的可选 Notice 结构化元数据。
+                            metadata,
                         })
                         .await;
                 }
@@ -615,6 +621,8 @@ impl ClaudeRemoteEngine {
                                 level: "info".to_string(),
                                 title: "Claude stop reason".to_string(),
                                 message: stop_reason,
+                                // stop reason notice 不附带结构化后台任务元数据。
+                                metadata: None,
                             })
                             .await;
                     }
@@ -1104,8 +1112,15 @@ impl Engine for ClaudeRemoteEngine {
                                 details: details.unwrap_or_else(|| serde_json::json!({})),
                             }).await;
                         }
-                        RemoteClaudeEvent::Notice { kind, level, title, message, .. } => {
-                            let _ = event_tx.send(EngineEvent::Notice { kind, level, title, message }).await;
+                        RemoteClaudeEvent::Notice { kind, level, title, message, metadata, .. } => {
+                            let _ = event_tx.send(EngineEvent::Notice {
+                                kind,
+                                level,
+                                title,
+                                message,
+                                // 透传远端 sidecar 提供的可选 Notice 结构化元数据。
+                                metadata,
+                            }).await;
                         }
                         RemoteClaudeEvent::UsageLimitsUpdated { usage, .. } => {
                             let _ = event_tx.send(EngineEvent::UsageLimitsUpdated {
@@ -1144,6 +1159,8 @@ impl Engine for ClaudeRemoteEngine {
                                     level: "info".to_string(),
                                     title: "Claude stop reason".to_string(),
                                     message: stop_reason,
+                                    // stop reason notice 不附带结构化后台任务元数据。
+                                    metadata: None,
                                 }).await;
                             }
                             let status = match status.as_str() {

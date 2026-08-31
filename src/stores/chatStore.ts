@@ -1794,6 +1794,8 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
           : "info",
       title: String(event.title ?? "Notice"),
       message: String(event.message ?? ""),
+      // Notice 元数据只透传到内容块，由专用 Claude 卡片决定是否解释。
+      ...(event.metadata !== undefined ? { metadata: event.metadata } : {}),
     });
   }
 

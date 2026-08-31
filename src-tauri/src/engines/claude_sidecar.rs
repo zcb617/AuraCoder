@@ -176,6 +176,9 @@ enum SidecarEvent {
         level: String,
         title: String,
         message: String,
+        /// sidecar Notice 携带的可选结构化元数据。
+        #[serde(default)]
+        metadata: Option<serde_json::Value>,
     },
     UsageLimitsUpdated {
         id: Option<String>,
@@ -2721,6 +2724,8 @@ impl Engine for ClaudeSidecarEngine {
                                                     level: "info".to_string(),
                                                     title: "Claude stop reason".to_string(),
                                                     message: stop_reason.clone(),
+                                                    // stop reason notice 不附带结构化后台任务元数据。
+                                                    metadata: None,
                                                 })
                                                 .await
                                                 .ok();
@@ -2751,6 +2756,7 @@ impl Engine for ClaudeSidecarEngine {
                                     level,
                                     title,
                                     message,
+                                    metadata,
                                     ..
                                 } => {
                                     event_tx
@@ -2759,6 +2765,8 @@ impl Engine for ClaudeSidecarEngine {
                                             level,
                                             title,
                                             message,
+                                            // 透传 sidecar 提供的可选 Notice 结构化元数据。
+                                            metadata,
                                         })
                                         .await
                                         .ok();
@@ -2846,6 +2854,8 @@ impl Engine for ClaudeSidecarEngine {
                                     level: "warning".to_string(),
                                     title: "Claude event lag".to_string(),
                                     message: message.clone(),
+                                    // 事件丢失提示不附带结构化后台任务元数据。
+                                    metadata: None,
                                 })
                                 .await
                                 .ok();

@@ -536,13 +536,52 @@ function requiresApprovalLegacy(permissionMode, toolName) {
  * 将 Claude SDK 的后台任务生命周期消息转换为 AuraCoder 可展示的状态通知。
  * 该通知只传递任务元数据，不读取或解释后台任务输出文件。
  */
-function emitClaudeBackgroundNotice(id, subtype, task = null, tasks = null) {
+function emitClaudeBackgroundNotice(id, subtype, task = null, tasks = null, context = null) {
   const taskId = typeof task?.task_id === "string" ? task.task_id : null;
   const description = typeof task?.description === "string" ? task.description : "Claude 后台任务";
   const status = typeof task?.status === "string" ? task.status : null;
-  const outputFile = typeof task?.output_file === "string" ? task.output_file : null;
   const summary = typeof task?.summary === "string" ? task.summary : null;
   const activeTasks = Array.isArray(tasks) ? tasks : null;
+  const backgroundTaskMetadata = context
+    ? [...context.backgroundTaskDisplay.values()]
+        .sort((left, right) => {
+          const leftRunning = left.status === "running";
+          const rightRunning = right.status === "running";
+          if (leftRunning !== rightRunning) {
+            return leftRunning ? -1 : 1;
+          }
+          if (!leftRunning) {
+            const leftFinishedAt =
+              typeof left.finishedAt === "number" ? left.finishedAt : Number.MAX_SAFE_INTEGER;
+            const rightFinishedAt =
+              typeof right.finishedAt === "number" ? right.finishedAt : Number.MAX_SAFE_INTEGER;
+            if (leftFinishedAt !== rightFinishedAt) {
+              return leftFinishedAt - rightFinishedAt;
+            }
+          }
+          return left.taskId.localeCompare(right.taskId);
+        })
+        .map((displayTask) => ({
+          // 后台任务稳定标识，用于前端在生命周期更新中复用同一行。
+          taskId: displayTask.taskId,
+          // 后台任务类型，用于保留 SDK 提供的任务元数据。
+          taskType: displayTask.taskType,
+          // 后台任务业务描述，用于展示任务名称。
+          description: displayTask.description,
+          // 后台任务当前生命周期状态，用于显示状态标签。
+          status: displayTask.status,
+          // 后台任务最新可展示摘要，不包含任务输出文件内容。
+          ...(typeof displayTask.summary === "string" && displayTask.summary.length > 0
+            ? { summary: displayTask.summary }
+            : {}),
+          // 后台任务开始时间，由 sidecar 在收到 SDK 生命周期事件时生成。
+          startedAt: displayTask.startedAt,
+          // 后台任务终态时间，仅终态任务拥有该字段。
+          ...(typeof displayTask.finishedAt === "number"
+            ? { finishedAt: displayTask.finishedAt }
+            : {}),
+        }))
+    : null;
   let message;
 
   if (subtype === "background_tasks_changed") {
@@ -574,18 +613,25 @@ function emitClaudeBackgroundNotice(id, subtype, task = null, tasks = null) {
     title: "Claude 后台任务",
     // 提示用户当前正在等待或继续处理后台任务。
     message,
+    // 传递后台任务卡片所需的完整显示元数据。
+    ...(backgroundTaskMetadata
+      ? {
+          metadata: {
+            // display map 保留活动任务和已结束任务，供当前 assistant 消息完整展示。
+            backgroundTasks: backgroundTaskMetadata,
+            // activeTaskCount 仅取 SDK 权威任务集合，不能被 display map 影响。
+            activeTaskCount: context.backgroundTasks.size,
+          },
+        }
+      : {}),
     // 保留 SDK 生命周期子类型，避免后台消息被静默丢弃。
     sdkSubtype: subtype,
     // 传递任务稳定标识，供当前消息关联任务状态。
     ...(taskId ? { taskId } : {}),
     // 传递 SDK 提供的任务状态，不在 sidecar 解释状态含义。
     ...(status ? { status } : {}),
-    // 传递输出文件路径元数据，但不读取输出文件内容。
-    ...(outputFile ? { outputFile } : {}),
     // 传递 SDK 提供的任务摘要，供用户看到后台任务结果提示。
     ...(summary ? { summary } : {}),
-    // 传递当前活动任务全集，遵守 SDK 的 REPLACE 语义。
-    ...(activeTasks ? { tasks: activeTasks } : {}),
   });
 }
 
@@ -637,6 +683,8 @@ function createQueryContext(id, approvalPolicy = null, planMode = false) {
     isPersistentSession: false,
     // 当前仍在运行的 SDK 后台任务，按 task_id 维护最新任务元数据。
     backgroundTasks: new Map(),
+    // 当前 assistant 消息展示的后台任务，包括活动任务和已结束任务。
+    backgroundTaskDisplay: new Map(),
     // 权威后台任务集合当前是否为空，只能随 background_tasks_changed 快照更新。
     authoritativeBackgroundTasksEmpty: true,
     // 当前权威任务集合中仍等待 task_notification 的任务标识。
@@ -2623,6 +2671,31 @@ async function handleQuery(req, persistentSession = null) {
             description:
               typeof task.description === "string" ? task.description : "Claude 后台任务",
           });
+          const existingDisplayTask = context.backgroundTaskDisplay.get(taskId);
+          if (existingDisplayTask) {
+            // 快照只更新活动任务的类型，不能覆盖 sidecar 已记录的开始时间。
+            existingDisplayTask.taskType =
+              typeof task.task_type === "string" ? task.task_type : existingDisplayTask.taskType;
+            // 快照只更新活动任务的描述，终态摘要和终态时间仍由 task_notification 保留。
+            existingDisplayTask.description =
+              typeof task.description === "string"
+                ? task.description
+                : existingDisplayTask.description;
+          } else {
+            context.backgroundTaskDisplay.set(taskId, {
+              // 后台任务稳定标识，用于前端在生命周期更新中复用同一行。
+              taskId,
+              // 后台任务类型，用于保留 SDK 提供的任务元数据。
+              taskType: typeof task.task_type === "string" ? task.task_type : "",
+              // 后台任务业务描述，用于展示任务名称。
+              description:
+                typeof task.description === "string" ? task.description : "Claude 后台任务",
+              // 完整快照首次出现时，任务默认为运行中。
+              status: "running",
+              // 收到完整快照的时刻作为任务开始时间。
+              startedAt: Date.now(),
+            });
+          }
         }
         for (const taskId of context.notifiedTaskIds) {
           if (!currentTaskIds.has(taskId)) {
@@ -2636,52 +2709,165 @@ async function handleQuery(req, persistentSession = null) {
         }
         context.authoritativeBackgroundTasksEmpty = context.backgroundTasks.size === 0;
         context.awaitingTaskNotification = context.pendingTaskNotificationIds.size > 0;
-        emitClaudeBackgroundNotice(id, message.subtype, null, tasks);
+        emitClaudeBackgroundNotice(id, message.subtype, null, tasks, context);
         // 快照变为空时也必须检查此前已收到的 SDK result 是否可以完成。
         maybeCompleteTurn();
       } else if (message.type === "system" && message.subtype === "task_started") {
         // task_started 只负责发送生命周期通知，权威任务集合仍由 background_tasks_changed 提供。
-        emitClaudeBackgroundNotice(id, message.subtype, message);
+        const taskId = typeof message.task_id === "string" ? message.task_id : "";
+        if (taskId) {
+          const existingDisplayTask = context.backgroundTaskDisplay.get(taskId);
+          if (existingDisplayTask) {
+            // task_started 重新标记活动任务，但保留首次开始时间供耗时计算。
+            existingDisplayTask.status = "running";
+            // 启动事件携带新类型时更新任务类型。
+            if (typeof message.task_type === "string") {
+              existingDisplayTask.taskType = message.task_type;
+            }
+            // 启动事件携带新描述时更新任务描述。
+            if (typeof message.description === "string") {
+              existingDisplayTask.description = message.description;
+            }
+            // 重新启动后的任务不沿用上一次终态摘要和终态时间。
+            delete existingDisplayTask.summary;
+            delete existingDisplayTask.finishedAt;
+          } else {
+            context.backgroundTaskDisplay.set(taskId, {
+              // 后台任务稳定标识，用于前端在生命周期更新中复用同一行。
+              taskId,
+              // 启动事件提供的后台任务类型。
+              taskType: typeof message.task_type === "string" ? message.task_type : "",
+              // 启动事件提供的后台任务业务描述。
+              description:
+                typeof message.description === "string"
+                  ? message.description
+                  : "Claude 后台任务",
+              // task_started 表示任务已经进入运行状态。
+              status: "running",
+              // 收到启动事件的时刻作为任务开始时间。
+              startedAt: Date.now(),
+            });
+          }
+        }
+        emitClaudeBackgroundNotice(id, message.subtype, message, null, context);
       } else if (message.type === "system" && message.subtype === "task_updated") {
         const taskId = typeof message.task_id === "string" ? message.task_id : "";
         const patch = message.patch && typeof message.patch === "object"
           ? message.patch
           : {};
+        const displayTask = context.backgroundTaskDisplay.get(taskId);
+        const patchSummary =
+          typeof patch.summary === "string"
+            ? patch.summary
+            : typeof patch.error === "string"
+              ? patch.error
+              : null;
+        if (displayTask) {
+          // task_updated 只更新展示描述，不改动权威后台任务集合。
+          if (typeof patch.description === "string") {
+            displayTask.description = patch.description;
+          }
+          // task_updated 的摘要仅来自 SDK 更新补丁，不读取后台任务输出文件。
+          if (patchSummary !== null) {
+            if (patchSummary.length > 0) {
+              displayTask.summary = patchSummary;
+            } else {
+              delete displayTask.summary;
+            }
+          }
+        }
         emitClaudeBackgroundNotice(id, message.subtype, {
           // 传递 SDK 更新消息中的任务标识，供 notice 关联当前业务任务。
           task_id: taskId,
-          // 优先展示 SDK 更新消息携带的描述，缺失时使用统一占位描述。
+          // 优先展示 display map 中的最新描述，再回退到 SDK 更新消息描述。
           description:
-            typeof patch.description === "string"
-              ? patch.description
-              : "Claude 后台任务",
+            displayTask?.description ||
+            (typeof patch.description === "string" ? patch.description : "Claude 后台任务"),
           // 传递 SDK 更新消息中的状态，不写入权威任务集合。
           status: typeof patch.status === "string" ? patch.status : undefined,
-          // 传递 SDK 更新消息中的错误摘要，不读取后台任务输出。
-          summary: typeof patch.error === "string" ? patch.error : undefined,
-        });
+          // 传递 SDK 更新消息中的摘要，不读取后台任务输出。
+          summary: patchSummary || undefined,
+        }, null, context);
       } else if (message.type === "system" && message.subtype === "task_progress") {
         const taskId = typeof message.task_id === "string" ? message.task_id : "";
+        const displayTask = context.backgroundTaskDisplay.get(taskId);
+        if (displayTask) {
+          // task_progress 只更新展示描述，不改动权威后台任务集合和开始时间。
+          if (typeof message.description === "string") {
+            displayTask.description = message.description;
+          }
+          // 进度摘要只来自 SDK 的 summary 字段，不读取后台任务输出文件。
+          if (typeof message.summary === "string") {
+            if (message.summary.length > 0) {
+              displayTask.summary = message.summary;
+            } else {
+              delete displayTask.summary;
+            }
+          }
+        }
         emitClaudeBackgroundNotice(id, message.subtype, {
           // 传递 SDK 进度消息中的任务标识，供 notice 关联当前业务任务。
           task_id: taskId,
-          // 传递 SDK 当前描述，仅用于展示进度信息。
-          description: message.description,
+          // 优先展示 display map 中的最新描述，再回退到 SDK 当前描述。
+          description:
+            displayTask?.description ||
+            (typeof message.description === "string"
+              ? message.description
+              : "Claude 后台任务"),
           // 进度消息表示 SDK 报告任务仍在运行，仅作为 notice 元数据。
           status: "running",
           // 传递 SDK 最新摘要，避免进度消息被静默丢弃。
-          summary: message.summary,
-        });
+          summary: typeof message.summary === "string" ? message.summary : undefined,
+        }, null, context);
       } else if (message.type === "system" && message.subtype === "task_notification") {
         const taskId = typeof message.task_id === "string" ? message.task_id : "";
+        const terminalStatus = ["completed", "failed", "stopped"].includes(message.status)
+          ? message.status
+          : "failed";
+        const finishedAt = Date.now();
         if (taskId) {
           // task_notification 只结算对应通知等待状态，不修改权威后台任务集合。
           context.pendingTaskNotificationIds.delete(taskId);
           context.notifiedTaskIds.add(taskId);
           context.awaitingTaskNotification = context.pendingTaskNotificationIds.size > 0;
+          const displayTask = context.backgroundTaskDisplay.get(taskId);
+          if (displayTask) {
+            // 终态状态只由 SDK task_notification 写入展示 map。
+            displayTask.status = terminalStatus;
+            // 终态摘要只接受 task_notification.message.summary，禁止读取输出文件。
+            if (typeof message.summary === "string" && message.summary.length > 0) {
+              displayTask.summary = message.summary;
+            } else {
+              delete displayTask.summary;
+            }
+            // 记录 sidecar 收到终态生命周期事件的时刻。
+            displayTask.finishedAt = finishedAt;
+          } else {
+            context.backgroundTaskDisplay.set(taskId, {
+              // 后台任务稳定标识，用于前端在生命周期更新中复用同一行。
+              taskId,
+              // task_notification 缺少类型时保留空类型元数据。
+              taskType: typeof message.task_type === "string" ? message.task_type : "",
+              // task_notification 缺少描述时使用统一后台任务占位描述。
+              description:
+                typeof message.description === "string"
+                  ? message.description
+                  : "Claude 后台任务",
+              // 非法或缺失的 SDK 终态统一作为失败展示。
+              status: terminalStatus,
+              // 没有先前生命周期事件时，以收到终态事件的时刻开始计时。
+              startedAt: finishedAt,
+              // 记录 sidecar 收到终态生命周期事件的时刻。
+              finishedAt,
+              // 终态摘要只来自 SDK task_notification.message.summary。
+              ...(typeof message.summary === "string" && message.summary.length > 0
+                ? { summary: message.summary }
+                : {}),
+            });
+          }
         }
         // task_notification 只发送最终通知和续跑输入，不修改权威任务集合。
-        emitClaudeBackgroundNotice(id, message.subtype, message);
+        emitClaudeBackgroundNotice(id, message.subtype, message, null, context);
 
         const persistentSessionIsAlive =
           !persistentSession || sessionHandles.get(persistentSession.threadId) === persistentSession;
@@ -2883,6 +3069,8 @@ async function handleQuery(req, persistentSession = null) {
     if (!context.isPersistentSession && context.messageInput && !context.messageInput.readableEnded) {
       context.messageInput.push(null);
     }
+    // 查询生命周期结束后清除后台任务展示状态，避免下一轮复用旧任务。
+    context.backgroundTaskDisplay.clear();
     activeQueries.delete(id);
   }
 }
@@ -3002,6 +3190,8 @@ async function sendPersistentSessionMessage(req) {
       : null;
     await entry.query.applyFlagSettings({ effortLevel: nextReasoningEffort });
 
+    // 新逻辑轮次重新开始展示，清除上一轮保留的终态任务行。
+    entry.context.backgroundTaskDisplay.clear();
     entry.context.cancelled = false;
     entry.context.turnCompleted = false;
     // 新逻辑轮次重新等待 SDK result，并恢复默认终态。
@@ -3121,6 +3311,8 @@ async function destroyPersistentSessionHandle(req) {
   sessionHandles.delete(threadId);
   entry.interruptRequested = true;
   if (entry.context) {
+    // 销毁持久会话时清除当前 assistant 卡片中的任务行。
+    entry.context.backgroundTaskDisplay.clear();
     entry.context.cancelled = true;
     cleanupPendingApprovalsForQuery(
       entry.context.id,
@@ -3155,6 +3347,8 @@ function handleCancel(params = {}) {
     return;
   }
 
+  // 显式取消时清除当前 assistant 卡片中的任务行，避免残留旧轮次展示。
+  context.backgroundTaskDisplay.clear();
   context.cancelled = true;
   cleanupPendingApprovalsForQuery(
     requestId,
@@ -3342,6 +3536,8 @@ function handleApprovalResponse(params = {}, requestId) {
 function handleShutdown(signal) {
   shuttingDown = true;
   for (const context of activeQueries.values()) {
+    // sidecar 关闭时清除所有查询的后台任务展示状态。
+    context.backgroundTaskDisplay.clear();
     context.cancelled = true;
     cleanupPendingApprovalsForQuery(
       context.id,

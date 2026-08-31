@@ -211,6 +211,9 @@ enum ContentBlock {
         level: String,
         title: String,
         message: String,
+        /// Notice 业务附带的可选结构化元数据，持久化后原样提供给前端。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Box<RawValue>>,
     },
 
     #[serde(rename = "error")]
@@ -3601,6 +3604,8 @@ async fn run_turn(
                         level: "info".to_string(),
                         title: "远端任务已终止".to_string(),
                         message: "本轮异常对应的远端执行已经取消。".to_string(),
+                        // 远端中断提示不附带结构化后台任务元数据。
+                        metadata: None,
                     };
                     let progress = process_stream_event(
                         &app,
@@ -5715,6 +5720,8 @@ fn apply_event_to_blocks(
                 level: "info".to_string(),
                 title: "Model rerouted".to_string(),
                 message: format_model_reroute_notice(from_model, to_model, reason),
+                // 模型切换提示不附带结构化后台任务元数据。
+                metadata: None,
             };
             progress.blocks_changed = upsert_notice_block(
                 blocks,
@@ -5731,12 +5738,15 @@ fn apply_event_to_blocks(
             level,
             title,
             message,
+            metadata,
         } => {
             let block = ContentBlock::Notice {
                 kind: kind.to_string(),
                 level: level.to_string(),
                 title: title.to_string(),
                 message: message.to_string(),
+                // 保留 Claude 后台任务结构化元数据，供持久化和前端卡片渲染。
+                metadata: metadata.as_ref().map(value_to_raw),
             };
             progress.blocks_changed =
                 upsert_notice_block(blocks, action_index, approval_index, kind, block);
@@ -7335,6 +7345,8 @@ mod tests {
                 level: "warning".to_string(),
                 title: "Deprecation notice".to_string(),
                 message: "Use the newer API.".to_string(),
+                // 通用测试通知不附带结构化后台任务元数据。
+                metadata: None,
             },
             1000,
         );
@@ -7349,6 +7361,8 @@ mod tests {
                 level: "warning".to_string(),
                 title: "Deprecation notice".to_string(),
                 message: "Use the newer permissions API.".to_string(),
+                // 通用测试通知不附带结构化后台任务元数据。
+                metadata: None,
             },
             1000,
         );
@@ -7388,6 +7402,8 @@ mod tests {
                 level: "info".to_string(),
                 title: "Hook started".to_string(),
                 message: "first hook started".to_string(),
+                // Hook 测试通知不附带结构化后台任务元数据。
+                metadata: None,
             },
             1000,
         );
@@ -7413,6 +7429,8 @@ mod tests {
                 level: "info".to_string(),
                 title: "Hook completed".to_string(),
                 message: "first hook completed".to_string(),
+                // Hook 测试通知不附带结构化后台任务元数据。
+                metadata: None,
             },
             1000,
         );

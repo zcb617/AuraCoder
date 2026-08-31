@@ -562,12 +562,46 @@ export interface DiffBlock {
   scope: "turn" | "file" | "workspace";
 }
 
+export type ClaudeBackgroundTaskStatus =
+  | "running"
+  | "completed"
+  | "failed"
+  | "stopped";
+
+/** Claude 后台任务卡片使用的单项任务结构化元数据。 */
+export interface ClaudeBackgroundTask {
+  /** SDK 后台任务的稳定标识。 */
+  taskId: string;
+  /** SDK 后台任务类型，例如 bash 或 agent。 */
+  taskType: string;
+  /** 面向用户展示的后台任务描述。 */
+  description: string;
+  /** 后台任务当前生命周期状态。 */
+  status: ClaudeBackgroundTaskStatus;
+  /** SDK 生命周期事件提供的最新任务摘要。 */
+  summary?: string;
+  /** sidecar 收到任务生命周期事件时记录的开始时间。 */
+  startedAt: number;
+  /** 后台任务进入终态时由 sidecar 记录的时间。 */
+  finishedAt?: number;
+}
+
+/** Claude 后台任务卡片的完整结构化元数据。 */
+export interface ClaudeBackgroundTaskMetadata {
+  /** 当前查询展示的活动任务和已结束任务列表。 */
+  backgroundTasks: ClaudeBackgroundTask[];
+  /** SDK 权威活动任务集合中的任务数量。 */
+  activeTaskCount: number;
+}
+
 export interface NoticeBlock {
   type: "notice";
   kind: string;
   level: "info" | "warning" | "error";
   title: string;
   message: string;
+  /** Notice 业务可选的结构化元数据。 */
+  metadata?: ClaudeBackgroundTaskMetadata;
 }
 
 export interface ActionBlock {
@@ -1665,6 +1699,8 @@ export interface NoticeEvent {
   level: "info" | "warning" | "error";
   title: string;
   message: string;
+  /** Notice 事件可选的结构化元数据。 */
+  metadata?: ClaudeBackgroundTaskMetadata;
 }
 
 export interface SteerAppliedEvent {

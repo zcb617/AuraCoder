@@ -749,6 +749,76 @@ describe("claude-agent-sdk-server sidecar", () => {
         "task_notification",
       ]),
     );
+
+    const lifecycleNotices = harness.events.filter(
+      (event) =>
+        event.id === "query-background-lifecycle" &&
+        event.type === "notice" &&
+        event.kind === "claude_background_tasks",
+    );
+    const runningNotice = lifecycleNotices.find(
+      (event) => event.sdkSubtype === "background_tasks_changed" && event.metadata,
+    );
+    expect(runningNotice?.metadata).toMatchObject({
+      activeTaskCount: 1,
+      backgroundTasks: [
+        {
+          taskId: "edge-task-1",
+          taskType: "bash",
+          description: "edge task",
+          status: "running",
+          startedAt: expect.any(Number),
+        },
+      ],
+    });
+
+    const progressNotice = lifecycleNotices.find(
+      (event) => event.sdkSubtype === "task_progress",
+    );
+    expect(progressNotice?.metadata).toMatchObject({
+      activeTaskCount: 1,
+      backgroundTasks: [
+        {
+          taskId: "edge-task-1",
+          description: "edge task progress",
+          status: "running",
+          summary: "edge task is running",
+          startedAt: expect.any(Number),
+        },
+      ],
+    });
+
+    const terminalNotice = lifecycleNotices.find(
+      (event) => event.sdkSubtype === "task_notification",
+    );
+    expect(terminalNotice?.metadata).toMatchObject({
+      activeTaskCount: 1,
+      backgroundTasks: [
+        {
+          taskId: "edge-task-1",
+          status: "completed",
+          summary: "edge task done",
+          startedAt: expect.any(Number),
+          finishedAt: expect.any(Number),
+        },
+      ],
+    });
+
+    const finalNotice = lifecycleNotices.at(-1);
+    expect(finalNotice?.sdkSubtype).toBe("background_tasks_changed");
+    expect(finalNotice?.metadata).toMatchObject({
+      activeTaskCount: 0,
+      backgroundTasks: [
+        {
+          taskId: "edge-task-1",
+          status: "completed",
+          summary: "edge task done",
+          startedAt: expect.any(Number),
+          finishedAt: expect.any(Number),
+        },
+      ],
+    });
+    expect(JSON.stringify(finalNotice?.metadata)).not.toContain("output_file");
   });
 
   it("completes an ordinary query immediately when no background task is active", async () => {

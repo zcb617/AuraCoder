@@ -200,6 +200,8 @@ impl TurnEventMapper {
                 message:
                     "Codex compacted the active thread context to keep the conversation moving."
                         .to_string(),
+                // Codex 上下文压缩通知不附带 Claude 后台任务元数据。
+                metadata: None,
             }],
             "warning" => vec![map_simple_notice(
                 "codex_warning",
@@ -1023,6 +1025,8 @@ fn map_deprecation_notice(params: &Value) -> Option<EngineEvent> {
         level: "warning".to_string(),
         title: "Deprecation notice".to_string(),
         message,
+        // Codex 弃用通知不附带 Claude 后台任务元数据。
+        metadata: None,
     })
 }
 
@@ -1032,6 +1036,8 @@ fn map_simple_notice(kind: &str, level: &str, title: &str, message: String) -> E
         level: level.to_string(),
         title: title.to_string(),
         message,
+        // 通用 Codex 通知不附带 Claude 后台任务元数据。
+        metadata: None,
     }
 }
 
@@ -1236,6 +1242,8 @@ fn map_hook_notification(
         level: level.to_string(),
         title: title.to_string(),
         message: message_lines.join("\n"),
+        // Codex Hook 通知不附带 Claude 后台任务元数据。
+        metadata: None,
     })
 }
 

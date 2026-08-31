@@ -685,6 +685,98 @@ describe("chatStore send", () => {
     vi.useRealTimers();
   });
 
+  it("stores Claude background task metadata and replaces it on same-kind updates", async () => {
+    vi.useFakeTimers();
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+    mockIpc.sendMessage.mockResolvedValueOnce("assistant-message-id");
+    await expect(
+      useChatStore.getState().send("run a background task", {
+        engineId: "claude",
+        modelId: "claude-sonnet",
+      }),
+    ).resolves.toBe(true);
+
+    streamHandler!({
+      type: "Notice",
+      kind: "claude_background_tasks",
+      level: "info",
+      title: "Claude 后台任务",
+      message: "后台任务已启动",
+      metadata: {
+        backgroundTasks: [
+          {
+            taskId: "task-1",
+            taskType: "bash",
+            description: "执行后台命令",
+            status: "running",
+            startedAt: 1_000,
+            summary: "正在执行",
+          },
+        ],
+        activeTaskCount: 1,
+      },
+    });
+    streamHandler!({
+      type: "Notice",
+      kind: "claude_background_tasks",
+      level: "info",
+      title: "Claude 后台任务",
+      message: "后台任务已结束",
+      metadata: {
+        backgroundTasks: [
+          {
+            taskId: "task-1",
+            taskType: "bash",
+            description: "执行后台命令",
+            status: "completed",
+            startedAt: 1_000,
+            summary: "执行完成",
+            finishedAt: 2_000,
+          },
+        ],
+        activeTaskCount: 0,
+      },
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    const assistant = useChatStore
+      .getState()
+      .messages.find((message) => message.role === "assistant" && message.blocks?.length);
+    expect(assistant?.blocks).toEqual([
+      {
+        type: "notice",
+        kind: "claude_background_tasks",
+        level: "info",
+        title: "Claude 后台任务",
+        message: "后台任务已结束",
+        metadata: {
+          backgroundTasks: [
+            {
+              taskId: "task-1",
+              taskType: "bash",
+              description: "执行后台命令",
+              status: "completed",
+              startedAt: 1_000,
+              summary: "执行完成",
+              finishedAt: 2_000,
+            },
+          ],
+          activeTaskCount: 0,
+        },
+      },
+    ]);
+
+    vi.useRealTimers();
+  });
+
   it("keeps hook notices at their stream positions", async () => {
     vi.useFakeTimers();
 
