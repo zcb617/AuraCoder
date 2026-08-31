@@ -147,6 +147,14 @@ struct RuntimeState {
     candidate: Option<Update>,
 }
 
+/// 表示下载操作是否已取得运行时状态的独占入口。
+enum DownloadReservation {
+    /// 当前调用已取得下载资格，并持有需要下载的更新候选。
+    Started(Update),
+    /// 另一调用已经进入下载或后续阶段，应直接返回已有状态。
+    Existing(UpdateProcessState),
+}
+
 pub struct UpdateManager {
     runtime: Mutex<RuntimeState>,
 }
@@ -193,6 +201,68 @@ impl UpdateManager {
             .clone()
     }
 
+    /// 在检查更新网络请求前原子复核状态并抢占 Checking 阶段，避免并发请求重复访问更新服务。
+    fn reserve_check(&self, source: &str) -> Option<UpdateProcessState> {
+        let mut runtime = self.runtime.lock().expect("update manager lock poisoned");
+        let current = runtime.state.clone();
+        if matches!(
+            current.phase,
+            UpdatePhase::Checking
+                | UpdatePhase::Downloading
+                | UpdatePhase::Downloaded
+                | UpdatePhase::Installing
+        ) || (current.phase == UpdatePhase::Available && runtime.candidate.is_some())
+        {
+            return Some(current);
+        }
+
+        runtime.state = UpdateProcessState {
+            phase: UpdatePhase::Checking,
+            version: None,
+            source: Some(source.to_string()),
+            downloaded_bytes: 0,
+            total_bytes: None,
+            error: None,
+            error_stage: None,
+        };
+        None
+    }
+
+    /// 在下载更新网络请求前原子读取候选并抢占 Downloading 阶段，避免并发下载复用临时文件。
+    fn reserve_download(&self, source: &str) -> Result<DownloadReservation, String> {
+        let mut runtime = self.runtime.lock().expect("update manager lock poisoned");
+        let current = runtime.state.clone();
+        if matches!(
+            current.phase,
+            UpdatePhase::Downloading | UpdatePhase::Downloaded | UpdatePhase::Installing
+        ) {
+            return Ok(DownloadReservation::Existing(current));
+        }
+
+        let update = runtime
+            .candidate
+            .clone()
+            .ok_or_else(|| "没有可下载的更新版本".to_string())?;
+        let version = update.version.clone();
+        runtime.state = UpdateProcessState {
+            phase: UpdatePhase::Downloading,
+            version: Some(version),
+            source: Some(source.to_string()),
+            downloaded_bytes: 0,
+            total_bytes: None,
+            error: None,
+            error_stage: None,
+        };
+        Ok(DownloadReservation::Started(update))
+    }
+
+    /// 在检查结果提交时原子更新候选和对应状态，避免下载观察到不匹配的中间状态。
+    fn commit_check_result(&self, candidate: Option<Update>, state: UpdateProcessState) {
+        let mut runtime = self.runtime.lock().expect("update manager lock poisoned");
+        runtime.candidate = candidate;
+        runtime.state = state;
+    }
+
     fn set_progress(&self, downloaded_bytes: u64, total_bytes: Option<u64>) {
         let mut runtime = self.runtime.lock().expect("update manager lock poisoned");
         runtime.state.phase = UpdatePhase::Downloading;
@@ -212,7 +282,9 @@ impl UpdateManager {
         error_stage: UpdateErrorStage,
         error: String,
     ) {
-        self.set_state(UpdateProcessState {
+        let mut runtime = self.runtime.lock().expect("update manager lock poisoned");
+        runtime.candidate = None;
+        runtime.state = UpdateProcessState {
             phase: UpdatePhase::Error,
             version,
             source: Some(source.to_string()),
@@ -220,15 +292,16 @@ impl UpdateManager {
             total_bytes,
             error: Some(error),
             error_stage: Some(error_stage),
-        });
+        };
     }
 
     pub fn restore(&self, app: &AppHandle) -> Result<UpdateProcessState, String> {
-        let current = self.state();
+        let mut runtime = self.runtime.lock().expect("update manager lock poisoned");
+        let current = runtime.state.clone();
         if matches!(
             current.phase,
             UpdatePhase::Checking | UpdatePhase::Downloading | UpdatePhase::Installing
-        ) || (current.phase == UpdatePhase::Available && self.candidate().is_some())
+        ) || (current.phase == UpdatePhase::Available && runtime.candidate.is_some())
         {
             return Ok(current);
         }
@@ -243,9 +316,10 @@ impl UpdateManager {
         };
 
         let Some(saved) = saved else {
-            self.set_candidate(None);
-            self.set_state(UpdateProcessState::default());
-            return Ok(UpdateProcessState::default());
+            let state = UpdateProcessState::default();
+            runtime.candidate = None;
+            runtime.state = state.clone();
+            return Ok(state);
         };
 
         let current_version = app.package_info().version.to_string();
@@ -255,9 +329,10 @@ impl UpdateManager {
             if completion_marker.is_file() {
                 fs::remove_file(&completion_marker).map_err(|error| error.to_string())?;
                 clear_saved_update(app, Some(&saved))?;
-                self.set_candidate(None);
-                self.set_state(UpdateProcessState::default());
-                return Ok(UpdateProcessState::default());
+                let state = UpdateProcessState::default();
+                runtime.candidate = None;
+                runtime.state = state.clone();
+                return Ok(state);
             }
             if compare_versions(&current_version, &saved.version) == Ordering::Equal {
                 let target_app_path = macos_target_app_path()?;
@@ -280,7 +355,7 @@ impl UpdateManager {
                     completion_path: completion_marker.to_string_lossy().into_owned(),
                     log_path: log_path.to_string_lossy().into_owned(),
                 };
-                self.set_state(UpdateProcessState {
+                runtime.state = UpdateProcessState {
                     phase: UpdatePhase::Installing,
                     version: Some(saved.version.clone()),
                     source: Some(saved.source.clone()),
@@ -288,33 +363,36 @@ impl UpdateManager {
                     total_bytes: saved.total_bytes,
                     error: None,
                     error_stage: None,
-                });
+                };
                 if let Err(error) = spawn_macos_updater(app, job) {
-                    self.set_error(
-                        Some(saved.version),
-                        &saved.source,
-                        saved.downloaded_bytes,
-                        saved.total_bytes,
-                        UpdateErrorStage::Install,
-                        error.clone(),
-                    );
+                    runtime.state = UpdateProcessState {
+                        phase: UpdatePhase::Error,
+                        version: Some(saved.version),
+                        source: Some(saved.source.clone()),
+                        downloaded_bytes: saved.downloaded_bytes,
+                        total_bytes: saved.total_bytes,
+                        error: Some(error.clone()),
+                        error_stage: Some(UpdateErrorStage::Install),
+                    };
                     return Err(error);
                 }
-                return Ok(self.state());
+                return Ok(runtime.state.clone());
             }
         }
         if compare_versions(&current_version, &saved.version) != Ordering::Less {
             clear_saved_update(app, Some(&saved))?;
-            self.set_candidate(None);
-            self.set_state(UpdateProcessState::default());
-            return Ok(UpdateProcessState::default());
+            let state = UpdateProcessState::default();
+            runtime.candidate = None;
+            runtime.state = state.clone();
+            return Ok(state);
         }
 
         if !saved_file_path(app, &saved)?.is_file() {
             clear_saved_update(app, Some(&saved))?;
-            self.set_candidate(None);
-            self.set_state(UpdateProcessState::default());
-            return Ok(UpdateProcessState::default());
+            let state = UpdateProcessState::default();
+            runtime.candidate = None;
+            runtime.state = state.clone();
+            return Ok(state);
         }
 
         let state = UpdateProcessState {
@@ -326,8 +404,8 @@ impl UpdateManager {
             error: None,
             error_stage: None,
         };
-        self.set_candidate(None);
-        self.set_state(state.clone());
+        runtime.candidate = None;
+        runtime.state = state.clone();
         Ok(state)
     }
 
@@ -336,32 +414,14 @@ impl UpdateManager {
         app: &AppHandle,
         source: &str,
     ) -> Result<UpdateProcessState, String> {
-        let current = self.state();
-        if matches!(
-            current.phase,
-            UpdatePhase::Checking
-                | UpdatePhase::Downloading
-                | UpdatePhase::Downloaded
-                | UpdatePhase::Installing
-        ) || (current.phase == UpdatePhase::Available && self.candidate().is_some())
-        {
-            return Ok(current);
-        }
-
         let restored = self.restore(app)?;
         if restored.phase == UpdatePhase::Downloaded {
             return Ok(restored);
         }
 
-        self.set_state(UpdateProcessState {
-            phase: UpdatePhase::Checking,
-            version: None,
-            source: Some(source.to_string()),
-            downloaded_bytes: 0,
-            total_bytes: None,
-            error: None,
-            error_stage: None,
-        });
+        if let Some(state) = self.reserve_check(source) {
+            return Ok(state);
+        }
 
         let updater = match app
             .updater_builder()
@@ -400,8 +460,7 @@ impl UpdateManager {
 
         let Some(update) = update else {
             let state = UpdateProcessState::default();
-            self.set_candidate(None);
-            self.set_state(state.clone());
+            self.commit_check_result(None, state.clone());
             return Ok(state);
         };
 
@@ -414,8 +473,7 @@ impl UpdateManager {
             error: None,
             error_stage: None,
         };
-        self.set_candidate(Some(update));
-        self.set_state(state.clone());
+        self.commit_check_result(Some(update.clone()), state.clone());
         Ok(state)
     }
 
@@ -424,28 +482,12 @@ impl UpdateManager {
         app: &AppHandle,
         source: &str,
     ) -> Result<UpdateProcessState, String> {
-        let current_state = self.state();
-        if matches!(
-            current_state.phase,
-            UpdatePhase::Downloading | UpdatePhase::Downloaded | UpdatePhase::Installing
-        ) {
-            return Ok(current_state);
-        }
-
-        let update = self
-            .candidate()
-            .ok_or_else(|| "没有可下载的更新版本".to_string())?;
+        let update = match self.reserve_download(source)? {
+            DownloadReservation::Started(update) => update,
+            DownloadReservation::Existing(state) => return Ok(state),
+        };
         let version = update.version.clone();
         let suffix = package_suffix(update.download_url.path());
-        self.set_state(UpdateProcessState {
-            phase: UpdatePhase::Downloading,
-            version: Some(version.clone()),
-            source: Some(source.to_string()),
-            downloaded_bytes: 0,
-            total_bytes: None,
-            error: None,
-            error_stage: None,
-        });
 
         let mut downloaded_bytes = 0_u64;
         let manager = self;
@@ -1141,47 +1183,38 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         return Err(error.to_string());
     }
 
-    let rename_error = match fs::rename(&temporary, path) {
-        Ok(()) => None,
-        Err(error) => {
-            #[cfg(target_os = "windows")]
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                let can_retry = match fs::remove_file(path) {
-                    Ok(()) => true,
-                    Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {
-                        true
-                    }
-                    Err(remove_error) => {
-                        log::error!(
-                            "Windows 更新目标已存在但删除失败: {remove_error}; path={}; 原始替换错误: {error}",
-                            path.display()
-                        );
-                        false
-                    }
-                };
-                if can_retry {
-                    match fs::rename(&temporary, path) {
-                        Ok(()) => return Ok(()),
-                        Err(retry_error) => {
-                            log::error!(
-                                "Windows 更新目标删除后重新替换失败: {retry_error}; path={}; 原始替换错误: {error}",
-                                path.display()
-                            );
-                        }
-                    }
-                }
-            }
-            Some(error)
+    #[cfg(target_os = "windows")]
+    let replace_result = {
+        use windows::{
+            core::PCWSTR,
+            Win32::Storage::FileSystem::{
+                MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+            },
+        };
+
+        let temporary_wide = encode_wide(temporary.as_os_str());
+        let path_wide = encode_wide(path.as_os_str());
+        unsafe {
+            MoveFileExW(
+                PCWSTR::from_raw(temporary_wide.as_ptr()),
+                PCWSTR::from_raw(path_wide.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
         }
+        .map_err(|error| error.to_string())
     };
-    if let Some(error) = rename_error {
+
+    #[cfg(not(target_os = "windows"))]
+    let replace_result = fs::rename(&temporary, path).map_err(|error| error.to_string());
+
+    if let Err(error) = replace_result {
         if let Err(cleanup_error) = fs::remove_file(&temporary) {
             log::error!(
                 "清理更新临时文件失败: {cleanup_error}; path={}; 原始替换错误: {error}",
                 temporary.display()
             );
         }
-        return Err(error.to_string());
+        return Err(error);
     }
     Ok(())
 }
@@ -1618,6 +1651,89 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"second update");
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// 验证检查结果提交会同步清空候选并写入状态，下载入口不会观察到可下载候选。
+    #[test]
+    fn commits_check_result_before_download_reservation() {
+        let manager = UpdateManager::default();
+        let state = UpdateProcessState::default();
+        manager.commit_check_result(None, state.clone());
+
+        assert!(manager.reserve_download("test").is_err());
+        assert_eq!(manager.state(), state);
+        let runtime = manager
+            .runtime
+            .lock()
+            .expect("update manager lock poisoned");
+        assert!(runtime.candidate.is_none());
+        assert_eq!(runtime.state.phase, UpdatePhase::Idle);
+    }
+
+    /// 验证并发更新检查只有一个调用可以原子抢占 Checking 阶段。
+    #[test]
+    fn reserves_checking_once_for_concurrent_checks() {
+        let manager = std::sync::Arc::new(UpdateManager::default());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let manager = std::sync::Arc::clone(&manager);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    manager.reserve_check("test")
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_none()).count(), 1);
+        assert!(results.iter().all(|result| {
+            result
+                .as_ref()
+                .is_none_or(|state| state.phase == UpdatePhase::Checking)
+        }));
+        assert_eq!(manager.state().phase, UpdatePhase::Checking);
+    }
+
+    /// 验证第二个并发下载调用在已有 Downloading 状态时直接返回现有状态。
+    #[test]
+    fn rejects_concurrent_download_after_reservation() {
+        let manager = std::sync::Arc::new(UpdateManager::default());
+        manager.set_state(UpdateProcessState {
+            phase: UpdatePhase::Downloading,
+            version: Some("1.0.4".to_string()),
+            source: Some("test".to_string()),
+            downloaded_bytes: 0,
+            total_bytes: Some(10),
+            error: None,
+            error_stage: None,
+        });
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let manager = std::sync::Arc::clone(&manager);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    manager.reserve_download("test")
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+
+        for handle in handles {
+            let result = handle.join().unwrap();
+            assert!(matches!(
+                result,
+                Ok(DownloadReservation::Existing(state))
+                    if state.phase == UpdatePhase::Downloading
+            ));
+        }
     }
 
     #[cfg(target_os = "linux")]
