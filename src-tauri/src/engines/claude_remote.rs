@@ -418,7 +418,7 @@ impl ClaudeRemoteEngine {
             "reasoningEffort": thread_config.sandbox.reasoning_effort,
             "planMode": plan_mode,
             "settingSources": ["user", "project"],
-            "strictMcpConfig": true,
+            "strictMcpConfig": false,
             "enforceApprovalRouting": true,
         });
         if let Some(session_id) = thread_config.agent_session_id.as_ref() {
@@ -1013,7 +1013,7 @@ impl Engine for ClaudeRemoteEngine {
             "reasoningEffort": thread_config.sandbox.reasoning_effort,
             "planMode": plan_mode,
             "settingSources": ["user", "project"],
-            "strictMcpConfig": true,
+            "strictMcpConfig": false,
             "enforceApprovalRouting": true,
         });
         if let Some(session_id) = thread_config.agent_session_id.as_ref() {
