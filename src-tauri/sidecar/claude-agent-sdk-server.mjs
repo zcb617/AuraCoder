@@ -668,7 +668,14 @@ function createQueryContext(id, approvalPolicy = null, planMode = false) {
     messageInput: null,
     query: null,
     actionCounter: 0,
+    // SDK 工具标识与 AuraCoder 操作标识的稳定关联，供后台任务归属后续补齐。
     actionIdsByToolUseId: new Map(),
+    // SDK 工具进度消息提供的工具与后台任务关联。
+    backgroundTaskIdsByToolUseId: new Map(),
+    // 已通知宿主的操作与后台任务关联，避免快照重放造成重复事件。
+    backgroundTaskIdsByActionId: new Map(),
+    // Hook 中子代理标识的缓存；当前 SDK 后台任务标识与子代理标识一致时用于补齐早到的操作。
+    agentIdsByToolUseId: new Map(),
     streamToolUseIdsByIndex: new Map(),
     suppressedToolUseIds: new Set(),
     pendingApprovalIds: new Set(),
@@ -774,13 +781,77 @@ function serializeToolOutput(output) {
 function getActionIdForToolUse(context, toolUseId) {
   if (typeof toolUseId === "string" && toolUseId.length > 0) {
     const actionId = context.actionIdsByToolUseId.get(toolUseId);
-    context.actionIdsByToolUseId.delete(toolUseId);
     if (actionId) {
       return actionId;
     }
   }
 
   return `claude-action-${context.actionCounter}`;
+}
+
+function getTaskIdFromToolInput(toolName, toolInput) {
+  if (
+    toolName === "TaskOutput" &&
+    toolInput &&
+    typeof toolInput === "object" &&
+    typeof toolInput.task_id === "string" &&
+    toolInput.task_id.length > 0
+  ) {
+    return toolInput.task_id;
+  }
+  return null;
+}
+
+function getKnownBackgroundTaskId(context, toolUseId, toolName, toolInput, agentId) {
+  const taskIdFromInput = getTaskIdFromToolInput(toolName, toolInput);
+  if (taskIdFromInput) {
+    return taskIdFromInput;
+  }
+  if (typeof toolUseId === "string" && toolUseId.length > 0) {
+    const taskId = context.backgroundTaskIdsByToolUseId.get(toolUseId);
+    if (taskId) {
+      return taskId;
+    }
+  }
+  if (
+    typeof agentId === "string" &&
+    agentId.length > 0 &&
+    context.backgroundTasks.has(agentId)
+  ) {
+    return agentId;
+  }
+  return null;
+}
+
+function associateActionWithBackgroundTask(context, requestId, toolUseId, taskId) {
+  if (
+    typeof toolUseId !== "string" ||
+    toolUseId.length === 0 ||
+    typeof taskId !== "string" ||
+    taskId.length === 0
+  ) {
+    return;
+  }
+
+  context.backgroundTaskIdsByToolUseId.set(toolUseId, taskId);
+  const actionId = context.actionIdsByToolUseId.get(toolUseId);
+  if (actionId && context.backgroundTaskIdsByActionId.get(actionId) !== taskId) {
+    context.backgroundTaskIdsByActionId.set(actionId, taskId);
+    emit({
+      id: requestId,
+      type: "action_background_task_assigned",
+      actionId,
+      taskId,
+    });
+  }
+}
+
+function associateKnownSubagentActions(context, requestId) {
+  for (const [toolUseId, agentId] of context.agentIdsByToolUseId) {
+    if (context.backgroundTasks.has(agentId)) {
+      associateActionWithBackgroundTask(context, requestId, toolUseId, agentId);
+    }
+  }
 }
 
 function formatSdkResultError(message) {
@@ -2352,6 +2423,7 @@ async function handleQuery(req, persistentSession = null) {
               const toolInput = hookInput?.tool_input || hookInput?.input || {};
               const toolUseId =
                 hookInput?.tool_use_id || hookInput?.toolUseID || hookInput?.toolUseId;
+              const agentId = hookInput?.agent_id || hookInput?.agentID || hookInput?.agentId;
               if (
                 typeof toolUseId === "string" &&
                 toolUseId.length > 0 &&
@@ -2362,7 +2434,17 @@ async function handleQuery(req, persistentSession = null) {
               const actionId = `claude-action-${++context.actionCounter}`;
               if (typeof toolUseId === "string" && toolUseId.length > 0) {
                 context.actionIdsByToolUseId.set(toolUseId, actionId);
+                if (typeof agentId === "string" && agentId.length > 0) {
+                  context.agentIdsByToolUseId.set(toolUseId, agentId);
+                }
               }
+              const backgroundTaskId = getKnownBackgroundTaskId(
+                context,
+                toolUseId,
+                toolName,
+                toolInput,
+                agentId,
+              );
 
               emit({
                 id,
@@ -2373,6 +2455,9 @@ async function handleQuery(req, persistentSession = null) {
                 summary: summarizeTool(toolName, toolInput),
                 details: toolInput,
               });
+              if (backgroundTaskId) {
+                associateActionWithBackgroundTask(context, id, toolUseId, backgroundTaskId);
+              }
 
               return {};
             },
@@ -2639,6 +2724,10 @@ async function handleQuery(req, persistentSession = null) {
             usage,
           });
         }
+      } else if (message.type === "tool_progress") {
+        const taskId = typeof message.task_id === "string" ? message.task_id : "";
+        const toolUseId = typeof message.tool_use_id === "string" ? message.tool_use_id : "";
+        associateActionWithBackgroundTask(context, id, toolUseId, taskId);
       } else if (message.type === "system" && message.subtype === "status") {
         const notice = buildStatusNotice(message);
         if (notice) {
@@ -2697,6 +2786,8 @@ async function handleQuery(req, persistentSession = null) {
             });
           }
         }
+        // 已在 Hook 中收到子代理操作的场景，任务快照到达后立即把这些操作归入对应任务。
+        associateKnownSubagentActions(context, id);
         for (const taskId of context.notifiedTaskIds) {
           if (!currentTaskIds.has(taskId)) {
             context.notifiedTaskIds.delete(taskId);

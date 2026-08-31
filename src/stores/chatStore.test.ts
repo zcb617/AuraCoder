@@ -777,6 +777,62 @@ describe("chatStore send", () => {
     vi.useRealTimers();
   });
 
+  it("associates Claude operations with their background task without changing foreground operations", async () => {
+    vi.useFakeTimers();
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+    mockIpc.sendMessage.mockResolvedValueOnce("assistant-message-id");
+    await expect(
+      useChatStore.getState().send("run background work", {
+        engineId: "claude",
+        modelId: "claude-sonnet",
+      }),
+    ).resolves.toBe(true);
+
+    streamHandler!({
+      type: "ActionStarted",
+      action_id: "background-action",
+      action_type: "command",
+      summary: "后台编译检查",
+      details: { command: "python -m py_compile src/proxy.py" },
+    });
+    streamHandler!({
+      type: "ActionStarted",
+      action_id: "foreground-action",
+      action_type: "search",
+      summary: "前台搜索",
+      details: { query: "proxy" },
+    });
+    streamHandler!({
+      type: "ActionBackgroundTaskAssigned",
+      action_id: "background-action",
+      task_id: "task-1",
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    const assistant = useChatStore
+      .getState()
+      .messages.find((message) => message.role === "assistant" && message.blocks?.length);
+    const actions = assistant?.blocks?.filter((block) => block.type === "action") ?? [];
+    const backgroundAction = actions.find(
+      (block) => block.type === "action" && block.actionId === "background-action",
+    );
+    const foregroundAction = actions.find(
+      (block) => block.type === "action" && block.actionId === "foreground-action",
+    );
+    expect(backgroundAction).toMatchObject({ backgroundTaskId: "task-1" });
+    expect(foregroundAction?.backgroundTaskId).toBeUndefined();
+
+    vi.useRealTimers();
+  });
+
   it("keeps hook notices at their stream positions", async () => {
     vi.useFakeTimers();
 

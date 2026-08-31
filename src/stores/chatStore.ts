@@ -246,6 +246,7 @@ function eventHasVisibleAssistantContent(event: StreamEvent): boolean {
     case "ThinkingDelta":
       return String(event.content ?? "").length > 0;
     case "ActionStarted":
+    case "ActionBackgroundTaskAssigned":
     case "ActionOutputDelta":
     case "ActionCompleted":
     case "ApprovalRequested":
@@ -1611,6 +1612,20 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
       outputDeferredLoaded: true,
       status: "running"
     });
+  }
+
+  if (event.type === "ActionBackgroundTaskAssigned") {
+    const actionId = String(event.action_id ?? "");
+    const taskId = String(event.task_id ?? "");
+    if (actionId && taskId) {
+      const blocks = assistant.blocks ?? [];
+      assistant.blocks = patchActionBlock(blocks, actionId, (block) => {
+        if (block.backgroundTaskId === taskId) {
+          return block;
+        }
+        return { ...block, backgroundTaskId: taskId };
+      });
+    }
   }
 
   if (event.type === "ActionOutputDelta") {

@@ -7770,6 +7770,7 @@ pub(crate) fn engine_event_kind(event: &EngineEvent) -> &'static str {
         EngineEvent::ActionStarted { .. } => "action_started",
         EngineEvent::ActionOutputDelta { .. } => "action_output_delta",
         EngineEvent::ActionProgressUpdated { .. } => "action_progress_updated",
+        EngineEvent::ActionBackgroundTaskAssigned { .. } => "action_background_task_assigned",
         EngineEvent::ActionCompleted { .. } => "action_completed",
         EngineEvent::DiffUpdated { .. } => "diff_updated",
         EngineEvent::ApprovalRequested { .. } => "approval_requested",

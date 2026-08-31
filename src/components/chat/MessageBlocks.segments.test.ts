@@ -3,6 +3,70 @@ import type { ContentBlock } from "../../types";
 import { buildBlockSegments, getSubagentCardTitle } from "./MessageBlocks";
 
 describe("buildBlockSegments", () => {
+  it("excludes operations already assigned to a Claude background task from the foreground action list", () => {
+    const blocks: ContentBlock[] = [
+      {
+        type: "notice",
+        kind: "claude_background_tasks",
+        level: "info",
+        title: "Claude 后台任务",
+        message: "后台任务执行中",
+        metadata: {
+          backgroundTasks: [
+            {
+              taskId: "task-1",
+              taskType: "local_agent",
+              description: "后台检查",
+              status: "running",
+              startedAt: 1_000,
+            },
+          ],
+          activeTaskCount: 1,
+        },
+      },
+      {
+        type: "action",
+        actionId: "background-action",
+        actionType: "command",
+        summary: "后台检查命令",
+        details: {},
+        backgroundTaskId: "task-1",
+        outputChunks: [],
+        status: "running",
+      },
+      {
+        type: "action",
+        actionId: "foreground-action",
+        actionType: "search",
+        summary: "前台搜索",
+        details: {},
+        outputChunks: [],
+        status: "running",
+      },
+    ];
+
+    const segments = buildBlockSegments(blocks, true, "claude");
+    const displayedActionIds = segments.flatMap((segment) => {
+      if (segment.kind === "action-group") {
+        return segment.blocks.map((block) => block.actionId);
+      }
+      if (segment.kind === "action-card") {
+        return segment.segments.flatMap((inner) =>
+          inner.kind === "action-group"
+            ? inner.blocks.map((block) => block.actionId)
+            : inner.block.type === "action"
+              ? [inner.block.actionId]
+              : [],
+        );
+      }
+      return segment.kind === "single" && segment.block.type === "action"
+        ? [segment.block.actionId]
+        : [];
+    });
+
+    expect(displayedActionIds).toEqual(["foreground-action"]);
+  });
+
   it("keeps non-Codex hooks at their stream positions", () => {
     const blocks: ContentBlock[] = [
       { type: "text", content: "before hooks" },

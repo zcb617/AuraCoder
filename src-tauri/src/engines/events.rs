@@ -152,6 +152,10 @@ pub enum EngineEvent {
         action_id: String,
         message: String,
     },
+    ActionBackgroundTaskAssigned {
+        action_id: String,
+        task_id: String,
+    },
     ActionCompleted {
         action_id: String,
         result: ActionResult,

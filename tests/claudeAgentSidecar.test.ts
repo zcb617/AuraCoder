@@ -2473,6 +2473,151 @@ describe("claude-agent-sdk-server sidecar", () => {
     }
   });
 
+  it("assigns background task operations by SDK tool progress and TaskOutput input", async () => {
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "hook",
+          hook: "PreToolUse",
+          input: {
+            tool_name: "Bash",
+            tool_input: { command: "python -m py_compile src/proxy.py" },
+            tool_use_id: "background-tool-1",
+          },
+        },
+        {
+          type: "yield",
+          message: {
+            type: "tool_progress",
+            tool_use_id: "background-tool-1",
+            tool_name: "Bash",
+            task_id: "background-task-1",
+            elapsed_time_seconds: 1,
+          },
+        },
+        {
+          type: "hook",
+          hook: "PostToolUse",
+          input: {
+            tool_name: "Bash",
+            tool_input: { command: "python -m py_compile src/proxy.py" },
+            tool_use_id: "background-tool-1",
+            tool_response: "checked",
+          },
+        },
+        {
+          type: "hook",
+          hook: "PreToolUse",
+          input: {
+            tool_name: "Read",
+            tool_input: { file_path: "/var/work/llm_router/src/proxy.py" },
+            tool_use_id: "background-agent-tool-1",
+            agent_id: "background-task-1",
+          },
+        },
+        {
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "background_tasks_changed",
+            tasks: [
+              {
+                task_id: "background-task-1",
+                task_type: "local_agent",
+                description: "后台检查",
+              },
+            ],
+          },
+        },
+        {
+          type: "hook",
+          hook: "PostToolUse",
+          input: {
+            tool_name: "Read",
+            tool_input: { file_path: "/var/work/llm_router/src/proxy.py" },
+            tool_use_id: "background-agent-tool-1",
+            agent_id: "background-task-1",
+            tool_response: "read",
+          },
+        },
+        {
+          type: "hook",
+          hook: "PreToolUse",
+          input: {
+            tool_name: "TaskOutput",
+            tool_input: { task_id: "background-task-1", block: false, timeout: 1_000 },
+            tool_use_id: "task-output-1",
+          },
+        },
+        {
+          type: "hook",
+          hook: "PostToolUse",
+          input: {
+            tool_name: "TaskOutput",
+            tool_input: { task_id: "background-task-1", block: false, timeout: 1_000 },
+            tool_use_id: "task-output-1",
+            tool_response: "task result",
+          },
+        },
+        {
+          type: "yield",
+          message: makeSuccessResult({ session_id: "session-background-operation" }),
+        },
+      ],
+    });
+
+    harness.send({
+      id: "query-background-operation",
+      method: "query",
+      params: {
+        prompt: "run background operation scenario",
+        cwd: repoRoot,
+      },
+    });
+
+    await harness.waitFor(
+      (event) => event.id === "query-background-operation" && event.type === "turn_completed",
+    );
+
+    const bashStarted = harness.events.find(
+      (event) =>
+        event.id === "query-background-operation" &&
+        event.type === "action_started" &&
+        (event.details as Record<string, unknown> | undefined)?.command ===
+          "python -m py_compile src/proxy.py",
+    );
+    const taskOutputStarted = harness.events.find(
+      (event) =>
+        event.id === "query-background-operation" &&
+        event.type === "action_started" &&
+        (event.details as Record<string, unknown> | undefined)?.task_id === "background-task-1",
+    );
+    const subagentStarted = harness.events.find(
+      (event) =>
+        event.id === "query-background-operation" &&
+        event.type === "action_started" &&
+        (event.details as Record<string, unknown> | undefined)?.file_path ===
+          "/var/work/llm_router/src/proxy.py",
+    );
+    const assignments = harness.events.filter(
+      (event) =>
+        event.id === "query-background-operation" &&
+        event.type === "action_background_task_assigned" &&
+        event.taskId === "background-task-1",
+    );
+
+    expect(bashStarted?.actionId).toBeDefined();
+    expect(taskOutputStarted?.actionId).toBeDefined();
+    expect(subagentStarted?.actionId).toBeDefined();
+    expect(assignments.map((event) => event.actionId)).toEqual(
+      expect.arrayContaining([
+        bashStarted!.actionId,
+        taskOutputStarted!.actionId,
+        subagentStarted!.actionId,
+      ]),
+    );
+  });
+
   it("uses tool_response and emits action output deltas", async () => {
     const harness = await spawnHarness({
       steps: [

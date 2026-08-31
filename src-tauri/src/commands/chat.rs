@@ -176,6 +176,8 @@ enum ContentBlock {
         action_type: String,
         summary: String,
         details: Box<RawValue>,
+        #[serde(rename = "backgroundTaskId", skip_serializing_if = "Option::is_none")]
+        background_task_id: Option<String>,
         #[serde(rename = "outputChunks")]
         output_chunks: Vec<ActionOutputChunk>,
         status: String,
@@ -5599,6 +5601,7 @@ fn apply_event_to_blocks(
                 action_type: action_type.as_str().to_string(),
                 summary: summary.to_string(),
                 details: value_to_raw(details),
+                background_task_id: None,
                 output_chunks: Vec::new(),
                 status: "running".to_string(),
                 result: None,
@@ -5654,6 +5657,20 @@ fn apply_event_to_blocks(
             if let Some(index) = action_index.get(action_id).copied() {
                 if let Some(ContentBlock::Action { details, .. }) = blocks.get_mut(index) {
                     progress.blocks_changed = update_action_progress(details, message);
+                }
+            }
+        }
+        EngineEvent::ActionBackgroundTaskAssigned { action_id, task_id } => {
+            if let Some(index) = action_index.get(action_id).copied() {
+                if let Some(ContentBlock::Action {
+                    background_task_id,
+                    ..
+                }) = blocks.get_mut(index)
+                {
+                    if background_task_id.as_deref() != Some(task_id.as_str()) {
+                        *background_task_id = Some(task_id.clone());
+                        progress.blocks_changed = true;
+                    }
                 }
             }
         }

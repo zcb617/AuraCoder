@@ -117,6 +117,13 @@ enum SidecarEvent {
         action_id: String,
         message: String,
     },
+    ActionBackgroundTaskAssigned {
+        id: Option<String>,
+        #[serde(rename = "actionId")]
+        action_id: String,
+        #[serde(rename = "taskId")]
+        task_id: String,
+    },
     ActionCompleted {
         id: Option<String>,
         #[serde(rename = "actionId")]
@@ -253,6 +260,7 @@ impl SidecarEvent {
             | SidecarEvent::ActionStarted { id, .. }
             | SidecarEvent::ActionOutputDelta { id, .. }
             | SidecarEvent::ActionProgressUpdated { id, .. }
+            | SidecarEvent::ActionBackgroundTaskAssigned { id, .. }
             | SidecarEvent::ActionCompleted { id, .. }
             | SidecarEvent::ApprovalRequested { id, .. }
             | SidecarEvent::ApprovalResponseResult { id, .. }
@@ -2549,6 +2557,19 @@ impl Engine for ClaudeSidecarEngine {
                                         .send(EngineEvent::ActionProgressUpdated {
                                             action_id,
                                             message,
+                                        })
+                                        .await
+                                        .ok();
+                                }
+                                SidecarEvent::ActionBackgroundTaskAssigned {
+                                    action_id,
+                                    task_id,
+                                    ..
+                                } => {
+                                    event_tx
+                                        .send(EngineEvent::ActionBackgroundTaskAssigned {
+                                            action_id,
+                                            task_id,
                                         })
                                         .await
                                         .ok();

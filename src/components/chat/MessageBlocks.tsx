@@ -427,10 +427,14 @@ export function buildBlockSegments(
   };
 
   // Codex 按回复边界重排 Hook，确保同一回复段的工具调用保持连续。
-  const indexedBlocks: DisplayBlock[] = blocks.map((block, index) => ({
-    block,
-    index,
-  }));
+  const indexedBlocks: DisplayBlock[] = blocks
+    .map((block, index) => ({ block, index }))
+    // 已归属到后台任务的操作只在对应任务卡片中展示，不能再混入前台统一汇总。
+    .filter(
+      (entry) =>
+        entry.block.type !== "action" ||
+        !(entry.block as ActionBlock).backgroundTaskId,
+    );
   const displayBlocks: DisplayBlock[] = [];
   const firstTextIndex = indexedBlocks.findIndex((entry) => entry.block.type === "text");
   if (engineId !== "codex" || firstTextIndex < 0) {
@@ -820,9 +824,15 @@ function formatClaudeBackgroundElapsed(startedAt: number, endedAt: number): stri
 /** 渲染 Claude 后台任务生命周期卡片，并保留用户手动控制的折叠状态。 */
 function ClaudeBackgroundTasksCard({
   metadata,
+  actions,
+  onLoadActionOutput,
 }: {
   /** Claude 后台任务卡片的结构化展示数据。 */
   metadata: ClaudeBackgroundTaskMetadata;
+  /** 当前消息中已确认归属到后台任务的操作。 */
+  actions: ActionBlock[];
+  /** 延迟加载某条操作完整结果的回调。 */
+  onLoadActionOutput?: (actionId: string) => Promise<void>;
 }) {
   const tasks = metadata.backgroundTasks;
   const hasRunningTask = tasks.some((task) => task.status === "running");
@@ -916,36 +926,58 @@ function ClaudeBackgroundTasksCard({
             const elapsedEnd = task.status === "running"
               ? now
               : task.finishedAt ?? now;
+            const taskActions = actions.filter((action) => action.backgroundTaskId === task.taskId);
+            const failedActionCount = taskActions.filter((action) => action.status === "error").length;
             return (
-              <div className="claude-background-task-row" key={task.taskId}>
-                <span className="claude-background-task-icon" aria-hidden="true">
-                  {taskStatusIcon}
-                </span>
-                <div className="claude-background-task-content">
-                  <div className="claude-background-task-heading">
-                    <span
-                      className="claude-background-task-description"
-                      title={task.description}
-                    >
-                      {task.description}
-                    </span>
-                    <span className={`claude-background-task-status ${taskStatusClass}`}>
-                      {taskStatusIcon}
-                      {taskStatusLabel}
-                    </span>
-                  </div>
-                  {task.summary && (
-                    <div
-                      className="claude-background-task-summary"
-                      title={task.summary}
-                    >
-                      {task.summary}
+              <div key={task.taskId} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <div className="claude-background-task-row">
+                  <span className="claude-background-task-icon" aria-hidden="true">
+                    {taskStatusIcon}
+                  </span>
+                  <div className="claude-background-task-content">
+                    <div className="claude-background-task-heading">
+                      <span
+                        className="claude-background-task-description"
+                        title={task.description}
+                      >
+                        {task.description}
+                      </span>
+                      <span className={`claude-background-task-status ${taskStatusClass}`}>
+                        {taskStatusIcon}
+                        {taskStatusLabel}
+                      </span>
                     </div>
-                  )}
+                    {task.summary && (
+                      <div
+                        className="claude-background-task-summary"
+                        title={task.summary}
+                      >
+                        {task.summary}
+                      </div>
+                    )}
+                  </div>
+                  <span className="claude-background-task-elapsed">
+                    {formatClaudeBackgroundElapsed(task.startedAt, elapsedEnd)}
+                  </span>
                 </div>
-                <span className="claude-background-task-elapsed">
-                  {formatClaudeBackgroundElapsed(task.startedAt, elapsedEnd)}
-                </span>
+                {taskActions.length > 0 && (
+                  <div className="action-group-body action-group-body--expanded">
+                    <div className="action-group-body-inner" style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                      <div className="msg-block-meta" style={{ padding: "3px 12px 1px" }}>
+                        {taskActions.length} 个操作{failedActionCount > 0 ? ` · ${failedActionCount} 个错误` : ""}
+                      </div>
+                      {taskActions.map((action) => (
+                        <ActionBlockView
+                          key={action.actionId}
+                          block={action}
+                          onLoadDeferredOutput={
+                            onLoadActionOutput ? () => onLoadActionOutput(action.actionId) : undefined
+                          }
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })}
@@ -955,12 +987,26 @@ function ClaudeBackgroundTasksCard({
   );
 }
 
-function NoticeBlockView({ block }: { block: NoticeBlock }) {
+function NoticeBlockView({
+  block,
+  backgroundTaskActions = [],
+  onLoadActionOutput,
+}: {
+  block: NoticeBlock;
+  backgroundTaskActions?: ActionBlock[];
+  onLoadActionOutput?: (actionId: string) => Promise<void>;
+}) {
   if (
     block.kind === "claude_background_tasks" &&
     isClaudeBackgroundTaskMetadata(block.metadata)
   ) {
-    return <ClaudeBackgroundTasksCard metadata={block.metadata} />;
+    return (
+      <ClaudeBackgroundTasksCard
+        metadata={block.metadata}
+        actions={backgroundTaskActions}
+        onLoadActionOutput={onLoadActionOutput}
+      />
+    );
   }
 
   return (
@@ -2149,6 +2195,7 @@ function renderSingleBlock(
   engineId: string | undefined,
   onApproval: (approvalId: string, response: ApprovalResponse) => void,
   onLoadActionOutput: ((actionId: string) => Promise<void>) | undefined,
+  backgroundTaskActions: ActionBlock[],
   onOpenDiffFile: ((filePath: string) => void) | undefined,
   onOpenImageAttachment: ((attachment: AttachmentBlock) => void) | undefined,
 ) {
@@ -2245,7 +2292,14 @@ function renderSingleBlock(
 
   /* ── Notice ── */
   if (block.type === "notice") {
-    return <NoticeBlockView key={blockKey} block={block} />;
+    return (
+      <NoticeBlockView
+        key={blockKey}
+        block={block}
+        backgroundTaskActions={backgroundTaskActions}
+        onLoadActionOutput={onLoadActionOutput}
+      />
+    );
   }
 
   /* ── Steer ── */
@@ -2352,6 +2406,14 @@ function MessageBlocksView({
     [blocks],
   );
 
+  const backgroundTaskActions = useMemo(
+    () =>
+      safeBlocks.filter(
+        (block): block is ActionBlock =>
+          block.type === "action" && typeof block.backgroundTaskId === "string",
+      ),
+    [safeBlocks],
+  );
   const isStreaming = status === "streaming";
   const blockSegments = useMemo(
     () => buildBlockSegments(safeBlocks, isStreaming, engineId),
@@ -2495,6 +2557,7 @@ function MessageBlocksView({
           engineId,
           onApproval,
           onLoadActionOutput,
+          backgroundTaskActions,
           onOpenDiffFile,
           onOpenImageAttachment,
         );

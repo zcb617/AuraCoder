@@ -611,6 +611,8 @@ export interface ActionBlock {
   actionType: ActionType;
   summary: string;
   details: Record<string, unknown>;
+  /** Claude 后台任务操作归属；缺失时表示前台操作。 */
+  backgroundTaskId?: string;
   outputChunks: Array<{ stream: "stdout" | "stderr" | "stdin"; content: string }>;
   outputDeferred?: boolean;
   outputDeferredLoaded?: boolean;
@@ -1617,6 +1619,12 @@ export interface ActionStartedEvent {
   details: Record<string, unknown>;
 }
 
+export interface ActionBackgroundTaskAssignedEvent {
+  type: "ActionBackgroundTaskAssigned";
+  action_id: string;
+  task_id: string;
+}
+
 export interface ActionOutputDeltaEvent {
   type: "ActionOutputDelta";
   action_id: string;
@@ -1718,6 +1726,7 @@ export type StreamEvent =
   | TextDeltaEvent
   | ThinkingDeltaEvent
   | ActionStartedEvent
+  | ActionBackgroundTaskAssignedEvent
   | ActionOutputDeltaEvent
   | ActionProgressUpdatedEvent
   | ActionCompletedEvent
