@@ -39,6 +39,8 @@ const NODE_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLAUDE_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
 // 本机 Claude 会话摘要请求的最长等待时间，避免历史读取长期占用调用方。
 const CLAUDE_SESSION_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
+// 本机 Claude 完整历史请求的最长等待时间，避免大文件读取无限占用调用方。
+const CLAUDE_SESSION_HISTORY_TIMEOUT: Duration = Duration::from_secs(60);
 const CLAUDE_RUNTIME_INFO_TIMEOUT: Duration = Duration::from_secs(5);
 const ARCHIVED_CLAUDE_SDK_NODE_MODULES: &str = "claude-sdk-node_modules.tar.gz";
 const SIDECAR_EVENT_BUFFER_CAPACITY: usize = 1024;
@@ -183,6 +185,13 @@ enum SidecarEvent {
         id: Option<String>,
         sessions: Vec<ClaudeSessionSummary>,
     },
+    SessionHistory {
+        id: Option<String>,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        cwd: String,
+        records: Vec<serde_json::Value>,
+    },
     Error {
         id: Option<String>,
         message: String,
@@ -237,6 +246,7 @@ impl SidecarEvent {
             | SidecarEvent::UsageLimitsUpdated { id, .. }
             | SidecarEvent::Models { id, .. }
             | SidecarEvent::Sessions { id, .. }
+            | SidecarEvent::SessionHistory { id, .. }
             | SidecarEvent::Error { id, .. }
             | SidecarEvent::Version { id, .. }
             | SidecarEvent::ComputerControlToolCall { id, .. } => id.as_deref(),
@@ -294,6 +304,17 @@ pub(crate) struct ClaudeSessionSummary {
     pub(crate) title: String,
     /// 会话文件最近更新时间。
     pub(crate) updated_at: String,
+}
+
+/// 本机 Claude 会话的完整 JSONL 历史，供统一线程同步业务转换消息使用。
+#[derive(Debug, Clone)]
+pub(crate) struct ClaudeSessionHistory {
+    /// 历史文件声明的 Claude 会话标识。
+    pub(crate) session_id: String,
+    /// 历史记录归属的工作目录。
+    pub(crate) cwd: String,
+    /// 按原始 JSONL 顺序读取的完整记录集合。
+    pub(crate) records: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1143,6 +1164,61 @@ impl ClaudeSidecarEngine {
         })
         .await
         .context("读取本机 Claude 会话超时")?
+    }
+
+    /// 按会话标识读取本机 Claude 的完整 JSONL 历史，供打开会话和 MCP 读取补齐消息。
+    pub async fn read_session_history(
+        &self,
+        cwd: &str,
+        session_id: &str,
+    ) -> anyhow::Result<ClaudeSessionHistory> {
+        let transport = self.ensure_transport().await?;
+        let request_id = Uuid::new_v4().to_string();
+        let mut receiver = transport.subscribe();
+        transport
+            .send_command(&serde_json::json!({
+                "id": request_id,
+                "method": "read_session_history",
+                "params": {
+                    "cwd": cwd,
+                    "sessionId": session_id,
+                },
+            }))
+            .await
+            .context("发送本机 Claude 完整历史读取命令失败")?;
+
+        timeout(CLAUDE_SESSION_HISTORY_TIMEOUT, async {
+            loop {
+                match receiver.recv().await {
+                    Ok(SidecarEvent::SessionHistory {
+                        id,
+                        session_id,
+                        cwd,
+                        records,
+                    }) if id.as_deref() == Some(request_id.as_str()) => {
+                        return Ok(ClaudeSessionHistory {
+                            session_id,
+                            cwd,
+                            records,
+                        });
+                    }
+                    Ok(SidecarEvent::Error { id, message, .. })
+                        if id.as_deref() == Some(request_id.as_str()) =>
+                    {
+                        anyhow::bail!(message);
+                    }
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        anyhow::bail!("本机 Claude 完整历史事件流丢失 {skipped} 条事件");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        anyhow::bail!("本机 Claude 完整历史读取期间 sidecar 已关闭");
+                    }
+                }
+            }
+        })
+        .await
+        .context("读取本机 Claude 完整历史超时")?
     }
 
     async fn fetch_models_from_runtime(&self) -> anyhow::Result<Vec<ModelInfo>> {
@@ -2613,6 +2689,7 @@ impl Engine for ClaudeSidecarEngine {
                                 | SidecarEvent::ApprovalResponseResult { .. }
                                 | SidecarEvent::Models { .. }
                                 | SidecarEvent::Sessions { .. }
+                                | SidecarEvent::SessionHistory { .. }
                                 | SidecarEvent::Version { .. } => {}
                             }
                             log::info!(

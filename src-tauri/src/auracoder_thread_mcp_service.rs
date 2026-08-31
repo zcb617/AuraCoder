@@ -132,6 +132,19 @@ impl AuraCoderThreadMcpService {
         .map_err(|error| format!("AuraCoder 会话项目查询任务失败：{error}"))?
     }
 
+    /// 读取目标 AuraCoder 会话所属的引擎标识，不判断调用方是否有权访问。
+    pub async fn thread_engine(&self, thread_id: &str) -> Result<Option<String>, String> {
+        let db = self.db.clone();
+        let thread_id = thread_id.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            threads::get_thread(&db, &thread_id)
+                .map_err(|error| error.to_string())
+                .map(|thread| thread.map(|value| value.engine_id))
+        })
+        .await
+        .map_err(|error| format!("AuraCoder 会话引擎查询任务失败：{error}"))?
+    }
+
     /// 读取目标 AuraCoder 会话的消息数量，不判断调用方是否有权访问。
     pub async fn thread_message_count(&self, thread_id: &str) -> Result<Value, String> {
         let db = self.db.clone();
@@ -290,6 +303,56 @@ mod tests {
         let value = serde_json::to_value(record).expect("message record should serialize");
         assert_eq!(value["created_at"], "2026-08-22T00:00:00Z");
         assert!(value.get("createdAt").is_none());
+    }
+
+    /// 验证现有 Codex、OpenCode 和不存在会话的引擎查询结果。
+    #[tokio::test]
+    async fn reads_engine_for_codex_opencode_and_missing_threads() {
+        let db = test_database();
+        let workspace = crate::db::workspaces::upsert_workspace(
+            &db,
+            &std::env::temp_dir()
+                .join(format!(
+                    "auracoder-thread-mcp-engine-workspace-{}",
+                    uuid::Uuid::new_v4()
+                ))
+                .to_string_lossy(),
+        )
+        .expect("workspace");
+        let codex_thread =
+            crate::db::threads::create_thread(&db, &workspace.id, "codex", "model", "Codex thread")
+                .expect("Codex thread");
+        let opencode_thread = crate::db::threads::create_thread(
+            &db,
+            &workspace.id,
+            "opencode",
+            "model",
+            "OpenCode thread",
+        )
+        .expect("OpenCode thread");
+        let service = AuraCoderThreadMcpService::new(db);
+
+        assert_eq!(
+            service
+                .thread_engine(&codex_thread.id)
+                .await
+                .expect("Codex engine query"),
+            Some("codex".to_string())
+        );
+        assert_eq!(
+            service
+                .thread_engine(&opencode_thread.id)
+                .await
+                .expect("OpenCode engine query"),
+            Some("opencode".to_string())
+        );
+        assert_eq!(
+            service
+                .thread_engine(&uuid::Uuid::new_v4().to_string())
+                .await
+                .expect("missing engine query"),
+            None
+        );
     }
 
     #[tokio::test]

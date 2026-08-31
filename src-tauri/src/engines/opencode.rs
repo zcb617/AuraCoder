@@ -41,14 +41,19 @@ use crate::{
 use super::{
     normalize_approval_response_for_engine, trim_action_output_delta_content, ActionResult,
     ActionType, ApprovalRequestRoute, DiffScope, Engine, EngineEvent, EngineSteerReceipt,
-    EngineThread, ModelInfo, ModelLimits, OpenCodeRemoteSessionSummary, OutputStream,
-    ReasoningEffortOption, SandboxPolicy, ThreadScope, TokenUsage, TurnCompletionStatus, TurnInput,
+    EngineThread, ImportedThreadMessage, ModelInfo, ModelLimits, OpenCodeRemoteSessionSummary,
+    OutputStream, ReasoningEffortOption, SandboxPolicy, ThreadScope, ThreadSyncSnapshot,
+    TokenUsage, TurnCompletionStatus, TurnInput,
 };
 
 const OPENCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const OPENCODE_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const OPENCODE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const OPENCODE_RECONCILE_MESSAGE_LIMIT: usize = 128;
+// OpenCode 完整历史同步的单次请求上限；活动回合补偿仍使用上面的固定 128 条上限。
+const OPENCODE_HISTORY_PAGE_LIMIT: usize = 128;
+// 完整历史同步允许多个分页请求，但仍需在有限时间内结束。
+const OPENCODE_HISTORY_TIMEOUT: Duration = Duration::from_secs(60);
 const OPENCODE_EVENT_BUFFER_CAPACITY: usize = 1024;
 const OPENCODE_EVENT_QUEUE_CAPACITY: usize = OPENCODE_EVENT_BUFFER_CAPACITY;
 const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
@@ -378,6 +383,31 @@ struct OpenCodePart {
     tool: Option<String>,
     state: Option<OpenCodeToolState>,
     reason: Option<String>,
+    /// OpenCode 文件 part 的远端文件地址或路径。
+    #[serde(default)]
+    file: Option<String>,
+    /// OpenCode patch part 的统一补丁文本。
+    #[serde(default)]
+    patch: Option<String>,
+    /// OpenCode diff part 的统一差异文本。
+    #[serde(default)]
+    diff: Option<String>,
+    /// OpenCode 文件 part 的显示文件名。
+    #[serde(default)]
+    filename: Option<String>,
+    /// OpenCode 文件 part 的 MIME 类型。
+    #[serde(default)]
+    mime: Option<String>,
+    /// OpenCode 文件 part 的 URL。
+    #[serde(default)]
+    url: Option<String>,
+    /// OpenCode patch part 包含的文件差异集合。
+    #[serde(default)]
+    files: Option<Vec<Value>>,
+    /// OpenCode patch part 的稳定哈希标识。
+    #[serde(default)]
+    hash: Option<String>,
+    /// OpenCode step 完成时产生的费用信息。
     cost: Option<f64>,
     tokens: Option<OpenCodeStepTokenUsage>,
 }
@@ -395,6 +425,64 @@ struct OpenCodeMessageInfo {
     role: String,
     #[serde(rename = "parentID")]
     parent_id: Option<String>,
+    #[serde(rename = "sessionID", default)]
+    session_id: Option<String>,
+    #[serde(rename = "modelID", default)]
+    model_id: Option<String>,
+    #[serde(rename = "providerID", default)]
+    provider_id: Option<String>,
+    /// OpenCode 消息执行所使用的模式。
+    #[serde(default)]
+    mode: Option<String>,
+    /// OpenCode 消息执行所使用的模型变体，用于还原推理档位。
+    #[serde(default)]
+    variant: Option<String>,
+    /// OpenCode 消息的创建和完成时间。
+    #[serde(default)]
+    time: Option<OpenCodeMessageTime>,
+    /// OpenCode 消息产生的费用。
+    #[serde(default)]
+    cost: Option<f64>,
+    /// OpenCode 消息累计 token 用量。
+    #[serde(default)]
+    tokens: Option<OpenCodeStepTokenUsage>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct OpenCodeMessageTime {
+    #[serde(default)]
+    created: Option<i64>,
+    #[serde(default)]
+    completed: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenCodeMessageResponseObject {
+    data: Vec<OpenCodeMessageWithParts>,
+    #[serde(default)]
+    cursor: Option<OpenCodeMessageCursor>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct OpenCodeMessageCursor {
+    #[serde(default)]
+    next: Option<String>,
+    #[serde(default)]
+    previous: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum OpenCodeMessageResponse {
+    Array(Vec<OpenCodeMessageWithParts>),
+    Object(OpenCodeMessageResponseObject),
+}
+
+#[derive(Debug, Clone)]
+struct OpenCodeMessagePage {
+    messages: Vec<OpenCodeMessageWithParts>,
+    continuation: Option<String>,
+    uses_cursor: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -2150,6 +2238,442 @@ impl OpenCodeEngine {
         }
     }
 
+    /// 读取 OpenCode 单页消息；该请求同时兼容当前数组响应和带 cursor 的 data 响应。
+    async fn fetch_session_message_page(
+        &self,
+        server: &OpenCodeServer,
+        engine_thread_id: &str,
+        limit: usize,
+        order: Option<&str>,
+        cursor: Option<&str>,
+    ) -> Result<OpenCodeMessagePage> {
+        let mut query = vec![("limit", limit.to_string())];
+        if let Some(order) = order.filter(|value| !value.trim().is_empty()) {
+            query.push(("order", order.to_string()));
+        }
+        if let Some(cursor) = cursor.filter(|value| !value.trim().is_empty()) {
+            query.push(("cursor", cursor.to_string()));
+        }
+        let response = self
+            .request(
+                server,
+                reqwest::Method::GET,
+                &format!("/session/{engine_thread_id}/message"),
+            )
+            .query(&query)
+            .send()
+            .await?
+            .error_for_status()
+            .context("failed to read OpenCode session messages")?;
+        let response = response
+            .json::<OpenCodeMessageResponse>()
+            .await
+            .context("failed to parse OpenCode session messages")?;
+        Ok(match response {
+            OpenCodeMessageResponse::Array(messages) => OpenCodeMessagePage {
+                messages,
+                continuation: None,
+                uses_cursor: false,
+            },
+            OpenCodeMessageResponse::Object(response) => {
+                // 完整历史按 asc 初始请求并沿时间线前进，只能使用协议定义的 cursor.next。
+                let continuation = response.cursor.and_then(|cursor| cursor.next);
+                OpenCodeMessagePage {
+                    messages: response.data,
+                    continuation,
+                    uses_cursor: true,
+                }
+            }
+        })
+    }
+
+    /// 读取 OpenCode 会话的完整历史，并将远端消息转换成 AuraCoder 快照。
+    pub async fn read_thread_sync_snapshot(
+        &self,
+        cwd: &str,
+        engine_thread_id: &str,
+    ) -> Result<ThreadSyncSnapshot> {
+        let server = self.ensure_server(cwd).await?;
+        let result = timeout(OPENCODE_HISTORY_TIMEOUT, async {
+            let mut all_messages = HashMap::<String, OpenCodeMessageWithParts>::new();
+            let mut cursor = None::<String>;
+            let mut seen_continuations = HashSet::new();
+
+            loop {
+                let page = self
+                    .fetch_session_message_page(
+                        server.as_ref(),
+                        engine_thread_id,
+                        OPENCODE_HISTORY_PAGE_LIMIT,
+                        cursor.is_none().then_some("asc"),
+                        cursor.as_deref(),
+                    )
+                    .await?;
+                let page_count = page.messages.len();
+                let page_messages = page.messages;
+                for message in page_messages.iter() {
+                    let message_id = message.info.id.trim();
+                    anyhow::ensure!(
+                        !message_id.is_empty(),
+                        "OpenCode 历史消息缺少稳定消息 ID"
+                    );
+                    if let Some(session_id) = message.info.session_id.as_deref() {
+                        anyhow::ensure!(
+                            session_id == engine_thread_id,
+                            "OpenCode 历史消息属于其他会话: expected={} actual={}",
+                            engine_thread_id,
+                            session_id
+                        );
+                    }
+                    anyhow::ensure!(
+                        matches!(message.info.role.as_str(), "user" | "assistant"),
+                        "OpenCode 历史消息角色无法识别: {}",
+                        message.info.role
+                    );
+                    all_messages
+                        .entry(message_id.to_string())
+                        .or_insert_with(|| message.clone());
+                }
+
+                if let Some(next_cursor) = page.continuation {
+                    anyhow::ensure!(
+                        page.uses_cursor,
+                        "OpenCode 返回了未声明游标的继续标记"
+                    );
+                    anyhow::ensure!(
+                        !next_cursor.trim().is_empty(),
+                        "OpenCode 历史消息返回空的 cursor.next"
+                    );
+                    anyhow::ensure!(
+                        cursor.as_deref() != Some(next_cursor.as_str()),
+                        "OpenCode 历史消息游标未推进: {}",
+                        next_cursor
+                    );
+                    anyhow::ensure!(
+                        seen_continuations.insert(next_cursor.clone()),
+                        "OpenCode 历史消息游标重复: {}",
+                        next_cursor
+                    );
+                    cursor = Some(next_cursor);
+                    continue;
+                }
+                if page.uses_cursor {
+                    // 当前响应已明确采用 cursor 协议；没有 next 就是协议声明的最后一页，
+                    // 即使本页恰好达到 limit，也不能误报为分页上限错误。
+                    break;
+                }
+                if page_count < OPENCODE_HISTORY_PAGE_LIMIT {
+                    break;
+                }
+                // 旧数组响应没有 continuation 字段，且项目没有证据证明其 before 语义或
+                // 返回顺序；达到 limit 时无法证明已经读完，必须放弃本次落库。
+                anyhow::bail!(
+                    "OpenCode 历史消息数组响应未提供可验证的分页标记，无法证明完整历史已读完: count={page_count} limit={OPENCODE_HISTORY_PAGE_LIMIT}"
+                );
+            }
+
+            let mut messages = all_messages.into_values().collect::<Vec<_>>();
+            messages.sort_by(|left, right| {
+                opencode_message_sort_key(left).cmp(&opencode_message_sort_key(right))
+            });
+            let imported_messages = messages
+                .iter()
+                .map(|message| {
+                    let role = message.info.role.trim().to_ascii_lowercase();
+                    let created_at = message
+                        .info
+                        .time
+                        .as_ref()
+                        .and_then(|time| time.created.or(time.completed))
+                        .and_then(|value| {
+                            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(value)
+                                .map(|timestamp| timestamp.to_rfc3339())
+                        });
+                    let mut blocks = Vec::new();
+                    let mut content_parts = Vec::new();
+                    let mut has_error = false;
+                    let mut has_running_action = false;
+                    let mut part_token_input = 0_u64;
+                    let mut part_token_output = 0_u64;
+
+                    for part in &message.parts {
+                        match part.part_type.trim().to_ascii_lowercase().as_str() {
+                            "text" => {
+                                let text = part
+                                    .text
+                                    .as_deref()
+                                    .context("OpenCode text part 缺少文本内容")?;
+                                if !text.is_empty() {
+                                    content_parts.push(text.to_string());
+                                    blocks.push(json!({
+                                        "type": "text",
+                                        "content": text,
+                                    }));
+                                }
+                            }
+                            "reasoning" => {
+                                let text = part
+                                    .text
+                                    .as_deref()
+                                    .context("OpenCode reasoning part 缺少文本内容")?;
+                                if !text.is_empty() {
+                                    blocks.push(json!({
+                                        "type": "thinking",
+                                        "content": text,
+                                    }));
+                                }
+                            }
+                            "tool" => {
+                                let state = part
+                                    .state
+                                    .as_ref()
+                                    .context("OpenCode tool part 缺少执行状态")?;
+                                let raw_status = state.status.trim().to_ascii_lowercase();
+                                let (status, success) = match raw_status.as_str() {
+                                    "pending" => ("pending", None),
+                                    "running" => {
+                                        has_running_action = true;
+                                        ("running", None)
+                                    }
+                                    "completed" | "success" | "done" => ("done", Some(true)),
+                                    "error" | "failed" => {
+                                        has_error = true;
+                                        ("error", Some(false))
+                                    }
+                                    other => {
+                                        anyhow::bail!(
+                                            "OpenCode tool part 状态无法识别: {other}"
+                                        )
+                                    }
+                                };
+                                let tool_name = part
+                                    .tool
+                                    .as_deref()
+                                    .filter(|value| !value.trim().is_empty())
+                                    .unwrap_or("tool");
+                                let output = state.output.clone().or_else(|| state.raw.clone());
+                                let error = state.error.clone();
+                                let result = success.map(|success| {
+                                    json!({
+                                        "success": success,
+                                        "output": output,
+                                        "error": error,
+                                        "diff": Value::Null,
+                                        "durationMs": 0,
+                                    })
+                                });
+                                let output_chunks = output
+                                    .as_deref()
+                                    .filter(|value| !value.is_empty())
+                                    .map(|value| {
+                                        vec![json!({
+                                            "stream": "stdout",
+                                            "content": value,
+                                        })]
+                                    })
+                                    .unwrap_or_default();
+                                blocks.push(json!({
+                                    "type": "action",
+                                    "actionId": part.id,
+                                    "engineActionId": part.call_id,
+                                    "actionType": action_type_for_tool(tool_name),
+                                    "summary": state.title.clone().unwrap_or_else(|| tool_name.to_string()),
+                                    "details": {
+                                        "tool": tool_name,
+                                        "callID": part.call_id,
+                                        "input": state.input,
+                                        "metadata": part.metadata.clone().or_else(|| state.metadata.clone()),
+                                    },
+                                    "outputChunks": output_chunks,
+                                    "status": status,
+                                    "result": result,
+                                }));
+                            }
+                            "patch" => {
+                                let mut diff = part.patch.clone().or_else(|| part.diff.clone());
+                                if diff.is_none() {
+                                    if let Some(files) = part.files.as_ref() {
+                                        let mut formatted = String::new();
+                                        for file in files {
+                                            let file_name = file
+                                                .get("file")
+                                                .or_else(|| file.get("path"))
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("file");
+                                            let patch = file
+                                                .get("patch")
+                                                .or_else(|| file.get("diff"))
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("");
+                                            if !patch.is_empty() {
+                                                formatted.push_str(&format!(
+                                                    "diff -- {file_name}\n{patch}\n"
+                                                ));
+                                            }
+                                        }
+                                        if !formatted.is_empty() {
+                                            diff = Some(formatted);
+                                        }
+                                    }
+                                }
+                                if diff.is_none() {
+                                    diff = part.source.as_ref().and_then(|source| {
+                                        source.as_str().map(ToOwned::to_owned).or_else(|| {
+                                            (!source.is_null())
+                                                .then(|| serde_json::to_string_pretty(source).ok())
+                                                .flatten()
+                                        })
+                                    });
+                                }
+                                let diff = diff.context("OpenCode patch part 缺少差异内容")?;
+                                if !diff.is_empty() {
+                                    blocks.push(json!({
+                                        "type": "diff",
+                                        "diff": diff,
+                                        "scope": "workspace",
+                                    }));
+                                }
+                            }
+                            "file" => {
+                                let file_path = part
+                                    .url
+                                    .clone()
+                                    .or_else(|| part.file.clone())
+                                    .context("OpenCode file part 缺少文件地址")?;
+                                let file_name = part
+                                    .filename
+                                    .clone()
+                                    .or_else(|| {
+                                        Path::new(&file_path)
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .map(ToOwned::to_owned)
+                                    })
+                                    .unwrap_or_else(|| "file".to_string());
+                                blocks.push(json!({
+                                    "type": "attachment",
+                                    "fileName": file_name,
+                                    "filePath": file_path,
+                                    "sizeBytes": 0,
+                                    "mimeType": part.mime.clone().unwrap_or_else(|| "application/octet-stream".to_string()),
+                                    "isRemote": true,
+                                }));
+                            }
+                            "agent" => {
+                                let agent_name = part
+                                    .name
+                                    .as_deref()
+                                    .filter(|value| !value.trim().is_empty())
+                                    .unwrap_or("agent");
+                                blocks.push(json!({
+                                    "type": "action",
+                                    "actionId": part.id,
+                                    "engineActionId": part.message_id,
+                                    "actionType": "other",
+                                    "summary": format!("OpenCode agent: {agent_name}"),
+                                    "details": {
+                                        "agent": agent_name,
+                                        "source": part.source,
+                                        "messageID": part.message_id,
+                                    },
+                                    "outputChunks": [],
+                                    "status": "done",
+                                    "result": {
+                                        "success": true,
+                                        "output": Value::Null,
+                                        "error": Value::Null,
+                                        "diff": Value::Null,
+                                        "durationMs": 0,
+                                    },
+                                }));
+                            }
+                            "step-finish" => {
+                                if let Some(tokens) = part.tokens.as_ref() {
+                                    part_token_input = part_token_input.saturating_add(tokens.input);
+                                    part_token_output = part_token_output.saturating_add(tokens.output);
+                                }
+                            }
+                            "step-start" | "snapshot" | "retry" | "compaction" => {
+                                let label = part.part_type.trim();
+                                blocks.push(json!({
+                                    "type": "notice",
+                                    "kind": format!("opencode_{label}"),
+                                    "level": "info",
+                                    "title": label,
+                                    "message": format!("OpenCode {label} record"),
+                                }));
+                            }
+                            unknown => {
+                                anyhow::bail!("OpenCode 历史消息 part 类型无法识别: {unknown}")
+                            }
+                        }
+                    }
+
+                    let info_tokens = message.info.tokens.as_ref();
+                    let token_input = info_tokens
+                        .map(|tokens| tokens.input)
+                        .unwrap_or(part_token_input);
+                    let token_output = info_tokens
+                        .map(|tokens| tokens.output)
+                        .unwrap_or(part_token_output);
+                    let status = if role == "user" {
+                        "completed"
+                    } else if has_error {
+                        "error"
+                    } else if has_running_action || message.info.time.as_ref().is_some_and(|time| time.completed.is_none()) {
+                        "streaming"
+                    } else {
+                        "completed"
+                    };
+                    let turn_model_id = match (
+                        message.info.provider_id.as_deref(),
+                        message.info.model_id.as_deref(),
+                    ) {
+                        (Some(provider), Some(model)) if !provider.is_empty() && !model.is_empty() => {
+                            Some(format!("{provider}/{model}"))
+                        }
+                        (_, Some(model)) if !model.is_empty() => Some(model.to_string()),
+                        _ => None,
+                    };
+                    Ok(ImportedThreadMessage {
+                        role,
+                        content: (!content_parts.is_empty()).then(|| content_parts.join("\\n")),
+                        blocks: Value::Array(blocks),
+                        status: status.to_string(),
+                        turn_engine_id: Some(message.info.id.trim().to_string()),
+                        turn_model_id,
+                        turn_reasoning_effort: message.info.variant.clone(),
+                        token_input,
+                        token_output,
+                        created_at,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let title = imported_messages
+                .iter()
+                .find(|message| message.role == "user")
+                .and_then(|message| message.content.clone())
+                .filter(|value| !value.trim().is_empty());
+            let preview = imported_messages
+                .iter()
+                .rev()
+                .find_map(|message| message.content.clone())
+                .filter(|value| !value.trim().is_empty());
+            Ok(ThreadSyncSnapshot {
+                title,
+                preview,
+                raw_status: None,
+                active_flags: Vec::new(),
+                imported_messages,
+            })
+        })
+        .await
+        .context("读取 OpenCode 会话历史超时")?;
+        self.stop_server_if_unused(cwd).await;
+        result
+    }
+
+    /// 活动回合结束后读取固定上限的消息，保持既有补偿筛选和事件行为不变。
     async fn reconcile_session_messages(
         &self,
         engine_thread_id: &str,
@@ -2157,24 +2681,20 @@ impl OpenCodeEngine {
         event_tx: &mpsc::Sender<EngineEvent>,
         server: &OpenCodeServer,
     ) {
-        let result = timeout(OPENCODE_COMMAND_TIMEOUT, async {
-            let response = self
-                .request(
-                    server,
-                    reqwest::Method::GET,
-                    &format!(
-                        "/session/{engine_thread_id}/message?limit={OPENCODE_RECONCILE_MESSAGE_LIMIT}"
-                    ),
-                )
-                .send()
-                .await?
-                .error_for_status()?;
-            response.json::<Vec<OpenCodeMessageWithParts>>().await
-        })
+        let result = timeout(
+            OPENCODE_COMMAND_TIMEOUT,
+            self.fetch_session_message_page(
+                server,
+                engine_thread_id,
+                OPENCODE_RECONCILE_MESSAGE_LIMIT,
+                None,
+                None,
+            ),
+        )
         .await;
 
         let messages = match result {
-            Ok(Ok(messages)) => messages,
+            Ok(Ok(page)) => page.messages,
             Ok(Err(error)) => {
                 log::warn!("failed to reconcile OpenCode messages after idle: {error}");
                 return;
@@ -2590,6 +3110,19 @@ fn should_cache_runtime_model_catalog(models: &[ModelInfo]) -> bool {
 
 fn opencode_prompt_message_path(engine_thread_id: &str) -> String {
     format!("/session/{engine_thread_id}/message")
+}
+
+/// 为 OpenCode 历史消息提供时间优先、消息 ID 兜底的稳定排序键。
+fn opencode_message_sort_key(message: &OpenCodeMessageWithParts) -> (i64, String) {
+    (
+        message
+            .info
+            .time
+            .as_ref()
+            .and_then(|time| time.created.or(time.completed))
+            .unwrap_or(i64::MAX),
+        message.info.id.trim().to_string(),
+    )
 }
 
 fn build_prompt_body(

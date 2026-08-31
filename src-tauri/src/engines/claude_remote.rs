@@ -134,6 +134,13 @@ enum RemoteClaudeEvent {
     SessionHandleDestroyed {
         id: Option<String>,
     },
+    SessionHistory {
+        id: Option<String>,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        cwd: String,
+        records: Vec<serde_json::Value>,
+    },
 }
 
 impl RemoteClaudeEvent {
@@ -158,7 +165,8 @@ impl RemoteClaudeEvent {
             | Self::SessionHandleCreated { id }
             | Self::SessionMessageAccepted { id }
             | Self::SessionHandleInterrupted { id }
-            | Self::SessionHandleDestroyed { id } => id.as_deref(),
+            | Self::SessionHandleDestroyed { id }
+            | Self::SessionHistory { id, .. } => id.as_deref(),
         }
     }
 }
@@ -639,7 +647,8 @@ impl ClaudeRemoteEngine {
                 | RemoteClaudeEvent::SessionHandleCreated { .. }
                 | RemoteClaudeEvent::SessionMessageAccepted { .. }
                 | RemoteClaudeEvent::SessionHandleInterrupted { .. }
-                | RemoteClaudeEvent::SessionHandleDestroyed { .. } => {}
+                | RemoteClaudeEvent::SessionHandleDestroyed { .. }
+                | RemoteClaudeEvent::SessionHistory { .. } => {}
             }
         }
         if let Some(config) = self.state.lock().await.threads.get_mut(engine_thread_id) {
@@ -729,6 +738,44 @@ impl ClaudeRemoteEngine {
             .json::<RemoteClaudeSession>()
             .await
             .context("解析 SSH 远端 Claude 会话失败")
+    }
+
+    /// 通过远端 Claude 按会话 ID读取完整 JSONL 历史，不执行 resume 或新 query。
+    pub async fn read_remote_session_history(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<RemoteClaudeSessionHistory> {
+        let mut url = reqwest::Url::parse(&format!("{}/", self.base_url))
+            .context("构造 SSH 远端 Claude 历史地址失败")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("SSH 远端 Claude 历史地址不支持路径片段"))?
+            .push("sessions")
+            .push(session_id)
+            .push("history");
+
+        let response = reqwest::Client::new()
+            .get(url)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .context("读取 SSH 远端 Claude 完整历史失败")?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(anyhow::Error::new(RemoteClaudeSessionNotFoundError {
+                session_id: session_id.to_string(),
+            }));
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "SSH 远端 Claude 完整历史读取失败: HTTP {status} session_id={session_id} detail={body}"
+            );
+        }
+
+        response
+            .json::<RemoteClaudeSessionHistory>()
+            .await
+            .context("解析 SSH 远端 Claude 完整历史失败")
     }
 
     async fn validate_remote_session(&self, cwd: &str, session_id: &str) -> anyhow::Result<()> {
@@ -821,6 +868,20 @@ pub struct RemoteClaudeSession {
     /// 会话最后更新时间。
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
+}
+
+/// SSH 远端 Claude 会话的完整 JSONL 历史，供统一线程同步业务转换消息使用。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RemoteClaudeSessionHistory {
+    /// 远端接口返回的会话主标识。
+    pub id: String,
+    /// 远端接口显式返回的会话标识。
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    /// 历史记录归属的远端工作目录。
+    pub cwd: String,
+    /// 按原始 JSONL 顺序返回的完整记录集合。
+    pub records: Vec<serde_json::Value>,
 }
 
 #[async_trait]
@@ -1112,7 +1173,8 @@ impl Engine for ClaudeRemoteEngine {
                         | RemoteClaudeEvent::SessionHandleCreated { .. }
                         | RemoteClaudeEvent::SessionMessageAccepted { .. }
                         | RemoteClaudeEvent::SessionHandleInterrupted { .. }
-                        | RemoteClaudeEvent::SessionHandleDestroyed { .. } => {}
+                        | RemoteClaudeEvent::SessionHandleDestroyed { .. }
+                        | RemoteClaudeEvent::SessionHistory { .. } => {}
                     }
                 }
             }

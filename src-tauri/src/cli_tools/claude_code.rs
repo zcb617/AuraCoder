@@ -20,8 +20,17 @@ use crate::{
     db,
     engines::{
         capabilities_for_engine,
-        claude_remote::RemoteClaudeSessionNotFoundError,
-        claude_sidecar::{ClaudeSessionSummary, ClaudeSidecarEngine},
+        claude_remote::{
+            // 旧历史响应类型导入保留迁移留痕；当前入口通过返回值类型推断使用历史结果。
+            // RemoteClaudeSessionHistory,
+            RemoteClaudeSessionNotFoundError,
+        },
+        claude_sidecar::{
+            // 旧历史响应类型导入保留迁移留痕；当前入口通过返回值类型推断使用历史结果。
+            // ClaudeSessionHistory,
+            ClaudeSessionSummary,
+            ClaudeSidecarEngine,
+        },
         map_engine_capabilities, map_model_info, map_provider_usage, ApprovalRequestRoute,
         CodexRuntimeEvent, Engine, EngineCapabilities, EngineEvent, EngineSteerReceipt,
         EngineThread, ModelInfo, SandboxPolicy, ThreadScope, ThreadSyncSnapshot, TurnInput,
@@ -296,6 +305,410 @@ pub struct ClaudeCodeCli {
 fn matches_claude_session_search(session: &ClaudeSessionSummary, query: Option<&str>) -> bool {
     query.map_or(true, |query| {
         session.title.to_lowercase().contains(&query.to_lowercase()) || session.id.contains(query)
+    })
+}
+
+/// 将 Claude Code 完整 JSONL 历史转换为 AuraCoder 线程同步快照，保留文本、思考、工具和错误信息。
+fn build_claude_thread_sync_snapshot(
+    session_id: &str,
+    cwd: &str,
+    records: &[Value],
+) -> Result<ThreadSyncSnapshot> {
+    anyhow::ensure!(!session_id.trim().is_empty(), "Claude 会话标识不能为空");
+    anyhow::ensure!(!cwd.trim().is_empty(), "Claude 会话工作目录不能为空");
+
+    let value_to_text = |value: &Value| -> Option<String> {
+        if let Some(text) = value.as_str() {
+            return (!text.is_empty()).then(|| text.to_string());
+        }
+        if let Some(items) = value.as_array() {
+            let parts = items
+                .iter()
+                .filter_map(|item| {
+                    if item.get("type").and_then(Value::as_str) == Some("text") {
+                        item.get("text").and_then(Value::as_str).map(str::to_string)
+                    } else {
+                        item.as_str().map(str::to_string)
+                    }
+                })
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            if !parts.is_empty() {
+                return Some(parts.join("\n"));
+            }
+        }
+        if value.is_object() {
+            let serialized = value.to_string();
+            return (!serialized.is_empty()).then_some(serialized);
+        }
+        None
+    };
+
+    let timestamp_text = |record: &Value| -> Option<String> {
+        let timestamp = record
+            .get("timestamp")
+            .or_else(|| record.get("createdAt"))
+            .or_else(|| record.get("created_at"))
+            .or_else(|| record.get("message").and_then(|message| message.get("timestamp")))?;
+        if let Some(value) = timestamp.as_str() {
+            return Some(value.to_string());
+        }
+        let numeric = timestamp.as_i64()?;
+        let seconds = if numeric > 10_000_000_000 {
+            numeric / 1000
+        } else {
+            numeric
+        };
+        chrono::DateTime::from_timestamp(seconds, 0).map(|value| value.to_rfc3339())
+    };
+
+    let tool_action_type = |tool_name: &str| -> &'static str {
+        match tool_name {
+            "Read" => "file_read",
+            "Write" => "file_write",
+            "Edit" => "file_edit",
+            "Bash" => "command",
+            "Glob" | "Grep" | "WebFetch" => "search",
+            _ => "other",
+        }
+    };
+
+    let tool_summary = |tool_name: &str, input: &Value| -> String {
+        let detail = input
+            .get("command")
+            .or_else(|| input.get("file_path"))
+            .or_else(|| input.get("pattern"))
+            .or_else(|| input.get("url"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        detail
+            .map(|detail| format!("{tool_name}: {detail}"))
+            .unwrap_or_else(|| tool_name.to_string())
+    };
+
+    let mut tool_results = HashMap::<String, (String, bool)>::new();
+    let mut tool_use_ids = std::collections::HashSet::<String>::new();
+    for record in records {
+        let content = record
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array);
+        let Some(content) = content else {
+            continue;
+        };
+        for block in content {
+            match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") | Some("server_tool_use") => {
+                    if let Some(tool_id) = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        tool_use_ids.insert(tool_id.to_string());
+                    }
+                }
+                Some("tool_result") => {
+                    let Some(tool_id) = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                    else {
+                        continue;
+                    };
+                    let output = block
+                        .get("content")
+                        .and_then(value_to_text)
+                        .or_else(|| block.get("text").and_then(Value::as_str).map(str::to_string))
+                        .unwrap_or_default();
+                    let is_error = block
+                        .get("is_error")
+                        .or_else(|| block.get("isError"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    tool_results.insert(tool_id.to_string(), (output, is_error));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut imported_messages = Vec::new();
+    let mut first_user_text = None;
+    let mut latest_text = None;
+    for (index, record) in records.iter().enumerate() {
+        let record_type = record.get("type").and_then(Value::as_str).unwrap_or("");
+        let ignorable = matches!(
+            record_type,
+            "system"
+                | "summary"
+                | "progress"
+                | "file-history-snapshot"
+                | "queue-operation"
+                | "custom-title"
+                | "last-prompt"
+                | "pr-link"
+                | "telemetry"
+                | "hook_progress"
+                | "tool_progress"
+        );
+        if ignorable {
+            // 已知 Claude 附属记录优先忽略，不受其附带 message.role 影响。
+            continue;
+        }
+        let message = record.get("message").and_then(Value::as_object);
+        let role = message
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str)
+            .or_else(|| matches!(record_type, "user" | "assistant").then_some(record_type));
+        let Some(role) = role else {
+            if record_type.is_empty() || message.is_none() {
+                // 没有 message 主体的未知记录属于附属协议记录，不阻断有效历史。
+                continue;
+            }
+            anyhow::bail!("Claude JSONL 消息记录缺少可识别角色: {record_type}");
+        };
+        anyhow::ensure!(
+            matches!(role, "user" | "assistant"),
+            "Claude JSONL 记录角色不支持: {role}"
+        );
+
+        let content_value = message
+            .and_then(|message| message.get("content"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let content_items = content_value.as_array().cloned().unwrap_or_default();
+        let mut blocks = Vec::new();
+        let mut content_parts = Vec::new();
+        let mut unmatched_tool_result_blocks = Vec::new();
+        let mut has_running_tool = false;
+        let mut has_error = false;
+
+        if let Some(text) = content_value.as_str().filter(|value| !value.is_empty()) {
+            content_parts.push(text.to_string());
+            blocks.push(json!({ "type": "text", "content": text }));
+        }
+        for (block_index, block) in content_items.into_iter().enumerate() {
+            let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+            match block_type {
+                "text" => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str).filter(|value| !value.is_empty()) {
+                        content_parts.push(text.to_string());
+                        blocks.push(json!({ "type": "text", "content": text }));
+                    }
+                }
+                "thinking" | "redacted_thinking" => {
+                    let text = block
+                        .get("thinking")
+                        .or_else(|| block.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("Claude thinking is redacted.");
+                    blocks.push(json!({ "type": "thinking", "content": text }));
+                }
+                "tool_use" | "server_tool_use" => {
+                    let tool_id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("unknown-tool-{index}-{block_index}"));
+                    let tool_name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Claude tool");
+                    let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                    let details = input.as_object().cloned().unwrap_or_else(|| {
+                        let mut details = serde_json::Map::new();
+                        details.insert("input".to_string(), input.clone());
+                        details
+                    });
+                    // actionId 同时包含记录和内容块位置，避免重复 tool id 或缺失 id 时发生合并。
+                    let action_id = format!("claude-import-{session_id}-{tool_id}-{index}-{block_index}");
+                    let result = tool_results.get(tool_id.as_str());
+                    let status = match result {
+                        Some((_, true)) => "error",
+                        Some(_) => "done",
+                        None => {
+                            has_running_tool = true;
+                            "running"
+                        }
+                    };
+                    let mut action = json!({
+                        "type": "action",
+                        "actionId": action_id,
+                        "engineActionId": tool_id,
+                        "actionType": tool_action_type(tool_name),
+                        "summary": tool_summary(tool_name, &input),
+                        "details": details,
+                        "outputChunks": [],
+                        "status": status,
+                    });
+                    if let Some((output, is_error)) = result {
+                        let output_chunks = if output.is_empty() {
+                            Vec::<Value>::new()
+                        } else {
+                            vec![json!({ "stream": if *is_error { "stderr" } else { "stdout" }, "content": output })]
+                        };
+                        action["outputChunks"] = Value::Array(output_chunks);
+                        action["result"] = json!({
+                            "success": !is_error,
+                            "output": if output.is_empty() { Value::Null } else { json!(output) },
+                            "error": if *is_error && !output.is_empty() { json!(output) } else { Value::Null },
+                            "diff": Value::Null,
+                            "durationMs": 0,
+                        });
+                        has_error |= *is_error;
+                    }
+                    blocks.push(action);
+                }
+                "tool_result" => {
+                    let tool_id = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    if tool_id.map_or(true, |value| !tool_use_ids.contains(value)) {
+                        let fallback_tool_id = tool_id
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("unknown-tool-{index}-{block_index}"));
+                        let output = block
+                            .get("content")
+                            .and_then(value_to_text)
+                            .unwrap_or_default();
+                        let is_error = block
+                            .get("is_error")
+                            .or_else(|| block.get("isError"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        unmatched_tool_result_blocks.push(json!({
+                            "type": "action",
+                            "actionId": format!("claude-import-{session_id}-{fallback_tool_id}-{index}-{block_index}"),
+                            "engineActionId": fallback_tool_id,
+                            "actionType": "other",
+                            "summary": "Claude tool result",
+                            "details": {},
+                            "outputChunks": if output.is_empty() { Vec::<Value>::new() } else { vec![json!({ "stream": if is_error { "stderr" } else { "stdout" }, "content": output })] },
+                            "status": if is_error { "error" } else { "done" },
+                            "result": { "success": !is_error, "output": output.clone(), "error": if is_error { output.clone() } else { String::new() }, "diff": null, "durationMs": 0 },
+                        }));
+                        has_error |= is_error;
+                    }
+                }
+                "image" | "document" | "web_search_tool_result" | "tool_search_tool_result" => {
+                    blocks.push(json!({
+                        "type": "notice",
+                        "kind": format!("claude_{block_type}"),
+                        "level": "info",
+                        "title": "Claude content",
+                        "message": block.to_string(),
+                    }));
+                }
+                _ => {
+                    // 未知内容块保留原始 JSON，避免附属扩展块阻断整段历史导入。
+                    blocks.push(json!({
+                        "type": "notice",
+                        "kind": "claude_unknown_content",
+                        "level": "info",
+                        "title": "Claude content",
+                        "message": block.to_string(),
+                    }));
+                }
+            }
+        }
+        let has_unmatched_tool_result = !unmatched_tool_result_blocks.is_empty();
+        blocks.extend(unmatched_tool_result_blocks);
+        if blocks.is_empty() {
+            if let Some(error) = record
+                .get("error")
+                .and_then(|value| value.get("message").or(Some(value)))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                blocks.push(json!({ "type": "error", "message": error }));
+                has_error = true;
+            }
+        }
+        if role == "user"
+            && !has_unmatched_tool_result
+            && blocks
+                .iter()
+                .all(|block| block.get("type").and_then(Value::as_str) == Some("action"))
+        {
+            // Claude 将已匹配工具结果写入 user 记录；正常情况下已合并到对应 assistant action，避免重复展示协议回执。
+            continue;
+        }
+        if blocks.is_empty() {
+            continue;
+        }
+        let text = content_parts.join("\n").trim().to_string();
+        if role == "user" && first_user_text.is_none() && !text.is_empty() {
+            first_user_text = Some(text.clone());
+        }
+        if !text.is_empty() {
+            latest_text = Some(text.clone());
+        }
+        let record_id = record
+            .get("uuid")
+            .or_else(|| record.get("id"))
+            .or_else(|| message.and_then(|message| message.get("id")))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            // JSONL 顺序是文件内可重复的事实；索引保证缺少协议 ID 的记录不会碰撞。
+            .unwrap_or_else(|| format!("record-{index}"));
+        let turn_id = format!("claude-import-{session_id}-{record_id}-{index}");
+        let model_id = message
+            .and_then(|message| message.get("model"))
+            .and_then(Value::as_str)
+            .or_else(|| record.get("model").and_then(Value::as_str))
+            .map(str::to_string);
+        let (token_input, token_output) = if role == "assistant" {
+            let usage = message.and_then(|message| message.get("usage"));
+            (
+                usage
+                    .and_then(|usage| usage.get("input_tokens").or_else(|| usage.get("inputTokens")))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                usage
+                    .and_then(|usage| usage.get("output_tokens").or_else(|| usage.get("outputTokens")))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            )
+        } else {
+            (0, 0)
+        };
+        imported_messages.push(crate::engines::ImportedThreadMessage {
+            role: role.to_string(),
+            content: (!text.is_empty()).then_some(text),
+            blocks: Value::Array(blocks),
+            status: if has_error {
+                "error".to_string()
+            } else if has_running_tool {
+                "streaming".to_string()
+            } else {
+                "completed".to_string()
+            },
+            turn_engine_id: Some(turn_id),
+            turn_model_id: model_id,
+            turn_reasoning_effort: None,
+            token_input,
+            token_output,
+            created_at: timestamp_text(record),
+        });
+    }
+
+    let title = first_user_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(120).collect::<String>());
+    Ok(ThreadSyncSnapshot {
+        title,
+        preview: latest_text,
+        raw_status: Some("idle".to_string()),
+        active_flags: Vec::new(),
+        imported_messages,
     })
 }
 
@@ -1647,14 +2060,66 @@ impl CliTool for ClaudeCodeCli {
         &self,
         context: &CliExecutionContext,
         _thread: &ThreadDto,
-        _engine_thread_id: &str,
+        engine_thread_id: &str,
     ) -> Result<Option<ThreadSyncSnapshot>> {
-        self.load_workspace(context).await?;
+        let workspace = self.load_workspace(context).await?;
+        anyhow::ensure!(
+            !engine_thread_id.trim().is_empty(),
+            "Claude Code 会话标识不能为空"
+        );
         if context.location_kind == CliLocationKind::Ssh {
-            Ok(None)
-        } else {
-            Ok(None)
+            let history = remote_project_claude_runtime_service::runtime(&workspace)
+                .await?
+                .read_remote_session_history(engine_thread_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "读取 SSH 远端 Claude 完整历史失败: session_id={engine_thread_id}"
+                    )
+                })?;
+            anyhow::ensure!(
+                history.id == engine_thread_id && history.session_id == engine_thread_id,
+                "SSH 远端 Claude 完整历史会话标识与请求不一致: requested={engine_thread_id} id={} sessionId={}",
+                history.id,
+                history.session_id
+            );
+            anyhow::ensure!(
+                path_utils::paths_equal(&history.cwd, &workspace.root_path),
+                "SSH 远端 Claude 完整历史不属于当前 workspace: session_id={engine_thread_id} cwd={} workspace_root={}",
+                history.cwd,
+                workspace.root_path
+            );
+            return Ok(Some(build_claude_thread_sync_snapshot(
+                engine_thread_id,
+                &history.cwd,
+                &history.records,
+            )?));
         }
+
+        let history = self
+            .local_engine()
+            .await?
+            .read_session_history(&workspace.root_path, engine_thread_id)
+            .await
+            .with_context(|| {
+                format!("读取本机 Claude 完整历史失败: session_id={engine_thread_id}")
+            })?;
+        anyhow::ensure!(
+            history.session_id == engine_thread_id,
+            "本机 Claude 完整历史会话标识与请求不一致: requested={engine_thread_id} actual={}",
+            history.session_id
+        );
+        anyhow::ensure!(
+            path_utils::paths_equal(&history.cwd, &workspace.root_path),
+            "本机 Claude 完整历史不属于当前 workspace: session_id={engine_thread_id} cwd={} workspace_root={}",
+            history.cwd,
+            workspace.root_path
+        );
+        Ok(Some(build_claude_thread_sync_snapshot(
+            engine_thread_id,
+            &history.cwd,
+            &history.records,
+        )?))
     }
 
     async fn set_thread_name(

@@ -259,6 +259,83 @@ impl BaseCliMcp {
                     "AuraCoder 会话工具只允许读取当前项目的会话",
                 );
             }
+
+            let target_engine = match service.thread_engine(target_thread_id).await {
+                Ok(engine_id) => engine_id,
+                Err(error) => {
+                    log::warn!(
+                        "BaseCliMcp session engine precheck failed: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, target_workspace={}, target_thread_id={}, result_code=tool_execution_failed, is_error=false, 原始错误：{error}",
+                        self.runtime.cli_id,
+                        self.runtime.location,
+                        tool_name,
+                        call_id,
+                        engine_thread_id,
+                        turn_id,
+                        source_workspace,
+                        target_workspace,
+                        target_thread_id,
+                    );
+                    None
+                }
+            };
+            let local_message_count = match service.thread_message_count(target_thread_id).await {
+                Ok(value) => match value.get("message_count").and_then(Value::as_u64) {
+                    Some(message_count) => Some(message_count),
+                    None => {
+                        log::warn!(
+                            "BaseCliMcp session message count precheck returned invalid data: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, target_workspace={}, target_thread_id={}, result_code=tool_execution_failed, is_error=false, returned_value={value}",
+                            self.runtime.cli_id,
+                            self.runtime.location,
+                            tool_name,
+                            call_id,
+                            engine_thread_id,
+                            turn_id,
+                            source_workspace,
+                            target_workspace,
+                            target_thread_id,
+                        );
+                        None
+                    }
+                },
+                Err(error) => {
+                    log::warn!(
+                        "BaseCliMcp session message count precheck failed: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, source_workspace={}, target_workspace={}, target_thread_id={}, result_code=tool_execution_failed, is_error=false, 原始错误：{error}",
+                        self.runtime.cli_id,
+                        self.runtime.location,
+                        tool_name,
+                        call_id,
+                        engine_thread_id,
+                        turn_id,
+                        source_workspace,
+                        target_workspace,
+                        target_thread_id,
+                    );
+                    None
+                }
+            };
+            if target_engine.as_deref().is_some_and(|engine_id| {
+                local_message_count
+                    .is_some_and(|message_count| should_sync_cli_thread(engine_id, message_count))
+            }) {
+                if let Err(error) = crate::commands::threads::sync_thread_from_engine_inner(
+                    &self.state,
+                    target_thread_id.to_string(),
+                )
+                .await
+                {
+                    log::warn!(
+                        "BaseCliMcp on-demand CLI thread sync failed: cli_id={}, location={:?}, tool_name={}, call_id={}, engine_thread_id={}, turn_id={}, target_thread_id={}, result_code=thread_sync_failed, is_error=false, 原始错误：{error}",
+                        self.runtime.cli_id,
+                        self.runtime.location,
+                        tool_name,
+                        call_id,
+                        engine_thread_id,
+                        turn_id,
+                        target_thread_id,
+                    );
+                }
+            }
+
             let query = match tool_name {
                 "get_auracoder_thread_message_count" => {
                     service.thread_message_count(target_thread_id).await
@@ -501,5 +578,41 @@ impl BaseCliMcp {
                 McpToolResult::error("tool_execution_failed", error)
             }
         }
+    }
+}
+
+/// 判断会话是否满足三种 CLI 空消息按需同步条件。
+fn should_sync_cli_thread(engine_id: &str, message_count: u64) -> bool {
+    matches!(engine_id, "codex" | "opencode" | "claude") && message_count == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_sync_cli_thread;
+
+    /// 验证 Codex 会话无本地消息时需要执行按需同步。
+    #[test]
+    fn codex_empty_thread_requires_sync() {
+        assert!(should_sync_cli_thread("codex", 0));
+    }
+
+    /// 验证已有本地消息的 Codex 会话不会执行按需同步。
+    #[test]
+    fn codex_thread_with_messages_skips_sync() {
+        assert!(!should_sync_cli_thread("codex", 1));
+    }
+
+    /// 验证 OpenCode 和 Claude Code 空消息会话也执行按需同步。
+    #[test]
+    fn supported_cli_threads_require_sync_when_empty() {
+        assert!(should_sync_cli_thread("opencode", 0));
+        assert!(should_sync_cli_thread("claude", 0));
+    }
+
+    /// 验证未知引擎和已有消息的会话不会执行按需同步。
+    #[test]
+    fn unsupported_or_non_empty_thread_skips_sync() {
+        assert!(!should_sync_cli_thread("unknown", 0));
+        assert!(!should_sync_cli_thread("claude", 1));
     }
 }

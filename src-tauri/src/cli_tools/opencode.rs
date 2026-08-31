@@ -1302,11 +1302,23 @@ impl CliTool for OpenCodeCli {
         &self,
         context: &CliExecutionContext,
         thread: &ThreadDto,
-        _engine_thread_id: &str,
+        engine_thread_id: &str,
     ) -> Result<Option<ThreadSyncSnapshot>> {
-        self.load_workspace(context).await?;
+        let workspace = self.load_workspace(context).await?;
         Self::validate_thread(context, thread)?;
-        Ok(None)
+        let cwd = self.thread_cwd(&workspace, thread).await?;
+        let snapshot = if context.location_kind == CliLocationKind::Ssh {
+            remote_project_opencode_runtime_service::runtime(&workspace)
+                .await?
+                .read_thread_sync_snapshot(&cwd, engine_thread_id)
+                .await?
+        } else {
+            self.local_engine()
+                .await?
+                .read_thread_sync_snapshot(&cwd, engine_thread_id)
+                .await?
+        };
+        Ok(Some(snapshot))
     }
 
     async fn set_thread_name(

@@ -124,6 +124,92 @@ async function readSessionSummary(filePath, expectedCwd, strict = false) {
   };
 }
 
+/** 严格读取单个远端 Claude JSONL 文件的完整历史并校验会话标识。 */
+async function readSessionHistory(filePath, expectedSessionId) {
+  const file = path.basename(filePath);
+  const sessionId = file.endsWith(".jsonl") ? file.slice(0, -".jsonl".length) : "";
+  if (sessionId !== expectedSessionId) {
+    throw new Error(`Claude session file ID mismatch: expected ${expectedSessionId}`);
+  }
+  const records = [];
+  let cwd = "";
+  let lineNumber = 0;
+  const lines = readline.createInterface({
+    input: createReadStream(filePath, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+  for await (const line of lines) {
+    lineNumber += 1;
+    if (!line.trim()) {
+      continue;
+    }
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch (error) {
+      throw new Error(
+        `Claude session history contains invalid JSON at line ${lineNumber}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    if (!record || typeof record !== "object" || Array.isArray(record)) {
+      throw new Error(`Claude session history record at line ${lineNumber} is not an object`);
+    }
+    if (
+      typeof record.sessionId === "string" &&
+      record.sessionId.trim() &&
+      record.sessionId !== expectedSessionId
+    ) {
+      throw new Error(
+        `Claude session history record has mismatched sessionId at line ${lineNumber}`,
+      );
+    }
+    if (typeof record.cwd === "string" && record.cwd.trim()) {
+      const recordCwd = path.posix.resolve(record.cwd);
+      if (cwd && cwd !== recordCwd) {
+        throw new Error(
+          `Claude session history contains multiple cwd values at line ${lineNumber}`,
+        );
+      }
+      cwd = recordCwd;
+    }
+    records.push(record);
+  }
+  if (!cwd) {
+    throw new Error(`Claude session history is missing cwd: ${expectedSessionId}`);
+  }
+  return { id: expectedSessionId, sessionId: expectedSessionId, cwd, records };
+}
+
+/** 在远端固定 Claude 数据根目录内按会话 ID查找唯一历史文件。 */
+async function findSessionFiles(sessionId) {
+  const directories = [projectsRoot()];
+  const files = [];
+  const targetFileName = `${sessionId}.jsonl`;
+  while (directories.length > 0) {
+    const directory = directories.pop();
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error && error.code === "ENOENT") {
+        continue;
+      }
+      throw error;
+    }
+    for (const entry of entries) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        directories.push(entryPath);
+      } else if (entry.isFile() && entry.name === targetFileName) {
+        files.push(entryPath);
+      }
+    }
+  }
+  return files;
+}
+
 async function listSessions(cwd) {
   const expectedCwd = path.posix.resolve(cwd);
   const directory = path.join(projectsRoot(), projectDirectoryName(expectedCwd));
@@ -510,6 +596,56 @@ const server = http.createServer(async (request, response) => {
   }
   // 按 ID 查询只在固定的 Claude 数据根目录内枚举文件名，不接受请求方传入目录。
   const rawPathname = (request.url ?? "/").split("?", 1)[0];
+  if (
+    request.method === "GET" &&
+    rawPathname.startsWith("/sessions/") &&
+    rawPathname.endsWith("/history")
+  ) {
+    let sessionId;
+    try {
+      const segments = rawPathname.split("/");
+      if (segments.length !== 4 || segments[1] !== "sessions" || segments[3] !== "history") {
+        throw new Error("session_id is required before /history");
+      }
+      sessionId = decodeURIComponent(segments[2]);
+      if (
+        !sessionId ||
+        sessionId.includes("/") ||
+        sessionId.includes("\\") ||
+        sessionId.includes("..") ||
+        !SESSION_ID_PATTERN.test(sessionId)
+      ) {
+        throw new Error("session_id is not a valid Claude session ID");
+      }
+    } catch (error) {
+      writeJson(response, 400, {
+        error:
+          error instanceof URIError
+            ? "session_id contains invalid URI encoding"
+            : error instanceof Error
+              ? error.message
+              : String(error),
+      });
+      return;
+    }
+    try {
+      const files = await findSessionFiles(sessionId);
+      if (files.length === 0) {
+        writeJson(response, 404, { error: `Claude session not found: ${sessionId}` });
+        return;
+      }
+      if (files.length > 1) {
+        writeJson(response, 409, {
+          error: `Multiple Claude session files found for session_id: ${sessionId}`,
+        });
+        return;
+      }
+      writeJson(response, 200, await readSessionHistory(files[0], sessionId));
+    } catch (error) {
+      writeJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
+    }
+    return;
+  }
   if (request.method === "GET" && rawPathname.startsWith("/sessions/")) {
     let sessionId;
     try {

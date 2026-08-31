@@ -148,6 +148,8 @@ function traceClaudeSdk(eventName, payload) {
 const MAX_CLAUDE_SESSIONS = 500;
 // 本机 Claude 会话摘要读取的最大 JSONL 行数，避免读取完整历史内容。
 const MAX_CLAUDE_TRANSCRIPT_LINES = 200;
+// Claude 会话文件名使用 UUID，完整历史读取只接受合法会话标识。
+const CLAUDE_SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const claudeUsageUrl =
   process.env.PANES_CLAUDE_USAGE_URL?.trim() || "https://api.anthropic.com/api/oauth/usage";
 const claudeUsageFetchDisabled = ["1", "true", "yes"].includes(
@@ -1743,8 +1745,8 @@ async function readClaudeSessionSummary(filePath, expectedCwd) {
   };
 }
 
-/** 扫描指定 cwd 对应的本机 Claude 项目目录并返回排序后的会话摘要。 */
-async function listClaudeSessions(cwd) {
+/** 扫描指定 cwd 对应的本机 Claude 项目目录并返回所有会话文件。 */
+async function listClaudeSessionFiles(cwd) {
   const expectedCwd = path.resolve(cwd);
   const directory = path.join(
     claudeProjectsRoot(),
@@ -1774,8 +1776,14 @@ async function listClaudeSessions(cwd) {
       }),
   );
   files.push(...nestedFiles.flat());
+  return files;
+}
+
+/** 扫描指定 cwd 对应的本机 Claude 项目目录并返回排序后的会话摘要。 */
+async function listClaudeSessions(cwd) {
+  const expectedCwd = path.resolve(cwd);
   const sessions = [];
-  for (const filePath of files) {
+  for (const filePath of await listClaudeSessionFiles(expectedCwd)) {
     const summary = await readClaudeSessionSummary(filePath, expectedCwd);
     if (summary) {
       sessions.push(summary);
@@ -1783,6 +1791,76 @@ async function listClaudeSessions(cwd) {
   }
   sessions.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   return sessions.slice(0, MAX_CLAUDE_SESSIONS);
+}
+
+/** 严格读取单个 Claude JSONL 文件的完整历史，并校验会话标识和工作目录。 */
+async function readClaudeSessionHistory(filePath, expectedCwd, expectedSessionId) {
+  const fileName = path.basename(filePath);
+  const sessionId = fileName.endsWith(".jsonl")
+    ? fileName.slice(0, -".jsonl".length)
+    : "";
+  if (sessionId !== expectedSessionId) {
+    throw new Error(`Claude session file ID mismatch: expected ${expectedSessionId}`);
+  }
+
+  const records = [];
+  let sessionCwd = "";
+  let lineNumber = 0;
+  const lines = createInterface({
+    input: createReadStream(filePath, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+  for await (const line of lines) {
+    lineNumber += 1;
+    if (!line.trim()) {
+      continue;
+    }
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch (error) {
+      throw new Error(
+        `Claude session history contains invalid JSON at line ${lineNumber}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    if (!record || typeof record !== "object" || Array.isArray(record)) {
+      throw new Error(`Claude session history record at line ${lineNumber} is not an object`);
+    }
+    if (
+      typeof record.sessionId === "string" &&
+      record.sessionId.trim() &&
+      record.sessionId !== expectedSessionId
+    ) {
+      throw new Error(
+        `Claude session history record has mismatched sessionId at line ${lineNumber}`,
+      );
+    }
+    if (typeof record.cwd === "string" && record.cwd.trim()) {
+      const recordCwd = path.resolve(record.cwd);
+      if (sessionCwd && sessionCwd !== recordCwd) {
+        throw new Error(
+          `Claude session history contains multiple cwd values at line ${lineNumber}`,
+        );
+      }
+      sessionCwd = recordCwd;
+      if (sessionCwd !== expectedCwd) {
+        throw new Error(
+          `Claude session history cwd does not match requested workspace: expected ${expectedCwd}, got ${sessionCwd}`,
+        );
+      }
+    }
+    records.push(record);
+  }
+  if (!sessionCwd) {
+    throw new Error(`Claude session history is missing cwd: ${expectedSessionId}`);
+  }
+  return {
+    sessionId: expectedSessionId,
+    cwd: sessionCwd,
+    records,
+  };
 }
 
 /** 处理本机 Claude 历史会话查询命令并返回关联请求 ID 的协议事件。 */
@@ -1800,6 +1878,62 @@ async function handleListSessions(req) {
   }
   try {
     emit({ id, type: "sessions", sessions: await listClaudeSessions(cwd) });
+  } catch (error) {
+    emit({
+      id,
+      type: "error",
+      message: error instanceof Error ? error.message : String(error),
+      recoverable: false,
+    });
+  }
+}
+
+/** 处理本机 Claude 完整历史读取命令，避免通过 resume 或新 query 获取历史。 */
+async function handleReadSessionHistory(req) {
+  const { id, params = {} } = req;
+  const cwd = typeof params.cwd === "string" ? params.cwd.trim() : "";
+  const sessionId = typeof params.sessionId === "string" ? params.sessionId.trim() : "";
+  if (!cwd || !sessionId) {
+    emit({
+      id,
+      type: "error",
+      message: "Claude read_session_history requires cwd and sessionId.",
+      recoverable: false,
+    });
+    return;
+  }
+  if (!CLAUDE_SESSION_ID_PATTERN.test(sessionId)) {
+    emit({
+      id,
+      type: "error",
+      message: "Claude read_session_history received an invalid sessionId.",
+      recoverable: false,
+    });
+    return;
+  }
+  try {
+    const expectedCwd = path.resolve(cwd);
+    const matchingFiles = (await listClaudeSessionFiles(expectedCwd)).filter(
+      (filePath) => path.basename(filePath) === `${sessionId}.jsonl`,
+    );
+    if (matchingFiles.length === 0) {
+      throw new Error(`Claude session not found: ${sessionId}`);
+    }
+    if (matchingFiles.length > 1) {
+      throw new Error(`Multiple Claude session files found for sessionId: ${sessionId}`);
+    }
+    const history = await readClaudeSessionHistory(
+      matchingFiles[0],
+      expectedCwd,
+      sessionId,
+    );
+    emit({
+      id,
+      type: "session_history",
+      sessionId: history.sessionId,
+      cwd: history.cwd,
+      records: history.records,
+    });
   } catch (error) {
     emit({
       id,
@@ -2797,6 +2931,11 @@ rl.on("line", (line) => {
 
   if (req.method === "list_sessions") {
     void handleListSessions(req);
+    return;
+  }
+
+  if (req.method === "read_session_history") {
+    void handleReadSessionHistory(req);
     return;
   }
 

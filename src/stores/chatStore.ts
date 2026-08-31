@@ -131,11 +131,17 @@ interface AssistantMessageTarget {
 const pendingTurnMetaByThread = new Map<string, PendingTurnMeta>();
 const inflightActionOutputHydration = new Map<string, Promise<void>>();
 
-function isCodexThreadAttached(thread: {
+/** 判断线程是否绑定了支持原生历史同步的 CLI 会话。 */
+function isCliThreadAttached(thread: {
   engineId: string;
   engineThreadId: string | null;
 } | undefined): boolean {
-  return thread?.engineId === "codex" && Boolean(thread.engineThreadId?.trim());
+  return (
+    (thread?.engineId === "codex" ||
+      thread?.engineId === "opencode" ||
+      thread?.engineId === "claude") &&
+    Boolean(thread?.engineThreadId?.trim())
+  );
 }
 
 function isThreadTurnActive(status: ThreadStatus): boolean {
@@ -1966,16 +1972,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       const threadState = useThreadStore.getState();
       let activeThread = threadState.threads.find((thread) => thread.id === threadId);
-      // A Codex thread can advance while AuraCoder is closed or while it is being
-      // used directly in Codex. Refresh every attached thread on activation;
-      // codexSyncRequired only describes a transient in-progress remote turn.
-      if (activeThread && isCodexThreadAttached(activeThread)) {
+      // A CLI thread can advance while AuraCoder is closed or while it is being
+      // used directly in its native CLI. Refresh every attached thread on activation;
+      // the engine-specific sync flag only describes a transient in-progress remote turn.
+      if (activeThread && isCliThreadAttached(activeThread)) {
         try {
           const syncedThread = await ipc.syncThreadFromEngine(threadId);
           threadState.applyThreadUpdateLocal(syncedThread);
           activeThread = syncedThread;
         } catch (error) {
-          console.warn(`Failed to sync Codex thread ${threadId}:`, error);
+          console.warn(`Failed to sync CLI thread ${threadId}:`, error);
         }
       }
 

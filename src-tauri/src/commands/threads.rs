@@ -2196,9 +2196,193 @@ pub async fn restore_thread(
     Ok(restored)
 }
 
+/// 对消息为空的 OpenCode 或 Claude Code 线程导入完整原生历史，并刷新本地统计。
+async fn sync_empty_cli_thread_from_engine(
+    state: &AppState,
+    thread_id: &str,
+    thread: &ThreadDto,
+) -> Result<ThreadDto, String> {
+    let message_count = run_db(state.db.clone(), {
+        let thread_id = thread_id.to_string();
+        move |db| db::messages::count_thread_messages(db, &thread_id)
+    })
+    .await?;
+    let mut summary_synced_thread = thread.clone();
+    if thread.engine_id == "opencode" {
+        if let Some(engine_thread_id) = thread
+            .engine_thread_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let workspace = run_db(state.db.clone(), {
+                let workspace_id = thread.workspace_id.clone();
+                move |db| {
+                    db::workspaces::find_workspace_by_id(db, &workspace_id)?
+                        .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))
+                }
+            })
+            .await?;
+            let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
+            let cli_tool = CliToolFactory::new(state.clone())
+                .create("opencode")
+                .map_err(|error| format!("unsupported CLI engine opencode: {error}"))?;
+            let cli: &dyn CliTool = cli_tool.as_ref();
+            let snapshot = match cli.read_session(&context, engine_thread_id).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    log::debug!(
+                        "failed to sync OpenCode session {engine_thread_id}: {error}"
+                    );
+                    return Ok(thread.clone());
+                }
+            };
+            let parse_timestamp = |value: Option<String>| {
+                value
+                    .as_deref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.timestamp_millis())
+                    .unwrap_or_default()
+            };
+            let session = OpenCodeRemoteSessionSummary {
+                engine_thread_id: snapshot.engine_thread_id,
+                title: Some(snapshot.title),
+                cwd: snapshot.cwd,
+                created_at: parse_timestamp(snapshot.created_at),
+                updated_at: parse_timestamp(snapshot.updated_at),
+                archived: snapshot.archived,
+            };
+            let title = build_opencode_remote_session_title(&session);
+            let metadata = build_opencode_remote_session_metadata(
+                thread.engine_metadata.as_ref(),
+                &session,
+                &thread.model_id,
+            );
+            let thread_id = thread_id.to_string();
+            summary_synced_thread = run_db(state.db.clone(), move |db| {
+                db::threads::update_thread_runtime_snapshot(
+                    db,
+                    &thread_id,
+                    Some(&title),
+                    Some(ThreadStatusDto::Idle),
+                    Some(&metadata),
+                )
+            })
+            .await?;
+            if message_count != 0 {
+                return Ok(summary_synced_thread);
+            }
+        }
+    }
+    if message_count != 0 {
+        return Ok(thread.clone());
+    }
+
+    let Some(engine_thread_id) = thread
+        .engine_thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(thread.clone());
+    };
+
+    let workspace = run_db(state.db.clone(), {
+        let workspace_id = thread.workspace_id.clone();
+        move |db| {
+            db::workspaces::find_workspace_by_id(db, &workspace_id)?
+                .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))
+        }
+    })
+    .await?;
+    let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
+    let cli_tool = CliToolFactory::new(state.clone())
+        .create(&thread.engine_id)
+        .map_err(|error| format!("unsupported CLI engine {}: {error}", thread.engine_id))?;
+    let cli: &dyn CliTool = cli_tool.as_ref();
+    let snapshot = match cli
+        .read_thread_sync_snapshot(
+            &context,
+            thread,
+            engine_thread_id,
+        )
+        .await
+    {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return Ok(summary_synced_thread),
+        Err(error) => {
+            // 旧完整历史入口会把原始读取错误返回给点击层和 MCP；两者再回退到本地结果。
+            return Err(err_to_string(error));
+            // 旧实现曾在此处记录 debug 后返回本地线程，保留迁移留痕但不再吞掉原生错误：
+            // log::debug!("failed to sync {} thread {}: {error}", thread.engine_id, thread_id);
+            // return Ok(thread.clone());
+        }
+    };
+
+    let imported_messages = snapshot
+        .imported_messages
+        .iter()
+        .map(|message| db::messages::ImportedMessageRecord {
+            role: message.role.clone(),
+            content: message.content.clone(),
+            blocks: message.blocks.clone(),
+            status: MessageStatusDto::from_str(message.status.as_str()),
+            turn_engine_id: message.turn_engine_id.clone(),
+            remote_turn_id: message.turn_engine_id.clone(),
+            turn_model_id: message.turn_model_id.clone(),
+            turn_reasoning_effort: message.turn_reasoning_effort.clone(),
+            token_input: message.token_input,
+            token_output: message.token_output,
+            created_at: message.created_at.clone(),
+        })
+        .collect::<Vec<_>>();
+    run_db(state.db.clone(), {
+        let thread_id = thread_id.to_string();
+        move |db| {
+            db::messages::append_thread_messages(db, &thread_id, &imported_messages)?;
+            db::threads::refresh_thread_message_stats(
+                db,
+                &thread_id,
+                db::threads::ThreadMessageStatsActivityPolicy::PreserveExisting,
+            )?;
+            Ok::<_, anyhow::Error>(())
+        }
+    })
+    .await?;
+
+    let title = snapshot
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    run_db(state.db.clone(), {
+        let thread_id = thread_id.to_string();
+        let title = title.map(str::to_string);
+        move |db| {
+            db::threads::update_thread_runtime_snapshot(
+                db,
+                &thread_id,
+                title.as_deref(),
+                None,
+                None,
+            )
+        }
+    })
+    .await
+}
+
+/// 通过 Tauri 命令同步指定引擎线程的最新会话内容。
 #[tauri::command]
 pub async fn sync_thread_from_engine(
     state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<ThreadDto, String> {
+    sync_thread_from_engine_inner(state.inner(), thread_id).await
+}
+
+/// 按目标线程所属引擎同步最新会话内容，供 Tauri 命令和 MCP 按需复用。
+pub(crate) async fn sync_thread_from_engine_inner(
+    state: &AppState,
     thread_id: String,
 ) -> Result<ThreadDto, String> {
     let db = state.db.clone();
@@ -2209,6 +2393,12 @@ pub async fn sync_thread_from_engine(
     .await?
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
 
+    if matches!(thread.engine_id.as_str(), "opencode" | "claude") {
+        return sync_empty_cli_thread_from_engine(state, &thread_id, &thread).await;
+    }
+
+    // 旧 OpenCode 摘要同步分支保留为迁移留痕；完整历史同步已由上方统一业务入口接替。
+    /*
     if thread.engine_id == "opencode" {
         let Some(engine_thread_id) = thread.engine_thread_id.as_deref() else {
             return Ok(thread);
@@ -2222,7 +2412,7 @@ pub async fn sync_thread_from_engine(
         })
         .await?;
         let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
-        let opencode = CliToolFactory::new(state.inner().clone())
+        let opencode = CliToolFactory::new(state.clone())
             .create("opencode")
             .expect("OpenCode CLI factory mapping must exist");
         let cli: &dyn CliTool = opencode.as_ref();
@@ -2265,6 +2455,7 @@ pub async fn sync_thread_from_engine(
         })
         .await;
     }
+    */
 
     if thread.engine_id != "codex" {
         return Ok(thread);
@@ -2282,7 +2473,7 @@ pub async fn sync_thread_from_engine(
         return Ok(thread);
     };
     let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
-    let codex = CliToolFactory::new(state.inner().clone())
+    let codex = CliToolFactory::new(state.clone())
         .create("codex")
         .expect("Codex CLI factory mapping must exist");
     let cli: &dyn CliTool = codex.as_ref();
