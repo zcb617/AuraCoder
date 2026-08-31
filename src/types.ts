@@ -9,6 +9,9 @@ export type UpdateProcessPhase =
   | "installing"
   | "error";
 
+/** 更新失败所属的业务阶段，用于区分自动重试下载和安装失败。 */
+export type UpdateErrorStage = "download" | "install" | "check";
+
 export interface UpdateProcessState {
   phase: UpdateProcessPhase;
   version: string | null;
@@ -16,6 +19,8 @@ export interface UpdateProcessState {
   downloadedBytes: number;
   totalBytes: number | null;
   error: string | null;
+  /** 当前错误所属的业务阶段，非错误状态为空。 */
+  errorStage: UpdateErrorStage | null;
 }
 
 export type UpdateInstallRestartMode = "tauriRelaunch" | "externalUpdater";

@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { ipc } from "../lib/ipc";
-import type { UpdateProcessState } from "../types";
+import type { UpdateErrorStage, UpdateProcessState } from "../types";
 
 export const DEFAULT_AUTO_UPDATE_INTERVAL_MINUTES = 30;
 
@@ -50,6 +50,7 @@ function mapUpdateState(state: UpdateProcessState): Partial<UpdateState> {
     status: state.phase,
     version: state.version,
     error: state.error,
+    errorStage: state.errorStage ?? null,
     downloadPhase: state.phase === "installing" ? "installing" : state.phase === "downloading" ? "downloading" : "idle",
     downloadedBytes: state.downloadedBytes,
     totalBytes: state.totalBytes,
@@ -61,6 +62,8 @@ interface UpdateState {
   status: UpdateStatus;
   version: string | null;
   error: string | null;
+  /** 当前错误所属的业务阶段，供自动更新决定是否重试。 */
+  errorStage: UpdateErrorStage | null;
   lastCheckedAt: number | null;
   downloadPhase: DownloadPhase;
   downloadedBytes: number;
@@ -109,6 +112,7 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
   status: "idle",
   version: null,
   error: null,
+  errorStage: null,
   lastCheckedAt: null,
   downloadPhase: "idle",
   downloadedBytes: 0,
@@ -124,7 +128,11 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
         const state = await ipc.getUpdateState();
         set({ ...mapUpdateState(state), lastCheckedAt: state.phase === "idle" ? Date.now() : get().lastCheckedAt });
       } catch (error) {
-        set({ status: "error", error: error instanceof Error ? error.message : String(error) });
+        set({
+          status: "error",
+          error: error instanceof Error ? error.message : String(error),
+          errorStage: "check",
+        });
       }
     })().finally(() => {
       restorePromise = null;
@@ -136,12 +144,16 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
     if (automaticUpdatePromise) return automaticUpdatePromise;
     automaticUpdatePromise = (async () => {
       const currentStatus = get().status;
+      if (currentStatus === "error" && get().errorStage === "install") {
+        return;
+      }
       if (["checking", "downloading", "downloaded", "installing", "ready"].includes(currentStatus)) {
         return;
       }
       if (currentStatus === "idle" || currentStatus === "error") {
         await get().restoreUpdateState();
       }
+      if (get().status === "error" && get().errorStage === "install") return;
       if (get().isUpdateDownloaded()) return;
 
       if (get().status !== "available") {
@@ -167,6 +179,7 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
       set({
         status: "checking",
         error: null,
+        errorStage: null,
         downloadPhase: "idle",
         downloadSource: mode,
       });
@@ -184,6 +197,7 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
           downloadedBytes: get().downloadedBytes,
           totalBytes: get().totalBytes,
           error: errorMessage,
+          errorStage: "check",
         };
         set({ ...mapUpdateState(errorState), lastCheckedAt: Date.now() });
         return errorState;
@@ -200,12 +214,18 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
       const currentStatus = get().status;
       if (["downloading", "downloaded", "installing", "ready"].includes(currentStatus)) return;
 
+      set({ error: null, errorStage: null });
       try {
         await ensureProgressListener(set);
         const state = await ipc.downloadUpdate(mode);
         set(mapUpdateState(state));
       } catch (error) {
-        set({ status: "error", error: error instanceof Error ? error.message : String(error), downloadPhase: "idle" });
+        set({
+          status: "error",
+          error: error instanceof Error ? error.message : String(error),
+          errorStage: "download",
+          downloadPhase: "idle",
+        });
       }
     })().finally(() => {
       downloadPromise = null;
@@ -238,15 +258,20 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
     installPromise = (async () => {
       if (!get().isUpdateDownloaded()) return;
 
-      set({ status: "installing", downloadPhase: "installing", error: null });
+      set({ status: "installing", downloadPhase: "installing", error: null, errorStage: null });
       try {
         const result = await ipc.installDownloadedUpdate();
-        set({ status: "ready" });
+        set({ status: "ready", error: null, errorStage: null });
         if (result.restartMode === "tauriRelaunch") {
           await relaunch();
         }
       } catch (error) {
-        set({ status: "error", error: error instanceof Error ? error.message : String(error), downloadPhase: "idle" });
+        set({
+          status: "error",
+          error: error instanceof Error ? error.message : String(error),
+          errorStage: "install",
+          downloadPhase: "idle",
+        });
       }
     })().finally(() => {
       installPromise = null;
@@ -270,7 +295,12 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
         }
         await installTask;
       } catch (error) {
-        set({ status: "error", error: error instanceof Error ? error.message : String(error), downloadPhase: "idle" });
+        set({
+          status: "error",
+          error: error instanceof Error ? error.message : String(error),
+          errorStage: "install",
+          downloadPhase: "idle",
+        });
       }
     })().finally(() => {
       localInstallPromise = null;
@@ -289,6 +319,7 @@ export const useUpdateStore = create<UpdateState>((set, get) => ({
       status: "idle",
       version: null,
       error: null,
+      errorStage: null,
       downloadSource: null,
       downloadPhase: "idle",
       downloadedBytes: 0,

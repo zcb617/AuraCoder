@@ -2,10 +2,12 @@ use std::{
     cmp::Ordering,
     fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -31,6 +33,18 @@ pub enum UpdatePhase {
     Error,
 }
 
+/// 更新失败所属的业务阶段，用于区分自动重试下载和安装失败。
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateErrorStage {
+    /// 下载、签名校验或保存更新文件失败。
+    Download,
+    /// 启动或执行已保存更新安装失败。
+    Install,
+    /// 检查更新或恢复已保存状态失败。
+    Check,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateProcessState {
@@ -40,6 +54,8 @@ pub struct UpdateProcessState {
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
     pub error: Option<String>,
+    /// 当前错误所属的业务阶段，非错误状态保持为空。
+    pub error_stage: Option<UpdateErrorStage>,
 }
 
 /// 更新安装命令返回给前端的重启方式。
@@ -110,6 +126,7 @@ impl Default for UpdateProcessState {
             downloaded_bytes: 0,
             total_bytes: None,
             error: None,
+            error_stage: None,
         }
     }
 }
@@ -182,14 +199,17 @@ impl UpdateManager {
         runtime.state.downloaded_bytes = downloaded_bytes;
         runtime.state.total_bytes = total_bytes;
         runtime.state.error = None;
+        runtime.state.error_stage = None;
     }
 
+    /// 记录更新流程失败及其业务阶段，供前端决定是否允许自动重试。
     fn set_error(
         &self,
         version: Option<String>,
         source: &str,
         downloaded_bytes: u64,
         total_bytes: Option<u64>,
+        error_stage: UpdateErrorStage,
         error: String,
     ) {
         self.set_state(UpdateProcessState {
@@ -199,6 +219,7 @@ impl UpdateManager {
             downloaded_bytes,
             total_bytes,
             error: Some(error),
+            error_stage: Some(error_stage),
         });
     }
 
@@ -266,6 +287,7 @@ impl UpdateManager {
                     downloaded_bytes: saved.downloaded_bytes,
                     total_bytes: saved.total_bytes,
                     error: None,
+                    error_stage: None,
                 });
                 if let Err(error) = spawn_macos_updater(app, job) {
                     self.set_error(
@@ -273,6 +295,7 @@ impl UpdateManager {
                         &saved.source,
                         saved.downloaded_bytes,
                         saved.total_bytes,
+                        UpdateErrorStage::Install,
                         error.clone(),
                     );
                     return Err(error);
@@ -301,6 +324,7 @@ impl UpdateManager {
             downloaded_bytes: saved.downloaded_bytes,
             total_bytes: saved.total_bytes,
             error: None,
+            error_stage: None,
         };
         self.set_candidate(None);
         self.set_state(state.clone());
@@ -336,6 +360,7 @@ impl UpdateManager {
             downloaded_bytes: 0,
             total_bytes: None,
             error: None,
+            error_stage: None,
         });
 
         let updater = match app
@@ -346,7 +371,14 @@ impl UpdateManager {
             Ok(updater) => updater,
             Err(error) => {
                 let message = error.to_string();
-                self.set_error(None, source, 0, None, message.clone());
+                self.set_error(
+                    None,
+                    source,
+                    0,
+                    None,
+                    UpdateErrorStage::Check,
+                    message.clone(),
+                );
                 return Err(message);
             }
         };
@@ -354,7 +386,14 @@ impl UpdateManager {
             Ok(update) => update,
             Err(error) => {
                 let message = error.to_string();
-                self.set_error(None, source, 0, None, message.clone());
+                self.set_error(
+                    None,
+                    source,
+                    0,
+                    None,
+                    UpdateErrorStage::Check,
+                    message.clone(),
+                );
                 return Err(message);
             }
         };
@@ -373,6 +412,7 @@ impl UpdateManager {
             downloaded_bytes: 0,
             total_bytes: None,
             error: None,
+            error_stage: None,
         };
         self.set_candidate(Some(update));
         self.set_state(state.clone());
@@ -404,6 +444,7 @@ impl UpdateManager {
             downloaded_bytes: 0,
             total_bytes: None,
             error: None,
+            error_stage: None,
         });
 
         let mut downloaded_bytes = 0_u64;
@@ -413,7 +454,14 @@ impl UpdateManager {
             .download(
                 |chunk_length, content_length| {
                     downloaded_bytes = downloaded_bytes.saturating_add(chunk_length as u64);
-                    manager.set_progress(downloaded_bytes, content_length);
+                    let visible_downloaded_bytes = match content_length {
+                        Some(total_bytes) if total_bytes > 0 => {
+                            downloaded_bytes.min(total_bytes.saturating_sub(1))
+                        }
+                        Some(_) => 0,
+                        None => downloaded_bytes,
+                    };
+                    manager.set_progress(visible_downloaded_bytes, content_length);
                     let _ = progress_app.emit("update-download-progress", manager.state());
                 },
                 || {},
@@ -428,6 +476,7 @@ impl UpdateManager {
                     source,
                     downloaded_bytes,
                     self.state().total_bytes,
+                    UpdateErrorStage::Download,
                     message.clone(),
                 );
                 return Err(message);
@@ -450,6 +499,7 @@ impl UpdateManager {
                     source,
                     downloaded_bytes,
                     self.state().total_bytes,
+                    UpdateErrorStage::Download,
                     error.clone(),
                 );
                 return Err(error);
@@ -462,8 +512,10 @@ impl UpdateManager {
             downloaded_bytes: saved.downloaded_bytes,
             total_bytes: saved.total_bytes,
             error: None,
+            error_stage: None,
         };
         self.set_state(state.clone());
+        let _ = app.emit("update-download-progress", state.clone());
         Ok(state)
     }
 
@@ -472,14 +524,43 @@ impl UpdateManager {
         &self,
         app: &AppHandle,
     ) -> Result<UpdateInstallResult, String> {
-        let saved = read_saved_update(app)?.ok_or_else(|| "没有已下载完成的更新".to_string())?;
-        let file_path = saved_file_path(app, &saved)?;
-        let file_size = fs::metadata(&file_path)
-            .map_err(|error| error.to_string())?
-            .len();
-        if file_size == 0 {
-            return Err("已下载的更新文件为空".to_string());
-        }
+        let previous_state = self.state();
+        let fallback_source = previous_state.source.as_deref().unwrap_or("unknown");
+        self.set_state(UpdateProcessState {
+            phase: UpdatePhase::Installing,
+            version: previous_state.version.clone(),
+            source: previous_state.source.clone(),
+            downloaded_bytes: previous_state.downloaded_bytes,
+            total_bytes: previous_state.total_bytes,
+            error: None,
+            error_stage: None,
+        });
+        let saved = match read_saved_update(app) {
+            Ok(Some(saved)) => saved,
+            Ok(None) => {
+                let error = "没有已下载完成的更新".to_string();
+                self.set_error(
+                    previous_state.version.clone(),
+                    fallback_source,
+                    previous_state.downloaded_bytes,
+                    previous_state.total_bytes,
+                    UpdateErrorStage::Install,
+                    error.clone(),
+                );
+                return Err(error);
+            }
+            Err(error) => {
+                self.set_error(
+                    previous_state.version.clone(),
+                    fallback_source,
+                    previous_state.downloaded_bytes,
+                    previous_state.total_bytes,
+                    UpdateErrorStage::Install,
+                    error.clone(),
+                );
+                return Err(error);
+            }
+        };
 
         self.set_state(UpdateProcessState {
             phase: UpdatePhase::Installing,
@@ -488,7 +569,50 @@ impl UpdateManager {
             downloaded_bytes: saved.downloaded_bytes,
             total_bytes: saved.total_bytes,
             error: None,
+            error_stage: None,
         });
+
+        let file_path = match saved_file_path(app, &saved) {
+            Ok(path) => path,
+            Err(error) => {
+                self.set_error(
+                    Some(saved.version.clone()),
+                    &saved.source,
+                    saved.downloaded_bytes,
+                    saved.total_bytes,
+                    UpdateErrorStage::Install,
+                    error.clone(),
+                );
+                return Err(error);
+            }
+        };
+        let file_size = match fs::metadata(&file_path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                let error = error.to_string();
+                self.set_error(
+                    Some(saved.version.clone()),
+                    &saved.source,
+                    saved.downloaded_bytes,
+                    saved.total_bytes,
+                    UpdateErrorStage::Install,
+                    error.clone(),
+                );
+                return Err(error);
+            }
+        };
+        if file_size == 0 {
+            let error = "已下载的更新文件为空".to_string();
+            self.set_error(
+                Some(saved.version.clone()),
+                &saved.source,
+                saved.downloaded_bytes,
+                saved.total_bytes,
+                UpdateErrorStage::Install,
+                error.clone(),
+            );
+            return Err(error);
+        }
 
         #[cfg(target_os = "macos")]
         {
@@ -500,6 +624,7 @@ impl UpdateManager {
                         &saved.source,
                         saved.downloaded_bytes,
                         saved.total_bytes,
+                        UpdateErrorStage::Install,
                         error.clone(),
                     );
                     return Err(error);
@@ -513,14 +638,41 @@ impl UpdateManager {
                         &saved.source,
                         saved.downloaded_bytes,
                         saved.total_bytes,
+                        UpdateErrorStage::Install,
                         error.clone(),
                     );
                     return Err(error);
                 }
             };
             let pid = current_process_id();
-            let updates_directory = updates_dir(app)?;
-            let unique_id = macos_job_unique_id()?;
+            let updates_directory = match updates_dir(app) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.set_error(
+                        Some(saved.version.clone()),
+                        &saved.source,
+                        saved.downloaded_bytes,
+                        saved.total_bytes,
+                        UpdateErrorStage::Install,
+                        error.clone(),
+                    );
+                    return Err(error);
+                }
+            };
+            let unique_id = match macos_job_unique_id() {
+                Ok(unique_id) => unique_id,
+                Err(error) => {
+                    self.set_error(
+                        Some(saved.version.clone()),
+                        &saved.source,
+                        saved.downloaded_bytes,
+                        saved.total_bytes,
+                        UpdateErrorStage::Install,
+                        error.clone(),
+                    );
+                    return Err(error);
+                }
+            };
             let ready_path =
                 updates_directory.join(format!("macos-install-ready-{pid}-{unique_id}"));
             let log_path = updates_directory.join(format!("macos-install-{pid}-{unique_id}.log"));
@@ -542,6 +694,7 @@ impl UpdateManager {
                     &saved.source,
                     saved.downloaded_bytes,
                     saved.total_bytes,
+                    UpdateErrorStage::Install,
                     error.clone(),
                 );
                 return Err(error);
@@ -552,7 +705,21 @@ impl UpdateManager {
         }
 
         #[cfg(not(target_os = "macos"))]
-        let bytes = fs::read(&file_path).map_err(|error| error.to_string())?;
+        let bytes = match fs::read(&file_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let error = error.to_string();
+                self.set_error(
+                    Some(saved.version.clone()),
+                    &saved.source,
+                    saved.downloaded_bytes,
+                    saved.total_bytes,
+                    UpdateErrorStage::Install,
+                    error.clone(),
+                );
+                return Err(error);
+            }
+        };
         #[cfg(not(target_os = "macos"))]
         let result = if let Some(update) = self.candidate() {
             update.install(bytes).map_err(|error| error.to_string())
@@ -566,6 +733,7 @@ impl UpdateManager {
                 &saved.source,
                 saved.downloaded_bytes,
                 saved.total_bytes,
+                UpdateErrorStage::Install,
                 error.clone(),
             );
             return Err(error);
@@ -638,6 +806,7 @@ impl UpdateManager {
                 downloaded_bytes: saved.downloaded_bytes,
                 total_bytes: saved.total_bytes,
                 error: None,
+                error_stage: None,
             };
             self.set_state(state.clone());
             Ok(state)
@@ -831,10 +1000,9 @@ fn save_downloaded_update(
 ) -> Result<SavedUpdate, String> {
     let directory = updates_dir(app)?;
     fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let state_file_path = directory.join(STATE_FILE);
     let file_name = format!("pending-update{suffix}");
     let file_path = directory.join(&file_name);
-    atomic_write(&file_path, bytes)?;
-
     let saved = SavedUpdate {
         state_version: STATE_VERSION,
         version: version.to_string(),
@@ -848,19 +1016,171 @@ fn save_downloaded_update(
         total_bytes,
     };
     let text = serde_json::to_vec_pretty(&saved).map_err(|error| error.to_string())?;
-    atomic_write(&state_path(app)?, &text)?;
+    let transaction_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let previous_file_backup =
+        directory.join(format!(".{0}.backup-{transaction_id}", saved.file_name));
+    let previous_state_backup = directory.join(format!(".{STATE_FILE}.backup-{transaction_id}"));
+    let had_previous_file = file_path.is_file();
+    if had_previous_file {
+        if let Err(error) = fs::copy(&file_path, &previous_file_backup) {
+            cleanup_saved_update_backup(&previous_file_backup, "旧更新包备份");
+            return Err(format!("备份旧更新包失败: {error}"));
+        }
+    }
+    let had_previous_state = state_file_path.is_file();
+    if had_previous_state {
+        if let Err(error) = fs::copy(&state_file_path, &previous_state_backup) {
+            cleanup_saved_update_backup(&previous_file_backup, "旧更新包备份");
+            return Err(format!("备份旧更新状态失败: {error}"));
+        }
+    }
+
+    if let Err(error) = atomic_write(&file_path, bytes) {
+        let mut message = format!("保存更新包失败: {error}");
+        let recovery_error = restore_saved_update_file(
+            &file_path,
+            &previous_file_backup,
+            had_previous_file,
+            "旧更新包",
+        );
+        if let Some(recovery_error) = &recovery_error {
+            message.push_str(&format!("; {recovery_error}"));
+        } else {
+            cleanup_saved_update_backup(&previous_file_backup, "旧更新包备份");
+        }
+        cleanup_saved_update_backup(&previous_state_backup, "旧更新状态备份");
+        return Err(message);
+    }
+
+    if let Err(error) = atomic_write(&state_file_path, &text) {
+        let mut recovery_errors = Vec::new();
+        let file_recovery_error = restore_saved_update_file(
+            &file_path,
+            &previous_file_backup,
+            had_previous_file,
+            "旧更新包",
+        );
+        if let Some(recovery_error) = &file_recovery_error {
+            recovery_errors.push(recovery_error.clone());
+        } else {
+            cleanup_saved_update_backup(&previous_file_backup, "旧更新包备份");
+        }
+        let state_recovery_error = restore_saved_update_file(
+            &state_file_path,
+            &previous_state_backup,
+            had_previous_state,
+            "旧更新状态",
+        );
+        if let Some(recovery_error) = &state_recovery_error {
+            recovery_errors.push(recovery_error.clone());
+        } else {
+            cleanup_saved_update_backup(&previous_state_backup, "旧更新状态备份");
+        }
+        let recovery_message = if recovery_errors.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", recovery_errors.join("; "))
+        };
+        return Err(format!("保存更新状态失败: {error}{recovery_message}"));
+    }
+
+    cleanup_saved_update_backup(&previous_file_backup, "旧更新包备份");
+    cleanup_saved_update_backup(&previous_state_backup, "旧更新状态备份");
     Ok(saved)
 }
 
+/// 清理更新事务产生的旧文件备份，并记录无法清理的原始异常。
+fn cleanup_saved_update_backup(path: &Path, description: &str) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            log::error!("清理{description}失败: {error}; path={}", path.display());
+        }
+    }
+}
+
+/// 在更新事务失败时恢复旧包或删除未提交的新文件，并返回恢复异常。
+fn restore_saved_update_file(
+    path: &Path,
+    backup_path: &Path,
+    had_previous_file: bool,
+    description: &str,
+) -> Option<String> {
+    if had_previous_file {
+        fs::copy(backup_path, path)
+            .map(|_| ())
+            .map_err(|error| format!("恢复{description}失败: {error}"))
+            .err()
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(format!("删除新{description}失败: {error}")),
+        }
+    }
+}
+
+/// 先写入同目录临时文件，再替换目标文件，保证更新状态不会留下半写入内容。
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| "更新文件名无效".to_string())?;
     let temporary = path.with_file_name(format!(".{name}.tmp"));
-    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
+    if let Err(error) = fs::write(&temporary, bytes) {
+        if let Err(cleanup_error) = fs::remove_file(&temporary) {
+            log::error!(
+                "清理更新临时文件失败: {cleanup_error}; path={}; 原始写入错误: {error}",
+                temporary.display()
+            );
+        }
+        return Err(error.to_string());
+    }
+
+    let rename_error = match fs::rename(&temporary, path) {
+        Ok(()) => None,
+        Err(error) => {
+            #[cfg(target_os = "windows")]
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                let can_retry = match fs::remove_file(path) {
+                    Ok(()) => true,
+                    Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {
+                        true
+                    }
+                    Err(remove_error) => {
+                        log::error!(
+                            "Windows 更新目标已存在但删除失败: {remove_error}; path={}; 原始替换错误: {error}",
+                            path.display()
+                        );
+                        false
+                    }
+                };
+                if can_retry {
+                    match fs::rename(&temporary, path) {
+                        Ok(()) => return Ok(()),
+                        Err(retry_error) => {
+                            log::error!(
+                                "Windows 更新目标删除后重新替换失败: {retry_error}; path={}; 原始替换错误: {error}",
+                                path.display()
+                            );
+                        }
+                    }
+                }
+            }
+            Some(error)
+        }
+    };
+    if let Some(error) = rename_error {
+        if let Err(cleanup_error) = fs::remove_file(&temporary) {
+            log::error!(
+                "清理更新临时文件失败: {cleanup_error}; path={}; 原始替换错误: {error}",
+                temporary.display()
+            );
+        }
         return Err(error.to_string());
     }
     Ok(())
@@ -924,26 +1244,48 @@ fn version_parts(version: &str) -> Vec<u64> {
         .collect()
 }
 
+/// 启动当前平台的已保存更新安装器；Windows 启动成功后结束旧进程，Linux 交由调用方重启。
 fn install_saved_file(path: &Path, file_name: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        if file_name.ends_with(".exe") {
-            let mut installer = Command::new(path);
-            installer.args(["/P", "/R", "/UPDATE", "/ARGS"]);
-            installer.args(std::env::args_os().skip(1));
-            installer.spawn().map_err(|error| error.to_string())?;
-        } else if file_name.ends_with(".msi") {
-            let mut installer = Command::new("msiexec.exe");
-            installer.args([
-                "/i",
-                path.to_string_lossy().as_ref(),
-                "/passive",
-                "/promptrestart",
-                "AUTOLAUNCHAPP=True",
-            ]);
-            installer.spawn().map_err(|error| error.to_string())?;
+        use std::ffi::OsStr;
+        use windows::{
+            core::PCWSTR,
+            Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOW},
+        };
+
+        let lower_file_name = file_name.to_ascii_lowercase();
+        let (installer_path, parameters) = if lower_file_name.ends_with(".exe") {
+            (
+                encode_wide(path.as_os_str()),
+                build_nsis_install_parameters(std::env::args_os().skip(1)),
+            )
+        } else if lower_file_name.ends_with(".msi") {
+            let package_argument = escape_nsis_current_exe_arg(path.as_os_str());
+            let parameter_text =
+                format!("/i {package_argument} /passive /promptrestart AUTOLAUNCHAPP=True");
+            (
+                encode_wide(OsStr::new("msiexec.exe")),
+                encode_wide(OsStr::new(&parameter_text)),
+            )
         } else {
             return Err("当前 Windows 更新包格式不受支持".to_string());
+        };
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                windows::core::w!("open"),
+                PCWSTR::from_raw(installer_path.as_ptr()),
+                PCWSTR::from_raw(parameters.as_ptr()),
+                PCWSTR::null(),
+                SW_SHOW,
+            )
+        };
+        let error_code = result.0 as usize;
+        if error_code <= 32 {
+            return Err(format!(
+                "启动 Windows 更新安装程序失败，错误码 {error_code}"
+            ));
         }
         std::process::exit(0);
     }
@@ -955,27 +1297,215 @@ fn install_saved_file(path: &Path, file_name: &str) -> Result<(), String> {
 
     #[cfg(target_os = "linux")]
     {
-        if file_name.ends_with(".deb") {
-            Command::new("pkexec")
+        let lower_file_name = file_name.to_ascii_lowercase();
+        if lower_file_name.ends_with(".deb") {
+            let status = Command::new("pkexec")
                 .args(["dpkg", "-i", path.to_string_lossy().as_ref()])
-                .spawn()
+                .status()
                 .map_err(|error| error.to_string())?;
-            std::process::exit(0);
+            if !status.success() {
+                return Err(format!(
+                    "Linux DEB 更新安装失败，退出码 {}",
+                    process_exit_code(&status)
+                ));
+            }
+            return Ok(());
         }
-        if file_name.ends_with(".rpm") {
-            Command::new("pkexec")
+        if lower_file_name.ends_with(".rpm") {
+            let status = Command::new("pkexec")
                 .args(["rpm", "-U", path.to_string_lossy().as_ref()])
-                .spawn()
+                .status()
                 .map_err(|error| error.to_string())?;
-            std::process::exit(0);
+            if !status.success() {
+                return Err(format!(
+                    "Linux RPM 更新安装失败，退出码 {}",
+                    process_exit_code(&status)
+                ));
+            }
+            return Ok(());
         }
-        let current = std::env::current_exe().map_err(|error| error.to_string())?;
-        fs::copy(path, current).map_err(|error| error.to_string())?;
-        std::process::exit(0);
+        if lower_file_name.ends_with(".appimage") {
+            install_linux_appimage(path)?;
+            return Ok(());
+        }
+        return Err("当前 Linux 更新包格式不受支持".to_string());
     }
 
     #[allow(unreachable_code)]
     Err("当前平台不支持持久化更新安装".to_string())
+}
+
+#[cfg(target_os = "linux")]
+/// 将进程退出状态转换为安装失败提示所需的原始退出码。
+fn process_exit_code(status: &std::process::ExitStatus) -> String {
+    status
+        .code()
+        .map_or_else(|| "未知".to_string(), |code| code.to_string())
+}
+
+#[cfg(target_os = "windows")]
+/// 按 NSIS 官方约定转义当前进程参数，避免安装器丢失参数边界。
+fn escape_nsis_current_exe_arg(arg: &std::ffi::OsStr) -> String {
+    let arg = arg.to_string_lossy();
+    let mut command: Vec<char> = Vec::new();
+    let quote = arg
+        .chars()
+        .any(|character| matches!(character, ' ' | '\t' | '/'))
+        || arg.is_empty();
+    let mut backslashes = 0_usize;
+
+    if quote {
+        command.push('"');
+    }
+    for character in arg.chars() {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if character == '"' {
+            let escaped_backslashes = backslashes.saturating_mul(2).saturating_add(1);
+            command.extend((0..escaped_backslashes).map(|_| '\\'));
+        } else {
+            command.extend((0..backslashes).map(|_| '\\'));
+        }
+        backslashes = 0;
+        command.push(character);
+    }
+    if quote {
+        command.extend((0..backslashes.saturating_mul(2)).map(|_| '\\'));
+        command.push('"');
+    } else {
+        command.extend((0..backslashes).map(|_| '\\'));
+    }
+    command.into_iter().collect()
+}
+
+#[cfg(target_os = "windows")]
+/// 构造 NSIS 更新安装器需要的固定参数和当前进程参数宽字符串。
+fn build_nsis_install_parameters<I>(args: I) -> Vec<u16>
+where
+    I: IntoIterator,
+    I::Item: AsRef<std::ffi::OsStr>,
+{
+    let mut parameters = String::from("/P /R /UPDATE /ARGS");
+    for argument in args {
+        parameters.push(' ');
+        parameters.push_str(&escape_nsis_current_exe_arg(argument.as_ref()));
+    }
+    encode_wide(std::ffi::OsStr::new(&parameters))
+}
+
+#[cfg(target_os = "windows")]
+/// 将 Windows 路径或参数编码为 ShellExecuteW 使用的 null 结尾 UTF-16。
+fn encode_wide(value: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(target_os = "linux")]
+/// 从当前运行路径定位并替换 Linux AppImage，避免直接覆盖打开中的可执行文件。
+fn install_linux_appimage(path: &Path) -> Result<(), String> {
+    let current = match std::env::var_os("APPIMAGE") {
+        Some(appimage_value) => {
+            let appimage_path = PathBuf::from(appimage_value);
+            let metadata = fs::metadata(&appimage_path).map_err(|error| {
+                format!(
+                    "读取 APPIMAGE 环境变量路径失败 {}: {error}",
+                    appimage_path.display()
+                )
+            })?;
+            if !metadata.is_file() {
+                return Err(format!(
+                    "APPIMAGE 环境变量路径不是普通文件: {}",
+                    appimage_path.display()
+                ));
+            }
+            appimage_path
+        }
+        None => std::env::current_exe().map_err(|error| error.to_string())?,
+    };
+    replace_linux_appimage(&current, path)
+}
+
+#[cfg(target_os = "linux")]
+/// 原子替换指定 AppImage，写入失败时恢复旧文件并保留原文件权限。
+fn replace_linux_appimage(current: &Path, path: &Path) -> Result<(), String> {
+    let current_parent = current
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .ok_or_else(|| "当前 Linux 可执行文件目录无效".to_string())?;
+    let permissions = fs::metadata(current)
+        .map_err(|error| error.to_string())?
+        .permissions();
+    let unique_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let temporary_directory = current_parent.join(format!(
+        ".auracoder-update-{}-{unique_id}",
+        std::process::id()
+    ));
+    fs::create_dir(&temporary_directory).map_err(|error| error.to_string())?;
+    let backup_path = temporary_directory.join("current-appimage");
+
+    if let Err(error) = fs::rename(current, &backup_path) {
+        let _ = fs::remove_dir_all(&temporary_directory);
+        return Err(error.to_string());
+    }
+
+    let replace_result = fs::copy(path, current)
+        .map(|_| ())
+        .and_then(|_| fs::set_permissions(current, permissions));
+    let Err(write_error) = replace_result else {
+        if let Err(cleanup_error) = fs::remove_dir_all(&temporary_directory) {
+            log::error!(
+                "Linux AppImage 更新已替换成功，但清理旧可执行文件目录失败: {cleanup_error}; directory={}",
+                temporary_directory.display()
+            );
+        }
+        return Ok(());
+    };
+
+    let remove_error = match fs::remove_file(current) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(error),
+    };
+    let restore_result = fs::rename(&backup_path, current);
+    let restore_succeeded = restore_result.is_ok();
+    let restore_error = restore_result.err();
+    let recovery_error = match (remove_error, restore_error) {
+        (None, None) => None,
+        (Some(remove_error), None) => Some(format!("删除不完整目标失败: {remove_error}")),
+        (None, Some(restore_error)) => Some(format!("恢复旧可执行文件失败: {restore_error}")),
+        (Some(remove_error), Some(restore_error)) => Some(format!(
+            "删除不完整目标失败: {remove_error}; 恢复旧可执行文件失败: {restore_error}"
+        )),
+    };
+    let cleanup_error = if restore_succeeded {
+        fs::remove_dir_all(&temporary_directory).err()
+    } else {
+        None
+    };
+    if let Some(cleanup_error) = &cleanup_error {
+        log::error!(
+            "Linux AppImage 更新失败后清理临时目录失败: {cleanup_error}; directory={}",
+            temporary_directory.display()
+        );
+    }
+    match (recovery_error, cleanup_error) {
+        (Some(recovery_error), Some(cleanup_error)) => Err(format!(
+            "替换 Linux AppImage 失败: {write_error}; {recovery_error}; 清理备份目录失败: {cleanup_error}"
+        )),
+        (Some(recovery_error), None) => {
+            Err(format!("替换 Linux AppImage 失败: {write_error}; {recovery_error}"))
+        }
+        (None, Some(cleanup_error)) => Err(format!(
+            "替换 Linux AppImage 失败: {write_error}; 清理备份目录失败: {cleanup_error}"
+        )),
+        (None, None) => Err(write_error.to_string()),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1027,4 +1557,115 @@ fn find_app_dir(root: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn escapes_nsis_current_process_arguments() {
+        let cases = [
+            ("", "\"\""),
+            ("some space", "\"some space\""),
+            ("some\ttab", "\"some\ttab\""),
+            ("slash/value", "\"slash/value\""),
+            ("C:\\work", "C:\\work"),
+            ("quote\"value", "quote\\\"value"),
+            ("path\\with space\\", "\"path\\with space\\\\\""),
+        ];
+
+        for (original, escaped) in cases {
+            assert_eq!(
+                escape_nsis_current_exe_arg(std::ffi::OsStr::new(original)),
+                escaped
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn builds_nsis_shell_execute_parameters() {
+        let arguments = [
+            std::ffi::OsStr::new("--workspace"),
+            std::ffi::OsStr::new("workspace path"),
+        ];
+        let parameters = build_nsis_install_parameters(arguments.iter().copied());
+
+        assert_eq!(parameters.last(), Some(&0));
+        let text = String::from_utf16(&parameters[..parameters.len() - 1]).unwrap();
+        assert_eq!(text, "/P /R /UPDATE /ARGS --workspace \"workspace path\"");
+    }
+
+    #[cfg(target_os = "windows")]
+    /// 验证 Windows 目标文件已存在时第二次原子写入可以完成替换。
+    #[test]
+    fn overwrites_existing_target_on_windows() {
+        let unique_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "auracoder-atomic-write-test-{}-{unique_id}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join("pending-update.exe");
+
+        assert!(atomic_write(&target, b"first update").is_ok());
+        assert!(atomic_write(&target, b"second update").is_ok());
+        assert_eq!(fs::read(&target).unwrap(), b"second update");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    /// 验证 Linux AppImage 成功替换后清理临时备份目录。
+    fn removes_linux_appimage_backup_after_success() {
+        let unique_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "auracoder-update-success-test-{}-{unique_id}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let current = directory.join("current.AppImage");
+        let replacement = directory.join("replacement.AppImage");
+        fs::write(&current, b"old appimage").unwrap();
+        fs::write(&replacement, b"new appimage").unwrap();
+
+        let result = replace_linux_appimage(&current, &replacement);
+
+        assert!(result.is_ok());
+        assert_eq!(fs::read(&current).unwrap(), b"new appimage");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restores_linux_appimage_when_replacement_fails() {
+        let unique_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "auracoder-update-test-{}-{unique_id}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let current = directory.join("current.AppImage");
+        let missing_update = directory.join("missing.AppImage");
+        fs::write(&current, b"old appimage").unwrap();
+
+        let result = replace_linux_appimage(&current, &missing_update);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&current).unwrap(), b"old appimage");
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

@@ -8,6 +8,9 @@ const ipcMocks = vi.hoisted(() => ({
 }));
 
 const relaunchMock = vi.hoisted(() => vi.fn());
+const eventMocks = vi.hoisted(() => ({
+  listen: vi.fn(),
+}));
 const storageMock = vi.hoisted(() => ({
   getItem: vi.fn(),
   setItem: vi.fn(),
@@ -22,28 +25,44 @@ vi.mock("@tauri-apps/plugin-process", () => ({
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async () => vi.fn()),
+  listen: eventMocks.listen,
 }));
 
-import { isUpdateDownloaded, useUpdateStore } from "./updateStore";
+import { disposeUpdateProgressListener, isUpdateDownloaded, useUpdateStore } from "./updateStore";
+import type { UpdateProcessState } from "../types";
 
-const idleState = {
-  phase: "idle" as const,
+const idleState: UpdateProcessState = {
+  phase: "idle",
   version: null,
   source: null,
   downloadedBytes: 0,
   totalBytes: null,
   error: null,
+  errorStage: null,
 };
+
+let progressHandler: ((event: { payload: UpdateProcessState }) => void) | null = null;
 
 describe("updateStore", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    disposeUpdateProgressListener();
+    progressHandler = null;
+    eventMocks.listen.mockImplementation(
+      async (
+        _eventName: string,
+        handler: (event: { payload: UpdateProcessState }) => void,
+      ) => {
+        progressHandler = handler;
+        return vi.fn();
+      },
+    );
     vi.stubGlobal("localStorage", storageMock);
     useUpdateStore.setState({
       status: "idle",
       version: null,
       error: null,
+      errorStage: null,
       lastCheckedAt: null,
       downloadPhase: "idle",
       downloadedBytes: 0,
@@ -65,6 +84,7 @@ describe("updateStore", () => {
       downloadedBytes: 1000,
       totalBytes: 1000,
       error: null,
+      errorStage: null,
     };
     ipcMocks.getUpdateState.mockResolvedValue(downloadedState);
 
@@ -89,6 +109,7 @@ describe("updateStore", () => {
       downloadedBytes: 0,
       totalBytes: 1000,
       error: null,
+      errorStage: null,
     });
     ipcMocks.downloadUpdate.mockResolvedValue({
       phase: "downloaded",
@@ -97,6 +118,7 @@ describe("updateStore", () => {
       downloadedBytes: 1000,
       totalBytes: 1000,
       error: null,
+      errorStage: null,
     });
 
     await useUpdateStore.getState().runAutomaticUpdate();
@@ -114,6 +136,7 @@ describe("updateStore", () => {
       downloadedBytes: 0,
       totalBytes: 1000,
       error: null,
+      errorStage: null,
     };
     const downloadedState = {
       phase: "downloaded" as const,
@@ -122,6 +145,7 @@ describe("updateStore", () => {
       downloadedBytes: 1000,
       totalBytes: 1000,
       error: null,
+      errorStage: null,
     };
     ipcMocks.checkForUpdate
       .mockResolvedValueOnce(availableState)
@@ -157,6 +181,7 @@ describe("updateStore", () => {
       downloadedBytes: 1000,
       totalBytes: 1000,
       error: null,
+      errorStage: null,
     });
     await useUpdateStore.getState().restoreUpdateState();
 
@@ -173,6 +198,7 @@ describe("updateStore", () => {
       status: "downloaded",
       version: "0.67.0",
       error: null,
+      errorStage: null,
       downloadPhase: "idle",
       downloadedBytes: 1000,
       totalBytes: 1000,
@@ -185,6 +211,87 @@ describe("updateStore", () => {
     expect(ipcMocks.installDownloadedUpdate).toHaveBeenCalledOnce();
     expect(relaunchMock).not.toHaveBeenCalled();
     expect(useUpdateStore.getState().status).toBe("ready");
+  });
+
+  it("does not automatically retry after install failure", async () => {
+    useUpdateStore.setState({
+      status: "downloaded",
+      version: "0.67.0",
+      error: null,
+      errorStage: null,
+      downloadPhase: "idle",
+      downloadedBytes: 1000,
+      totalBytes: 1000,
+      downloadSource: "automatic",
+    });
+    ipcMocks.installDownloadedUpdate.mockRejectedValueOnce(new Error("安装程序启动失败"));
+
+    await useUpdateStore.getState().installDownloadedUpdate();
+
+    expect(useUpdateStore.getState()).toMatchObject({
+      status: "error",
+      error: "安装程序启动失败",
+      errorStage: "install",
+    });
+
+    await useUpdateStore.getState().runAutomaticUpdate();
+
+    expect(ipcMocks.getUpdateState).not.toHaveBeenCalled();
+    expect(ipcMocks.checkForUpdate).not.toHaveBeenCalled();
+    expect(ipcMocks.downloadUpdate).not.toHaveBeenCalled();
+  });
+
+  it("keeps downloading status until the downloaded state is returned", async () => {
+    useUpdateStore.setState({
+      status: "available",
+      version: "0.67.0",
+      error: null,
+      errorStage: null,
+      downloadPhase: "idle",
+      downloadedBytes: 0,
+      totalBytes: 1000,
+      downloadSource: "manual",
+    });
+    let resolveDownload!: (state: UpdateProcessState) => void;
+    ipcMocks.downloadUpdate.mockReturnValue(
+      new Promise<UpdateProcessState>((resolve) => {
+        resolveDownload = resolve;
+      }),
+    );
+
+    const downloadTask = useUpdateStore.getState().downloadUpdate("manual");
+    expect(progressHandler).not.toBeNull();
+    progressHandler!({
+      payload: {
+        phase: "downloading",
+        version: "0.67.0",
+        source: "manual",
+        downloadedBytes: 999,
+        totalBytes: 1000,
+        error: null,
+        errorStage: null,
+      },
+    });
+
+    expect(useUpdateStore.getState()).toMatchObject({
+      status: "downloading",
+      downloadedBytes: 999,
+      errorStage: null,
+    });
+    expect(useUpdateStore.getState().status).not.toBe("downloaded");
+
+    resolveDownload({
+      phase: "downloaded",
+      version: "0.67.0",
+      source: "manual",
+      downloadedBytes: 1000,
+      totalBytes: 1000,
+      error: null,
+      errorStage: null,
+    });
+    await downloadTask;
+
+    expect(useUpdateStore.getState().status).toBe("downloaded");
   });
 
   it("persists a zero interval to disable automatic checks", () => {
