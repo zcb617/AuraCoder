@@ -245,5 +245,50 @@ export function query({ prompt, options }) {
     return clone(models);
   };
 
+  // 为上下文用量请求模拟 Claude SDK Query.getContextUsage() 的稳定返回值。
+  iterator.getContextUsage = async () => {
+    if (scenario.contextUsage !== undefined && scenario.contextUsage !== null) {
+      return clone(scenario.contextUsage);
+    }
+
+    let totalTokens = 1;
+    for (const step of scenario.steps ?? []) {
+      const streamEvent = step?.type === "yield" && step.message?.type === "stream_event"
+        ? step.message.event
+        : null;
+      if (streamEvent?.type !== "message_start") {
+        continue;
+      }
+      const rawUsage = streamEvent.message?.usage;
+      const candidateTotalTokens = [
+        rawUsage?.input_tokens,
+        rawUsage?.cache_creation_input_tokens,
+        rawUsage?.cache_read_input_tokens,
+      ].reduce((total, value) => {
+        return typeof value === "number" && Number.isFinite(value)
+          ? total + Math.max(0, value)
+          : total;
+      }, 0);
+      if (candidateTotalTokens > 0) {
+        totalTokens = Math.max(1, Math.round(candidateTotalTokens));
+        break;
+      }
+    }
+
+    const defaultMaxTokens = 200_000;
+    return clone({
+      // 模拟 SDK 返回的当前上下文 token 总量，兼容已有 message_start 场景。
+      totalTokens,
+      // 模拟 SDK 返回的模型原始上下文上限。
+      maxTokens: defaultMaxTokens,
+      // 模拟 SDK 返回的原始模型上限字段。
+      rawMaxTokens: defaultMaxTokens,
+      // 模拟 SDK 返回的当前上下文使用百分比。
+      percentage: Math.max(0, Math.min(100, Math.round((totalTokens / defaultMaxTokens) * 100))),
+      // 模拟 SDK 返回的自动压缩阈值，作为有效显示上限。
+      autoCompactThreshold: defaultMaxTokens,
+    });
+  };
+
   return iterator;
 }

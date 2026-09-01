@@ -1689,6 +1689,9 @@ async function fetchClaudeUsageSnapshot() {
   }
 }
 
+// 迁移停用：上下文快照必须改由 Claude Agent SDK Query.getContextUsage() 提供。
+// 以下旧实现仅保留原文用于迁移追踪，不再执行，也不再根据模型 ID 或 message_start usage 推导窗口。
+/*
 function inferClaudeContextWindowTokens(model) {
   const normalized = String(model || "").toLowerCase();
   const millionTokenMatch = normalized.match(/\[(\d+)m\]/);
@@ -1742,6 +1745,106 @@ function buildContextUsageSnapshot(streamEvent, model) {
     opusWeeklyResetsAt: null,
     sonnetWeeklyResetsAt: null,
   };
+}
+*/
+
+/** 从 Claude SDK 查询读取可靠上下文数据，并生成前端使用的上下文额度快照。 */
+async function readClaudeContextUsageSnapshot(context) {
+  let sdkUsage;
+  try {
+    const query = context?.query;
+    if (!query || typeof query.getContextUsage !== "function") {
+      console.error("Claude SDK context usage is unavailable", {
+        queryPresent: Boolean(query),
+        getContextUsageType: typeof query?.getContextUsage,
+      });
+      return null;
+    }
+    sdkUsage = await query.getContextUsage();
+  } catch (error) {
+    console.error("Claude SDK getContextUsage failed", error);
+    return null;
+  }
+
+  if (!sdkUsage || typeof sdkUsage !== "object" || Array.isArray(sdkUsage)) {
+    console.error("Claude SDK getContextUsage returned an invalid response", {
+      responseType: Array.isArray(sdkUsage) ? "array" : typeof sdkUsage,
+    });
+    return null;
+  }
+
+  // 将 SDK 的正数 token 字段规范化为前端可展示的非负整数。
+  const normalizeTokenCount = (value) => {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+      return null;
+    }
+    return Math.max(0, Math.round(value));
+  };
+  let rawTotalTokens;
+  let rawAutoCompactThreshold;
+  let rawMaxTokens;
+  try {
+    rawTotalTokens = sdkUsage.totalTokens;
+    rawAutoCompactThreshold = sdkUsage.autoCompactThreshold;
+    rawMaxTokens = sdkUsage.maxTokens;
+  } catch (error) {
+    console.error("Claude SDK getContextUsage fields could not be read", error);
+    return null;
+  }
+  const totalTokens = normalizeTokenCount(rawTotalTokens);
+  const autoCompactThreshold = normalizeTokenCount(rawAutoCompactThreshold);
+  const maxTokens = normalizeTokenCount(rawMaxTokens);
+  const maxContextTokens = autoCompactThreshold ?? maxTokens;
+  if (totalTokens === null || maxContextTokens === null) {
+    console.error("Claude SDK getContextUsage returned incomplete fields", {
+      totalTokens: rawTotalTokens,
+      autoCompactThreshold: rawAutoCompactThreshold,
+      maxTokens: rawMaxTokens,
+    });
+    return null;
+  }
+
+  const contextWindowPercent = Math.max(
+    0,
+    Math.min(100, Math.round(((maxContextTokens - totalTokens) / maxContextTokens) * 100)),
+  );
+  return {
+    // SDK 返回的当前上下文 token 总量，供前端显示当前用量。
+    currentTokens: totalTokens,
+    // SDK 有效的自动压缩阈值或原始上限，供前端显示配置后的窗口。
+    maxContextTokens,
+    // 根据当前用量和有效窗口计算的剩余百分比。
+    contextWindowPercent,
+    // 账号五小时额度由独立账号额度路径提供，此处保持空值。
+    fiveHourPercent: null,
+    // 账号周额度由独立账号额度路径提供，此处保持空值。
+    weeklyPercent: null,
+    // Fable 账号周额度由独立账号额度路径提供，此处保持空值。
+    fableWeeklyPercent: null,
+    // Opus 账号周额度由独立账号额度路径提供，此处保持空值。
+    opusWeeklyPercent: null,
+    // Sonnet 账号周额度由独立账号额度路径提供，此处保持空值。
+    sonnetWeeklyPercent: null,
+    // 账号五小时额度重置时间由独立账号额度路径提供，此处保持空值。
+    fiveHourResetsAt: null,
+    // 账号周额度重置时间由独立账号额度路径提供，此处保持空值。
+    weeklyResetsAt: null,
+    // Fable 账号周额度重置时间由独立账号额度路径提供，此处保持空值。
+    fableWeeklyResetsAt: null,
+    // Opus 账号周额度重置时间由独立账号额度路径提供，此处保持空值。
+    opusWeeklyResetsAt: null,
+    // Sonnet 账号周额度重置时间由独立账号额度路径提供，此处保持空值。
+    sonnetWeeklyResetsAt: null,
+  };
+}
+
+/** 保存 SDK 生成的线程上下文快照，供当前查询事件和后续线程请求复用。 */
+function saveClaudeContextUsageSnapshot(context, contextUsage) {
+  context.contextUsage = contextUsage;
+  const contextThreadId = context.threadId || context.sessionId;
+  if (typeof contextThreadId === "string" && contextThreadId.length > 0) {
+    contextUsageByThreadId.set(contextThreadId, contextUsage);
+  }
 }
 
 function buildStatusNotice(message) {
@@ -2235,13 +2338,37 @@ async function handleUsageLimits(req) {
   });
 }
 
-/** 返回当前 sidecar 进程中指定 Claude 线程最近一次可靠的上下文快照。 */
-function handleContextUsage(req) {
+/** 查询指定 Claude 线程的最新 SDK 上下文，并在失败时返回已有可靠快照。 */
+async function handleContextUsage(req) {
   const threadId = typeof req?.params?.threadId === "string" ? req.params.threadId.trim() : "";
-  let usage = threadId ? contextUsageByThreadId.get(threadId) || null : null;
+  let usage = null;
+  const sessionEntry = threadId ? sessionHandles.get(threadId) : null;
+  const candidateContexts = [];
+
+  if (sessionEntry?.context) {
+    candidateContexts.push(sessionEntry.context);
+  }
+  if (threadId) {
+    for (const context of activeQueries.values()) {
+      if (context.threadId === threadId && !candidateContexts.includes(context)) {
+        candidateContexts.push(context);
+      }
+    }
+  }
+
+  for (const context of candidateContexts) {
+    usage = await readClaudeContextUsageSnapshot(context);
+    if (usage) {
+      saveClaudeContextUsageSnapshot(context, usage);
+      break;
+    }
+  }
+
   if (!usage && threadId) {
-    const entry = sessionHandles.get(threadId);
-    usage = entry?.context?.contextUsage || null;
+    usage = contextUsageByThreadId.get(threadId) || null;
+  }
+  if (!usage && sessionEntry?.context) {
+    usage = sessionEntry.context.contextUsage || null;
   }
   if (!usage && threadId) {
     for (const context of activeQueries.values()) {
@@ -2251,6 +2378,7 @@ function handleContextUsage(req) {
       }
     }
   }
+
   emit({
     id: req.id,
     type: "usage_limits_updated",
@@ -3093,18 +3221,16 @@ async function handleQuery(req, persistentSession = null) {
       } else if (message.type === "stream_event") {
         const streamEvent = message.event;
         updateTokenUsageFromStreamEvent(context, streamEvent);
-        const contextUsage = buildContextUsageSnapshot(streamEvent, model);
-        if (contextUsage) {
-          context.contextUsage = contextUsage;
-          const contextThreadId = context.threadId || context.sessionId;
-          if (typeof contextThreadId === "string" && contextThreadId.length > 0) {
-            contextUsageByThreadId.set(contextThreadId, contextUsage);
+        if (streamEvent?.type === "message_start") {
+          const contextUsage = await readClaudeContextUsageSnapshot(context);
+          if (contextUsage) {
+            saveClaudeContextUsageSnapshot(context, contextUsage);
+            emit({
+              id,
+              type: "usage_limits_updated",
+              usage: contextUsage,
+            });
           }
-          emit({
-            id,
-            type: "usage_limits_updated",
-            usage: contextUsage,
-          });
         }
 
         if (streamEvent?.type === "content_block_start") {
@@ -3825,7 +3951,9 @@ rl.on("line", (line) => {
   }
 
   if (req.method === "get_context_usage") {
-    handleContextUsage(req);
+    void handleContextUsage(req).catch((error) => {
+      console.error("Claude context usage request failed", error);
+    });
     return;
   }
 

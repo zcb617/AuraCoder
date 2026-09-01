@@ -2100,6 +2100,18 @@ describe("claude-agent-sdk-server sidecar", () => {
 
   it("surfaces assistant errors, status notices, rate limits, and token usage", async () => {
     const harness = await spawnHarness({
+      contextUsage: {
+        // 模拟 SDK 返回的当前上下文 token 总量。
+        totalTokens: 12_345,
+        // 模拟 SDK 返回的模型原始上下文上限。
+        maxTokens: 200_000,
+        // 模拟 SDK 返回的原始模型上限，验证生产代码不会使用该字段。
+        rawMaxTokens: 1_000_000,
+        // 模拟 SDK 返回的上下文使用百分比，生产代码不据此计算展示值。
+        percentage: 12,
+        // 模拟 SDK 返回的配置后自动压缩阈值，作为有效显示上限。
+        autoCompactThreshold: 100_000,
+      },
       steps: [
         {
           type: "yield",
@@ -2208,7 +2220,7 @@ describe("claude-agent-sdk-server sidecar", () => {
       (event) =>
         event.id === "query-events" &&
         event.type === "usage_limits_updated" &&
-        (event.usage as { currentTokens?: unknown } | undefined)?.currentTokens === 11,
+        (event.usage as { currentTokens?: unknown } | undefined)?.currentTokens === 12_345,
     );
 
     expect(errorEvent).toMatchObject({
@@ -2230,9 +2242,9 @@ describe("claude-agent-sdk-server sidecar", () => {
     });
     expect(contextUsageEvent).toMatchObject({
       usage: {
-        currentTokens: 11,
-        maxContextTokens: 200_000,
-        contextWindowPercent: 100,
+        currentTokens: 12_345,
+        maxContextTokens: 100_000,
+        contextWindowPercent: 88,
       },
     });
     expect(completed).toMatchObject({
@@ -2329,6 +2341,18 @@ describe("claude-agent-sdk-server sidecar", () => {
 
   it("keeps the Fable weekly limit separate and reports Fable context", async () => {
     const harness = await spawnHarness({
+      contextUsage: {
+        // 模拟 SDK 返回的当前上下文 token 总量。
+        totalTokens: 51_200,
+        // 模拟 SDK 返回的模型原始上下文上限。
+        maxTokens: 1_000_000,
+        // 模拟 SDK 返回的原始模型上限。
+        rawMaxTokens: 1_000_000,
+        // 模拟 SDK 返回的上下文使用百分比，生产代码不据此计算展示值。
+        percentage: 5,
+        // 模拟 SDK 返回的配置后自动压缩阈值，作为有效显示上限。
+        autoCompactThreshold: 512_000,
+      },
       steps: [
         {
           type: "yield",
@@ -2412,7 +2436,11 @@ describe("claude-agent-sdk-server sidecar", () => {
           }),
         }),
         expect.objectContaining({
-          usage: expect.objectContaining({ contextWindowPercent: 95 }),
+          usage: expect.objectContaining({
+            currentTokens: 51_200,
+            maxContextTokens: 512_000,
+            contextWindowPercent: 90,
+          }),
         }),
       ]),
     );
