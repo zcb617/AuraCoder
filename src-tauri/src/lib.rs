@@ -13,6 +13,7 @@ mod git;
 #[cfg(any(target_os = "linux", test))]
 mod linux_appimage;
 mod linux_webkit;
+mod logging;
 mod local_cli_service_lifecycle;
 mod locale;
 mod mcp_gateway;
@@ -86,7 +87,14 @@ pub fn initialize_from_cli() -> anyhow::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::init();
+    if let Err(error) = runtime_env::migrate_legacy_app_data_dir() {
+        eprintln!("AuraCoder 启动时迁移旧应用数据目录失败: {error:#}");
+        return;
+    }
+    if let Err(error) = logging::initialize() {
+        eprintln!("AuraCoder 启动时初始化日志失败: {error:#}");
+        return;
+    }
     linux_webkit::apply_webkit_display_workarounds();
     let tauri_context = tauri::generate_context!();
 
