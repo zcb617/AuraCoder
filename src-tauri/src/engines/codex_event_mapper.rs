@@ -44,6 +44,10 @@ impl TurnEventMapper {
         subagent_thread_id: Option<&str>,
     ) -> Vec<EngineEvent> {
         let method_key = method_signature(method);
+        let source_thread_id = params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .or_else(|| params.get("thread_id").and_then(Value::as_str));
 
         match method_key.as_str() {
             "turnstarted" => vec![EngineEvent::TurnStarted {
@@ -55,7 +59,17 @@ impl TurnEventMapper {
                 let token_usage =
                     extract_token_usage(params).or_else(|| self.latest_token_usage.clone());
                 let status = extract_turn_completion_status(params);
-                if let Some(context_update) = extract_context_usage_limits(params) {
+                let context_update = extract_context_usage_limits(params);
+                log::info!(
+                    "Codex realtime context usage event mapped: method={} method_key={} source_thread_id={:?} subagent_thread_id={:?} stage=turn_completed_context_update raw_context_usage={:?} parsed_usage={:?}",
+                    method,
+                    method_key,
+                    source_thread_id,
+                    subagent_thread_id,
+                    raw_context_usage_fields(params),
+                    context_update
+                );
+                if let Some(context_update) = context_update {
                     self.latest_usage_limits.current_tokens = context_update.current_tokens;
                     self.latest_usage_limits.max_context_tokens = context_update.max_context_tokens;
                     self.latest_usage_limits.context_window_percent =
@@ -171,7 +185,17 @@ impl TurnEventMapper {
             "itemmcptoolcallprogress" => self.map_mcp_tool_call_progress(params),
             "threadtokenusageupdated" => {
                 self.latest_token_usage = extract_token_usage(params);
-                if let Some(context_update) = extract_context_usage_limits(params) {
+                let context_update = extract_context_usage_limits(params);
+                log::info!(
+                    "Codex realtime context usage event mapped: method={} method_key={} source_thread_id={:?} subagent_thread_id={:?} stage=thread_token_usage_updated raw_context_usage={:?} parsed_usage={:?}",
+                    method,
+                    method_key,
+                    source_thread_id,
+                    subagent_thread_id,
+                    raw_context_usage_fields(params),
+                    context_update
+                );
+                if let Some(context_update) = context_update {
                     self.latest_usage_limits.current_tokens = context_update.current_tokens;
                     self.latest_usage_limits.max_context_tokens = context_update.max_context_tokens;
                     self.latest_usage_limits.context_window_percent =
@@ -356,7 +380,17 @@ impl TurnEventMapper {
             }
         }
 
-        if let Some(context_update) = extract_context_usage_limits(result) {
+        let context_update = extract_context_usage_limits(result);
+        log::info!(
+            "Codex realtime context usage event mapped: method=turn/result method_key=turnresult source_thread_id={:?} stage=turn_result_context_update raw_context_usage={:?} parsed_usage={:?}",
+            result
+                .get("threadId")
+                .and_then(Value::as_str)
+                .or_else(|| result.get("thread_id").and_then(Value::as_str)),
+            raw_context_usage_fields(result),
+            context_update
+        );
+        if let Some(context_update) = context_update {
             self.latest_usage_limits.current_tokens = context_update.current_tokens;
             self.latest_usage_limits.max_context_tokens = context_update.max_context_tokens;
             self.latest_usage_limits.context_window_percent = context_update.context_window_percent;
@@ -1525,6 +1559,33 @@ pub(crate) fn extract_context_usage_limits(value: &Value) -> Option<UsageLimitsS
         max_context_tokens,
         context_window_percent,
         ..UsageLimitsSnapshot::default()
+    })
+}
+
+/// 提取实时 Codex 用量事件中与线程上下文诊断直接相关的原始字段，避免记录事件正文。
+fn raw_context_usage_fields(value: &Value) -> Value {
+    let token_usage = value
+        .get("tokenUsage")
+        .or_else(|| value.get("turn").and_then(|turn| turn.get("tokenUsage")));
+    let model_context_window = token_usage
+        .and_then(|usage| {
+            usage
+                .get("modelContextWindow")
+                .or_else(|| usage.get("model_context_window"))
+        })
+        .or_else(|| {
+            value
+                .get("modelContextWindow")
+                .or_else(|| value.get("model_context_window"))
+        });
+
+    serde_json::json!({
+        "tokenUsage": token_usage.cloned().unwrap_or(Value::Null),
+        "modelContextWindow": model_context_window
+            .cloned()
+            .unwrap_or(Value::Null),
+        "tokenUsageFieldPresent": token_usage.is_some(),
+        "modelContextWindowFieldPresent": model_context_window.is_some(),
     })
 }
 

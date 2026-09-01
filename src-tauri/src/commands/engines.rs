@@ -586,8 +586,15 @@ pub async fn get_cli_context_usage(
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<Option<CliContextUsageDto>, String> {
+    let raw_thread_id = thread_id.clone();
     let thread_id = thread_id.trim().to_string();
+    log::info!(
+        "CLI context usage controller request started: operation=get_cli_context_usage stage=validate_thread_id raw_thread_id={raw_thread_id:?} thread_id={thread_id:?}"
+    );
     if thread_id.is_empty() {
+        log::error!(
+            "CLI context usage controller request rejected: operation=get_cli_context_usage stage=validate_thread_id raw_thread_id={raw_thread_id:?} thread_id={thread_id:?} error=thread id must not be empty"
+        );
         return Err("thread id must not be empty".to_string());
     }
 
@@ -597,9 +604,27 @@ pub async fn get_cli_context_usage(
         crate::db::threads::get_thread(&db, &lookup_thread_id)
     })
     .await
-    .map_err(err_to_string)?
-    .map_err(err_to_string)?
-    .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+    .map_err(|error| {
+        log::error!(
+            "CLI context usage controller thread query join failed: operation=get_cli_context_usage stage=thread_query_join thread_id={} error={error:?}",
+            thread_id
+        );
+        err_to_string(error)
+    })?
+    .map_err(|error| {
+        log::error!(
+            "CLI context usage controller thread query failed: operation=get_cli_context_usage stage=thread_query thread_id={} error={error:?}",
+            thread_id
+        );
+        err_to_string(error)
+    })?
+    .ok_or_else(|| {
+        log::error!(
+            "CLI context usage controller thread lookup returned no row: operation=get_cli_context_usage stage=thread_query_not_found thread_id={}",
+            thread_id
+        );
+        format!("thread not found: {thread_id}")
+    })?;
 
     let db = state.db.clone();
     let workspace_id = thread.workspace_id.clone();
@@ -608,17 +633,127 @@ pub async fn get_cli_context_usage(
         crate::db::workspaces::find_workspace_by_id(&db, &lookup_workspace_id)
     })
     .await
-    .map_err(err_to_string)?
-    .map_err(err_to_string)?
-    .ok_or_else(|| format!("workspace not found: {workspace_id}"))?;
+    .map_err(|error| {
+        log::error!(
+            "CLI context usage controller workspace query join failed: operation=get_cli_context_usage stage=workspace_query_join thread_id={} workspace_id={} error={error:?}",
+            thread.id,
+            workspace_id
+        );
+        err_to_string(error)
+    })?
+    .map_err(|error| {
+        log::error!(
+            "CLI context usage controller workspace query failed: operation=get_cli_context_usage stage=workspace_query thread_id={} workspace_id={} error={error:?}",
+            thread.id,
+            workspace_id
+        );
+        err_to_string(error)
+    })?
+    .ok_or_else(|| {
+        log::error!(
+            "CLI context usage controller workspace lookup returned no row: operation=get_cli_context_usage stage=workspace_query_not_found thread_id={} workspace_id={}",
+            thread.id,
+            workspace_id
+        );
+        format!("workspace not found: {workspace_id}")
+    })?;
 
-    let cli = CliToolFactory::new(state.inner().clone())
-        .create(&thread.engine_id)
-        .map_err(err_to_string)?;
-    let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
-    cli.get_context_usage(&context, &thread)
-        .await
-        .map_err(err_to_string)
+    log::info!(
+        "CLI context usage controller records resolved: operation=get_cli_context_usage stage=thread_workspace_resolved thread_id={} engine_id={} workspace_id={} engine_thread_id={:?} location_kind={}",
+        thread.id,
+        thread.engine_id,
+        workspace.id,
+        thread.engine_thread_id,
+        workspace.location_kind
+    );
+
+    log::info!(
+        "CLI context usage controller factory create start: operation=get_cli_context_usage stage=factory_create thread_id={} engine_id={}",
+        thread.id,
+        thread.engine_id
+    );
+    let cli = match CliToolFactory::new(state.inner().clone()).create(&thread.engine_id) {
+        Ok(cli) => {
+            log::info!(
+                "CLI context usage controller factory create success: operation=get_cli_context_usage stage=factory_create_success thread_id={} engine_id={}",
+                thread.id,
+                thread.engine_id
+            );
+            cli
+        }
+        Err(error) => {
+            log::error!(
+                "CLI context usage controller factory create failed: operation=get_cli_context_usage stage=factory_create thread_id={} engine_id={} error={error:?}",
+                thread.id,
+                thread.engine_id
+            );
+            return Err(err_to_string(error));
+        }
+    };
+
+    log::info!(
+        "CLI context usage controller execution context start: operation=get_cli_context_usage stage=execution_context thread_id={} engine_id={} workspace_id={} location_kind={}",
+        thread.id,
+        thread.engine_id,
+        workspace.id,
+        workspace.location_kind
+    );
+    let context = match CliExecutionContext::from_workspace(&workspace) {
+        Ok(context) => {
+            log::info!(
+                "CLI context usage controller execution context success: operation=get_cli_context_usage stage=execution_context_success thread_id={} engine_id={} workspace_id={} location_kind={:?} root_path={:?}",
+                thread.id,
+                thread.engine_id,
+                context.workspace_id,
+                context.location_kind,
+                context.root_path
+            );
+            context
+        }
+        Err(error) => {
+            log::error!(
+                "CLI context usage controller execution context failed: operation=get_cli_context_usage stage=execution_context thread_id={} engine_id={} workspace_id={} error={error:?}",
+                thread.id,
+                thread.engine_id,
+                workspace.id
+            );
+            return Err(err_to_string(error));
+        }
+    };
+
+    log::info!(
+        "CLI context usage controller CLI interface call start: operation=get_cli_context_usage stage=cli_interface_call thread_id={} engine_id={} workspace_id={} engine_thread_id={:?} location_kind={:?}",
+        thread.id,
+        thread.engine_id,
+        context.workspace_id,
+        thread.engine_thread_id,
+        context.location_kind
+    );
+    match cli.get_context_usage(&context, &thread).await {
+        Ok(usage) => {
+            log::info!(
+                "CLI context usage controller CLI interface call success: operation=get_cli_context_usage stage=cli_interface_result thread_id={} engine_id={} workspace_id={} engine_thread_id={:?} location_kind={:?} result={usage:?} is_null={}",
+                thread.id,
+                thread.engine_id,
+                context.workspace_id,
+                thread.engine_thread_id,
+                context.location_kind,
+                usage.is_none()
+            );
+            Ok(usage)
+        }
+        Err(error) => {
+            log::error!(
+                "CLI context usage controller CLI interface call failed: operation=get_cli_context_usage stage=cli_interface_call thread_id={} engine_id={} workspace_id={} engine_thread_id={:?} location_kind={:?} error={error:?}",
+                thread.id,
+                thread.engine_id,
+                context.workspace_id,
+                thread.engine_thread_id,
+                context.location_kind
+            );
+            Err(err_to_string(error))
+        }
+    }
 }
 
 #[tauri::command]

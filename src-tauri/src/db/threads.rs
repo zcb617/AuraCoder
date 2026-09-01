@@ -38,7 +38,8 @@ pub fn get_thread(db: &Database, thread_id: &str) -> anyhow::Result<Option<Threa
     let conn = db.connect()?;
     conn.query_row(
         "SELECT id, workspace_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
-            COALESCE(title, ''), status, message_count, total_tokens, created_at, last_activity_at,
+            COALESCE(title, ''), status, message_count, total_tokens, context_current_tokens, context_max_tokens,
+            context_usage_updated_at, created_at, last_activity_at,
             plan_mode, send_method, reasoning_effort, permission_mode
      FROM threads WHERE id = ?1",
         params![thread_id],
@@ -56,7 +57,8 @@ pub fn find_thread_by_engine_thread_id(
     let conn = db.connect()?;
     conn.query_row(
         "SELECT id, workspace_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
-                COALESCE(title, ''), status, message_count, total_tokens, created_at, last_activity_at,
+                COALESCE(title, ''), status, message_count, total_tokens, context_current_tokens, context_max_tokens,
+            context_usage_updated_at, created_at, last_activity_at,
                 plan_mode, send_method, reasoning_effort, permission_mode
          FROM threads
          WHERE engine_id = ?1
@@ -83,7 +85,8 @@ pub fn find_thread_by_workspace_engine_thread_id(
     conn.query_row(
         "SELECT id, workspace_id, engine_id, model_id, engine_thread_id,
                 engine_metadata_json, COALESCE(title, ''), status, message_count,
-                total_tokens, created_at, last_activity_at,
+                total_tokens, context_current_tokens, context_max_tokens,
+            context_usage_updated_at, created_at, last_activity_at,
                 plan_mode, send_method, reasoning_effort, permission_mode
          FROM threads
          WHERE workspace_id = ?1 AND engine_id = ?2 AND engine_thread_id = ?3
@@ -228,7 +231,8 @@ pub fn list_threads_for_workspace(
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
         "SELECT id, workspace_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
-            COALESCE(title, ''), status, message_count, total_tokens, created_at, last_activity_at,
+            COALESCE(title, ''), status, message_count, total_tokens, context_current_tokens, context_max_tokens,
+            context_usage_updated_at, created_at, last_activity_at,
             plan_mode, send_method, reasoning_effort, permission_mode
      FROM threads
      WHERE workspace_id = ?1
@@ -258,7 +262,8 @@ pub fn list_archived_threads_for_workspace(
     let conn = db.connect()?;
     let mut stmt = conn.prepare(
         "SELECT id, workspace_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
-            COALESCE(title, ''), status, message_count, total_tokens, created_at, last_activity_at,
+            COALESCE(title, ''), status, message_count, total_tokens, context_current_tokens, context_max_tokens,
+            context_usage_updated_at, created_at, last_activity_at,
             plan_mode, send_method, reasoning_effort, permission_mode
      FROM threads
      WHERE workspace_id = ?1
@@ -430,7 +435,8 @@ pub fn reconfigure_unstarted_thread_runtime(
         .query_row(
             "SELECT id, workspace_id, engine_id, model_id, engine_thread_id,
                     engine_metadata_json, COALESCE(title, ''), status, message_count,
-                    total_tokens, created_at, last_activity_at,
+                    total_tokens, context_current_tokens, context_max_tokens,
+            context_usage_updated_at, created_at, last_activity_at,
                     plan_mode, send_method, reasoning_effort, permission_mode
              FROM threads
              WHERE id = ?1",
@@ -575,8 +581,11 @@ pub fn update_thread(db: &Database, update: &ThreadUpdateDto) -> anyhow::Result<
                  plan_mode = COALESCE(?14, plan_mode),
                  send_method = COALESCE(?15, send_method),
                  reasoning_effort = COALESCE(?16, reasoning_effort),
-                 permission_mode = COALESCE(?17, permission_mode)
-             WHERE id = ?18",
+                 permission_mode = COALESCE(?17, permission_mode),
+                 context_current_tokens = COALESCE(?18, context_current_tokens),
+                 context_max_tokens = COALESCE(?19, context_max_tokens),
+                 context_usage_updated_at = COALESCE(?20, context_usage_updated_at)
+             WHERE id = ?21",
             params![
                 update.workspace_id,
                 update.engine_id,
@@ -595,6 +604,9 @@ pub fn update_thread(db: &Database, update: &ThreadUpdateDto) -> anyhow::Result<
                 update.send_method,
                 update.reasoning_effort,
                 update.permission_mode,
+                update.context_current_tokens,
+                update.context_max_tokens,
+                update.context_usage_updated_at,
                 update.id,
             ],
         )
@@ -605,6 +617,36 @@ pub fn update_thread(db: &Database, update: &ThreadUpdateDto) -> anyhow::Result<
 
     get_thread(db, &update.id)?
         .ok_or_else(|| anyhow::anyhow!("thread not found after update: {}", update.id))
+}
+
+/// 读取线程持久化的上下文 token 快照，供 CLI 线程上下文展示使用。
+///
+/// 两个 token 字段都为空时返回 None；线程不存在或 token 无法转换为 u64 时返回错误。
+pub fn get_context_usage_snapshot(
+    db: &Database,
+    thread_id: &str,
+) -> anyhow::Result<Option<(Option<u64>, Option<u64>)>> {
+    let conn = db.connect()?;
+    let snapshot: Option<(Option<i64>, Option<i64>)> = conn
+        .query_row(
+            "SELECT context_current_tokens, context_max_tokens
+             FROM threads
+             WHERE id = ?1",
+            params![thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .context("failed to query thread context usage snapshot")?;
+    let Some((current_tokens, max_context_tokens)) = snapshot else {
+        anyhow::bail!("thread not found: {thread_id}");
+    };
+    if current_tokens.is_none() && max_context_tokens.is_none() {
+        return Ok(None);
+    }
+
+    let current_tokens = current_tokens.map(u64::try_from).transpose()?;
+    let max_context_tokens = max_context_tokens.map(u64::try_from).transpose()?;
+    Ok(Some((current_tokens, max_context_tokens)))
 }
 
 /// 持久化会话底部 6 项运行时选择。
@@ -920,16 +962,19 @@ fn map_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadDto> {
         model_id: row.get(3)?,
         engine_thread_id: row.get(4)?,
         engine_metadata: metadata,
-        plan_mode: row.get(12)?,
-        send_method: row.get(13)?,
-        reasoning_effort: row.get(14)?,
-        permission_mode: row.get(15)?,
+        plan_mode: row.get(15)?,
+        send_method: row.get(16)?,
+        reasoning_effort: row.get(17)?,
+        permission_mode: row.get(18)?,
         title: row.get(6)?,
         status: ThreadStatusDto::from_str(&row.get::<_, String>(7)?),
         message_count: row.get(8)?,
         total_tokens: row.get(9)?,
-        created_at: row.get(10)?,
-        last_activity_at: row.get(11)?,
+        context_current_tokens: row.get(10)?,
+        context_max_tokens: row.get(11)?,
+        context_usage_updated_at: row.get(12)?,
+        created_at: row.get(13)?,
+        last_activity_at: row.get(14)?,
     })
 }
 

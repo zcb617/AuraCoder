@@ -4634,6 +4634,113 @@ async fn process_stream_event(
         _ => {}
     }
 
+    // Codex 推送上下文用量事件时，异步保存线程快照；持久化失败不得影响事件广播和后续处理。
+    if thread.engine_id == "codex" {
+        if let EngineEvent::UsageLimitsUpdated { usage } = &normalized_event {
+            let mut conversion_failed = false;
+            let context_current_tokens = match usage.current_tokens {
+                Some(value) => match i64::try_from(value) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        conversion_failed = true;
+                        log::error!(
+                            "Codex thread context usage persistence conversion failed: thread_id={} engine_thread_id={:?} workspace_id={} assistant_message_id={} field=current_tokens value={} error={error:?}",
+                            thread.id,
+                            thread.engine_thread_id,
+                            thread.workspace_id,
+                            assistant_message_id,
+                            value
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            let context_max_tokens = match usage.max_context_tokens {
+                Some(value) => match i64::try_from(value) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        conversion_failed = true;
+                        log::error!(
+                            "Codex thread context usage persistence conversion failed: thread_id={} engine_thread_id={:?} workspace_id={} assistant_message_id={} field=max_context_tokens value={} error={error:?}",
+                            thread.id,
+                            thread.engine_thread_id,
+                            thread.workspace_id,
+                            assistant_message_id,
+                            value
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+
+            if conversion_failed {
+                log::error!(
+                    "Codex thread context usage persistence skipped after conversion failure: thread_id={} engine_thread_id={:?} workspace_id={} assistant_message_id={} usage={usage:?}",
+                    thread.id,
+                    thread.engine_thread_id,
+                    thread.workspace_id,
+                    assistant_message_id
+                );
+            } else if context_current_tokens.is_none() && context_max_tokens.is_none() {
+                log::info!(
+                    "Codex thread context usage persistence skipped: thread_id={} engine_thread_id={:?} workspace_id={} assistant_message_id={} reason=no_context_fields usage={usage:?}",
+                    thread.id,
+                    thread.engine_thread_id,
+                    thread.workspace_id,
+                    assistant_message_id
+                );
+            } else {
+                let context_usage_updated_at = runtime_env::system_time_rfc3339();
+                let update = ThreadUpdateDto {
+                    id: thread.id.clone(),
+                    context_current_tokens,
+                    context_max_tokens,
+                    context_usage_updated_at: Some(context_usage_updated_at.clone()),
+                    ..Default::default()
+                };
+                let thread_id = thread.id.clone();
+                let engine_thread_id = thread.engine_thread_id.clone();
+                let workspace_id = thread.workspace_id.clone();
+                let assistant_message_id = assistant_message_id.to_string();
+                let current_tokens_for_log = update.context_current_tokens;
+                let max_context_tokens_for_log = update.context_max_tokens;
+                match run_db(state.db.clone(), move |db| {
+                    db::threads::update_thread(db, &update)
+                })
+                .await
+                {
+                    Ok(updated_thread) => {
+                        log::info!(
+                            "Codex thread context usage persistence succeeded: thread_id={} updated_thread_id={} engine_thread_id={:?} workspace_id={} assistant_message_id={} current_tokens={:?} max_context_tokens={:?} updated_at={}",
+                            thread_id,
+                            updated_thread.id,
+                            engine_thread_id,
+                            workspace_id,
+                            assistant_message_id,
+                            current_tokens_for_log,
+                            max_context_tokens_for_log,
+                            context_usage_updated_at
+                        );
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "Codex thread context usage persistence failed: thread_id={} engine_thread_id={:?} workspace_id={} assistant_message_id={} current_tokens={:?} max_context_tokens={:?} updated_at={} error={error}",
+                            thread_id,
+                            engine_thread_id,
+                            workspace_id,
+                            assistant_message_id,
+                            current_tokens_for_log,
+                            max_context_tokens_for_log,
+                            context_usage_updated_at
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     let _ = app.emit(stream_event_topic, &normalized_event);
     if let EngineEvent::ApprovalRequested { summary, .. } = &normalized_event {
         let _ = app.emit(approval_event_topic, &normalized_event);

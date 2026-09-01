@@ -2845,24 +2845,35 @@ impl CodexEngine {
             Ok(transport) => transport,
             Err(error) => {
                 log::error!(
-                    "Codex thread context snapshot could not initialize transport: {error:?}"
+                    "Codex thread context snapshot could not initialize transport: stage=transport_init engine_thread_id={} error={error:?}",
+                    engine_thread_id
                 );
                 return Err(error).context("failed to initialize Codex thread context transport");
             }
         };
+        let request_params = serde_json::json!({
+            "threadId": engine_thread_id,
+            "includeTurns": true,
+        });
+        log::info!(
+            "Codex thread context snapshot thread/read request start: stage=thread_read_request engine_thread_id={} methods={:?} includeTurns=true",
+            engine_thread_id,
+            THREAD_READ_METHODS
+        );
         let response = match request_with_fallback(
             transport.as_ref(),
             THREAD_READ_METHODS,
-            serde_json::json!({
-                "threadId": engine_thread_id,
-                "includeTurns": true,
-            }),
+            request_params,
             DEFAULT_TIMEOUT,
         )
         .await
         {
             Ok(response) => response,
             Err(error) => {
+                log::error!(
+                    "Codex thread context snapshot thread/read failed with raw error: stage=thread_read_request engine_thread_id={} error={error:?}",
+                    engine_thread_id
+                );
                 log::warn!(
                     "Codex thread context snapshot thread/read failed for {engine_thread_id}: {error:?}"
                 );
@@ -2870,9 +2881,65 @@ impl CodexEngine {
             }
         };
 
+        let turns = extract_turns_from_thread_read_response(&response);
+        let turns_field_present = response.get("turns").is_some()
+            || response
+                .get("thread")
+                .and_then(|thread| thread.get("turns"))
+                .is_some()
+            || response.get("data").is_some();
+        let raw_turn_context_fields: Vec<serde_json::Value> = turns
+            .iter()
+            .enumerate()
+            .map(|(turn_index, turn)| {
+                let token_usage = turn.get("tokenUsage").or_else(|| {
+                    turn.get("turn")
+                        .and_then(|nested_turn| nested_turn.get("tokenUsage"))
+                });
+                let model_context_window = token_usage
+                    .and_then(|usage| {
+                        usage
+                            .get("modelContextWindow")
+                            .or_else(|| usage.get("model_context_window"))
+                    })
+                    .or_else(|| {
+                        turn.get("modelContextWindow")
+                            .or_else(|| turn.get("model_context_window"))
+                    });
+                serde_json::json!({
+                    "turn_index": turn_index,
+                    "tokenUsage": token_usage.cloned().unwrap_or(serde_json::Value::Null),
+                    "modelContextWindow": model_context_window
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "tokenUsageFieldPresent": token_usage.is_some(),
+                    "modelContextWindowFieldPresent": model_context_window.is_some(),
+                })
+            })
+            .collect();
+        log::info!(
+            "Codex thread context snapshot thread/read raw context fields: stage=thread_read_response engine_thread_id={} turns_field_present={} turns_count={} raw_turn_context_fields={:?}",
+            engine_thread_id,
+            turns_field_present,
+            turns.len(),
+            raw_turn_context_fields
+        );
+
         match extract_latest_thread_context_usage(&response) {
-            Some(snapshot) => Ok(Some(snapshot)),
+            Some(snapshot) => {
+                log::info!(
+                    "Codex thread context snapshot parsed result: stage=context_usage_parse engine_thread_id={} result=Some(current_tokens={}, max_context_tokens={})",
+                    engine_thread_id,
+                    snapshot.0,
+                    snapshot.1
+                );
+                Ok(Some(snapshot))
+            }
             None => {
+                log::info!(
+                    "Codex thread context snapshot parsed result: stage=context_usage_parse engine_thread_id={} result=None no_hit_reason_stage=no_reliable_tokenUsage_or_modelContextWindow",
+                    engine_thread_id
+                );
                 log::warn!(
                     "Codex thread context snapshot has no reliable tokenUsage/modelContextWindow for {engine_thread_id}"
                 );

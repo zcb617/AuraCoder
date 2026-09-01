@@ -415,6 +415,7 @@ pub fn active_thread_for_task(
     conn.query_row(
         "SELECT id, workspace_id, engine_id, model_id, engine_thread_id,
                 engine_metadata_json, title, status, message_count, total_tokens,
+                context_current_tokens, context_max_tokens, context_usage_updated_at,
                 created_at, last_activity_at,
                 plan_mode, send_method, reasoning_effort, permission_mode
          FROM threads
@@ -429,16 +430,19 @@ pub fn active_thread_for_task(
                 model_id: row.get(3)?,
                 engine_thread_id: row.get(4)?,
                 engine_metadata: metadata.and_then(|value| serde_json::from_str(&value).ok()),
-                plan_mode: row.get(12)?,
-                send_method: row.get(13)?,
-                reasoning_effort: row.get(14)?,
-                permission_mode: row.get(15)?,
+                plan_mode: row.get(15)?,
+                send_method: row.get(16)?,
+                reasoning_effort: row.get(17)?,
+                permission_mode: row.get(18)?,
                 title: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 status: ThreadStatusDto::from_str(&row.get::<_, String>(7)?),
                 message_count: row.get(8)?,
                 total_tokens: row.get(9)?,
-                created_at: row.get(10)?,
-                last_activity_at: row.get(11)?,
+                context_current_tokens: row.get(10)?,
+                context_max_tokens: row.get(11)?,
+                context_usage_updated_at: row.get(12)?,
+                created_at: row.get(13)?,
+                last_activity_at: row.get(14)?,
             })
         },
     )

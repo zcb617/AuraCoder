@@ -509,8 +509,31 @@ export const ipc = {
       engineId: engineId ?? null,
     }),
   /** 读取指定线程当前 CLI 的真实上下文窗口快照，和账号额度状态分开维护。 */
-  getCliContextUsage: (threadId: string) =>
-    invoke<CliContextUsage | null>("get_cli_context_usage", { threadId }),
+  getCliContextUsage: async (threadId: string): Promise<CliContextUsage | null> => {
+    console.info("[context-usage] IPC request start", {
+      operation: "get_cli_context_usage",
+      threadId,
+    });
+    try {
+      const contextUsage = await invoke<CliContextUsage | null>(
+        "get_cli_context_usage",
+        { threadId },
+      );
+      console.info("[context-usage] IPC response success", {
+        operation: "get_cli_context_usage",
+        threadId,
+        contextUsage,
+      });
+      return contextUsage;
+    } catch (error) {
+      console.error("[context-usage] IPC response failed", {
+        operation: "get_cli_context_usage",
+        threadId,
+        error,
+      });
+      throw error;
+    }
+  },
   engineHealth: (engineId: string, workspaceId?: string | null) =>
     invoke<EngineHealth>("engine_health", { engineId, workspaceId: workspaceId ?? null }),
   prewarmEngine: (engineId: string, workspaceId?: string | null) =>

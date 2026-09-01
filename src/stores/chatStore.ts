@@ -1975,6 +1975,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     activeThreadBindSeq += 1;
     const bindSeq = activeThreadBindSeq;
+    console.info("[context-usage] thread bind start", {
+      threadId,
+      currentThreadId,
+      bindSeq,
+    });
 
     // Tear down the current listener. If the thread was still streaming,
     // install a lightweight background listener that watches for TurnCompleted
@@ -2009,6 +2014,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     if (!threadId) {
       if (bindSeq !== activeThreadBindSeq) {
+        console.info("[context-usage] stale thread unbind discarded", {
+          phase: "unbind-validation",
+          threadId,
+          currentThreadId,
+          bindSeq,
+          activeBindSeq: activeThreadBindSeq,
+        });
         return;
       }
 
@@ -2030,6 +2042,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
         usageLimitsLoading: false,
         unlisten: undefined,
       });
+      console.info("[context-usage] thread unbind state cleared", {
+        phase: "unbind-cleared",
+        threadId: null,
+        currentThreadId,
+        bindSeq,
+        shouldRefreshContextUsage: false,
+        contextUsage: get().contextUsage,
+        contextUsageLoading: get().contextUsageLoading,
+      });
       return;
     }
 
@@ -2037,8 +2058,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Clean up any background listener for this thread before re-subscribing
       cleanupBackgroundListener(threadId);
       if (bindSeq !== activeThreadBindSeq) {
+        console.info("[context-usage] stale thread bind discarded", {
+          phase: "after-background-listener-cleanup",
+          threadId,
+          currentThreadId,
+          bindSeq,
+          activeBindSeq: activeThreadBindSeq,
+          storeThreadId: get().threadId,
+        });
         return;
       }
+      console.info("[context-usage] thread switch context state clearing", {
+        phase: "switch-clearing",
+        threadId,
+        currentThreadId,
+        bindSeq,
+        calculation: "not_started",
+      });
       set({
         threadId,
         messages: [],
@@ -2083,6 +2119,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const olderCursor = messageWindow.nextCursor;
       messages = applyHydrationWindow(messages);
       if (bindSeq !== activeThreadBindSeq) {
+        console.info("[context-usage] stale thread bind discarded", {
+          phase: "after-message-window-load",
+          threadId,
+          currentThreadId,
+          bindSeq,
+          activeBindSeq: activeThreadBindSeq,
+          storeThreadId: get().threadId,
+        });
         return;
       }
 
@@ -2134,6 +2178,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
         try {
           set((state) => {
             if (bindSeq !== activeThreadBindSeq || state.threadId !== threadId) {
+              console.info("[context-usage] stale realtime batch discarded", {
+                phase: "stream-flush-stale-validation",
+                threadId,
+                bindSeq,
+                activeBindSeq: activeThreadBindSeq,
+                storeThreadId: state.threadId,
+                batchSize: batch.length,
+              });
               return state;
             }
 
@@ -2149,6 +2201,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
             for (const queuedEvent of batch) {
               if (queuedEvent.type === "UsageLimitsUpdated") {
                 const usageUpdate = mapUsageLimitsFromEvent(queuedEvent);
+                console.info("[context-usage] realtime usage event mapped", {
+                  phase: "stream-flush-usage-limits-updated",
+                  source: "normalized_stream_event",
+                  eventType: queuedEvent.type,
+                  threadId,
+                  bindSeq,
+                  rawContextUsage: {
+                    current_tokens: queuedEvent.usage?.current_tokens ?? null,
+                    max_context_tokens: queuedEvent.usage?.max_context_tokens ?? null,
+                    context_window_percent:
+                      queuedEvent.usage?.context_window_percent ?? null,
+                  },
+                  contextUsage: usageUpdate.contextUsage,
+                });
                 nextContextUsage = mergeContextUsage(
                   nextContextUsage,
                   usageUpdate.contextUsage,
@@ -2237,6 +2303,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       const unlistenStream = await listenThreadEvents(threadId, (event) => {
         if (bindSeq !== activeThreadBindSeq) {
+          console.info("[context-usage] stale realtime event discarded", {
+            phase: "stream-event-stale-validation",
+            threadId,
+            bindSeq,
+            activeBindSeq: activeThreadBindSeq,
+            storeThreadId: get().threadId,
+            eventType: event.type,
+          });
           return;
         }
         if (event.type === "TurnStarted") {
@@ -2288,6 +2362,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       };
 
       if (bindSeq !== activeThreadBindSeq) {
+        console.info("[context-usage] stale thread listener discarded", {
+          phase: "after-thread-event-listener",
+          threadId,
+          currentThreadId,
+          bindSeq,
+          activeBindSeq: activeThreadBindSeq,
+          storeThreadId: get().threadId,
+        });
         unlisten();
         return;
       }
@@ -2306,6 +2388,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
           unlisten: currentState.unlisten ?? unlisten,
           error: undefined,
         });
+        console.info("[context-usage] thread bind complete with streaming state preserved", {
+          phase: "bind-complete-streaming-preserved",
+          threadId,
+          currentThreadId,
+          bindSeq,
+          shouldRefreshContextUsage: false,
+          storeThreadId: get().threadId,
+          contextUsage: get().contextUsage,
+          contextUsageLoading: get().contextUsageLoading,
+        });
         return;
       }
 
@@ -2318,6 +2410,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
         messages.some((message) => message.role === "user") &&
         (restoredEngineId === "codex" || restoredEngineId === "claude");
 
+      console.info("[context-usage] thread bind context state cleared", {
+        phase: "bind-context-state-cleared",
+        threadId,
+        currentThreadId,
+        bindSeq,
+        shouldRefreshContextUsage,
+        contextUsage: null,
+        contextUsageLoading: shouldRefreshContextUsage,
+      });
       set({
         threadId,
         messages,
@@ -2339,19 +2440,76 @@ export const useChatStore = create<ChatState>((set, get) => ({
         usageLimits: null,
         usageLimitsLoading: shouldRefreshUsageLimits,
       });
+      console.info("[context-usage] thread bind complete", {
+        phase: "bind-complete",
+        threadId,
+        currentThreadId,
+        bindSeq,
+        shouldRefreshContextUsage,
+        storeThreadId: get().threadId,
+        contextUsage: get().contextUsage,
+        contextUsageLoading: get().contextUsageLoading,
+      });
 
       if (shouldRefreshContextUsage) {
         const refreshRestoredContextUsage = async () => {
+          console.info("[context-usage] historical restore start", {
+            phase: "get_cli_context_usage-start",
+            operation: "get_cli_context_usage",
+            threadId,
+            bindSeq,
+            storeThreadId: get().threadId,
+          });
           try {
             const restoredContextUsage = await ipc.getCliContextUsage(threadId);
+            console.info("[context-usage] historical restore response", {
+              phase: "get_cli_context_usage-response",
+              operation: "get_cli_context_usage",
+              threadId,
+              bindSeq,
+              storeThreadId: get().threadId,
+              restoredContextUsage,
+            });
             if (bindSeq !== activeThreadBindSeq || get().threadId !== threadId) {
+              console.info("[context-usage] stale historical restore response discarded", {
+                phase: "restore-stale-validation",
+                operation: "get_cli_context_usage",
+                threadId,
+                bindSeq,
+                activeBindSeq: activeThreadBindSeq,
+                storeThreadId: get().threadId,
+              });
               return;
             }
+            console.info("[context-usage] historical restore store write start", {
+              phase: "restore-store-write-start",
+              threadId,
+              bindSeq,
+              storeThreadId: get().threadId,
+              restoredContextUsage,
+              contextUsageLoading: get().contextUsageLoading,
+            });
             set((state) => ({
               contextUsage: restoredContextUsage ?? state.contextUsage,
               contextUsageLoading: false,
             }));
+            console.info("[context-usage] historical restore store write complete", {
+              phase: "restore-store-write-complete",
+              threadId,
+              bindSeq,
+              storeThreadId: get().threadId,
+              contextUsage: get().contextUsage,
+              contextUsageLoading: get().contextUsageLoading,
+            });
           } catch (error) {
+            console.error("[context-usage] historical restore failed", {
+              phase: "get_cli_context_usage-error",
+              operation: "get_cli_context_usage",
+              threadId,
+              bindSeq,
+              storeThreadId: get().threadId,
+              error,
+            });
             console.warn(`Failed to restore CLI context usage for thread ${threadId}:`, error);
             if (bindSeq === activeThreadBindSeq && get().threadId === threadId) {
               set({ contextUsageLoading: false });
@@ -2388,7 +2546,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
         void refreshRestoredUsageLimits();
       }
     } catch (error) {
+      console.error("[context-usage] thread bind failed", {
+        phase: "thread-bind-error",
+        threadId,
+        currentThreadId,
+        bindSeq,
+        activeBindSeq: activeThreadBindSeq,
+        storeThreadId: get().threadId,
+        error,
+      });
       if (bindSeq !== activeThreadBindSeq) {
+        console.info("[context-usage] stale thread bind error discarded", {
+          phase: "thread-bind-error-stale-validation",
+          threadId,
+          currentThreadId,
+          bindSeq,
+          activeBindSeq: activeThreadBindSeq,
+          storeThreadId: get().threadId,
+        });
         return;
       }
       set({

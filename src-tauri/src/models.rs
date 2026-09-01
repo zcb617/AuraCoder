@@ -169,6 +169,12 @@ pub struct ThreadDto {
     pub status: ThreadStatusDto,
     pub message_count: i64,
     pub total_tokens: i64,
+    /// 当前线程已经占用的上下文 token 数量快照。
+    pub context_current_tokens: Option<i64>,
+    /// 当前线程允许使用的最大上下文 token 数量快照。
+    pub context_max_tokens: Option<i64>,
+    /// 上下文 token 快照的 RFC3339 更新时间。
+    pub context_usage_updated_at: Option<String>,
     pub created_at: String,
     pub last_activity_at: String,
 }
@@ -213,6 +219,12 @@ pub struct ThreadUpdateDto {
     pub reasoning_effort: Option<String>,
     /// CLI 原始权限 JSON 字符串。
     pub permission_mode: Option<String>,
+    /// 当前线程已经占用的上下文 token 数量快照。
+    pub context_current_tokens: Option<i64>,
+    /// 当前线程允许使用的最大上下文 token 数量快照。
+    pub context_max_tokens: Option<i64>,
+    /// 上下文 token 快照的 RFC3339 更新时间。
+    pub context_usage_updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

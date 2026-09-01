@@ -845,40 +845,94 @@ impl CliTool for CodexCli {
         )))
     }
 
-    /// 用户进入 Codex 线程时，读取该线程的真实上下文 token 快照，不混用账号额度。
+    /// 用户进入 Codex 线程时，读取该线程持久化的上下文 token 快照，不再访问 CLI 会话协议。
     async fn get_context_usage(
         &self,
         context: &CliExecutionContext,
         thread: &ThreadDto,
     ) -> Result<Option<CliContextUsageDto>> {
-        let Some(engine_thread_id) = thread
-            .engine_thread_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            log::warn!(
-                "Codex thread context snapshot skipped: thread {} has no engine thread id",
-                thread.id
-            );
-            return Ok(None);
+        log::info!(
+            "Codex context usage service entered: stage=service_entry thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} root_path={:?} ssh_connection_id={:?}",
+            thread.id,
+            thread.engine_thread_id,
+            context.workspace_id,
+            context.location_kind,
+            context.root_path,
+            context.ssh_connection_id
+        );
+
+        log::info!(
+            "Codex context usage database read start: stage=database_read_start thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} root_path={:?}",
+            thread.id,
+            thread.engine_thread_id,
+            context.workspace_id,
+            context.location_kind,
+            context.root_path
+        );
+        let db = self.state.db.clone();
+        let thread_id = thread.id.clone();
+        let database_task = tokio::task::spawn_blocking(move || {
+            db::threads::get_context_usage_snapshot(&db, &thread_id)
+        });
+        let database_result = match database_task.await {
+            Ok(result) => {
+                log::info!(
+                    "Codex context usage database task joined: stage=database_read_join thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?}",
+                    thread.id,
+                    thread.engine_thread_id,
+                    context.workspace_id,
+                    context.location_kind
+                );
+                result
+            }
+            Err(error) => {
+                log::error!(
+                    "Codex context usage database task join failed: stage=database_read_join thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} error={error:?}",
+                    thread.id,
+                    thread.engine_thread_id,
+                    context.workspace_id,
+                    context.location_kind
+                );
+                return Err(error.into());
+            }
         };
 
-        let workspace = self.load_workspace(context).await?;
-        let snapshot = if context.location_kind == CliLocationKind::Ssh {
-            remote_project_codex_runtime_service::runtime(&workspace)
-                .await?
-                .context_usage_snapshot(engine_thread_id)
-                .await?
-        } else {
-            self.local_engine()
-                .await?
-                .context_usage_snapshot(engine_thread_id)
-                .await?
+        let snapshot = match database_result {
+            Ok(snapshot) => {
+                log::info!(
+                    "Codex context usage database query succeeded: stage=database_query thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} snapshot={snapshot:?} is_none={}",
+                    thread.id,
+                    thread.engine_thread_id,
+                    context.workspace_id,
+                    context.location_kind,
+                    snapshot.is_none()
+                );
+                snapshot
+            }
+            Err(error) => {
+                log::error!(
+                    "Codex context usage database query failed: stage=database_query thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} error={error:?}",
+                    thread.id,
+                    thread.engine_thread_id,
+                    context.workspace_id,
+                    context.location_kind
+                );
+                return Err(error);
+            }
         };
-        Ok(snapshot.and_then(|(current_tokens, max_context_tokens)| {
-            map_context_usage(Some(current_tokens), Some(max_context_tokens))
-        }))
+
+        let mapped = snapshot.and_then(|(current_tokens, max_context_tokens)| {
+            map_context_usage(current_tokens, max_context_tokens)
+        });
+        log::info!(
+            "Codex context usage mapping completed: stage=dto_mapping thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} snapshot={snapshot:?} result={mapped:?} is_none={}",
+            thread.id,
+            thread.engine_thread_id,
+            context.workspace_id,
+            context.location_kind,
+            mapped.is_none()
+        );
+        Ok(mapped)
     }
 
     async fn engine_health(&self, context: &CliExecutionContext) -> Result<EngineHealthDto> {
