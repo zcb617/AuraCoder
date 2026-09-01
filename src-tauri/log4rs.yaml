@@ -2,11 +2,17 @@ appenders:
   stderr:
     kind: console
     target: stderr
+    filters:
+      - kind: threshold
+        level: info
     encoder:
       pattern: "{d(%Y-%m-%d %H:%M:%S%.3f)} [{l}] {t} - {m}{n}"
   file:
     kind: rolling_file
     path: logs/auracoder.log
+    filters:
+      - kind: threshold
+        level: debug
     encoder:
       pattern: "{d(%Y-%m-%d %H:%M:%S%.3f)} [{l}] {t} - {m}{n}"
     policy:
@@ -20,7 +26,7 @@ appenders:
         base: 1
         count: 100
 root:
-  level: info
+  level: debug
   appenders:
     - stderr
     - file
