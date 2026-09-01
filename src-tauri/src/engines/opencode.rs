@@ -1653,9 +1653,24 @@ impl OpenCodeEngine {
             )
             .await
             .context("读取 OpenCode 上下文消息失败")?;
-        let message = page.messages.iter().find(|message| {
-            message.info.role == "assistant" && message.info.tokens.is_some()
-        });
+        let message = page
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                if message.info.role != "assistant" || message.info.tokens.is_none() {
+                    return None;
+                }
+                let timestamp = message
+                    .info
+                    .time
+                    .as_ref()
+                    .and_then(|time| time.completed.or(time.created))
+                    .unwrap_or(0);
+                Some((timestamp, index, message))
+            })
+            .max_by_key(|(timestamp, index, _)| (*timestamp, *index))
+            .map(|(_, _, message)| message);
         let Some(message) = message else {
             log::info!(
                 "OpenCode context usage unavailable: no assistant message with token info; session={engine_thread_id}"
@@ -1685,7 +1700,24 @@ impl OpenCodeEngine {
             .sessions
             .get(engine_thread_id)
             .map(|session| session.model_id.clone());
-        let model_id = message.info.model_id.clone().or(state_model_id);
+        let model_id = match (
+            message
+                .info
+                .provider_id
+                .as_deref()
+                .filter(|provider_id| !provider_id.is_empty()),
+            message
+                .info
+                .model_id
+                .as_deref()
+                .filter(|model_id| !model_id.is_empty()),
+        ) {
+            (Some(provider_id), Some(model_id)) if !model_id.contains('/') => {
+                Some(format!("{provider_id}/{model_id}"))
+            }
+            (_, Some(model_id)) => Some(model_id.to_string()),
+            (_, None) => state_model_id,
+        };
         let Some(model_id) = model_id else {
             log::warn!(
                 "OpenCode context usage unavailable: assistant message has no model ID; session={engine_thread_id}"
@@ -5235,6 +5267,9 @@ mod tests {
 
     use super::*;
     use crate::engines::TurnAttachment;
+
+    #[path = "../../../../tests/unit/opencode_context_usage_tests.rs"]
+    mod opencode_context_usage_tests;
 
     fn test_remote_engine(base_url: String) -> OpenCodeEngine {
         let (event_bus, _) = broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
