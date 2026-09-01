@@ -1555,18 +1555,18 @@ fn build_windows_keep_awake_script(owner_pid: u32, profile: &PowerProfile) -> St
     format!(
         "$marker = '{WINDOWS_KEEP_AWAKE_MARKER}'; \
 $ownerPid = {owner_pid}; \
-$signature = @'\
-using System.Runtime.InteropServices; \
-public static class AuraCoderKeepAwakeNative {{ \
-  [DllImport(\"kernel32.dll\", SetLastError=true)] \
-  public static extern uint SetThreadExecutionState(uint esFlags); \
-}} \
-{screen_saver_type}\
+$signature = @'\n\
+using System.Runtime.InteropServices;\n\
+public static class AuraCoderKeepAwakeNative {{\n\
+  [DllImport(\"kernel32.dll\", SetLastError=true)]\n\
+  public static extern uint SetThreadExecutionState(uint esFlags);\n\
+}}\n\
+{screen_saver_type}\n\
 '@; \
 Add-Type -TypeDefinition $signature; \
-$continuous = 0x80000000; \
-$systemRequired = 0x00000001; \
-$displayRequired = 0x00000002; \
+$continuous = [uint32]2147483648; \
+$systemRequired = [uint32]1; \
+$displayRequired = [uint32]2; \
 {screen_saver_disable}\
 try {{ \
   while (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue) {{ \
