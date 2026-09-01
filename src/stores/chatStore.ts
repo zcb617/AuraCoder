@@ -2751,27 +2751,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     schedulePendingTurnShellMetric(threadId, clientTurnId);
 
     try {
-      // 先持久化本轮底部运行选择，再保存统一权限，最后发送消息。
-      // 旧逻辑还要求 permissionModeJson 存在，现已改为只判断五项运行选择是否完整；旧条件保留如下：
-      // options?.engineId && options?.modelId && options?.sendMethod !== undefined && options?.permissionModeJson !== undefined
-      if (
-        options?.engineId &&
-        options?.modelId &&
-        options?.sendMethod !== undefined
-      ) {
-        await ipc.updateThreadRuntimeSelection(threadId, {
-          engineId: options.engineId,
-          modelId: options.modelId,
-          planMode,
-          sendMethod: options.sendMethod ?? null,
-          reasoningEffort: options.reasoningEffort ?? null,
-          permissionMode: options.permissionModeJson ?? null,
-        });
-        if (options.permissionValues) {
-          await ipc.setThreadPermissions(threadId, options.permissionValues);
-        }
-      }
-
+      // 发送业务将本轮运行选择、权限和消息内容一次交给发送 Controller，后端先保存配置再发送。
       await ipc.sendMessage(
         threadId,
         message,
@@ -2782,13 +2762,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
         planMode,
         clientTurnId,
         options?.referencedAuraCoderThreadId ?? null,
+        options?.engineId ?? null,
+        options?.sendMethod ?? null,
+        options?.permissionModeJson ?? null,
+        options?.permissionValues ?? null,
       );
       set({ preparingEngineId: null, preparingAttachments: false });
 
-      // 旧逻辑在 sendMessage 成功后才保存运行选择，并吞掉保存异常；已停用，保留如下追踪：
-      // if (options?.engineId && options?.modelId && options?.sendMethod !== undefined && options?.permissionModeJson !== undefined) {
-      //   await ipc.updateThreadRuntimeSelection(threadId, runtimeSelection);
-      // }
+      // 旧的独立运行选择和权限保存入口已停用，保留参数变化时的保存入口供 ChatPanel 使用。
       return true;
     } catch (error) {
       pendingTurnMetaByThread.delete(threadId);

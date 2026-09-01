@@ -279,16 +279,7 @@ describe("chatStore send", () => {
     },
   );
 
-  it("persists a complete runtime selection before sending the message", async () => {
-    mockIpc.updateThreadRuntimeSelection.mockResolvedValueOnce(undefined);
-    mockIpc.setThreadPermissions.mockResolvedValueOnce({
-      autonomyPreset: ["automatic"],
-      trust: ["automatic"],
-      approval: ["automatic"],
-      sandbox: ["automatic"],
-      network: ["automatic"],
-      defaultForNewThreads: [],
-    });
+  it("sends one request carrying the complete runtime configuration and permissions", async () => {
     mockIpc.sendMessage.mockResolvedValueOnce("assistant-message-id");
 
     await expect(
@@ -309,20 +300,35 @@ describe("chatStore send", () => {
       }),
     ).resolves.toBe(true);
 
-    expect(mockIpc.updateThreadRuntimeSelection).toHaveBeenCalledTimes(1);
-    expect(mockIpc.setThreadPermissions).toHaveBeenCalledTimes(1);
+    expect(mockIpc.updateThreadRuntimeSelection).not.toHaveBeenCalled();
+    expect(mockIpc.setThreadPermissions).not.toHaveBeenCalled();
     expect(mockIpc.sendMessage).toHaveBeenCalledTimes(1);
-    expect(mockIpc.updateThreadRuntimeSelection.mock.invocationCallOrder[0]).toBeLessThan(
-      mockIpc.setThreadPermissions.mock.invocationCallOrder[0],
-    );
-    expect(mockIpc.setThreadPermissions.mock.invocationCallOrder[0]).toBeLessThan(
-      mockIpc.sendMessage.mock.invocationCallOrder[0],
+    expect(mockIpc.sendMessage).toHaveBeenCalledWith(
+      "thread-1",
+      "hello",
+      "openai/gpt-5",
+      "high",
+      null,
+      null,
+      false,
+      expect.any(String),
+      null,
+      "opencode",
+      "prompt",
+      "allow",
+      {
+        autonomyPreset: ["automatic"],
+        trust: ["automatic"],
+        approval: ["automatic"],
+        sandbox: ["automatic"],
+        network: ["automatic"],
+        defaultForNewThreads: [],
+      },
     );
   });
 
-  it("does not send when permission persistence fails and rolls back the optimistic turn", async () => {
-    mockIpc.updateThreadRuntimeSelection.mockResolvedValueOnce(undefined);
-    mockIpc.setThreadPermissions.mockRejectedValueOnce(new Error("permission failed"));
+  it("does not retain optimistic turn when the combined send request fails", async () => {
+    mockIpc.sendMessage.mockRejectedValueOnce(new Error("send failed"));
 
     await expect(
       useChatStore.getState().send("hello", {
@@ -341,15 +347,15 @@ describe("chatStore send", () => {
       }),
     ).resolves.toBe(false);
 
-    expect(mockIpc.updateThreadRuntimeSelection).toHaveBeenCalledTimes(1);
-    expect(mockIpc.setThreadPermissions).toHaveBeenCalledTimes(1);
-    expect(mockIpc.sendMessage).not.toHaveBeenCalled();
+    expect(mockIpc.updateThreadRuntimeSelection).not.toHaveBeenCalled();
+    expect(mockIpc.setThreadPermissions).not.toHaveBeenCalled();
+    expect(mockIpc.sendMessage).toHaveBeenCalledTimes(1);
     expect(useChatStore.getState().streaming).toBe(false);
     expect(useChatStore.getState().messages).toEqual([]);
   });
 
-  it("does not send when runtime selection persistence fails and rolls back the optimistic turn", async () => {
-    mockIpc.updateThreadRuntimeSelection.mockRejectedValueOnce(new Error("selection failed"));
+  it("does not retain optimistic turn when the combined send request fails without a complete selection", async () => {
+    mockIpc.sendMessage.mockRejectedValueOnce(new Error("send failed"));
 
     await expect(
       useChatStore.getState().send("hello", {
@@ -361,7 +367,9 @@ describe("chatStore send", () => {
       }),
     ).resolves.toBe(false);
 
-    expect(mockIpc.sendMessage).not.toHaveBeenCalled();
+    expect(mockIpc.updateThreadRuntimeSelection).not.toHaveBeenCalled();
+    expect(mockIpc.setThreadPermissions).not.toHaveBeenCalled();
+    expect(mockIpc.sendMessage).toHaveBeenCalledTimes(1);
     expect(useChatStore.getState().streaming).toBe(false);
     expect(useChatStore.getState().messages).toEqual([]);
   });

@@ -27,8 +27,8 @@ use crate::{
     cli_tools::{factory::CliToolFactory, CliTool},
     commands::{
         chat::{
-            cancel_turn_inner, save_pasted_image_attachment, send_message_inner,
-            ChatAttachmentPayload,
+            cancel_turn_inner, save_pasted_image_attachment, ChatAttachmentPayload,
+            ChatMessageService, SendMessageRequest,
         },
         threads::create_thread_with_defaults,
     },
@@ -2217,19 +2217,24 @@ impl RemoteTunnelManager {
                                                                                 .await
                                                                             {
                                                                                 Ok(()) => {
-                                                                                    let send_result = send_message_inner(
+                                                                                    let send_result = ChatMessageService::new(&state).send_message(
                                                                                         app.clone(),
-                                                                                        &state,
-                                                                                        thread_id,
-                                                                                        message,
-                                                                                        model_id,
-                                                                                        reasoning_effort,
-                                                                                        Some(attachments),
-                                                                                        None,
-                                                                                        Some(false),
-                                                                                        Some(request.id.clone()),
-                                                                                        None,
-                                                                                        None,
+                                                                                        SendMessageRequest {
+                                                                                            thread_id,
+                                                                                            message,
+                                                                                            engine_id: None,
+                                                                                            model_id,
+                                                                                            plan_mode: Some(false),
+                                                                                            send_method: None,
+                                                                                            reasoning_effort,
+                                                                                            permission_mode_json: None,
+                                                                                            permission_values: None,
+                                                                                            attachments: Some(attachments),
+                                                                                            input_items: None,
+                                                                                            client_turn_id: Some(request.id.clone()),
+                                                                                            scheduled_run_id: None,
+                                                                                            referenced_thread_id: None,
+                                                                                        },
                                                                                     )
                                                                                     .await;
                                                                                     match send_result {
@@ -2291,19 +2296,24 @@ impl RemoteTunnelManager {
                                                                         Err("message or attachment is required".to_string())
                                                                     } else {
                                                                         // 缺少 batch_id 或 attachment_key 的请求沿用旧 file_path 路径。
-                                                                        send_message_inner(
+                                                                        ChatMessageService::new(&state).send_message(
                                                                             app.clone(),
-                                                                            &state,
-                                                                            thread_id,
-                                                                            message,
-                                                                            model_id,
-                                                                            reasoning_effort,
-                                                                            attachments,
-                                                                            None,
-                                                                            Some(false),
-                                                                            Some(request.id.clone()),
-                                                                            None,
-                                                                            None,
+                                                                            SendMessageRequest {
+                                                                                thread_id,
+                                                                                message,
+                                                                                engine_id: None,
+                                                                                model_id,
+                                                                                plan_mode: Some(false),
+                                                                                send_method: None,
+                                                                                reasoning_effort,
+                                                                                permission_mode_json: None,
+                                                                                permission_values: None,
+                                                                                attachments,
+                                                                                input_items: None,
+                                                                                client_turn_id: Some(request.id.clone()),
+                                                                                scheduled_run_id: None,
+                                                                                referenced_thread_id: None,
+                                                                            },
                                                                         )
                                                                         .await
                                                                         .map(|assistant_message_id| json!({ "assistant_message_id": assistant_message_id }))

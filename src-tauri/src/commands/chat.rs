@@ -48,8 +48,8 @@ use crate::{
     // 旧版 Controller 直接调用本机和 SSH CLI 生命周期的入口已停用，现由 CliTool Service 实现类承接。
     models::{
         ActionOutputDto, EngineInfoDto, EngineModelDto, MessageDto, MessageStatusDto,
-        MessageWindowCursorDto, MessageWindowDto, SearchResultDto, SteerReceiptDto, ThreadDto,
-        ThreadStatusDto, ThreadUpdateDto, TrustLevelDto,
+        MessageWindowCursorDto, MessageWindowDto, PermissionComponentJson, SearchResultDto,
+        SteerReceiptDto, ThreadDto, ThreadStatusDto, ThreadUpdateDto, TrustLevelDto,
     },
     runtime_env,
     ssh::remote_attachments::{self, RemoteAttachmentBatch},
@@ -794,52 +794,86 @@ async fn emit_assistant_message_completed(
     let _ = app.emit("assistant-message-completed", event);
 }
 
+/// 一次发送业务所需的线程配置、权限和消息数据，由 Controller 传给发送 Service。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SendMessageRequest {
+    /// 需要继续对话的 AuraCoder 线程主键。
+    pub thread_id: String,
+    /// 本轮需要交给 CLI 处理的用户消息。
+    pub message: String,
+    /// 本轮选中的 CLI 工具标识；为空时沿用线程当前工具。
+    pub engine_id: Option<String>,
+    /// 本轮选中的模型标识；为空时沿用线程当前模型。
+    pub model_id: Option<String>,
+    /// 本轮是否启用计划模式。
+    pub plan_mode: Option<bool>,
+    /// 本轮消息发送方式，并持久化到线程运行配置。
+    pub send_method: Option<String>,
+    /// 本轮选中的思考强度，并持久化到线程运行配置。
+    pub reasoning_effort: Option<String>,
+    /// 前端传入的 CLI 原始权限 JSON；没有统一权限组件时作为持久化兜底。
+    pub permission_mode_json: Option<String>,
+    /// 前端本轮选中的统一权限组件，发送前由当前 CLI 转换并持久化。
+    pub permission_values: Option<PermissionComponentJson>,
+    /// 本轮需要交给 CLI 的文件附件。
+    pub attachments: Option<Vec<ChatAttachmentPayload>>,
+    /// 本轮需要交给 CLI 的结构化输入项。
+    pub input_items: Option<Vec<ChatInputItemPayload>>,
+    /// 前端为本轮生成的幂等标识。
+    pub client_turn_id: Option<String>,
+    /// 定时任务运行标识；存在时需要绑定助手占位消息。
+    pub scheduled_run_id: Option<String>,
+    /// 本轮临时引用的 AuraCoder 线程主键。
+    pub referenced_thread_id: Option<String>,
+}
+
+/// 消息发送业务 Service，负责持久化线程配置、准备 CLI 会话并提交一轮消息。
+pub(crate) struct ChatMessageService<'a> {
+    /// 当前应用状态，提供数据库、回合登记和 CLI 工厂所需的业务依赖。
+    state: &'a AppState,
+}
+
 #[tauri::command]
 pub async fn send_message(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-    thread_id: String,
-    message: String,
-    model_id: Option<String>,
-    reasoning_effort: Option<String>,
-    attachments: Option<Vec<ChatAttachmentPayload>>,
-    input_items: Option<Vec<ChatInputItemPayload>>,
-    plan_mode: Option<bool>,
-    client_turn_id: Option<String>,
-    referenced_thread_id: Option<String>,
+    request: SendMessageRequest,
 ) -> Result<String, String> {
-    send_message_inner(
-        app,
-        state.inner(),
-        thread_id,
-        message,
-        model_id,
-        reasoning_effort,
-        attachments,
-        input_items,
-        plan_mode,
-        client_turn_id,
-        None,
-        referenced_thread_id,
-    )
-    .await
+    ChatMessageService::new(state.inner())
+        .send_message(app, request)
+        .await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn send_message_inner(
-    app: tauri::AppHandle,
-    state: &AppState,
-    thread_id: String,
-    message: String,
-    model_id: Option<String>,
-    reasoning_effort: Option<String>,
-    attachments: Option<Vec<ChatAttachmentPayload>>,
-    input_items: Option<Vec<ChatInputItemPayload>>,
-    plan_mode: Option<bool>,
-    client_turn_id: Option<String>,
-    scheduled_run_id: Option<String>,
-    referenced_thread_id: Option<String>,
-) -> Result<String, String> {
+impl<'a> ChatMessageService<'a> {
+    /// 创建绑定当前应用状态的消息发送 Service。
+    pub(crate) fn new(state: &'a AppState) -> Self {
+        Self { state }
+    }
+
+    /// 执行一次消息发送：先保存本轮线程配置和权限，再使用本次请求继续当前 CLI 会话。
+    pub(crate) async fn send_message(
+        &self,
+        app: tauri::AppHandle,
+        request: SendMessageRequest,
+    ) -> Result<String, String> {
+        let state = self.state;
+        let SendMessageRequest {
+        thread_id,
+        message,
+        engine_id,
+        model_id,
+        plan_mode,
+        send_method,
+        reasoning_effort,
+        permission_mode_json,
+        permission_values,
+        attachments,
+        input_items,
+        client_turn_id,
+        scheduled_run_id,
+        referenced_thread_id,
+    } = request;
     let already_running = state.turns.get(&thread_id).await.is_some();
     if already_running {
         return Err(
@@ -856,6 +890,44 @@ pub(crate) async fn send_message_inner(
     .await?
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
     migrate_legacy_codex_on_failure_thread_metadata(state, &mut thread).await;
+
+    // 保存前保留原模型，用于后续判断本轮是否发生模型切换；发送始终使用本次请求确定的配置。
+    let original_thread_model_id = thread.model_id.clone();
+    let selected_engine_id = engine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| thread.engine_id.clone());
+    let selected_model_id = model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| thread.model_id.clone());
+    let selected_plan_mode = plan_mode.unwrap_or(false);
+    let selection_send_method = send_method.clone();
+    let selection_reasoning_effort = reasoning_effort.clone();
+    let selection_permission_mode_json = permission_mode_json.clone();
+    thread = run_db(db.clone(), {
+        let thread_id = thread.id.clone();
+        let engine_id = selected_engine_id.clone();
+        let model_id = selected_model_id.clone();
+        move |db| {
+            db::threads::update_thread_runtime_selection(
+                db,
+                &thread_id,
+                &engine_id,
+                &model_id,
+                Some(selected_plan_mode),
+                selection_send_method.as_deref(),
+                selection_reasoning_effort.as_deref(),
+                selection_permission_mode_json.as_deref(),
+            )
+        }
+    })
+    .await?;
+
     let execution_workspace = run_db(db.clone(), {
         let workspace_id = thread.workspace_id.clone();
         move |db| {
@@ -901,7 +973,7 @@ pub(crate) async fn send_message_inner(
     //     plan_mode,
     //     input_items: engine_input_items,
     // };
-    let current_turn_model_id = thread.model_id.clone();
+    let current_turn_model_id = original_thread_model_id.clone();
     let model_switch_requested = requested_model_id
         .map(|value| value != current_turn_model_id.as_str())
         .unwrap_or(false);
@@ -971,6 +1043,51 @@ pub(crate) async fn send_message_inner(
     } else {
         None
     };
+
+    // 发送路径只保存线程权限，不向已经运行的 CLI session 发送权限更新协议。
+    if let Some(values) = permission_values.clone() {
+        thread = if let (Some(codex), Some(context)) =
+            (codex_cli.as_ref(), codex_context.as_ref())
+        {
+            let cli: &dyn CliTool = codex.as_ref();
+            cli.save_permissions_for_send(context, &thread, values)
+                .await
+                .map_err(err_to_string)?
+        } else if let (Some(opencode), Some(context)) =
+            (opencode_cli.as_ref(), opencode_context.as_ref())
+        {
+            let cli: &dyn CliTool = opencode.as_ref();
+            cli.save_permissions_for_send(context, &thread, values)
+                .await
+                .map_err(err_to_string)?
+        } else if let (Some(claude), Some(context)) =
+            (claude_cli.as_ref(), claude_context.as_ref())
+        {
+            let cli: &dyn CliTool = claude.as_ref();
+            cli.save_permissions_for_send(context, &thread, values)
+                .await
+                .map_err(err_to_string)?
+        } else {
+            return Err(format!("当前 CLI {} 不支持发送前权限持久化", thread.engine_id));
+        };
+    } else if let Some(raw_permission_mode) = permission_mode_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        // 没有统一权限组件时，保留调用方传入的原始权限 JSON。
+        let thread_id_for_permission = thread.id.clone();
+        let raw_permission_mode = raw_permission_mode.to_string();
+        thread = run_db(db.clone(), move |db| {
+            db::threads::update_thread_permissions(
+                db,
+                &thread_id_for_permission,
+                Some(&raw_permission_mode),
+            )
+        })
+        .await?;
+    }
+
     let remote_engine_catalog = if execution_workspace.location_kind == "ssh" {
         // 阶段计划 3 在这里拒绝所有本机附件；阶段计划 4 改为模型校验后统一上传。
         // if !attachments.is_empty() {
@@ -1508,7 +1625,8 @@ pub(crate) async fn send_message_inner(
         .await;
     });
 
-    Ok(assistant_message.id)
+        Ok(assistant_message.id)
+    }
 }
 
 #[tauri::command]
@@ -2801,7 +2919,7 @@ async fn run_turn(
     let cancellation_for_engine = engine_cancellation.clone();
     let cli_turn = codex_cli.or(opencode_cli).or(claude_cli);
     let cli_turn_for_engine = cli_turn.clone();
-    let engines_for_engine = engines.clone();
+    // let engines_for_engine = engines.clone();
     let assistant_message_id_for_engine = assistant_message_id.clone();
 
     let mut engine_task = tokio::spawn(async move {
@@ -2859,6 +2977,9 @@ async fn run_turn(
              */
             send_result
         } else {
+            anyhow::bail!("当前 CLI 发送实例未准备完成")
+        }
+        /*else {
             let send_result = engines_for_engine
                 .send_message(
                     &thread_for_engine,
@@ -2868,7 +2989,7 @@ async fn run_turn(
                     cancellation_for_engine,
                 )
                 .await;
-            /*
+
              * 旧 Engine 兼容入口的异常收尾同样移到 run_turn，发送任务只返回 Result。
             if let Err(send_error) = send_result {
                 log::error!(
@@ -2895,9 +3016,9 @@ async fn run_turn(
                 };
             }
             Ok(())
-             */
+
             send_result
-        }
+        }*/
     });
 
     let mut blocks: Vec<ContentBlock> = Vec::new();

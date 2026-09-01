@@ -1035,6 +1035,74 @@ impl CliTool for OpenCodeCli {
         Ok(result)
     }
 
+    /// 发送前只把 OpenCode 权限规则保存到线程，不更新已经运行的 session。
+    async fn save_permissions_for_send(
+        &self,
+        context: &CliExecutionContext,
+        thread: &ThreadDto,
+        values: PermissionComponentJson,
+    ) -> Result<ThreadDto> {
+        self.load_workspace(context).await?;
+        Self::validate_thread(context, thread)?;
+        anyhow::ensure!(
+            thread.workspace_id == context.workspace_id,
+            "当前会话不属于该 workspace"
+        );
+        validate_permission_component(&values)?;
+        let preset = permission_choice(&values, "autonomyPreset")?;
+        let approval = permission_choice(&values, "approval")?;
+        let autonomy_is_empty = values
+            .get("autonomyPreset")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+        anyhow::ensure!(
+            permission_choice(&values, "sandbox")?.map_or(true, |v| v == "automatic"),
+            "OpenCode 不支持 sandbox 覆盖"
+        );
+        anyhow::ensure!(
+            permission_choice(&values, "network")?.map_or(true, |v| v == "automatic"),
+            "OpenCode 不支持 network 覆盖"
+        );
+        let rules = match preset {
+            Some("automatic") => json!([]),
+            None if autonomy_is_empty || approval == Some("automatic") => json!([]),
+            Some("read-only") => json!([{ "permission": "*", "pattern": "*", "action": "deny" }]),
+            Some("ask") => json!([
+                { "permission": "*", "pattern": "*", "action": "ask" },
+                { "permission": "question", "pattern": "*", "action": "allow" }
+            ]),
+            Some("auto") | Some("full") => {
+                json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
+            }
+            _ => match approval {
+                Some("restricted") => {
+                    json!([{ "permission": "*", "pattern": "*", "action": "deny" }])
+                }
+                Some("ask") => json!([
+                    { "permission": "*", "pattern": "*", "action": "ask" },
+                    { "permission": "question", "pattern": "*", "action": "allow" }
+                ]),
+                Some("autonomous") => {
+                    json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
+                }
+                _ => raw_rules_from_thread(thread)?,
+            },
+        };
+        // 只替换 OpenCode 的 permission 字段，保留原始 JSON 中其他顶层扩展字段。
+        let raw = if thread
+            .permission_mode
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .is_some_and(|value| value.is_array())
+        {
+            rules.to_string()
+        } else {
+            raw_permission_value(thread, &rules).to_string()
+        };
+        db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw))
+            .map_err(Into::into)
+    }
+
     async fn set_permissions(
         &self,
         context: &CliExecutionContext,

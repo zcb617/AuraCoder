@@ -423,6 +423,7 @@ impl CodexCli {
         context: &CliExecutionContext,
         thread: &ThreadDto,
         values: PermissionComponentJson,
+        force_persist: bool,
     ) -> Result<PermissionComponentJson> {
         self.load_workspace(context).await?;
         anyhow::ensure!(thread.engine_id == "codex", "当前会话不属于 Codex");
@@ -445,7 +446,9 @@ impl CodexCli {
                     .get("autoApproveMcpElicitations")
                     .and_then(Value::as_bool)
             });
-        if current.get("autonomyPreset") == values.get("autonomyPreset")
+        // 发送路径每次都需要把权限写入 threads 表；参数变化入口仍保留相同权限短路。
+        if !force_persist
+            && current.get("autonomyPreset") == values.get("autonomyPreset")
             && current.get("approval") == values.get("approval")
             && current.get("sandbox") == values.get("sandbox")
             && current.get("network") == values.get("network")
@@ -1205,7 +1208,19 @@ impl CliTool for CodexCli {
         thread: &ThreadDto,
         values: PermissionComponentJson,
     ) -> Result<PermissionComponentJson> {
-        self.save_permissions(context, thread, values).await
+        self.save_permissions(context, thread, values, false).await
+    }
+
+    /// 发送前只保存 Codex 线程权限，不更新已经运行的 CLI session。
+    async fn save_permissions_for_send(
+        &self,
+        context: &CliExecutionContext,
+        thread: &ThreadDto,
+        values: PermissionComponentJson,
+    ) -> Result<ThreadDto> {
+        self.save_permissions(context, thread, values, true).await?;
+        db::threads::get_thread(&self.state.db, &thread.id)?
+            .ok_or_else(|| anyhow::anyhow!("thread not found after Codex permission update: {}", thread.id))
     }
 
     /// 将 Codex 的原始权限字段转换为统一运行时权限结构。

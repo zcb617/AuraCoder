@@ -6,7 +6,10 @@ use tauri::{AppHandle, Emitter};
 use tokio::{sync::Notify, time::sleep};
 
 use crate::{
-    commands::{chat, threads},
+    commands::{
+        chat::{self, ChatMessageService, SendMessageRequest},
+        threads,
+    },
     db,
     models::{ScheduledTaskDto, ScheduledTaskRunDto, ThreadDto},
     state::AppState,
@@ -227,19 +230,24 @@ async fn execute_claimed_task_inner(
         sleep(THREAD_BUSY_RETRY_DELAY).await;
     }
 
-    chat::send_message_inner(
+    ChatMessageService::new(state).send_message(
         app.clone(),
-        state,
-        thread.id.clone(),
-        task.description.clone(),
-        Some(runtime.model_id),
-        runtime.reasoning_effort,
-        None,
-        None,
-        Some(false),
-        Some(format!("scheduled:{}", run.id)),
-        Some(run.id.clone()),
-        None,
+        SendMessageRequest {
+            thread_id: thread.id.clone(),
+            message: task.description.clone(),
+            engine_id: Some(runtime.engine_id),
+            model_id: Some(runtime.model_id),
+            plan_mode: Some(false),
+            send_method: thread.send_method.clone(),
+            reasoning_effort: runtime.reasoning_effort,
+            permission_mode_json: None,
+            permission_values: None,
+            attachments: None,
+            input_items: None,
+            client_turn_id: Some(format!("scheduled:{}", run.id)),
+            scheduled_run_id: Some(run.id.clone()),
+            referenced_thread_id: None,
+        },
     )
     .await?;
     emit_task_updated(app, &task.id);

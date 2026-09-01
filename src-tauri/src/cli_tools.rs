@@ -390,6 +390,16 @@ pub trait CliTool: Send + Sync {
         values: PermissionComponentJson,
     ) -> Result<PermissionComponentJson>;
 
+    /// 发送前只持久化当前线程权限，不更新已经运行的 CLI session。
+    async fn save_permissions_for_send(
+        &self,
+        _context: &CliExecutionContext,
+        _thread: &ThreadDto,
+        _values: PermissionComponentJson,
+    ) -> Result<ThreadDto> {
+        anyhow::bail!("当前 CLI 不支持发送前权限持久化")
+    }
+
     /// 读取当前 CLI 原始权限字段，不读取 engine_metadata_json 权限镜像。
     async fn runtime_permissions(
         &self,

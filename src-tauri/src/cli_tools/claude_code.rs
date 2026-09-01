@@ -1707,6 +1707,72 @@ impl CliTool for ClaudeCodeCli {
         permissions_from_thread(thread)
     }
 
+    /// 发送前只把 Claude 权限转换并保存到线程，不触发活动 session 权限同步。
+    async fn save_permissions_for_send(
+        &self,
+        context: &CliExecutionContext,
+        thread: &ThreadDto,
+        values: PermissionComponentJson,
+    ) -> Result<ThreadDto> {
+        self.load_workspace(context).await?;
+        anyhow::ensure!(thread.engine_id == "claude", "当前会话不属于 Claude Code");
+        anyhow::ensure!(
+            thread.workspace_id == context.workspace_id,
+            "当前会话不属于该 workspace"
+        );
+        validate_permission_component(&values)?;
+        let preset = permission_choice(&values, "autonomyPreset")?;
+        let approval = permission_choice(&values, "approval")?;
+        let sandbox = permission_choice(&values, "sandbox")?;
+        let network = permission_choice(&values, "network")?;
+        let autonomy_is_empty = values
+            .get("autonomyPreset")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+        anyhow::ensure!(
+            sandbox != Some("full-access"),
+            "Claude Code 不支持 full-access sandbox"
+        );
+        let (mode, sandbox_mode, allow_network) = match preset {
+            Some("automatic") => (None, None, None),
+            None if autonomy_is_empty
+                || (approval.is_none() && sandbox.is_none() && network.is_none()) =>
+            {
+                (None, None, None)
+            }
+            Some("read-only") => (Some("dontAsk"), Some("read-only"), Some(false)),
+            Some("ask") => (Some("default"), Some("workspace-write"), Some(false)),
+            Some("auto") => (Some("acceptEdits"), Some("workspace-write"), None),
+            Some("full") => (
+                Some("bypassPermissions"),
+                Some("workspace-write"),
+                Some(true),
+            ),
+            _ => (
+                match approval {
+                    Some("restricted") => Some("dontAsk"),
+                    Some("ask") => Some("default"),
+                    Some("autonomous") => Some("bypassPermissions"),
+                    _ => None,
+                },
+                match sandbox {
+                    Some("read-only") => Some("read-only"),
+                    Some("workspace-write") => Some("workspace-write"),
+                    _ => None,
+                },
+                match network {
+                    Some("enabled") => Some(true),
+                    Some("restricted") => Some(false),
+                    _ => None,
+                },
+            ),
+        };
+        let raw_value = raw_permissions_value(thread, mode, sandbox_mode, allow_network);
+        let raw_string = raw_value.to_string();
+        db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw_string))
+            .map_err(Into::into)
+    }
+
     async fn set_permissions(
         &self,
         context: &CliExecutionContext,
@@ -1724,17 +1790,16 @@ impl CliTool for ClaudeCodeCli {
         if current.get("autonomyPreset") == values.get("autonomyPreset")
             && current.get("approval") == values.get("approval")
             && current.get("sandbox") == values.get("sandbox")
-            && current.get("network") == values.get("network")
-        {
-            let mut result = current;
+            && current.get("network") == values.get("network") {
+
+                let mut result = current;
             if let Some(value) = values.get("trust") {
                 result.insert("trust".to_string(), value.clone());
             }
             if let Some(value) = values.get("defaultForNewThreads") {
                 result.insert("defaultForNewThreads".to_string(), value.clone());
             }
-            self.sync_thread_execution_policy_from_runtime(context, thread)
-                .await?;
+            self.sync_thread_execution_policy_from_runtime(context, thread).await?;
             return Ok(result);
         }
         let preset = permission_choice(&values, "autonomyPreset")?;
@@ -1792,9 +1857,8 @@ impl CliTool for ClaudeCodeCli {
         let original_permission_mode = thread.permission_mode.clone();
         let saved =
             db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw_string))?;
-        if let Err(sync_error) = self
-            .sync_thread_execution_policy_from_runtime(context, &saved)
-            .await
+
+        if let Err(sync_error) = self.sync_thread_execution_policy_from_runtime(context, &saved).await
         {
             if let Err(rollback_error) = db::threads::update_thread_permissions(
                 &self.state.db,
