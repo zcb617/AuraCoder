@@ -7920,6 +7920,9 @@ pub(crate) fn engine_event_kind(event: &EngineEvent) -> &'static str {
 static CODEX_TRANSPORT_LOG_WRITER: OnceLock<mpsc::UnboundedSender<Vec<u8>>> = OnceLock::new();
 
 pub(crate) async fn append_codex_transport_log(record: &serde_json::Value) {
+    log::debug!("Codex transport log: {record}");
+
+    /*
     let mut line = match serde_json::to_vec(record) {
         Ok(line) => line,
         Err(error) => {
@@ -7973,6 +7976,8 @@ pub(crate) async fn append_codex_transport_log(record: &serde_json::Value) {
     //     sender
     // });
     // let _ = sender.send(line);
+    }
+    */
 }
 
 fn transport_failure_message(

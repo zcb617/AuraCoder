@@ -4777,27 +4777,18 @@ async fn process_stream_event(
         }
     }
 
-    if state.config.debug.persist_engine_event_logs {
-        let log_event = engine_event_for_debug_log(&normalized_event);
-        if let Ok(value) = serde_json::to_value(&log_event) {
-            if let Err(error) = run_db(state.db.clone(), {
-                let thread_id = thread.id.clone();
-                let assistant_message_id = assistant_message_id.to_string();
-                let value = value.clone();
-                move |db| {
-                    log::debug!(
-                        "engine event: thread_id={}, message_id={}, event={}",
-                        thread_id,
-                        assistant_message_id,
-                        value
-                    );                    
-                    // db::actions::append_event_log(db, &thread_id, &assistant_message_id, &value)
-                }
-            })
-            .await
-            {
-                log::warn!("failed to append engine event log: {error}");
-            }
+    let log_event = engine_event_for_debug_log(&normalized_event);
+    match serde_json::to_value(&log_event) {
+        Ok(value) => {
+            log::debug!(
+                "engine event: thread_id={}, message_id={}, event={}",
+                thread.id,
+                assistant_message_id,
+                value
+            );
+        }
+        Err(error) => {
+            log::error!("failed to serialize engine event: {error:#}");
         }
     }
 
