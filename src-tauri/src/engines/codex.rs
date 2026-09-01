@@ -1002,8 +1002,18 @@ impl Engine for CodexEngine {
                           }),
                         )
                         .await;
-                      if turn_request_done
-                        && self
+                      // provider 传输错误只能作为异常报告，不能直接结束 AuraCoder 轮次。
+                      send_engine_event_with_diagnostics(
+                        &event_tx,
+                        EngineEvent::Error {
+                          message: error_message.clone(),
+                          recoverable: false,
+                        },
+                        &thread_id,
+                        "turn_transport_failure",
+                      ).await;
+                      if turn_request_done {
+                        let _ = self
                           .try_emit_reconciled_turn_completion(
                             &thread_id,
                             expected_turn_id.as_deref(),
@@ -1011,10 +1021,10 @@ impl Engine for CodexEngine {
                             "stream failure while waiting for turn events",
                             TurnCompletionRecoveryMode::StreamLost,
                           )
-                          .await
-                      {
-                        completion_seen = true;
-                        break;
+                          .await;
+                        // 旧逻辑会把重读 completion 当作 AuraCoder 轮次终止，保留但不执行。
+                        // completion_seen = true;
+                        // break;
                       }
                       return Err(anyhow::anyhow!(error_message));
                     }
@@ -1440,8 +1450,18 @@ impl Engine for CodexEngine {
                           }),
                         )
                         .await;
-                    if turn_request_done
-                        && self
+                    // 事件队列丢失只能作为异常报告，不能直接结束 AuraCoder 轮次。
+                    send_engine_event_with_diagnostics(
+                        &event_tx,
+                        EngineEvent::Error {
+                            message: error_message.clone(),
+                            recoverable: false,
+                        },
+                        &thread_id,
+                        "turn_event_queue_lagged",
+                    ).await;
+                    if turn_request_done {
+                        let _ = self
                             .try_emit_reconciled_turn_completion(
                                 &thread_id,
                                 expected_turn_id.as_deref(),
@@ -1449,10 +1469,10 @@ impl Engine for CodexEngine {
                                 "lagged turn-event subscription",
                                 TurnCompletionRecoveryMode::StreamLost,
                             )
-                            .await
-                    {
-                        completion_seen = true;
-                        break;
+                            .await;
+                        // 旧逻辑会把重读 completion 当作 AuraCoder 轮次终止，保留但不执行。
+                        // completion_seen = true;
+                        // break;
                     }
                     return Err(anyhow::anyhow!(error_message));
                   }
@@ -1463,9 +1483,11 @@ impl Engine for CodexEngine {
                       "consumer": "turn",
                     })).await;
                     self.clear_active_turn(&thread_id).await;
+                    let error_message =
+                        "codex transport closed while waiting for turn events".to_string();
                     self
                       .invalidate_transport_with_details(
-                        "codex transport subscription closed while waiting for turn events",
+                        &error_message,
                         serde_json::json!({
                           "thread_id": thread_id,
                           "turn_id": expected_turn_id.as_deref(),
@@ -1473,8 +1495,18 @@ impl Engine for CodexEngine {
                         }),
                       )
                       .await;
-                    if turn_request_done
-                        && self
+                    // 通道关闭只能作为异常报告，不能直接结束 AuraCoder 轮次。
+                    send_engine_event_with_diagnostics(
+                        &event_tx,
+                        EngineEvent::Error {
+                            message: error_message.clone(),
+                            recoverable: false,
+                        },
+                        &thread_id,
+                        "turn_event_queue_closed",
+                    ).await;
+                    if turn_request_done {
+                        let _ = self
                             .try_emit_reconciled_turn_completion(
                                 &thread_id,
                                 expected_turn_id.as_deref(),
@@ -1482,14 +1514,12 @@ impl Engine for CodexEngine {
                                 "closed turn-event subscription",
                                 TurnCompletionRecoveryMode::StreamLost,
                             )
-                            .await
-                    {
-                        completion_seen = true;
-                        break;
+                            .await;
+                        // 旧逻辑会把重读 completion 当作 AuraCoder 轮次终止，保留但不执行。
+                        // completion_seen = true;
+                        // break;
                     }
-                    return Err(anyhow::anyhow!(
-                      "codex transport closed while waiting for turn events"
-                    ));
+                    return Err(anyhow::anyhow!(error_message));
                   }
                 }
               }
@@ -1499,7 +1529,7 @@ impl Engine for CodexEngine {
                     >= completion_inactivity_timeout.expect("guarded by is_some")
                   {
                     log::warn!(
-                      "codex turn completion inactivity timeout reached for thread {thread_id}; synthesizing completion"
+                      "codex turn completion inactivity timeout reached for thread {thread_id}; reporting timeout anomaly without synthesizing completion"
                     );
                     break;
                   }
@@ -1534,16 +1564,17 @@ impl Engine for CodexEngine {
                     "completion_timeout_error",
                 )
                 .await;
-                send_engine_event_with_diagnostics(
-                    &event_tx,
-                    EngineEvent::TurnCompleted {
-                        token_usage: None,
-                        status: TurnCompletionStatus::Failed,
-                    },
-                    &thread_id,
-                    "completion_timeout_completed",
-                )
-                .await;
+                // 旧逻辑会把超时合成 Failed TurnCompleted，直接结束 AuraCoder 轮次，保留但不执行。
+                // send_engine_event_with_diagnostics(
+                //     &event_tx,
+                //     EngineEvent::TurnCompleted {
+                //         token_usage: None,
+                //         status: TurnCompletionStatus::Failed,
+                //     },
+                //     &thread_id,
+                //     "completion_timeout_completed",
+                // )
+                // .await;
             }
         }
 
@@ -2207,8 +2238,18 @@ impl CodexEngine {
                           }),
                         )
                         .await;
-                      if turn_request_done
-                        && self
+                      // provider 传输错误只能作为异常报告，不能直接结束 AuraCoder 轮次。
+                      send_engine_event_with_diagnostics(
+                        &event_tx,
+                        EngineEvent::Error {
+                          message: error_message.clone(),
+                          recoverable: false,
+                        },
+                        &active_thread_id,
+                        "review_transport_failure",
+                      ).await;
+                      if turn_request_done {
+                        let _ = self
                           .try_emit_reconciled_turn_completion(
                             &active_thread_id,
                             expected_turn_id.as_deref(),
@@ -2216,10 +2257,10 @@ impl CodexEngine {
                             "stream failure while waiting for review events",
                             TurnCompletionRecoveryMode::StreamLost,
                           )
-                          .await
-                      {
-                        completion_seen = true;
-                        break;
+                          .await;
+                        // 旧逻辑会把重读 completion 当作 AuraCoder 轮次终止，保留但不执行。
+                        // completion_seen = true;
+                        // break;
                       }
                       drop(started_tx.take());
                       return Err(anyhow::anyhow!(error_message));
@@ -2457,8 +2498,18 @@ impl CodexEngine {
                           }),
                         )
                         .await;
-                    if turn_request_done
-                        && self
+                    // 事件队列丢失只能作为异常报告，不能直接结束 AuraCoder 轮次。
+                    send_engine_event_with_diagnostics(
+                        &event_tx,
+                        EngineEvent::Error {
+                            message: error_message.clone(),
+                            recoverable: false,
+                        },
+                        &active_thread_id,
+                        "review_event_queue_lagged",
+                    ).await;
+                    if turn_request_done {
+                        let _ = self
                             .try_emit_reconciled_turn_completion(
                                 &active_thread_id,
                                 expected_turn_id.as_deref(),
@@ -2466,10 +2517,10 @@ impl CodexEngine {
                                 "lagged review-event subscription",
                                 TurnCompletionRecoveryMode::StreamLost,
                             )
-                            .await
-                    {
-                        completion_seen = true;
-                        break;
+                            .await;
+                        // 旧逻辑会把重读 completion 当作 AuraCoder 轮次终止，保留但不执行。
+                        // completion_seen = true;
+                        // break;
                     }
                     drop(started_tx.take());
                     return Err(anyhow::anyhow!(error_message));
@@ -2481,9 +2532,11 @@ impl CodexEngine {
                       "consumer": "review",
                     })).await;
                     self.clear_active_turn(&active_thread_id).await;
+                    let error_message =
+                        "codex transport closed while waiting for review events".to_string();
                     self
                       .invalidate_transport_with_details(
-                        "codex transport subscription closed while waiting for review events",
+                        &error_message,
                         serde_json::json!({
                           "thread_id": active_thread_id,
                           "turn_id": expected_turn_id.as_deref(),
@@ -2491,8 +2544,18 @@ impl CodexEngine {
                         }),
                       )
                       .await;
-                    if turn_request_done
-                        && self
+                    // 通道关闭只能作为异常报告，不能直接结束 AuraCoder 轮次。
+                    send_engine_event_with_diagnostics(
+                        &event_tx,
+                        EngineEvent::Error {
+                            message: error_message.clone(),
+                            recoverable: false,
+                        },
+                        &active_thread_id,
+                        "review_event_queue_closed",
+                    ).await;
+                    if turn_request_done {
+                        let _ = self
                             .try_emit_reconciled_turn_completion(
                                 &active_thread_id,
                                 expected_turn_id.as_deref(),
@@ -2500,15 +2563,13 @@ impl CodexEngine {
                                 "closed review-event subscription",
                                 TurnCompletionRecoveryMode::StreamLost,
                             )
-                            .await
-                    {
-                        completion_seen = true;
-                        break;
+                            .await;
+                        // 旧逻辑会把重读 completion 当作 AuraCoder 轮次终止，保留但不执行。
+                        // completion_seen = true;
+                        // break;
                     }
                     drop(started_tx.take());
-                    return Err(anyhow::anyhow!(
-                      "codex transport closed while waiting for review events"
-                    ));
+                    return Err(anyhow::anyhow!(error_message));
                   }
                 }
               }
@@ -2518,7 +2579,7 @@ impl CodexEngine {
                     >= completion_inactivity_timeout.expect("guarded by is_some")
                   {
                     log::warn!(
-                      "codex review completion inactivity timeout reached for thread {active_thread_id}; synthesizing completion"
+                      "codex review completion inactivity timeout reached for thread {active_thread_id}; reporting timeout anomaly without synthesizing completion"
                     );
                     break;
                   }
@@ -2553,16 +2614,17 @@ impl CodexEngine {
                     "review_completion_timeout_error",
                 )
                 .await;
-                send_engine_event_with_diagnostics(
-                    &event_tx,
-                    EngineEvent::TurnCompleted {
-                        token_usage: None,
-                        status: TurnCompletionStatus::Failed,
-                    },
-                    &active_thread_id,
-                    "review_completion_timeout_completed",
-                )
-                .await;
+                // 旧逻辑会把超时合成 Failed TurnCompleted，直接结束 AuraCoder 轮次，保留但不执行。
+                // send_engine_event_with_diagnostics(
+                //     &event_tx,
+                //     EngineEvent::TurnCompleted {
+                //         token_usage: None,
+                //         status: TurnCompletionStatus::Failed,
+                //     },
+                //     &active_thread_id,
+                //     "review_completion_timeout_completed",
+                // )
+                // .await;
             }
         }
 

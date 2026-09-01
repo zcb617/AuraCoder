@@ -155,6 +155,7 @@ function isThreadTurnActive(status: ThreadStatus): boolean {
   return status === "streaming" || status === "awaiting_approval";
 }
 
+/** 根据后端事件更新线程运行态；仅消费后端最终完成或用户主动终止结果。 */
 function applyRuntimeStateFromEvent(
   status: ThreadStatus,
   streaming: boolean,
@@ -172,19 +173,32 @@ function applyRuntimeStateFromEvent(
     return { status: "streaming", streaming: true };
   }
 
-  if (event.type === "Error" && !event.recoverable) {
-    return { status: "error", streaming: false };
+  // 旧逻辑会把不可恢复错误直接升级为终态，现保留迁移留痕但不再执行：
+  // if (event.type === "Error" && !event.recoverable) {
+  //   return { status: "error", streaming: false };
+  // }
+  if (event.type === "Error") {
+    return { status, streaming };
   }
 
   if (event.type === "TurnCompleted") {
-    const completionStatus = String(event.status ?? "completed");
-    if (completionStatus === "failed") {
-      return { status: "error", streaming: false };
-    }
+    // 旧逻辑会把缺失 status 也转换为 completed，现保留迁移留痕但不再执行：
+    // const completionStatus = String(event.status ?? "completed");
+    const completionStatus = event.status;
+    // 缺失 status、failed 或未知状态只是过程观察，必须等待后端发送合法终态。
+    // 旧逻辑会把 failed 观察升级为 error，现保留迁移留痕但不再执行：
+    // if (completionStatus === "failed") {
+    //   return { status: "error", streaming: false };
+    // }
     if (completionStatus === "interrupted") {
       return { status: "idle", streaming: false };
     }
-    return { status: "completed", streaming: false };
+    if (completionStatus === "completed") {
+      return { status: "completed", streaming: false };
+    }
+    // 旧逻辑会把未知状态也当作 completed，现保留迁移留痕但不再执行：
+    // return { status: "completed", streaming: false };
+    return { status, streaming };
   }
 
   if (event.type === "TurnStarted") {
@@ -1522,6 +1536,21 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
     return resolveApprovalInMessages(messages, String(event.approval_id ?? ""));
   }
 
+  // Error 事件只作为过程观察，不写入用户消息，也不改变本轮终态。
+  if (event.type === "Error") {
+    return messages;
+  }
+
+  // 缺失 status、failed 或未知的 TurnCompleted 只是过程观察，等待后端发送合法终态。
+  if (event.type === "TurnCompleted") {
+    // 旧逻辑会把缺失 status 也转换为 completed，现保留迁移留痕但不再执行：
+    // const completionStatus = String(event.status ?? "completed");
+    const completionStatus = event.status;
+    if (completionStatus !== "completed" && completionStatus !== "interrupted") {
+      return messages;
+    }
+  }
+
   const assistantTarget = resolveAssistantTargetFromEvent(threadId, event);
   const { messages: ensuredMessages, assistantIndex } = ensureAssistantMessage(
     messages,
@@ -1860,24 +1889,29 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
     });
   }
 
-  if (event.type === "Error") {
-    const blocks = assistant.blocks ?? [];
-    const errorBlocks: ContentBlock[] = [
-      ...blocks,
-      { type: "error", message: String(event.message ?? "Unknown error") },
-    ];
-    assistant.blocks = event.recoverable
-      ? errorBlocks
-      : settlePendingSteerBlocks(errorBlocks);
-    if (!event.recoverable) {
-      assistant.status = "error";
-    }
-  }
+  // 旧逻辑会把原始 Error message 写入消息并设置 error，现保留迁移留痕但不再执行：
+  // if (event.type === "Error") {
+  //   const blocks = assistant.blocks ?? [];
+  //   const errorBlocks: ContentBlock[] = [
+  //     ...blocks,
+  //     { type: "error", message: String(event.message ?? "Unknown error") },
+  //   ];
+  //   assistant.blocks = event.recoverable
+  //     ? errorBlocks
+  //     : settlePendingSteerBlocks(errorBlocks);
+  //   if (!event.recoverable) {
+  //     assistant.status = "error";
+  //   }
+  // }
 
   if (event.type === "TurnCompleted") {
-    const status = String(event.status ?? "completed");
+    // 上方已拦截缺失、failed 和未知状态；这里只处理明确的后端终态。
+    // 旧逻辑会把缺失 status 默认成 completed，现保留迁移留痕但不再执行：
+    // const status = String(event.status ?? "completed");
+    const status = event.status;
     if (status === "failed") {
-      assistant.status = "error";
+      // 旧逻辑会把外部 failed 观察设置为 error；非法状态已在上方直接返回。
+      // assistant.status = "error";
     } else if (status === "interrupted") {
       assistant.status = "interrupted";
     } else {
@@ -2241,9 +2275,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
               );
               nextStatus = nextRuntimeState.status;
               nextStreaming = nextRuntimeState.streaming;
+              const queuedEventStatus =
+                queuedEvent.type === "TurnCompleted"
+                  ? queuedEvent.status
+                  : null;
+              // 旧逻辑会把缺失 status 也转换为 completed，现保留迁移留痕但不再执行：
+              // ? String(queuedEvent.status ?? "completed")
               if (
-                queuedEvent.type === "TurnCompleted" ||
-                (queuedEvent.type === "Error" && !queuedEvent.recoverable)
+                queuedEvent.type === "TurnCompleted" &&
+                (queuedEventStatus === "completed" || queuedEventStatus === "interrupted")
+                // 旧逻辑会在不可恢复 Error 时清理本轮元数据，现保留迁移留痕但不再执行：
+                // || (queuedEvent.type === "Error" && !queuedEvent.recoverable)
               ) {
                 pendingTurnMetaByThread.delete(threadId);
                 nextTurnStartedAt = null;
@@ -2840,6 +2882,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return false;
     }
   },
+  // 业务说明：把用户主动终止请求交给后端，等待其最终 TurnCompleted(interrupted) 结果。
   cancel: async () => {
     const threadId = get().threadId;
     if (!threadId) {
@@ -2848,33 +2891,35 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     try {
       await ipc.cancelTurn(threadId);
-      pendingTurnMetaByThread.delete(threadId);
-      const currentState = get();
-      if (currentState.threadId !== threadId || !currentState.streaming) {
-        return;
-      }
+      // 旧逻辑会在 IPC 成功后本地伪造 interrupted 并清理消息，现保留迁移留痕但不再执行：
+      // pendingTurnMetaByThread.delete(threadId);
+      // const currentState = get();
+      // if (currentState.threadId !== threadId || !currentState.streaming) {
+      //   return;
+      // }
       // Remove the trailing assistant message if it has no meaningful content
       // (e.g. only thinking blocks with no text, or completely empty)
-      const messages = updateSteerBlockDelivery(
-        currentState.messages,
-        null,
-        "settled",
-      );
-      const interruptedMessages = applyStreamEvent(
-        messages,
-        { type: "TurnCompleted", status: "interrupted" },
-        threadId,
-      );
-      const last = interruptedMessages[interruptedMessages.length - 1];
-      const lastHasContent = last?.role === "assistant" && (last.blocks ?? []).some((b) => {
-        if (b.type === "text") return Boolean(b.content?.trim());
-        if (b.type === "action" || b.type === "diff" || b.type === "code" || b.type === "approval" || b.type === "steer") return true;
-        return false;
-      });
-      const nextMessages = last?.role === "assistant" && !lastHasContent
-        ? interruptedMessages.slice(0, -1)
-        : interruptedMessages;
-      set({ status: "idle", streaming: false, turnStartedAt: null, messages: nextMessages });
+      // const messages = updateSteerBlockDelivery(
+      //   currentState.messages,
+      //   null,
+      //   "settled",
+      // );
+      // const interruptedMessages = applyStreamEvent(
+      //   messages,
+      //   { type: "TurnCompleted", status: "interrupted" },
+      //   threadId,
+      // );
+      // const last = interruptedMessages[interruptedMessages.length - 1];
+      // const lastHasContent = last?.role === "assistant" && (last.blocks ?? []).some((b) => {
+      //   if (b.type === "text") return Boolean(b.content?.trim());
+      //   if (b.type === "action" || b.type === "diff" || b.type === "code" || b.type === "approval" || b.type === "steer") return true;
+      //   return false;
+      // });
+      // const nextMessages = last?.role === "assistant" && !lastHasContent
+      //   ? interruptedMessages.slice(0, -1)
+      //   : interruptedMessages;
+      // set({ status: "idle", streaming: false, turnStartedAt: null, messages: nextMessages });
+      return;
     } catch (error) {
       set({ error: String(error) });
     }

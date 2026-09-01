@@ -1024,6 +1024,9 @@ impl Engine for OpenCodeEngine {
                                 );
                                 return Ok(());
                             }
+                            log::error!(
+                                "OpenCode /message request failed before turn completion: {error:#}"
+                            );
                             event_tx
                                 .send(EngineEvent::Error {
                                     message: format!("failed to send OpenCode prompt: {error:#}"),
@@ -1031,29 +1034,88 @@ impl Engine for OpenCodeEngine {
                                 })
                                 .await
                                 .ok();
-                            emit_turn_completed(
-                                &mut mapper,
-                                &event_tx,
-                                TurnCompletionStatus::Failed,
-                            )
-                            .await;
+                            // provider 异常只作为 EngineEvent::Error 上报；AuraCoder 轮次是否终止由上层业务判断。
+                            // emit_turn_completed(
+                            //     &mut mapper,
+                            //     &event_tx,
+                            //     TurnCompletionStatus::Failed,
+                            // )
+                            // .await;
                             return Err(error);
                         }
                     }
                 }
                 incoming = timeout(SSE_IDLE_TIMEOUT, incoming_rx.recv()) => {
-                    let event = match incoming.context("timed out waiting for OpenCode events")? {
+                    let incoming = match incoming {
+                        Ok(incoming) => incoming,
+                        Err(error) => {
+                            let error = anyhow::anyhow!(
+                                "timed out waiting for OpenCode events: {error}"
+                            );
+                            log::error!(
+                                "OpenCode event wait failed: engine_thread_id={}, error={error:#}",
+                                engine_thread_id
+                            );
+                            event_tx
+                                .send(EngineEvent::Error {
+                                    message: error.to_string(),
+                                    recoverable: false,
+                                })
+                                .await
+                                .ok();
+                            return Err(error);
+                        }
+                    };
+                    let event = match incoming {
                         Some(OpenCodeIncomingEvent::Message(event)) => event,
                         Some(OpenCodeIncomingEvent::Failure(message)) => {
-                            anyhow::bail!("OpenCode 事件监听失败：{message}");
+                            let error = anyhow::anyhow!("OpenCode 事件监听失败：{message}");
+                            log::error!(
+                                "OpenCode event listener failed: engine_thread_id={}, error={error:#}",
+                                engine_thread_id
+                            );
+                            event_tx
+                                .send(EngineEvent::Error {
+                                    message: error.to_string(),
+                                    recoverable: false,
+                                })
+                                .await
+                                .ok();
+                            return Err(error);
                         }
                         Some(OpenCodeIncomingEvent::Lagged(skipped)) => {
-                            anyhow::bail!(
+                            let error = anyhow::anyhow!(
                                 "OpenCode 事件监听丢失了 {skipped} 条本轮事件"
                             );
+                            log::error!(
+                                "OpenCode event listener lagged: engine_thread_id={}, error={error:#}",
+                                engine_thread_id
+                            );
+                            event_tx
+                                .send(EngineEvent::Error {
+                                    message: error.to_string(),
+                                    recoverable: false,
+                                })
+                                .await
+                                .ok();
+                            return Err(error);
                         }
                         None | Some(OpenCodeIncomingEvent::Closed) => {
-                            anyhow::bail!("OpenCode event bus closed before the turn completed");
+                            let error = anyhow::anyhow!(
+                                "OpenCode event bus closed before the turn completed"
+                            );
+                            log::error!(
+                                "OpenCode event bus closed: engine_thread_id={}, error={error:#}",
+                                engine_thread_id
+                            );
+                            event_tx
+                                .send(EngineEvent::Error {
+                                    message: error.to_string(),
+                                    recoverable: false,
+                                })
+                                .await
+                                .ok();
+                            return Err(error);
                         }
                     };
                     let matched = event_matches_session(event.as_ref(), engine_thread_id);
@@ -1076,7 +1138,19 @@ impl Engine for OpenCodeEngine {
                         )
                         .await;
                     } else if last_relevant_event_at.elapsed() > SSE_IDLE_TIMEOUT {
-                        anyhow::bail!("timed out waiting for OpenCode turn events");
+                        let error = anyhow::anyhow!("timed out waiting for OpenCode turn events");
+                        log::error!(
+                            "OpenCode turn event wait timed out: engine_thread_id={}, error={error:#}",
+                            engine_thread_id
+                        );
+                        event_tx
+                            .send(EngineEvent::Error {
+                                message: error.to_string(),
+                                recoverable: false,
+                            })
+                            .await
+                            .ok();
+                        return Err(error);
                     }
                     if mapper.completed {
                         match timeout(OPENCODE_COMMAND_TIMEOUT, &mut prompt_request).await {
@@ -2343,6 +2417,11 @@ impl OpenCodeEngine {
                 mapper.failed = true;
                 mapper.content_seen = true;
                 let message = session_error_message(&event.properties);
+                log::error!(
+                    "OpenCode session.error observed: engine_thread_id={}, raw_event={:?}",
+                    engine_thread_id,
+                    event.properties
+                );
                 event_tx
                     .send(EngineEvent::Error {
                         message,
@@ -2350,7 +2429,8 @@ impl OpenCodeEngine {
                     })
                     .await
                     .ok();
-                emit_turn_completed(mapper, event_tx, TurnCompletionStatus::Failed).await;
+                // provider 异常只作为 EngineEvent::Error 上报；AuraCoder 轮次是否终止由上层业务判断。
+                // emit_turn_completed(mapper, event_tx, TurnCompletionStatus::Failed).await;
             }
             "session.diff" => {
                 if let Some(diff) = format_session_diff(&event.properties) {
@@ -2390,20 +2470,26 @@ impl OpenCodeEngine {
         mapper: &mut OpenCodeTurnMapper,
         event_tx: &mpsc::Sender<EngineEvent>,
     ) {
+        if mapper.failed {
+            return;
+        }
         if mapper.content_seen {
             emit_turn_completed(mapper, event_tx, TurnCompletionStatus::Completed).await;
             return;
         }
 
+        mapper.failed = true;
+        let message = "OpenCode became idle without producing a response for this prompt.";
+        log::error!("OpenCode idle completion observation failed: {message}");
         event_tx
             .send(EngineEvent::Error {
-                message: "OpenCode became idle without producing a response for this prompt."
-                    .to_string(),
+                message: message.to_string(),
                 recoverable: false,
             })
             .await
             .ok();
-        emit_turn_completed(mapper, event_tx, TurnCompletionStatus::Failed).await;
+        // 无响应只能作为 EngineEvent::Error 上报，不能生成失败 TurnCompleted 结束 AuraCoder 轮次。
+        // emit_turn_completed(mapper, event_tx, TurnCompletionStatus::Failed).await;
     }
 
     async fn handle_part_updated(
@@ -7056,7 +7142,7 @@ opencode/gpt-5-nano
     }
 
     #[tokio::test]
-    async fn idle_without_current_prompt_response_fails_turn() {
+    async fn idle_without_current_prompt_response_reports_error_without_completion() {
         let engine = OpenCodeEngine::default();
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let mut mapper = OpenCodeTurnMapper::new("msg_current_user".to_string());
@@ -7074,12 +7160,7 @@ opencode/gpt-5-nano
             }
             other => panic!("expected error event, got {other:?}"),
         }
-        match event_rx.try_recv().expect("expected failed completion") {
-            EngineEvent::TurnCompleted { status, .. } => {
-                assert_eq!(status, TurnCompletionStatus::Failed);
-            }
-            other => panic!("expected failed completion, got {other:?}"),
-        }
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]

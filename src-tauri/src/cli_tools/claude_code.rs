@@ -2114,6 +2114,9 @@ impl CliTool for ClaudeCodeCli {
                 };
                 */
 
+                /*
+                // 旧实现由 send_message 监听取消令牌并主动中断 SSH 复用会话。
+                // 取消动作现统一由上层 run_turn 的用户停止路径执行，避免第二个取消执行者。
                 let session_handles = self.session_handles.clone();
                 let cancel_thread_id = thread.id.clone();
                 let cancel_token = cancellation.clone();
@@ -2126,10 +2129,14 @@ impl CliTool for ClaudeCodeCli {
                         );
                     }
                 });
+                */
                 let result = engine
                     .relay_persistent_turn(engine_thread_id, &handle_id, persistent_turn, event_tx)
                     .await;
+                /*
+                // 旧实现的自动取消任务在 relay 完成后主动终止，现保留为迁移留痕。
                 cancel_task.abort();
+                */
                 /*
                 // 原有 relay 成功与失败都进入五分钟空闲倒计时的逻辑保留为迁移留痕：
                 let idle_result = self.session_handles.mark_turn_completed(&thread.id).await;
