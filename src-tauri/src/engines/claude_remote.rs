@@ -708,6 +708,63 @@ impl ClaudeRemoteEngine {
         self.ensure_transport().await.map(|_| ())
     }
 
+    /// 查询远端 Claude 当前线程最近一次可靠的上下文快照，复用既有事件连接和请求编号。
+    pub async fn context_usage_snapshot(
+        &self,
+        engine_thread_id: &str,
+    ) -> anyhow::Result<super::UsageLimitsSnapshot> {
+        let transport = self.ensure_transport().await?;
+        let request_id = Uuid::new_v4().to_string();
+        let mut events = transport.subscribe();
+        transport
+            .send_command(&serde_json::json!({
+                "id": request_id,
+                "method": "get_context_usage",
+                "params": { "threadId": engine_thread_id },
+            }))
+            .await
+            .context("发送 SSH 远端 Claude 上下文快照命令失败")?;
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            loop {
+                match events.recv().await {
+                    Ok(RemoteClaudeEvent::UsageLimitsUpdated { id, usage })
+                        if id.as_deref() == Some(request_id.as_str()) =>
+                    {
+                        return Ok(super::UsageLimitsSnapshot {
+                            current_tokens: usage.current_tokens,
+                            max_context_tokens: usage.max_context_tokens,
+                            context_window_percent: usage.context_window_percent,
+                            five_hour_percent: None,
+                            weekly_percent: None,
+                            fable_weekly_percent: None,
+                            opus_weekly_percent: None,
+                            sonnet_weekly_percent: None,
+                            five_hour_resets_at: None,
+                            weekly_resets_at: None,
+                            fable_weekly_resets_at: None,
+                            opus_weekly_resets_at: None,
+                            sonnet_weekly_resets_at: None,
+                        });
+                    }
+                    Ok(RemoteClaudeEvent::Error { id, message, .. })
+                        if id.as_deref() == Some(request_id.as_str()) =>
+                    {
+                        anyhow::bail!("SSH 远端 Claude 上下文快照命令失败: {message}");
+                    }
+                    Ok(RemoteClaudeEvent::TransportClosed) => {
+                        anyhow::bail!("SSH 远端 Claude 上下文事件连接已关闭");
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        anyhow::bail!("SSH 远端 Claude 上下文快照期间事件连接已关闭");
+                    }
+                }
+            }
+        })
+        .await
+        .context("读取 SSH 远端 Claude 上下文快照超时")?
+    }
+
     /// 通过远端 Claude 按会话 ID读取单个会话摘要。
     ///
     /// 该方法只负责 Claude 协议请求；远端服务入口由上层

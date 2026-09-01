@@ -722,7 +722,7 @@
     "minutesShort": "{{count}} 分钟",
     "hoursMinutesShort": "{{hours}} 小时 {{minutes}} 分钟",
     "daysHoursShort": "{{days}} 天 {{hours}} 小时",
-    "context": "剩余上下文",
+    "context": "线程上下文",
     "windowFiveHoursLeft": "剩余 5 小时",
     "windowWeeklyLeft": "本周剩余",
     "windowFableWeeklyLeft": "Fable 本周剩余",
@@ -733,7 +733,7 @@
     "usageLoading": "正在加载用量限制…",
     "usageUnavailable": "无法从服务器获取用量限制",
     "openUsageLimits": "打开用量限制",
-    "contextRingTitle": "剩余上下文：{{percent}}。打开用量限制。"
+    "contextRingTitle": "当前线程上下文：{{usage}}"
   },
   "slashCommands": {
     "groups": {

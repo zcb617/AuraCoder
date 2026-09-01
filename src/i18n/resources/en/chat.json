@@ -722,7 +722,7 @@
     "minutesShort": "{{count}} min",
     "hoursMinutesShort": "{{hours}} h {{minutes}} min",
     "daysHoursShort": "{{days}} d {{hours}} h",
-    "context": "Context left",
+    "context": "Thread context",
     "windowFiveHoursLeft": "5h left",
     "windowWeeklyLeft": "Weekly left",
     "windowFableWeeklyLeft": "Fable weekly left",
@@ -733,7 +733,7 @@
     "usageLoading": "Loading usage limits...",
     "usageUnavailable": "Usage limits unavailable from server",
     "openUsageLimits": "Open usage limits",
-    "contextRingTitle": "Context left: {{percent}}. Open usage limits."
+    "contextRingTitle": "Current thread context: {{usage}}"
   },
   "slashCommands": {
     "groups": {

@@ -12,8 +12,10 @@ use crate::{
     cli_tools::{factory::CliToolFactory, CliExecutionContext, CliLocationKind, CliTool},
     engines::{capabilities_for_engine, map_engine_capabilities},
     models::{
-        ChatProviderUsageDto, CodexAppDto, CodexPluginDto, CodexSkillDto, EngineCheckResultDto,
-        EngineHealthDto, EngineInfoDto, ExecutionTargetDto, OpenCodeRuntimeCatalogDto,
+        ChatProviderUsageDto, CliContextUsageDto, CodexAppDto, CodexPluginDto, CodexSkillDto,
+        EngineCheckResultDto, EngineHealthDto, EngineInfoDto, ExecutionTargetDto,
+        OpenCodeRuntimeCatalogDto,
+        // ThreadDto,
     },
     process_utils,
     state::AppState,
@@ -573,6 +575,50 @@ pub async fn get_chat_provider_usage(
         }
     }
     Ok(usage)
+}
+
+/// 查询指定 AuraCoder 线程所属 CLI 的真实上下文窗口快照。
+///
+/// 业务调用只按线程保存的 engine_id 选择统一 CLI 接口，并通过 workspace
+/// 上下文校验执行位置；具体协议和本机/SSH 生命周期由 CLI 实现负责。
+#[tauri::command]
+pub async fn get_cli_context_usage(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<Option<CliContextUsageDto>, String> {
+    let thread_id = thread_id.trim().to_string();
+    if thread_id.is_empty() {
+        return Err("thread id must not be empty".to_string());
+    }
+
+    let db = state.db.clone();
+    let lookup_thread_id = thread_id.clone();
+    let thread = tokio::task::spawn_blocking(move || {
+        crate::db::threads::get_thread(&db, &lookup_thread_id)
+    })
+    .await
+    .map_err(err_to_string)?
+    .map_err(err_to_string)?
+    .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+    let db = state.db.clone();
+    let workspace_id = thread.workspace_id.clone();
+    let lookup_workspace_id = workspace_id.clone();
+    let workspace = tokio::task::spawn_blocking(move || {
+        crate::db::workspaces::find_workspace_by_id(&db, &lookup_workspace_id)
+    })
+    .await
+    .map_err(err_to_string)?
+    .map_err(err_to_string)?
+    .ok_or_else(|| format!("workspace not found: {workspace_id}"))?;
+
+    let cli = CliToolFactory::new(state.inner().clone())
+        .create(&thread.engine_id)
+        .map_err(err_to_string)?;
+    let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
+    cli.get_context_usage(&context, &thread)
+        .await
+        .map_err(err_to_string)
 }
 
 #[tauri::command]

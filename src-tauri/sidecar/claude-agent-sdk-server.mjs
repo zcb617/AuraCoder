@@ -124,6 +124,8 @@ try {
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const activeQueries = new Map();
 const sessionHandles = new Map();
+// 按 Claude 线程标识保存最近一次已确认的上下文快照，供重新进入线程时恢复。
+const contextUsageByThreadId = new Map();
 const pendingApprovals = new Map();
 let shuttingDown = false;
 const claudeCodeExecutable = process.env.PANES_CLAUDE_CODE_EXECUTABLE?.trim() || null;
@@ -705,6 +707,8 @@ function createQueryContext(id, approvalPolicy = null, planMode = false) {
     // 已收到对应 synthetic continuation result 的数量。
     backgroundContinuationResultCount: 0,
     sessionId: null,
+    // 当前线程最近一次由 Claude message_start 确认的上下文窗口快照。
+    contextUsage: null,
     tokenUsage: null,
     stopReason: null,
     pendingComputerControlCalls: new Map(),
@@ -1724,8 +1728,8 @@ function buildContextUsageSnapshot(streamEvent, model) {
   );
 
   return {
-    currentTokens: null,
-    maxContextTokens: null,
+    currentTokens,
+    maxContextTokens,
     contextWindowPercent: remainingPercent,
     fiveHourPercent: null,
     weeklyPercent: null,
@@ -2228,6 +2232,43 @@ async function handleUsageLimits(req) {
     type: "error",
     message: "Claude usage limits are unavailable for the current account.",
     recoverable: true,
+  });
+}
+
+/** 返回当前 sidecar 进程中指定 Claude 线程最近一次可靠的上下文快照。 */
+function handleContextUsage(req) {
+  const threadId = typeof req?.params?.threadId === "string" ? req.params.threadId.trim() : "";
+  let usage = threadId ? contextUsageByThreadId.get(threadId) || null : null;
+  if (!usage && threadId) {
+    const entry = sessionHandles.get(threadId);
+    usage = entry?.context?.contextUsage || null;
+  }
+  if (!usage && threadId) {
+    for (const context of activeQueries.values()) {
+      if (context.threadId === threadId) {
+        usage = context.contextUsage || null;
+        break;
+      }
+    }
+  }
+  emit({
+    id: req.id,
+    type: "usage_limits_updated",
+    usage: usage || {
+      currentTokens: null,
+      maxContextTokens: null,
+      contextWindowPercent: null,
+      fiveHourPercent: null,
+      weeklyPercent: null,
+      fableWeeklyPercent: null,
+      opusWeeklyPercent: null,
+      sonnetWeeklyPercent: null,
+      fiveHourResetsAt: null,
+      weeklyResetsAt: null,
+      fableWeeklyResetsAt: null,
+      opusWeeklyResetsAt: null,
+      sonnetWeeklyResetsAt: null,
+    },
   });
 }
 
@@ -3054,6 +3095,11 @@ async function handleQuery(req, persistentSession = null) {
         updateTokenUsageFromStreamEvent(context, streamEvent);
         const contextUsage = buildContextUsageSnapshot(streamEvent, model);
         if (contextUsage) {
+          context.contextUsage = contextUsage;
+          const contextThreadId = context.threadId || context.sessionId;
+          if (typeof contextThreadId === "string" && contextThreadId.length > 0) {
+            contextUsageByThreadId.set(contextThreadId, contextUsage);
+          }
           emit({
             id,
             type: "usage_limits_updated",
@@ -3775,6 +3821,11 @@ rl.on("line", (line) => {
 
   if (req.method === "get_usage_limits") {
     void handleUsageLimits(req);
+    return;
+  }
+
+  if (req.method === "get_context_usage") {
+    handleContextUsage(req);
     return;
   }
 

@@ -12,7 +12,7 @@ use super::{
     },
     BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
     CliReviewStarted, CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError,
-    CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult,
+    CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult, map_context_usage,
 };
 use crate::{
     config::app_config::ClaudeCodeSessionMode,
@@ -37,8 +37,8 @@ use crate::{
     extensions,
     local_cli_service_lifecycle::{LocalCliHandle, LocalCliServiceLifecycle},
     models::{
-        CachedExtensionCatalogDto, ChatProviderUsageDto, CodexAppDto, CodexPluginDto,
-        CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
+        CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
+        CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionCatalogRefreshErrorDto, ExtensionItemDto,
         OpenCodeRuntimeCatalogDto, PermissionComponentJson, ThreadDto, ThreadStatusDto,
         WorkspaceDto,
@@ -1350,6 +1350,29 @@ impl CliTool for ClaudeCodeCli {
             "Claude",
             engine.usage_limits_snapshot().await,
         )))
+    }
+
+    /// 用户进入 Claude 线程时，读取当前本机或远端 Claude 会话的真实上下文快照。
+    async fn get_context_usage(
+        &self,
+        context: &CliExecutionContext,
+        thread: &ThreadDto,
+    ) -> Result<Option<CliContextUsageDto>> {
+        let workspace = self.load_workspace(context).await?;
+        let snapshot = if context.location_kind == CliLocationKind::Ssh {
+            remote_project_claude_runtime_service::runtime(&workspace)
+                .await?
+                .context_usage_snapshot(thread.engine_thread_id.as_deref().unwrap_or(&thread.id))
+                .await?
+        } else {
+            self.local_engine().await?.context_usage_snapshot(
+                thread.engine_thread_id.as_deref().unwrap_or(&thread.id),
+            ).await?
+        };
+        Ok(map_context_usage(
+            snapshot.current_tokens,
+            snapshot.max_context_tokens,
+        ))
     }
 
     async fn engine_health(&self, context: &CliExecutionContext) -> Result<EngineHealthDto> {

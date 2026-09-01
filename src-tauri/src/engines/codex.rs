@@ -38,7 +38,7 @@ use crate::models::{
 use crate::{process_utils, runtime_env};
 
 use super::{
-    codex_event_mapper::TurnEventMapper,
+    codex_event_mapper::{extract_context_usage_limits, TurnEventMapper},
     codex_protocol::{raw_value_to_value, IncomingMessage, RpcError},
     codex_transport::{CodexTransport, CodexTransportMessage},
     ApprovalRequestRoute, CodexRemoteThreadSummary, Engine, EngineEvent, EngineSteerReceipt,
@@ -2828,6 +2828,57 @@ impl CodexEngine {
                 .list_thread_import_messages(transport.as_ref(), engine_thread_id)
                 .await?,
         })
+    }
+
+    /// 读取 Codex 当前线程最新可靠的 tokenUsage 与 modelContextWindow 快照。
+    pub async fn context_usage_snapshot(
+        &self,
+        engine_thread_id: &str,
+    ) -> anyhow::Result<Option<(u64, u64)>> {
+        let engine_thread_id = engine_thread_id.trim();
+        if engine_thread_id.is_empty() {
+            log::warn!("Codex thread context snapshot skipped: missing engine thread id");
+            return Ok(None);
+        }
+
+        let transport = match self.ensure_ready_transport().await {
+            Ok(transport) => transport,
+            Err(error) => {
+                log::error!(
+                    "Codex thread context snapshot could not initialize transport: {error:?}"
+                );
+                return Err(error).context("failed to initialize Codex thread context transport");
+            }
+        };
+        let response = match request_with_fallback(
+            transport.as_ref(),
+            THREAD_READ_METHODS,
+            serde_json::json!({
+                "threadId": engine_thread_id,
+                "includeTurns": true,
+            }),
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                log::warn!(
+                    "Codex thread context snapshot thread/read failed for {engine_thread_id}: {error:?}"
+                );
+                return Err(error).context("failed to read Codex thread context");
+            }
+        };
+
+        match extract_latest_thread_context_usage(&response) {
+            Some(snapshot) => Ok(Some(snapshot)),
+            None => {
+                log::warn!(
+                    "Codex thread context snapshot has no reliable tokenUsage/modelContextWindow for {engine_thread_id}"
+                );
+                Ok(None)
+            }
+        }
     }
 
     pub async fn read_thread_runtime(
@@ -5737,6 +5788,24 @@ fn thread_runtime_from_resume_response(
     runtime
 }
 
+/// 从 thread/read 的 turns 中按协议顺序选择最新完整的线程上下文快照。
+fn extract_latest_thread_context_usage(
+    response: &serde_json::Value,
+) -> Option<(u64, u64)> {
+    extract_turns_from_thread_read_response(response)
+        .iter()
+        .rev()
+        .find_map(|turn| {
+            let snapshot = extract_context_usage_limits(turn)?;
+            match (snapshot.current_tokens, snapshot.max_context_tokens) {
+                (Some(current_tokens), Some(max_context_tokens)) if max_context_tokens > 0 => {
+                    Some((current_tokens, max_context_tokens))
+                }
+                _ => None,
+            }
+        })
+}
+
 fn extract_turns_from_thread_read_response(response: &serde_json::Value) -> Vec<serde_json::Value> {
     for candidate in [
         response.get("turns"),
@@ -8185,6 +8254,41 @@ mod tests {
 
     use crate::engines::ActionResult;
     use serde_json::{json, Value};
+
+    #[test]
+    fn extract_latest_thread_context_usage_uses_latest_reliable_turn() {
+        let response = json!({
+            "thread": {
+                "turns": [
+                    {
+                        "id": "turn-old",
+                        "tokenUsage": {
+                            "last": { "totalTokens": 32000 },
+                            "modelContextWindow": 128000
+                        }
+                    },
+                    {
+                        "id": "turn-reliable",
+                        "tokenUsage": {
+                            "last": { "totalTokens": 64000 },
+                            "modelContextWindow": 128000
+                        }
+                    },
+                    {
+                        "id": "turn-latest-without-window",
+                        "tokenUsage": {
+                            "last": { "totalTokens": 96000 }
+                        }
+                    }
+                ]
+            }
+        });
+
+        assert_eq!(
+            extract_latest_thread_context_usage(&response),
+            Some((64000, 128000))
+        );
+    }
 
     #[test]
     fn codex_thread_subscription_allows_primary_and_registered_subagent_only() {

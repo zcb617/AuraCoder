@@ -13,6 +13,7 @@ const mockIpc = vi.hoisted(() => ({
   setThreadPermissions: vi.fn(),
   steerMessage: vi.fn(),
   getThreadMessagesWindow: vi.fn(),
+  getCliContextUsage: vi.fn(),
   getChatProviderUsage: vi.fn(),
   getActionOutput: vi.fn(),
   respondApproval: vi.fn(),
@@ -52,6 +53,7 @@ describe("chatStore send", () => {
       messages: [],
       nextCursor: null,
     });
+    mockIpc.getCliContextUsage.mockResolvedValue(null);
     mockIpc.getChatProviderUsage.mockResolvedValue([]);
     mockIpc.getActionOutput.mockResolvedValue({
       found: true,
@@ -104,6 +106,8 @@ describe("chatStore send", () => {
       streaming: false,
       preparingEngineId: null,
       preparingAttachments: false,
+      contextUsage: null,
+      contextUsageLoading: false,
       usageLimits: null,
       usageLimitsLoading: false,
       error: undefined,
@@ -925,10 +929,12 @@ describe("chatStore send", () => {
 
     await vi.advanceTimersByTimeAsync(20);
 
-    expect(useChatStore.getState().usageLimits).toEqual({
+    expect(useChatStore.getState().contextUsage).toEqual({
       currentTokens: 30000,
       maxContextTokens: 200000,
-      contextPercent: 90,
+      contextPercent: 85,
+    });
+    expect(useChatStore.getState().usageLimits).toEqual({
       windowFiveHourPercent: 83,
       windowWeeklyPercent: 58,
       windowFableWeeklyPercent: null,
@@ -1022,6 +1028,10 @@ describe("chatStore send", () => {
         },
       ],
     });
+    // 恢复测试的同步结果必须保持 Claude 提供方语义，避免复用默认 Codex mock。
+    mockIpc.syncThreadFromEngine.mockResolvedValueOnce({
+      ...useThreadStore.getState().threads[0]!,
+    });
 
     await useChatStore.getState().setActiveThread("thread-1");
 
@@ -1047,12 +1057,151 @@ describe("chatStore send", () => {
     await vi.waitFor(() => {
       expect(useChatStore.getState().usageLimitsLoading).toBe(false);
     });
+    expect(useChatStore.getState().contextUsage).toBeNull();
     expect(useChatStore.getState().usageLimits).toMatchObject({
-      contextPercent: null,
       windowFiveHourPercent: 80,
       windowWeeklyPercent: 65,
       windowFableWeeklyPercent: 55,
       windowFiveHourResetsAt: "2025-02-19T21:20:00.000Z",
+    });
+  });
+
+  it("restores thread context usage when binding an existing CLI conversation", async () => {
+    const contextRequest = deferred<{
+      currentTokens: number | null;
+      maxContextTokens: number | null;
+      contextPercent: number | null;
+    } | null>();
+    mockIpc.getCliContextUsage.mockReturnValueOnce(contextRequest.promise);
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+    const restoredThread: Thread = {
+      id: "thread-1",
+      workspaceId: "workspace-1",
+      engineId: "opencode",
+      modelId: "openai/gpt-5",
+      engineThreadId: "engine-thread-1",
+      engineMetadata: {},
+      title: "Restored OpenCode thread",
+      status: "idle",
+      messageCount: 1,
+      totalTokens: 0,
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+    };
+    useThreadStore.setState({
+      threads: [restoredThread],
+      threadsByWorkspace: { "workspace-1": [restoredThread] },
+      archivedThreadsByWorkspace: {},
+      activeThreadId: "thread-1",
+      loading: false,
+      error: undefined,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(mockIpc.getCliContextUsage).toHaveBeenCalledWith("thread-1");
+    expect(useChatStore.getState()).toMatchObject({
+      contextUsage: null,
+      contextUsageLoading: true,
+    });
+
+    expect(streamHandler).not.toBeNull();
+    streamHandler!({
+      type: "UsageLimitsUpdated",
+      usage: { five_hour_percent: 20 },
+    });
+    await vi.waitFor(() => {
+      expect(useChatStore.getState().usageLimits?.windowFiveHourPercent).toBe(80);
+    });
+    expect(useChatStore.getState().contextUsageLoading).toBe(true);
+
+    contextRequest.resolve({
+      currentTokens: 128_000,
+      maxContextTokens: 256_000,
+      contextPercent: 50,
+    });
+    await vi.waitFor(() => {
+      expect(useChatStore.getState().contextUsageLoading).toBe(false);
+    });
+    expect(useChatStore.getState().contextUsage).toEqual({
+      currentTokens: 128_000,
+      maxContextTokens: 256_000,
+      contextPercent: 50,
+    });
+  });
+
+  it("does not let a stale context restore replace a newer thread", async () => {
+    const firstContextRequest = deferred<{
+      currentTokens: number | null;
+      maxContextTokens: number | null;
+      contextPercent: number | null;
+    } | null>();
+    const secondContextRequest = deferred<{
+      currentTokens: number | null;
+      maxContextTokens: number | null;
+      contextPercent: number | null;
+    } | null>();
+    mockIpc.getCliContextUsage
+      .mockReturnValueOnce(firstContextRequest.promise)
+      .mockReturnValueOnce(secondContextRequest.promise);
+    const firstThread: Thread = {
+      id: "thread-1",
+      workspaceId: "workspace-1",
+      engineId: "codex",
+      modelId: "gpt-5.3-codex",
+      engineThreadId: "engine-thread-1",
+      engineMetadata: {},
+      title: "First thread",
+      status: "idle",
+      messageCount: 1,
+      totalTokens: 0,
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+    };
+    const secondThread: Thread = {
+      ...firstThread,
+      id: "thread-2",
+      engineThreadId: "engine-thread-2",
+      title: "Second thread",
+    };
+    useThreadStore.setState({
+      threads: [firstThread, secondThread],
+      threadsByWorkspace: { "workspace-1": [firstThread, secondThread] },
+      archivedThreadsByWorkspace: {},
+      activeThreadId: null,
+      loading: false,
+      error: undefined,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+    await useChatStore.getState().setActiveThread("thread-2");
+
+    firstContextRequest.resolve({
+      currentTokens: 10_000,
+      maxContextTokens: 100_000,
+      contextPercent: 90,
+    });
+    await vi.waitFor(() => {
+      expect(useChatStore.getState().threadId).toBe("thread-2");
+    });
+    expect(useChatStore.getState().contextUsage).toBeNull();
+
+    secondContextRequest.resolve({
+      currentTokens: 20_000,
+      maxContextTokens: 100_000,
+      contextPercent: 80,
+    });
+    await vi.waitFor(() => {
+      expect(useChatStore.getState().contextUsageLoading).toBe(false);
+    });
+    expect(useChatStore.getState().contextUsage).toEqual({
+      currentTokens: 20_000,
+      maxContextTokens: 100_000,
+      contextPercent: 80,
     });
   });
 

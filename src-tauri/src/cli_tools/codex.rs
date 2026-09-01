@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
     CliReviewStarted, CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError,
-    CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult,
+    CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult, map_context_usage,
 };
 use crate::{
     db,
@@ -24,8 +24,8 @@ use crate::{
     extensions,
     local_cli_service_lifecycle::{LocalCliHandle, LocalCliServiceLifecycle},
     models::{
-        CachedExtensionCatalogDto, ChatProviderUsageDto, CodexAppDto, CodexPluginDto,
-        CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
+        CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
+        CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
         PermissionComponentJson, ThreadDto, ThreadStatusDto, WorkspaceDto,
     },
@@ -843,6 +843,42 @@ impl CliTool for CodexCli {
             "Codex",
             engine.usage_limits_snapshot().await,
         )))
+    }
+
+    /// 用户进入 Codex 线程时，读取该线程的真实上下文 token 快照，不混用账号额度。
+    async fn get_context_usage(
+        &self,
+        context: &CliExecutionContext,
+        thread: &ThreadDto,
+    ) -> Result<Option<CliContextUsageDto>> {
+        let Some(engine_thread_id) = thread
+            .engine_thread_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            log::warn!(
+                "Codex thread context snapshot skipped: thread {} has no engine thread id",
+                thread.id
+            );
+            return Ok(None);
+        };
+
+        let workspace = self.load_workspace(context).await?;
+        let snapshot = if context.location_kind == CliLocationKind::Ssh {
+            remote_project_codex_runtime_service::runtime(&workspace)
+                .await?
+                .context_usage_snapshot(engine_thread_id)
+                .await?
+        } else {
+            self.local_engine()
+                .await?
+                .context_usage_snapshot(engine_thread_id)
+                .await?
+        };
+        Ok(snapshot.and_then(|(current_tokens, max_context_tokens)| {
+            map_context_usage(Some(current_tokens), Some(max_context_tokens))
+        }))
     }
 
     async fn engine_health(&self, context: &CliExecutionContext) -> Result<EngineHealthDto> {

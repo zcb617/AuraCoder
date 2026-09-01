@@ -547,6 +547,7 @@ pub fn run() {
             commands::engines::list_actived_clis,
             commands::engines::get_engine_info,
             commands::engines::get_chat_provider_usage,
+            commands::engines::get_cli_context_usage,
             commands::engines::codex_uses_external_sandbox,
             commands::engines::engine_health,
             commands::engines::prewarm_engine,

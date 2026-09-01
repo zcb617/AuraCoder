@@ -15,6 +15,7 @@ import type {
   ChatEngineId,
   ChatInputItem,
   ChatProviderUsage,
+  CliContextUsage,
   ComputerControlStatus,
   ComputerControlApprovalRequest,
   CodexApprovalsReviewer,
@@ -507,6 +508,9 @@ export const ipc = {
       workspaceId: workspaceId ?? null,
       engineId: engineId ?? null,
     }),
+  /** 读取指定线程当前 CLI 的真实上下文窗口快照，和账号额度状态分开维护。 */
+  getCliContextUsage: (threadId: string) =>
+    invoke<CliContextUsage | null>("get_cli_context_usage", { threadId }),
   engineHealth: (engineId: string, workspaceId?: string | null) =>
     invoke<EngineHealth>("engine_health", { engineId, workspaceId: workspaceId ?? null }),
   prewarmEngine: (engineId: string, workspaceId?: string | null) =>

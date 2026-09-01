@@ -1150,6 +1150,64 @@ impl ClaudeSidecarEngine {
         .context("timed out reading Claude usage limits")?
     }
 
+    /// 查询当前 sidecar 进程内指定 Claude 线程最近一次可靠的上下文快照。
+    pub async fn context_usage_snapshot(
+        &self,
+        engine_thread_id: &str,
+    ) -> anyhow::Result<super::UsageLimitsSnapshot> {
+        let transport = self.ensure_transport().await?;
+        let request_id = Uuid::new_v4().to_string();
+        let mut receiver = transport.subscribe();
+        transport
+            .send_command(&serde_json::json!({
+                "id": request_id,
+                "method": "get_context_usage",
+                "params": { "threadId": engine_thread_id },
+            }))
+            .await
+            .context("发送本机 Claude 上下文快照命令失败")?;
+
+        timeout(Duration::from_secs(7), async {
+            loop {
+                match receiver.recv().await {
+                    Ok(SidecarEvent::UsageLimitsUpdated { id, usage })
+                        if id.as_deref() == Some(request_id.as_str()) =>
+                    {
+                        return Ok(super::UsageLimitsSnapshot {
+                            current_tokens: usage.current_tokens,
+                            max_context_tokens: usage.max_context_tokens,
+                            context_window_percent: usage.context_window_percent,
+                            five_hour_percent: None,
+                            weekly_percent: None,
+                            fable_weekly_percent: None,
+                            opus_weekly_percent: None,
+                            sonnet_weekly_percent: None,
+                            five_hour_resets_at: None,
+                            weekly_resets_at: None,
+                            fable_weekly_resets_at: None,
+                            opus_weekly_resets_at: None,
+                            sonnet_weekly_resets_at: None,
+                        });
+                    }
+                    Ok(SidecarEvent::Error { id, message, .. })
+                        if id.as_deref() == Some(request_id.as_str()) =>
+                    {
+                        anyhow::bail!("本机 Claude 上下文快照命令失败: {message}");
+                    }
+                    Ok(_) => continue,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        anyhow::bail!("本机 Claude 上下文事件流丢失 {skipped} 条事件");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        anyhow::bail!("本机 Claude 上下文快照期间 sidecar 已关闭");
+                    }
+                }
+            }
+        })
+        .await
+        .context("读取本机 Claude 上下文快照超时")?
+    }
+
     /// 按项目根目录读取本机 Claude 历史会话摘要，并保持请求错误上下文。
     pub async fn list_sessions_for_cwd(
         &self,

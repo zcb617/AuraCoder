@@ -20,8 +20,8 @@ use crate::{
         ThreadSyncSnapshot, TurnInput,
     },
     models::{
-        CachedExtensionCatalogDto, ChatProviderUsageDto, CodexAppDto, CodexPluginDto,
-        CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
+        CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
+        CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
         PermissionComponentJson, ThreadDto, ThreadStatusDto, WorkspaceDto,
     },
@@ -120,6 +120,28 @@ impl CliExecutionContext {
             ssh_connection_id: workspace.ssh_connection_id.clone(),
         })
     }
+}
+
+/// 将 CLI 原始上下文 token 转换成统一的线程上下文快照，按 current/max 计算剩余百分比。
+pub(crate) fn map_context_usage(
+    current_tokens: Option<u64>,
+    max_context_tokens: Option<u64>,
+) -> Option<CliContextUsageDto> {
+    if current_tokens.is_none() && max_context_tokens.is_none() {
+        return None;
+    }
+    let context_percent = match (current_tokens, max_context_tokens) {
+        (Some(current), Some(max)) if max > 0 => Some(
+            (((max.saturating_sub(current) as f64 / max as f64) * 100.0).round())
+                .clamp(0.0, 100.0) as u8,
+        ),
+        _ => None,
+    };
+    Some(CliContextUsageDto {
+        current_tokens,
+        max_context_tokens,
+        context_percent,
+    })
 }
 
 /// CLI 会话列表中的一条会话记录。
@@ -292,6 +314,13 @@ pub trait CliTool: Send + Sync {
         &self,
         context: &CliExecutionContext,
     ) -> Result<Option<ChatProviderUsageDto>>;
+
+    /// 用户进入已有线程或发送消息时，读取当前 CLI 线程的上下文 token 快照，供输入区显示剩余上下文。
+    async fn get_context_usage(
+        &self,
+        context: &CliExecutionContext,
+        thread: &ThreadDto,
+    ) -> Result<Option<CliContextUsageDto>>;
 
     /// 用户查看或重试运行目标时，检查当前 CLI 是否可以使用，并在页面显示版本、问题和处理建议。
     async fn engine_health(&self, context: &CliExecutionContext) -> Result<EngineHealthDto>;

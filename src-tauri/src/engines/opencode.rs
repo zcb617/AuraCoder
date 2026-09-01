@@ -39,7 +39,7 @@ use super::{
     ActionType, ApprovalRequestRoute, DiffScope, Engine, EngineEvent, EngineSteerReceipt,
     EngineThread, ImportedThreadMessage, ModelInfo, ModelLimits, OpenCodeRemoteSessionSummary,
     OutputStream, ReasoningEffortOption, SandboxPolicy, ThreadScope, ThreadSyncSnapshot,
-    TokenUsage, TurnCompletionStatus, TurnInput,
+    TokenUsage, TurnCompletionStatus, TurnInput, UsageLimitsSnapshot,
 };
 
 const OPENCODE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1007,6 +1007,12 @@ impl Engine for OpenCodeEngine {
                                     session.connection.as_ref(),
                                 )
                                 .await;
+                                self.emit_context_usage_update(
+                                    &session.connection.cwd,
+                                    engine_thread_id,
+                                    &event_tx,
+                                )
+                                .await;
                                 self.complete_after_idle(&mut mapper, &event_tx).await;
                             }
                             return Ok(());
@@ -1630,6 +1636,126 @@ impl OpenCodeEngine {
             .unwrap_or_else(|| self.models())
     }
 
+    /// 读取 OpenCode 最新 assistant 消息的可靠输入 token，并结合模型 context limit 形成快照。
+    pub async fn context_usage_snapshot(
+        &self,
+        cwd: &str,
+        engine_thread_id: &str,
+    ) -> Result<Option<(u64, u64)>> {
+        let connection = self.connection_for_cwd(cwd).await?;
+        let page = self
+            .fetch_session_message_page(
+                connection.as_ref(),
+                engine_thread_id,
+                OPENCODE_RECONCILE_MESSAGE_LIMIT,
+                Some("desc"),
+                None,
+            )
+            .await
+            .context("读取 OpenCode 上下文消息失败")?;
+        let message = page.messages.iter().find(|message| {
+            message.info.role == "assistant" && message.info.tokens.is_some()
+        });
+        let Some(message) = message else {
+            log::info!(
+                "OpenCode context usage unavailable: no assistant message with token info; session={engine_thread_id}"
+            );
+            return Ok(None);
+        };
+        let Some(tokens) = message.info.tokens.as_ref() else {
+            return Ok(None);
+        };
+        let Some(total) = tokens.total else {
+            log::warn!(
+                "OpenCode context usage unavailable: assistant info.tokens.total is missing; session={engine_thread_id}"
+            );
+            return Ok(None);
+        };
+        if tokens.input == 0 || total < tokens.input {
+            log::warn!(
+                "OpenCode context usage unavailable: assistant token semantics are invalid; session={engine_thread_id} input={} total={total}",
+                tokens.input,
+            );
+            return Ok(None);
+        }
+        let state_model_id = self
+            .state
+            .lock()
+            .await
+            .sessions
+            .get(engine_thread_id)
+            .map(|session| session.model_id.clone());
+        let model_id = message.info.model_id.clone().or(state_model_id);
+        let Some(model_id) = model_id else {
+            log::warn!(
+                "OpenCode context usage unavailable: assistant message has no model ID; session={engine_thread_id}"
+            );
+            return Ok(None);
+        };
+        let models = self.list_models_runtime_for_cwd(cwd).await;
+        let max_context_tokens = models
+            .iter()
+            .find(|model| model.id == model_id)
+            .and_then(|model| model.limits.as_ref())
+            .and_then(|limits| limits.context_tokens);
+        let Some(max_context_tokens) = max_context_tokens.filter(|limit| *limit > 0) else {
+            log::warn!(
+                "OpenCode context usage unavailable: model context limit is missing; session={engine_thread_id} model={model_id}"
+            );
+            return Ok(None);
+        };
+        Ok(Some((tokens.input, max_context_tokens)))
+    }
+
+    /// 在 OpenCode 本轮消息校正完成后，向聊天事件流推送可靠的线程上下文快照。
+    async fn emit_context_usage_update(
+        &self,
+        cwd: &str,
+        engine_thread_id: &str,
+        event_tx: &mpsc::Sender<EngineEvent>,
+    ) {
+        match self.context_usage_snapshot(cwd, engine_thread_id).await {
+            Ok(Some((current_tokens, max_context_tokens))) => {
+                let context_window_percent = Some(
+                    (((max_context_tokens.saturating_sub(current_tokens) as f64
+                        / max_context_tokens as f64)
+                        * 100.0)
+                        .round()
+                        .clamp(0.0, 100.0)) as u8,
+                );
+                let event = EngineEvent::UsageLimitsUpdated {
+                    usage: UsageLimitsSnapshot {
+                        current_tokens: Some(current_tokens),
+                        max_context_tokens: Some(max_context_tokens),
+                        context_window_percent,
+                        ..UsageLimitsSnapshot::default()
+                    },
+                };
+                if let Err(error) = event_tx.send(event).await {
+                    log::warn!(
+                        "发送 OpenCode 上下文用量事件失败: session={} cwd={} error={error}",
+                        engine_thread_id,
+                        cwd,
+                    );
+                }
+            }
+            Ok(None) => {
+                log::debug!(
+                    "OpenCode 上下文用量事件跳过: session={} cwd={}；没有可靠的 current/max 快照",
+                    engine_thread_id,
+                    cwd,
+                );
+            }
+            Err(error) => {
+                log::warn!(
+                    "读取 OpenCode 实时上下文用量失败: session={} cwd={} error={error:#}",
+                    engine_thread_id,
+                    cwd,
+                );
+            }
+        }
+    }
+
     pub async fn runtime_catalog(&self, cwd: &str) -> Result<OpenCodeRuntimeCatalogDto> {
         let connection = self.connection_for_cwd(cwd).await?;
         let result = async {
@@ -2162,6 +2288,8 @@ impl OpenCodeEngine {
                             connection.as_ref(),
                         )
                         .await;
+                        self.emit_context_usage_update(&connection.cwd, engine_thread_id, event_tx)
+                            .await;
                         self.complete_after_idle(mapper, event_tx).await;
                     }
                     _ => {}
@@ -2175,6 +2303,8 @@ impl OpenCodeEngine {
                     connection.as_ref(),
                 )
                 .await;
+                self.emit_context_usage_update(&connection.cwd, engine_thread_id, event_tx)
+                    .await;
                 self.complete_after_idle(mapper, event_tx).await;
             }
             "session.error" => {

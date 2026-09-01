@@ -1898,6 +1898,38 @@ function formatUsagePercent(percent: number | null): string {
   return `${Math.max(0, Math.min(100, Math.round(percent)))}%`;
 }
 
+/** 按聊天输入区业务规则格式化上下文 token，支持原数值、K 和 M 单位。 */
+function formatContextTokens(tokens: number | null): string {
+  if (typeof tokens !== "number" || !Number.isFinite(tokens)) {
+    return "--";
+  }
+  const normalized = Math.max(0, Math.round(tokens));
+  if (normalized < 1_000) {
+    return String(normalized);
+  }
+  if (normalized < 1_000_000) {
+    const value = normalized / 1_000;
+    return `${value >= 100 ? value.toFixed(0) : value.toFixed(1).replace(/\.0$/, "")}K`;
+  }
+  const value = normalized / 1_000_000;
+  return `${value >= 100 ? value.toFixed(0) : value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "")}M`;
+}
+
+/** 将线程上下文快照格式化为输入区展示的已用/总量/剩余比例。 */
+function formatContextUsage(
+  contextUsage: { currentTokens: number | null; maxContextTokens: number | null; contextPercent: number | null } | null,
+): string {
+  if (
+    !contextUsage ||
+    contextUsage.currentTokens === null ||
+    contextUsage.maxContextTokens === null ||
+    contextUsage.contextPercent === null
+  ) {
+    return "--";
+  }
+  return `${formatContextTokens(contextUsage.currentTokens)}/${formatContextTokens(contextUsage.maxContextTokens)}（${formatUsagePercent(contextUsage.contextPercent)}）`;
+}
+
 function usagePercentToWidth(percent: number | null): string {
   if (typeof percent !== "number" || !Number.isFinite(percent)) {
     return "0%";
@@ -2055,6 +2087,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     preparingEngineId,
     preparingAttachments,
     turnStartedAt,
+    contextUsage,
+    contextUsageLoading,
     usageLimits,
     usageLimitsLoading,
     error,
@@ -2077,6 +2111,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       preparingEngineId: state.preparingEngineId,
       preparingAttachments: state.preparingAttachments,
       turnStartedAt: state.turnStartedAt,
+      contextUsage: state.contextUsage,
+      contextUsageLoading: state.contextUsageLoading,
       usageLimits: state.usageLimits,
       usageLimitsLoading: state.usageLimitsLoading,
       error: state.error,
@@ -8753,24 +8789,26 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 {!showSpecialInputComposer &&
-                  (isCodexEngine || selectedEngineId === "claude") &&
-                  usageLimits?.contextPercent != null && (
+                  contextUsage?.currentTokens != null &&
+                  contextUsage.maxContextTokens != null &&
+                  contextUsage.contextPercent != null && (
                   <button
                     type="button"
                     className={`chat-context-ring${
-                      usageLimits.contextPercent <= 10
+                      contextUsage.contextPercent <= 10
                         ? " chat-context-ring--critical"
-                        : usageLimits.contextPercent <= 25
+                        : contextUsage.contextPercent <= 25
                           ? " chat-context-ring--warning"
                           : ""
                     }`}
                     onClick={openUsageLimitsModal}
                     title={t("status.contextRingTitle", {
-                      percent: formatUsagePercent(usageLimits.contextPercent),
+                      usage: formatContextUsage(contextUsage),
                     })}
                     aria-label={t("status.contextRingTitle", {
-                      percent: formatUsagePercent(usageLimits.contextPercent),
+                      usage: formatContextUsage(contextUsage),
                     })}
+                    aria-busy={contextUsageLoading}
                   >
                     <svg width="16" height="16" viewBox="0 0 16 16" style={{ transform: "rotate(-90deg)" }} aria-hidden="true">
                       <circle className="chat-context-ring-track" cx="8" cy="8" r="6" strokeWidth="2" />
@@ -8782,11 +8820,11 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                         strokeWidth="2"
                         strokeDasharray={2 * Math.PI * 6}
                         strokeDashoffset={
-                          2 * Math.PI * 6 * (1 - Math.max(0, Math.min(100, usageLimits.contextPercent)) / 100)
+                          2 * Math.PI * 6 * (1 - Math.max(0, Math.min(100, contextUsage.contextPercent)) / 100)
                         }
                       />
                     </svg>
-                    <span>{formatUsagePercent(usageLimits.contextPercent)}</span>
+                    <span>{formatContextUsage(contextUsage)}</span>
                   </button>
                 )}
 

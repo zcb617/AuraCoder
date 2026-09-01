@@ -1447,7 +1447,23 @@ struct RateLimitWindowInfo {
     window_duration_mins: Option<i64>,
 }
 
-const CONTEXT_WINDOW_BASELINE_TOKENS: u64 = 12_000;
+// 旧 12K baseline 算法保留迁移留痕，但当前业务不再执行：
+// const CONTEXT_WINDOW_BASELINE_TOKENS: u64 = 12_000;
+// fn calculate_context_window_percent_remaining(
+//     current_tokens: u64,
+//     max_context_tokens: u64,
+// ) -> Option<u8> {
+//     if max_context_tokens <= CONTEXT_WINDOW_BASELINE_TOKENS {
+//         return Some(0);
+//     }
+//     let effective_window = max_context_tokens - CONTEXT_WINDOW_BASELINE_TOKENS;
+//     let used_tokens = current_tokens.saturating_sub(CONTEXT_WINDOW_BASELINE_TOKENS);
+//     let remaining_tokens = effective_window.saturating_sub(used_tokens);
+//     let percent = ((remaining_tokens as f64 / effective_window as f64) * 100.0)
+//         .clamp(0.0, 100.0)
+//         .round() as i64;
+//     Some(percent.clamp(0, 100) as u8)
+// }
 
 fn extract_context_tokens(token_usage: &Value) -> Option<u64> {
     token_usage
@@ -1465,25 +1481,25 @@ fn extract_context_tokens(token_usage: &Value) -> Option<u64> {
         .or_else(|| extract_any_u64(token_usage, &["totalTokens", "total_tokens"]))
 }
 
+/// 按线程原始已用 token 与上下文上限计算剩余百分比，不扣除历史 baseline。
 fn calculate_context_window_percent_remaining(
     current_tokens: u64,
     max_context_tokens: u64,
 ) -> Option<u8> {
-    if max_context_tokens <= CONTEXT_WINDOW_BASELINE_TOKENS {
-        return Some(0);
+    if max_context_tokens == 0 {
+        return None;
     }
 
-    let effective_window = max_context_tokens - CONTEXT_WINDOW_BASELINE_TOKENS;
-    let used_tokens = current_tokens.saturating_sub(CONTEXT_WINDOW_BASELINE_TOKENS);
-    let remaining_tokens = effective_window.saturating_sub(used_tokens);
-    let percent = ((remaining_tokens as f64 / effective_window as f64) * 100.0)
+    let remaining_tokens = max_context_tokens.saturating_sub(current_tokens);
+    let percent = ((remaining_tokens as f64 / max_context_tokens as f64) * 100.0)
         .clamp(0.0, 100.0)
         .round() as i64;
 
     Some(percent.clamp(0, 100) as u8)
 }
 
-fn extract_context_usage_limits(value: &Value) -> Option<UsageLimitsSnapshot> {
+/// 从 Codex 线程事件或线程读取响应提取可证明的上下文 token 快照。
+pub(crate) fn extract_context_usage_limits(value: &Value) -> Option<UsageLimitsSnapshot> {
     let token_usage = value
         .get("tokenUsage")
         .or_else(|| value.get("turn").and_then(|turn| turn.get("tokenUsage")))?;
@@ -2106,7 +2122,7 @@ mod tests {
             EngineEvent::UsageLimitsUpdated { usage } => {
                 assert_eq!(usage.current_tokens, Some(50000));
                 assert_eq!(usage.max_context_tokens, Some(200000));
-                assert_eq!(usage.context_window_percent, Some(80));
+                assert_eq!(usage.context_window_percent, Some(75));
             }
             _ => panic!("expected usage limits update"),
         }
@@ -2185,7 +2201,7 @@ mod tests {
             EngineEvent::UsageLimitsUpdated { usage } => {
                 assert_eq!(usage.current_tokens, Some(30000));
                 assert_eq!(usage.max_context_tokens, Some(200000));
-                assert_eq!(usage.context_window_percent, Some(90));
+                assert_eq!(usage.context_window_percent, Some(85));
             }
             _ => panic!("expected usage limits update"),
         }
@@ -2240,6 +2256,7 @@ mod tests {
                 level,
                 title,
                 message,
+                ..
             } => {
                 assert_eq!(kind, "context_compacted");
                 assert_eq!(level, "info");
@@ -2269,6 +2286,7 @@ mod tests {
                 level,
                 title,
                 message,
+                ..
             } => {
                 assert_eq!(kind, "deprecation_notice");
                 assert_eq!(level, "warning");
@@ -2315,6 +2333,7 @@ mod tests {
                 level,
                 title,
                 message,
+                ..
             } => {
                 assert_eq!(kind, "hook_completed_hook_123");
                 assert_eq!(level, "info");

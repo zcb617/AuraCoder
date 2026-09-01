@@ -10,8 +10,9 @@ import type {
   ChatAttachment,
   ChatInputItem,
   ChatProviderUsage,
+  ChatProviderUsageLimits,
+  CliContextUsage,
   ContentBlock,
-  ContextUsage,
   MentionBlock,
   Message,
   MessageWindowCursor,
@@ -38,7 +39,13 @@ interface ChatState {
   preparingEngineId: string | null;
   preparingAttachments: boolean;
   turnStartedAt: number | null;
-  usageLimits: ContextUsage | null;
+  /** 当前线程 CLI 返回的上下文窗口快照，不承载账号额度。 */
+  contextUsage: CliContextUsage | null;
+  /** 当前线程上下文快照恢复请求是否仍在执行。 */
+  contextUsageLoading: boolean;
+  /** 当前 CLI 账号额度窗口快照，不承载线程上下文。 */
+  usageLimits: ChatProviderUsageLimits | null;
+  /** 当前 CLI 账号额度恢复请求是否仍在执行。 */
   usageLimitsLoading: boolean;
   error?: string;
   unlisten?: () => void;
@@ -1265,9 +1272,37 @@ function toIsoTimestamp(value: number | null | undefined): string | null {
   return date.toISOString();
 }
 
-const CONTEXT_WINDOW_BASELINE_TOKENS = 12_000;
+/*
+ * 旧上下文百分比算法曾扣除固定 12K 基线，导致 current/max 的原始比例被改变；
+ * 该实现仅保留作迁移记录，不再执行。
+ * const CONTEXT_WINDOW_BASELINE_TOKENS = 12_000;
+ * function calculateContextPercentRemaining(
+ *   currentTokens: number | null,
+ *   maxContextTokens: number | null,
+ * ): number | null {
+ *   if (
+ *     typeof currentTokens !== "number" ||
+ *     !Number.isFinite(currentTokens) ||
+ *     typeof maxContextTokens !== "number" ||
+ *     !Number.isFinite(maxContextTokens)
+ *   ) {
+ *     return null;
+ *   }
+ *   if (maxContextTokens <= CONTEXT_WINDOW_BASELINE_TOKENS) {
+ *     return 0;
+ *   }
+ *   const effectiveWindow = maxContextTokens - CONTEXT_WINDOW_BASELINE_TOKENS;
+ *   const usedTokens = Math.max(0, currentTokens - CONTEXT_WINDOW_BASELINE_TOKENS);
+ *   const remainingTokens = Math.max(0, effectiveWindow - usedTokens);
+ *   return Math.max(
+ *     0,
+ *     Math.min(100, Math.round((remainingTokens / effectiveWindow) * 100)),
+ *   );
+ * }
+ */
 
-function calculateContextPercentRemaining(
+/** 按 CLI 原始 current/max token 比值计算上下文剩余百分比。 */
+function calculateRawContextPercentRemaining(
   currentTokens: number | null,
   maxContextTokens: number | null,
 ): number | null {
@@ -1275,63 +1310,54 @@ function calculateContextPercentRemaining(
     typeof currentTokens !== "number" ||
     !Number.isFinite(currentTokens) ||
     typeof maxContextTokens !== "number" ||
-    !Number.isFinite(maxContextTokens)
+    !Number.isFinite(maxContextTokens) ||
+    maxContextTokens <= 0
   ) {
     return null;
   }
 
-  if (maxContextTokens <= CONTEXT_WINDOW_BASELINE_TOKENS) {
-    return 0;
-  }
-
-  const effectiveWindow = maxContextTokens - CONTEXT_WINDOW_BASELINE_TOKENS;
-  const usedTokens = Math.max(0, currentTokens - CONTEXT_WINDOW_BASELINE_TOKENS);
-  const remainingTokens = Math.max(0, effectiveWindow - usedTokens);
-
   return Math.max(
     0,
-    Math.min(100, Math.round((remainingTokens / effectiveWindow) * 100)),
+    Math.min(
+      100,
+      Math.round(((maxContextTokens - currentTokens) / maxContextTokens) * 100),
+    ),
   );
 }
 
-function mapUsageLimitsFromEvent(event: Extract<StreamEvent, { type: "UsageLimitsUpdated" }>): ContextUsage | null {
+/** 将统一 UsageLimitsUpdated 事件拆成线程上下文和账号额度两类状态。 */
+function mapUsageLimitsFromEvent(
+  event: Extract<StreamEvent, { type: "UsageLimitsUpdated" }>,
+): {
+  contextUsage: CliContextUsage | null;
+  usageLimits: ChatProviderUsageLimits | null;
+} {
   const usage = event.usage ?? {};
   const currentTokensRaw = usage.current_tokens;
   const maxContextTokensRaw = usage.max_context_tokens;
   const contextPercentRaw = usage.context_window_percent;
-  const fiveHourPercentRaw = usage.five_hour_percent;
-  const weeklyPercentRaw = usage.weekly_percent;
-  const fableWeeklyPercentRaw = usage.fable_weekly_percent;
-  const opusWeeklyPercentRaw = usage.opus_weekly_percent;
-  const sonnetWeeklyPercentRaw = usage.sonnet_weekly_percent;
-
   const currentTokens =
-    typeof currentTokensRaw === "number" ? Math.max(0, Math.round(currentTokensRaw)) : null;
+    typeof currentTokensRaw === "number" && Number.isFinite(currentTokensRaw)
+      ? Math.max(0, Math.round(currentTokensRaw))
+      : null;
   const maxContextTokens =
-    typeof maxContextTokensRaw === "number" ? Math.max(0, Math.round(maxContextTokensRaw)) : null;
-  const hasContextMetrics = currentTokens !== null || maxContextTokens !== null;
+    typeof maxContextTokensRaw === "number" && Number.isFinite(maxContextTokensRaw)
+      ? Math.max(0, Math.round(maxContextTokensRaw))
+      : null;
+  const rawContextPercent = calculateRawContextPercentRemaining(
+    currentTokens,
+    maxContextTokens,
+  );
+  const contextPercent =
+    rawContextPercent ??
+    (typeof contextPercentRaw === "number" && Number.isFinite(contextPercentRaw)
+      ? Math.max(0, Math.min(100, Math.round(contextPercentRaw)))
+      : null);
+  const contextUsage =
+    currentTokens !== null || maxContextTokens !== null || contextPercent !== null
+      ? { currentTokens, maxContextTokens, contextPercent }
+      : null;
 
-  let contextPercent = calculateContextPercentRemaining(currentTokens, maxContextTokens);
-  if (contextPercent === null && typeof contextPercentRaw === "number") {
-    contextPercent = Math.round(contextPercentRaw);
-  }
-  if (contextPercent !== null && !Number.isFinite(contextPercent)) {
-    contextPercent = null;
-  }
-
-  const hasAnyMetric =
-    hasContextMetrics ||
-    typeof contextPercentRaw === "number" ||
-    typeof fiveHourPercentRaw === "number" ||
-    typeof weeklyPercentRaw === "number" ||
-    typeof fableWeeklyPercentRaw === "number" ||
-    typeof opusWeeklyPercentRaw === "number" ||
-    typeof sonnetWeeklyPercentRaw === "number";
-  if (!hasAnyMetric) {
-    return null;
-  }
-
-  // Codex reports `usedPercent`; UI shows remaining budget.
   const toRemainingPercent = (
     usedPercent: number | null | undefined,
   ): number | null => {
@@ -1341,34 +1367,38 @@ function mapUsageLimitsFromEvent(event: Extract<StreamEvent, { type: "UsageLimit
     const used = Math.max(0, Math.min(100, Math.round(usedPercent)));
     return 100 - used;
   };
+  const usageLimits =
+    typeof usage.five_hour_percent === "number" ||
+    typeof usage.weekly_percent === "number" ||
+    typeof usage.fable_weekly_percent === "number" ||
+    typeof usage.opus_weekly_percent === "number" ||
+    typeof usage.sonnet_weekly_percent === "number"
+      ? {
+          windowFiveHourPercent: toRemainingPercent(usage.five_hour_percent),
+          windowWeeklyPercent: toRemainingPercent(usage.weekly_percent),
+          windowFableWeeklyPercent: toRemainingPercent(usage.fable_weekly_percent),
+          windowOpusWeeklyPercent: toRemainingPercent(usage.opus_weekly_percent),
+          windowSonnetWeeklyPercent: toRemainingPercent(usage.sonnet_weekly_percent),
+          windowFiveHourResetsAt: toIsoTimestamp(usage.five_hour_resets_at),
+          windowWeeklyResetsAt: toIsoTimestamp(usage.weekly_resets_at),
+          windowFableWeeklyResetsAt: toIsoTimestamp(usage.fable_weekly_resets_at),
+          windowOpusWeeklyResetsAt: toIsoTimestamp(usage.opus_weekly_resets_at),
+          windowSonnetWeeklyResetsAt: toIsoTimestamp(usage.sonnet_weekly_resets_at),
+        }
+      : null;
 
-  return {
-    currentTokens,
-    maxContextTokens,
-    contextPercent:
-      contextPercent === null ? null : Math.max(0, Math.min(100, contextPercent)),
-    windowFiveHourPercent: toRemainingPercent(fiveHourPercentRaw),
-    windowWeeklyPercent: toRemainingPercent(weeklyPercentRaw),
-    windowFableWeeklyPercent: toRemainingPercent(fableWeeklyPercentRaw),
-    windowOpusWeeklyPercent: toRemainingPercent(opusWeeklyPercentRaw),
-    windowSonnetWeeklyPercent: toRemainingPercent(sonnetWeeklyPercentRaw),
-    windowFiveHourResetsAt: toIsoTimestamp(usage.five_hour_resets_at),
-    windowWeeklyResetsAt: toIsoTimestamp(usage.weekly_resets_at),
-    windowFableWeeklyResetsAt: toIsoTimestamp(usage.fable_weekly_resets_at),
-    windowOpusWeeklyResetsAt: toIsoTimestamp(usage.opus_weekly_resets_at),
-    windowSonnetWeeklyResetsAt: toIsoTimestamp(usage.sonnet_weekly_resets_at),
-  };
+  return { contextUsage, usageLimits };
 }
 
-function mapProviderUsage(provider: ChatProviderUsage | undefined): ContextUsage | null {
+/** 将账号额度接口响应转换为独立的账号额度状态。 */
+function mapProviderUsage(
+  provider: ChatProviderUsage | undefined,
+): ChatProviderUsageLimits | null {
   if (!provider?.available || provider.windows.length === 0) {
     return null;
   }
 
-  const usage: ContextUsage = {
-    currentTokens: null,
-    maxContextTokens: null,
-    contextPercent: null,
+  const usage: ChatProviderUsageLimits = {
     windowFiveHourPercent: null,
     windowWeeklyPercent: null,
     windowFableWeeklyPercent: null,
@@ -1411,10 +1441,29 @@ function mapProviderUsage(provider: ChatProviderUsage | undefined): ContextUsage
   return usage;
 }
 
+/** 合并同一线程的上下文快照，避免部分事件清空已有可靠 token。 */
+function mergeContextUsage(
+  previous: CliContextUsage | null,
+  update: CliContextUsage | null,
+): CliContextUsage | null {
+  if (!update) {
+    return previous;
+  }
+  if (!previous) {
+    return update;
+  }
+  return {
+    currentTokens: update.currentTokens ?? previous.currentTokens,
+    maxContextTokens: update.maxContextTokens ?? previous.maxContextTokens,
+    contextPercent: update.contextPercent ?? previous.contextPercent,
+  };
+}
+
+/** 合并同一线程的账号额度窗口，避免单窗口事件清空其他窗口。 */
 function mergeUsageLimits(
-  previous: ContextUsage | null,
-  update: ContextUsage | null,
-): ContextUsage | null {
+  previous: ChatProviderUsageLimits | null,
+  update: ChatProviderUsageLimits | null,
+): ChatProviderUsageLimits | null {
   if (!update) {
     return previous;
   }
@@ -1423,9 +1472,6 @@ function mergeUsageLimits(
   }
 
   return {
-    currentTokens: update.currentTokens ?? previous.currentTokens,
-    maxContextTokens: update.maxContextTokens ?? previous.maxContextTokens,
-    contextPercent: update.contextPercent ?? previous.contextPercent,
     windowFiveHourPercent:
       update.windowFiveHourPercent ?? previous.windowFiveHourPercent,
     windowWeeklyPercent: update.windowWeeklyPercent ?? previous.windowWeeklyPercent,
@@ -1919,6 +1965,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   preparingEngineId: null,
   preparingAttachments: false,
   turnStartedAt: null,
+  contextUsage: null,
+  contextUsageLoading: false,
   usageLimits: null,
   usageLimitsLoading: false,
   setActiveThread: async (threadId) => {
@@ -1976,6 +2024,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         preparingAttachments: false,
         turnStartedAt: null,
         status: "idle",
+        contextUsage: null,
+        contextUsageLoading: false,
         usageLimits: null,
         usageLimitsLoading: false,
         unlisten: undefined,
@@ -2002,6 +2052,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         preparingAttachments: false,
         turnStartedAt: null,
         status: "idle",
+        contextUsage: null,
+        contextUsageLoading: false,
         usageLimits: null,
         usageLimitsLoading: false,
         error: undefined,
@@ -2089,14 +2141,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
             let nextStreaming = state.streaming;
             let nextStatus = state.status;
             let nextTurnStartedAt = state.turnStartedAt;
+            let nextContextUsage = state.contextUsage;
+            let nextContextUsageLoading = state.contextUsageLoading;
             let nextUsageLimits = state.usageLimits;
             let nextUsageLimitsLoading = state.usageLimitsLoading;
             let hydrationRecalcRequired = false;
             for (const queuedEvent of batch) {
               if (queuedEvent.type === "UsageLimitsUpdated") {
+                const usageUpdate = mapUsageLimitsFromEvent(queuedEvent);
+                nextContextUsage = mergeContextUsage(
+                  nextContextUsage,
+                  usageUpdate.contextUsage,
+                );
+                if (usageUpdate.contextUsage !== null) {
+                  nextContextUsageLoading = false;
+                }
                 nextUsageLimits = mergeUsageLimits(
                   nextUsageLimits,
-                  mapUsageLimitsFromEvent(queuedEvent),
+                  usageUpdate.usageLimits,
                 );
                 nextUsageLimitsLoading = false;
                 continue;
@@ -2130,6 +2192,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
               nextStatus === state.status &&
               nextStreaming === state.streaming &&
               nextTurnStartedAt === state.turnStartedAt &&
+              nextContextUsage === state.contextUsage &&
+              nextContextUsageLoading === state.contextUsageLoading &&
               nextUsageLimits === state.usageLimits &&
               nextUsageLimitsLoading === state.usageLimitsLoading
             ) {
@@ -2142,6 +2206,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
               status: nextStatus,
               streaming: nextStreaming,
               turnStartedAt: nextTurnStartedAt,
+              contextUsage: nextContextUsage,
+              contextUsageLoading: nextContextUsageLoading,
               usageLimits: nextUsageLimits,
               usageLimitsLoading: nextUsageLimitsLoading,
             };
@@ -2246,6 +2312,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const restoredEngineId = activeThread?.engineId ??
         messages.find((message) => message.turnEngineId)?.turnEngineId ??
         null;
+      const shouldRefreshContextUsage =
+        Boolean(activeThread && isCliThreadAttached(activeThread));
       const shouldRefreshUsageLimits =
         messages.some((message) => message.role === "user") &&
         (restoredEngineId === "codex" || restoredEngineId === "claude");
@@ -2266,9 +2334,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ? resolveRestoredTurnStartedAt(messages)
           : null,
         status: threadStatus,
+        contextUsage: null,
+        contextUsageLoading: shouldRefreshContextUsage,
         usageLimits: null,
         usageLimitsLoading: shouldRefreshUsageLimits,
       });
+
+      if (shouldRefreshContextUsage) {
+        const refreshRestoredContextUsage = async () => {
+          try {
+            const restoredContextUsage = await ipc.getCliContextUsage(threadId);
+            if (bindSeq !== activeThreadBindSeq || get().threadId !== threadId) {
+              return;
+            }
+            set((state) => ({
+              contextUsage: restoredContextUsage ?? state.contextUsage,
+              contextUsageLoading: false,
+            }));
+          } catch (error) {
+            console.warn(`Failed to restore CLI context usage for thread ${threadId}:`, error);
+            if (bindSeq === activeThreadBindSeq && get().threadId === threadId) {
+              set({ contextUsageLoading: false });
+            }
+          }
+        };
+        void refreshRestoredContextUsage();
+      }
 
       if (shouldRefreshUsageLimits) {
         const refreshRestoredUsageLimits = async () => {
@@ -2287,7 +2378,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
               usageLimits: mergeUsageLimits(state.usageLimits, providerUsage),
               usageLimitsLoading: false,
             }));
-          } catch {
+          } catch (error) {
+            console.warn(`Failed to restore provider usage for thread ${threadId}:`, error);
             if (bindSeq === activeThreadBindSeq && get().threadId === threadId) {
               set({ usageLimitsLoading: false });
             }
@@ -2306,6 +2398,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         hasOlderMessages: false,
         loadingOlderMessages: false,
         olderLoadBlockedUntil: 0,
+        contextUsage: null,
+        contextUsageLoading: false,
         usageLimits: null,
         usageLimitsLoading: false,
         turnStartedAt: null,

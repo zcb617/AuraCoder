@@ -1828,21 +1828,39 @@ export type ChatInputItem =
 
 export type ChatInputReference = Exclude<ChatInputItem, { type: "text" }>;
 
-// ── Context Usage ───────────────────────────────────────────────────
+// ── CLI Thread Context Usage ────────────────────────────────────────
 
-export interface ContextUsage {
+/** 当前线程所属 CLI 返回的上下文窗口快照，不承载账号额度。 */
+export interface CliContextUsage {
+  /** 当前线程已经占用的上下文 token 数量。 */
   currentTokens: number | null;
+  /** 当前模型支持的最大上下文 token 数量。 */
   maxContextTokens: number | null;
+  /** 当前上下文窗口剩余百分比。 */
   contextPercent: number | null;
+}
+
+/** 当前 CLI 账号额度窗口快照，不承载线程上下文 token。 */
+export interface ChatProviderUsageLimits {
+  /** 五小时账号额度剩余百分比。 */
   windowFiveHourPercent: number | null;
+  /** 周账号额度剩余百分比。 */
   windowWeeklyPercent: number | null;
+  /** Fable 模型周账号额度剩余百分比。 */
   windowFableWeeklyPercent: number | null;
+  /** Opus 模型周账号额度剩余百分比。 */
   windowOpusWeeklyPercent: number | null;
+  /** Sonnet 模型周账号额度剩余百分比。 */
   windowSonnetWeeklyPercent: number | null;
+  /** 五小时额度重置时间。 */
   windowFiveHourResetsAt: string | null;
+  /** 周额度重置时间。 */
   windowWeeklyResetsAt: string | null;
+  /** Fable 周额度重置时间。 */
   windowFableWeeklyResetsAt: string | null;
+  /** Opus 周额度重置时间。 */
   windowOpusWeeklyResetsAt: string | null;
+  /** Sonnet 周额度重置时间。 */
   windowSonnetWeeklyResetsAt: string | null;
 }
 

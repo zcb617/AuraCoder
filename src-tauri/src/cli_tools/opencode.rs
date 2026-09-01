@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
     CliReviewStarted, CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError,
-    CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult,
+    CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult, map_context_usage,
 };
 use crate::{
     db,
@@ -25,8 +25,8 @@ use crate::{
     extensions,
     local_cli_service_lifecycle::{LocalCliHandle, LocalCliServiceLifecycle},
     models::{
-        CachedExtensionCatalogDto, ChatProviderUsageDto, CodexAppDto, CodexPluginDto,
-        CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
+        CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
+        CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
         PermissionComponentJson, ThreadDto, ThreadStatusDto, WorkspaceDto,
     },
@@ -728,6 +728,37 @@ impl CliTool for OpenCodeCli {
     ) -> Result<Option<ChatProviderUsageDto>> {
         self.load_workspace(context).await?;
         Ok(None)
+    }
+
+    /// 用户进入 OpenCode 线程时，读取模型上下文上限和最新可靠 assistant token 快照。
+    async fn get_context_usage(
+        &self,
+        context: &CliExecutionContext,
+        thread: &ThreadDto,
+    ) -> Result<Option<CliContextUsageDto>> {
+        let workspace = self.load_workspace(context).await?;
+        let engine_thread_id = thread
+            .engine_thread_id
+            .as_deref()
+            .context("OpenCode 线程缺少 CLI 会话标识")?;
+        let usage = if context.location_kind == CliLocationKind::Ssh {
+            context
+                .ssh_connection_id
+                .as_deref()
+                .context("SSH 远端 OpenCode 未绑定连接")?;
+            remote_project_opencode_runtime_service::runtime(&workspace)
+                .await?
+                .context_usage_snapshot(&context.root_path, engine_thread_id)
+                .await?
+        } else {
+            self.local_engine(&context.root_path)
+                .await?
+                .context_usage_snapshot(&context.root_path, engine_thread_id)
+                .await?
+        };
+        Ok(usage.and_then(|(current_tokens, max_context_tokens)| {
+            map_context_usage(Some(current_tokens), Some(max_context_tokens))
+        }))
     }
 
     async fn engine_health(&self, context: &CliExecutionContext) -> Result<EngineHealthDto> {

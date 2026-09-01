@@ -474,6 +474,18 @@ pub struct ChatProviderUsageWindowDto {
     pub resets_at: Option<i64>,
 }
 
+/// 当前 CLI 线程上下文窗口的统一快照。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliContextUsageDto {
+    /// 当前线程已经占用的上下文 token 数量。
+    pub current_tokens: Option<u64>,
+    /// 当前模型支持的最大上下文 token 数量。
+    pub max_context_tokens: Option<u64>,
+    /// 当前上下文剩余百分比，按原始 current/max 比值计算。
+    pub context_percent: Option<u8>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineCapabilitiesDto {

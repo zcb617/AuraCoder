@@ -722,7 +722,7 @@
     "minutesShort": "{{count}} min",
     "hoursMinutesShort": "{{hours}} h {{minutes}} min",
     "daysHoursShort": "{{days}} d {{hours}} h",
-    "context": "Contexto restante",
+    "context": "Contexto da thread",
     "windowFiveHoursLeft": "5h restantes",
     "windowWeeklyLeft": "Semana restante",
     "windowFableWeeklyLeft": "Semana Fable restante",
@@ -733,7 +733,7 @@
     "usageLoading": "Carregando limites de uso...",
     "usageUnavailable": "Limites de uso indisponíveis no servidor",
     "openUsageLimits": "Abrir limites de uso",
-    "contextRingTitle": "Contexto restante: {{percent}}. Abrir limites de uso."
+    "contextRingTitle": "Contexto da thread atual: {{usage}}"
   },
   "slashCommands": {
     "groups": {

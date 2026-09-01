@@ -2204,6 +2204,12 @@ describe("claude-agent-sdk-server sidecar", () => {
     const usageEvent = harness.events.find(
       (event) => event.id === "query-events" && event.type === "usage_limits_updated",
     );
+    const contextUsageEvent = harness.events.find(
+      (event) =>
+        event.id === "query-events" &&
+        event.type === "usage_limits_updated" &&
+        (event.usage as { currentTokens?: unknown } | undefined)?.currentTokens === 11,
+    );
 
     expect(errorEvent).toMatchObject({
       message: "Claude authentication failed. Sign in again or refresh your credentials.",
@@ -2220,6 +2226,13 @@ describe("claude-agent-sdk-server sidecar", () => {
       usage: {
         fiveHourPercent: 87,
         fiveHourResetsAt: 1_740_000_000,
+      },
+    });
+    expect(contextUsageEvent).toMatchObject({
+      usage: {
+        currentTokens: 11,
+        maxContextTokens: 200_000,
+        contextWindowPercent: 100,
       },
     });
     expect(completed).toMatchObject({

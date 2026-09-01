@@ -618,6 +618,7 @@ const server = http.createServer(async (request, response) => {
           "approval_response",
           "list_models",
           "get_usage_limits",
+          "get_context_usage",
           "version",
         ].includes(command.method)
       ) {
