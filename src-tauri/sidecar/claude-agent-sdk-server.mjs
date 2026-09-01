@@ -2496,6 +2496,9 @@ async function handleQuery(req, persistentSession = null) {
       };
       toolList.push("mcp__auracoder__*");
     }
+    if (permissionOptions.decisionMode === "full" && !toolList.includes("mcp__*")) {
+      toolList.push("mcp__*");
+    }
     const automaticallyAllowedTools = enforceApprovalRouting
       ? permissionOptions.decisionMode === "read-only"
         ? toolList.filter((toolName) =>

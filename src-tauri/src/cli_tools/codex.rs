@@ -432,7 +432,8 @@ impl CodexCli {
         );
         validate_permission_component(&values)?;
         let preset = permission_choice(&values, "autonomyPreset")?;
-        let auto_approve_mcp_elicitations = (preset == Some("auto")).then_some(true);
+        let auto_approve_mcp_elicitations =
+            matches!(preset, Some("auto" | "full")).then_some(true);
         let current = <Self as CliTool>::get_permissions(self, context, thread).await?;
         let stored_auto_approve_mcp_elicitations = thread
             .permission_mode
@@ -1262,6 +1263,7 @@ impl CliTool for CodexCli {
                 object.get("allowNetwork").and_then(Value::as_bool),
             ),
             (Some("on-request"), Some("workspace-write"), Some(true))
+                | (Some("never"), Some("danger-full-access"), Some(true))
         ))
     }
 
