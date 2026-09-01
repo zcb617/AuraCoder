@@ -7930,47 +7930,49 @@ pub(crate) async fn append_codex_transport_log(record: &serde_json::Value) {
     line.push(b'\n');
 
     let sender = CODEX_TRANSPORT_LOG_WRITER.get_or_init(|| {
-        let (sender, mut receiver) = mpsc::unbounded_channel::<Vec<u8>>();
-        tokio::spawn(async move {
-            let log_dir = crate::runtime_env::app_data_dir().join("logs");
-            if let Err(error) = tokio_fs::create_dir_all(&log_dir).await {
-                log::warn!(
-                    "failed to create Codex transport log directory {}: {error}",
-                    log_dir.display()
-                );
-                return;
-            }
 
-            let path = log_dir.join("codex-transport.jsonl");
-            let mut file = match tokio_fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .await
-            {
-                Ok(file) => file,
-                Err(error) => {
-                    log::warn!(
-                        "failed to open Codex transport log {}: {error}",
-                        path.display()
-                    );
-                    return;
-                }
-            };
+        //废弃，使用log4jrs
+    //     let (sender, mut receiver) = mpsc::unbounded_channel::<Vec<u8>>();
+    //     tokio::spawn(async move {
+    //         let log_dir = crate::runtime_env::app_data_dir().join("logs");
+    //         if let Err(error) = tokio_fs::create_dir_all(&log_dir).await {
+    //             log::warn!(
+    //                 "failed to create Codex transport log directory {}: {error}",
+    //                 log_dir.display()
+    //             );
+    //             return;
+    //         }
 
-            while let Some(line) = receiver.recv().await {
-                if let Err(error) = file.write_all(&line).await {
-                    log::warn!(
-                        "failed to write Codex transport log {}: {error}",
-                        path.display()
-                    );
-                    break;
-                }
-            }
-        });
-        sender
-    });
-    let _ = sender.send(line);
+    //         let path = log_dir.join("codex-transport.jsonl");
+    //         let mut file = match tokio_fs::OpenOptions::new()
+    //             .create(true)
+    //             .append(true)
+    //             .open(&path)
+    //             .await
+    //         {
+    //             Ok(file) => file,
+    //             Err(error) => {
+    //                 log::warn!(
+    //                     "failed to open Codex transport log {}: {error}",
+    //                     path.display()
+    //                 );
+    //                 return;
+    //             }
+    //         };
+
+    //         while let Some(line) = receiver.recv().await {
+    //             if let Err(error) = file.write_all(&line).await {
+    //                 log::warn!(
+    //                     "failed to write Codex transport log {}: {error}",
+    //                     path.display()
+    //                 );
+    //                 break;
+    //             }
+    //         }
+    //     });
+    //     sender
+    // });
+    // let _ = sender.send(line);
 }
 
 fn transport_failure_message(

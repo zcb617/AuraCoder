@@ -218,19 +218,20 @@ pub fn find_approval_context(
     Ok(context)
 }
 
-pub fn append_event_log(
-    db: &Database,
-    thread_id: &str,
-    message_id: &str,
-    event: &Value,
-) -> anyhow::Result<()> {
-    let conn = db.connect()?;
-    let created_at = runtime_env::system_time_rfc3339();
-    conn.execute(
-        "INSERT INTO engine_event_logs (thread_id, message_id, event_json, created_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![thread_id, message_id, event.to_string(), created_at],
-    )
-    .context("failed to append engine event log")?;
-    Ok(())
-}
+// 废弃，使用log4jrs
+// pub fn append_event_log(
+//     db: &Database,
+//     thread_id: &str,
+//     message_id: &str,
+//     event: &Value,
+// ) -> anyhow::Result<()> {
+//     let conn = db.connect()?;
+//     let created_at = runtime_env::system_time_rfc3339();
+//     conn.execute(
+//         "INSERT INTO engine_event_logs (thread_id, message_id, event_json, created_at)
+//          VALUES (?1, ?2, ?3, ?4)",
+//         params![thread_id, message_id, event.to_string(), created_at],
+//     )
+//     .context("failed to append engine event log")?;
+//     Ok(())
+// }

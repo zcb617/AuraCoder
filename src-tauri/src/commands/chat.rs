@@ -4785,7 +4785,13 @@ async fn process_stream_event(
                 let assistant_message_id = assistant_message_id.to_string();
                 let value = value.clone();
                 move |db| {
-                    db::actions::append_event_log(db, &thread_id, &assistant_message_id, &value)
+                    log::debug!(
+                        "engine event: thread_id={}, message_id={}, event={}",
+                        thread_id,
+                        assistant_message_id,
+                        value
+                    );                    
+                    // db::actions::append_event_log(db, &thread_id, &assistant_message_id, &value)
                 }
             })
             .await

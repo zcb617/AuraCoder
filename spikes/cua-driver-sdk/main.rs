@@ -344,7 +344,7 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "cua_driver_sdk.dll".to_string());
     if let Err(error) = run(&path) {
-        eprintln!("SPIKE_FAILED {error}");
+        log::error!("SPIKE_FAILED {error}");
         std::process::exit(1);
     }
     println!("SPIKE_PASSED");

@@ -183,12 +183,12 @@ pub fn apply_webkit_display_workarounds() {
                 }
 
                 let error = command.exec();
-                eprintln!(
+                log::error!(
                     "failed to relaunch with system libwayland-client preload ({candidate}): {error}"
                 );
             }
             Err(error) => {
-                eprintln!(
+                log::error!(
                     "failed to determine current executable for libwayland-client relaunch: {error}"
                 );
             }

@@ -787,7 +787,7 @@ pub async fn add_git_worktree(
 
         // Keep .auracoder/ ignored, but don't fail the command after successful creation.
         if let Err(error) = ensure_gitignore_entry(&repo_path, ".auracoder/") {
-            eprintln!(
+            log::error!(
                 "warning: failed to ensure .auracoder/ in .gitignore for '{}': {}",
                 repo_path, error
             );
