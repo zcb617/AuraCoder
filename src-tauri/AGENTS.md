@@ -2,6 +2,54 @@
 1. 所有的异常，必须捕获。日志记录原始异常信息。
 2. 禁止执行rustfmt，这个格式化代码的命令
 
+# 日志统一设计（先看这里）
+
+## 日志在哪里
+
+- 日志配置源文件：[`log4rs.yaml`](log4rs.yaml)。
+- 配置加载代码：[`src/logging.rs`](src/logging.rs) 的 `initialize()`。
+- 应用启动入口：[`src/lib.rs`](src/lib.rs) 的 `run()`，先完成旧数据目录处理，再加载日志配置。
+- 运行时配置副本：`runtime_env::app_data_dir()/log4rs.yaml`；首次启动由 `initialize()` 生成，已有文件不会覆盖。
+- 当前统一日志文件：`logs/auracoder.log`。
+- 轮转文件：`logs/auracoder.1.log` 至 `logs/auracoder.100.log`。
+- 当前配置：文件单个达到 5 MB 后轮转，最多保留 100 个历史文件；控制台输出 `info` 及以上，文件输出 `debug` 及以上。
+- `log4rs.yaml` 中的日志路径是相对路径，实际目录以进程工作目录为准；排查时先查进程工作目录下的 `logs` 目录。
+
+## 统一调用方式
+
+业务代码统一直接使用 `log` facade：
+
+```rust
+log::info!("...");
+log::debug!("...");
+log::warn!("...");
+log::error!("...");
+```
+
+- `info`：正常业务流程和生命周期状态。
+- `debug`：开发阶段的详细信息、JSON、协议原文和子进程原始输出。
+- `warn`：可以继续运行的异常和降级处理。
+- `error`：捕获到的异常、操作失败和无法完成的业务动作；必须保留原始错误信息。
+- JSON、结构体和原始文本都作为日志消息内容交给 `log`，不得在业务代码中自行创建日志文件。
+- 不得为了输出一条日志新增冗长包装函数；具有真实数据转换职责的函数不属于日志包装函数。
+
+## 日志输出边界
+
+- `log4rs.yaml` 负责输出目标、日志级别、格式和文件轮转；`logging.rs` 只负责加载配置，不在业务类中重复实现日志管理。
+- Codex 传输记录通过 `src/engines/codex.rs` 的 `append_codex_transport_log()` 进入 `log::debug!`，不得恢复旧的独立 JSONL writer。
+- 引擎事件通过业务处理处的 `log::debug!`/`log::error!` 输出，不再通过 `db::actions::append_event_log()` 作为新的日志出口；已有数据库历史数据不删除。
+- 启动日志初始化前的 `main.rs`/`run()` 失败兜底可以使用 `eprintln!`，因为此时全局 logger 尚未可用。
+- `terminal_notifications.rs` 中的 CLI 帮助文本是用户命令输出，不属于诊断日志，继续使用标准输出。
+- CLI、SSH 隧道、CLI 生命周期、MCP 和数据库业务调用链不得因日志改造改变。
+
+## 修改日志前的检查顺序
+
+1. 先看本节，确认日志文件位置和级别。
+2. 再看 [`log4rs.yaml`](log4rs.yaml)，确认输出配置。
+3. 再看 [`src/logging.rs`](src/logging.rs)，确认配置加载路径。
+4. 最后沿业务入口到具体实现类查找 `log::info!`、`log::debug!`、`log::warn!`、`log::error!`。
+5. 不要先改业务代码，也不要先新增日志函数或日志文件写入器。
+
 # src-tauri 后端架构红线与调用链
 
 本文件是 `src-tauri` 后端开发、排错、重构和代码审查的强制规则。
