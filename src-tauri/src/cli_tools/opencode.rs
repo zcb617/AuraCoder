@@ -1937,6 +1937,9 @@ mod tests {
             status: ThreadStatusDto::Idle,
             message_count: 0,
             total_tokens: 0,
+            context_current_tokens: None,
+            context_max_tokens: None,
+            context_usage_updated_at: None,
             created_at: String::new(),
             last_activity_at: String::new(),
         }

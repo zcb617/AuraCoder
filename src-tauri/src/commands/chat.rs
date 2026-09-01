@@ -4634,7 +4634,7 @@ async fn process_stream_event(
         _ => {}
     }
 
-    // Codex 推送上下文用量事件时，异步保存线程快照；持久化失败不得影响事件广播和后续处理。
+    // Codex 推送上下文用量事件时，在当前事件处理链保存线程快照；持久化失败不得影响事件广播和后续处理。
     if thread.engine_id == "codex" {
         if let EngineEvent::UsageLimitsUpdated { usage } = &normalized_event {
             let mut conversion_failed = false;

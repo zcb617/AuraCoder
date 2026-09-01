@@ -365,6 +365,9 @@ pub async fn attach_codex_remote_thread(
             status: ThreadStatusDto::Idle,
             message_count: 0,
             total_tokens: 0,
+            context_current_tokens: None,
+            context_max_tokens: None,
+            context_usage_updated_at: None,
             created_at: String::new(),
             last_activity_at: String::new(),
         });
@@ -645,6 +648,9 @@ pub async fn attach_opencode_remote_session(
             status: ThreadStatusDto::Idle,
             message_count: 0,
             total_tokens: 0,
+            context_current_tokens: None,
+            context_max_tokens: None,
+            context_usage_updated_at: None,
             created_at: String::new(),
             last_activity_at: String::new(),
         });
@@ -4808,6 +4814,9 @@ mod tests {
             status: ThreadStatusDto::Idle,
             message_count: 2,
             total_tokens: 0,
+            context_current_tokens: None,
+            context_max_tokens: None,
+            context_usage_updated_at: None,
             created_at: "2026-03-13T00:00:00Z".to_string(),
             last_activity_at: "2026-03-13T00:00:00Z".to_string(),
         };

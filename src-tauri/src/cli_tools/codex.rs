@@ -845,7 +845,7 @@ impl CliTool for CodexCli {
         )))
     }
 
-    /// 用户进入 Codex 线程时，读取该线程持久化的上下文 token 快照，不再访问 CLI 会话协议。
+    /// 用户进入 Codex 线程时，直接读取线程记录中的持久化上下文 token 快照。
     async fn get_context_usage(
         &self,
         context: &CliExecutionContext,
@@ -862,68 +862,58 @@ impl CliTool for CodexCli {
         );
 
         log::info!(
-            "Codex context usage database read start: stage=database_read_start thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} root_path={:?}",
+            "Codex context usage thread snapshot read start: stage=thread_snapshot_read_start thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} root_path={:?}",
             thread.id,
             thread.engine_thread_id,
             context.workspace_id,
             context.location_kind,
             context.root_path
         );
-        let db = self.state.db.clone();
-        let thread_id = thread.id.clone();
-        let database_task = tokio::task::spawn_blocking(move || {
-            db::threads::get_context_usage_snapshot(&db, &thread_id)
-        });
-        let database_result = match database_task.await {
-            Ok(result) => {
-                log::info!(
-                    "Codex context usage database task joined: stage=database_read_join thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?}",
-                    thread.id,
-                    thread.engine_thread_id,
-                    context.workspace_id,
-                    context.location_kind
-                );
-                result
-            }
-            Err(error) => {
-                log::error!(
-                    "Codex context usage database task join failed: stage=database_read_join thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} error={error:?}",
-                    thread.id,
-                    thread.engine_thread_id,
-                    context.workspace_id,
-                    context.location_kind
-                );
-                return Err(error.into());
-            }
+        let current_tokens = match thread.context_current_tokens {
+            Some(value) => match u64::try_from(value) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    log::error!(
+                        "Codex context usage current token conversion failed: stage=thread_snapshot_conversion thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} field=context_current_tokens value={} error={error:?}",
+                        thread.id,
+                        thread.engine_thread_id,
+                        context.workspace_id,
+                        context.location_kind,
+                        value
+                    );
+                    return Err(error.into());
+                }
+            },
+            None => None,
         };
-
-        let snapshot = match database_result {
-            Ok(snapshot) => {
-                log::info!(
-                    "Codex context usage database query succeeded: stage=database_query thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} snapshot={snapshot:?} is_none={}",
-                    thread.id,
-                    thread.engine_thread_id,
-                    context.workspace_id,
-                    context.location_kind,
-                    snapshot.is_none()
-                );
-                snapshot
-            }
-            Err(error) => {
-                log::error!(
-                    "Codex context usage database query failed: stage=database_query thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} error={error:?}",
-                    thread.id,
-                    thread.engine_thread_id,
-                    context.workspace_id,
-                    context.location_kind
-                );
-                return Err(error);
-            }
+        let max_context_tokens = match thread.context_max_tokens {
+            Some(value) => match u64::try_from(value) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    log::error!(
+                        "Codex context usage max token conversion failed: stage=thread_snapshot_conversion thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} field=context_max_tokens value={} error={error:?}",
+                        thread.id,
+                        thread.engine_thread_id,
+                        context.workspace_id,
+                        context.location_kind,
+                        value
+                    );
+                    return Err(error.into());
+                }
+            },
+            None => None,
         };
+        let snapshot = (current_tokens, max_context_tokens);
+        log::info!(
+            "Codex context usage thread snapshot read succeeded: stage=thread_snapshot_read thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} snapshot={snapshot:?} is_empty={}",
+            thread.id,
+            thread.engine_thread_id,
+            context.workspace_id,
+            context.location_kind,
+            snapshot.0.is_none() && snapshot.1.is_none()
+        );
 
-        let mapped = snapshot.and_then(|(current_tokens, max_context_tokens)| {
-            map_context_usage(current_tokens, max_context_tokens)
-        });
+        let mapped = map_context_usage(snapshot.0, snapshot.1);
         log::info!(
             "Codex context usage mapping completed: stage=dto_mapping thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} snapshot={snapshot:?} result={mapped:?} is_none={}",
             thread.id,
@@ -2063,6 +2053,9 @@ mod tests {
             status: ThreadStatusDto::Idle,
             message_count: 0,
             total_tokens: 0,
+            context_current_tokens: None,
+            context_max_tokens: None,
+            context_usage_updated_at: None,
             created_at: String::new(),
             last_activity_at: String::new(),
         }

@@ -667,6 +667,13 @@ mod migration_tests {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            INSERT INTO ssh_connections (
+                id, display_name, source_kind, host_name, user_name,
+                host_key_type, host_key_base64
+            ) VALUES (
+                'ssh-1', 'existing ssh', 'manual', 'example.com', 'user',
+                'ssh-ed25519', 'abc'
+            );
             CREATE TABLE workspaces (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -905,6 +912,10 @@ mod migration_tests {
             .expect("failed to inspect remote thread workspace"),
             ssh_repo_workspace_id
         );
+        let supported_migration = migrations::MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == migrations::SUPPORTED_DATABASE_VERSION)
+            .expect("supported migration should be registered");
         assert_eq!(
             conn.query_row(
                 "SELECT version || ':' || migration_file FROM schema_version WHERE id = 1",
@@ -912,7 +923,11 @@ mod migration_tests {
                 |row| row.get::<_, String>(0),
             )
             .expect("failed to inspect migrated schema version"),
-            "108:108.sql"
+            format!(
+                "{}:{}",
+                migrations::SUPPORTED_DATABASE_VERSION,
+                supported_migration.file
+            )
         );
         assert_eq!(
             conn.query_row(

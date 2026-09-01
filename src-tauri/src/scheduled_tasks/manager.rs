@@ -374,6 +374,9 @@ mod tests {
             status: ThreadStatusDto::Idle,
             message_count: 0,
             total_tokens: 0,
+            context_current_tokens: None,
+            context_max_tokens: None,
+            context_usage_updated_at: None,
             created_at: "2026-08-09T00:00:00Z".to_string(),
             last_activity_at: "2026-08-09T00:00:00Z".to_string(),
         }
