@@ -33,3 +33,5 @@ uniapp_build/build
 .tmp
 .pnpm-store
 .worktree
+.claude/skills/**
+src-tauri/sidecar-dist/**
