@@ -21,6 +21,7 @@ use crate::{
         ThreadUpdateDto, TrustLevelDto,
     },
     path_utils::paths_equal,
+    runtime_env,
     state::AppState,
 };
 
@@ -1869,7 +1870,7 @@ async fn append_codex_thread_archive_log(
     };
     let mut record = json!({
         // 日志产生时间。
-        "at": Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         // Codex 归档生命周期事件名。
         "event": event,
         // AuraCoder 本地会话标识。

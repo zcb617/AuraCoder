@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::Context;
-use chrono::Utc;
+
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio::{
@@ -191,7 +191,7 @@ impl CodexTransport {
                 })
                 .collect::<serde_json::Map<_, _>>();
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "codex_process_launch",
                 "auracoder_pid": std::process::id(),
                 "auracoder_executable": auracoder_executable,
@@ -210,7 +210,7 @@ impl CodexTransport {
             Ok(child) => {
                 #[cfg(target_os = "macos")]
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "codex_process_spawned",
                     "auracoder_pid": std::process::id(),
                     "codex_pid": child.id(),
@@ -223,7 +223,7 @@ impl CodexTransport {
             Err(error) => {
                 #[cfg(target_os = "macos")]
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "codex_process_spawn_failed",
                     "auracoder_pid": std::process::id(),
                     "codex_executable": codex_executable,
@@ -265,7 +265,7 @@ impl CodexTransport {
             let next_incoming_sequence = next_incoming_sequence.clone();
             tokio::spawn(async move {
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "codex_stdout_reader_started",
                 }))
                 .await;
@@ -277,7 +277,7 @@ impl CodexTransport {
                             let sequence = next_incoming_sequence.fetch_add(1, Ordering::Relaxed);
                             #[cfg(target_os = "macos")]
                             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                                "at": Utc::now().to_rfc3339(),
+                                "at": runtime_env::system_time_rfc3339(),
                                 "event": "codex_transport_inbound_payload",
                                 "source": "stdio",
                                 "sequence": sequence,
@@ -285,7 +285,7 @@ impl CodexTransport {
                             }))
                             .await;
                             let line_bytes = line.len();
-                            let parsed_at = Utc::now().to_rfc3339();
+                            let parsed_at = runtime_env::system_time_rfc3339();
                             match parse_incoming(&line) {
                                 Ok(IncomingMessage::Response(response)) => {
                                     let diagnostics = CodexTransportEventDiagnostics {
@@ -316,7 +316,7 @@ impl CodexTransport {
                                     }
                                     crate::engines::codex::append_codex_transport_log(
                                         &serde_json::json!({
-                                            "at": Utc::now().to_rfc3339(),
+                                            "at": runtime_env::system_time_rfc3339(),
                                             "event": "codex_stdout_response_routed",
                                             "sequence": sequence,
                                             "pending_found": pending_found,
@@ -364,7 +364,7 @@ impl CodexTransport {
                                     let receiver_count = incoming_tx.receiver_count();
                                     let send_result = incoming_tx.send(envelope);
                                     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                                    "at": Utc::now().to_rfc3339(),
+                                    "at": runtime_env::system_time_rfc3339(),
                                     "event": "codex_broadcast_publish",
                                     "sequence": sequence,
                                     "capacity": INCOMING_EVENT_BUFFER_CAPACITY,
@@ -405,7 +405,7 @@ impl CodexTransport {
                         Ok(None) => {
                             let sequence = next_incoming_sequence.fetch_add(1, Ordering::Relaxed);
                             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                                "at": Utc::now().to_rfc3339(),
+                                "at": runtime_env::system_time_rfc3339(),
                                 "event": "codex_stdout_reader_eof",
                                 "sequence": sequence,
                             }))
@@ -414,7 +414,7 @@ impl CodexTransport {
                                 &last_event,
                                 CodexTransportEventDiagnostics {
                                     sequence,
-                                    at: Utc::now().to_rfc3339(),
+                                    at: runtime_env::system_time_rfc3339(),
                                     kind: "transport".to_string(),
                                     method: Some("transport/eof".to_string()),
                                     id: None,
@@ -440,7 +440,7 @@ impl CodexTransport {
                             let sequence = next_incoming_sequence.fetch_add(1, Ordering::Relaxed);
                             log::warn!("codex stdout read error: {error}");
                             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                                "at": Utc::now().to_rfc3339(),
+                                "at": runtime_env::system_time_rfc3339(),
                                 "event": "codex_stdout_reader_error",
                                 "sequence": sequence,
                                 "error": error.to_string(),
@@ -450,7 +450,7 @@ impl CodexTransport {
                                 &last_event,
                                 CodexTransportEventDiagnostics {
                                     sequence,
-                                    at: Utc::now().to_rfc3339(),
+                                    at: runtime_env::system_time_rfc3339(),
                                     kind: "transport".to_string(),
                                     method: Some("transport/read_error".to_string()),
                                     id: None,
@@ -481,7 +481,7 @@ impl CodexTransport {
             let last_stderr = last_stderr.clone();
             tokio::spawn(async move {
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "codex_stderr_reader_started",
                 }))
                 .await;
@@ -495,14 +495,14 @@ impl CodexTransport {
                                 log::debug!("codex stderr: {line}");
                                 #[cfg(target_os = "macos")]
                                 let stderr_record = serde_json::json!({
-                                        "at": Utc::now().to_rfc3339(),
+                                        "at": runtime_env::system_time_rfc3339(),
                                         "event": "codex_stderr_line",
                                         "line": line,
                                         "diagnostic_line": trimmed,
                                 });
                                 #[cfg(not(target_os = "macos"))]
                                 let stderr_record = serde_json::json!({
-                                    "at": Utc::now().to_rfc3339(),
+                                    "at": runtime_env::system_time_rfc3339(),
                                     "event": "codex_stderr_line",
                                     "line": trimmed,
                                 });
@@ -512,7 +512,7 @@ impl CodexTransport {
                         }
                         Ok(None) => {
                             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                                "at": Utc::now().to_rfc3339(),
+                                "at": runtime_env::system_time_rfc3339(),
                                 "event": "codex_stderr_reader_eof",
                             }))
                             .await;
@@ -521,7 +521,7 @@ impl CodexTransport {
                         Err(error) => {
                             log::debug!("codex stderr read error: {error}");
                             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                                "at": Utc::now().to_rfc3339(),
+                                "at": runtime_env::system_time_rfc3339(),
                                 "event": "codex_stderr_reader_error",
                                 "error": error.to_string(),
                             }))
@@ -550,7 +550,7 @@ impl CodexTransport {
     pub async fn connect_websocket(url: &str) -> anyhow::Result<Self> {
         #[cfg(target_os = "macos")]
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "codex_websocket_connect_start",
             "url": url,
             "auracoder_pid": std::process::id(),
@@ -562,7 +562,7 @@ impl CodexTransport {
             Err(error) => {
                 #[cfg(target_os = "macos")]
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "codex_websocket_connect_failed",
                     "url": url,
                     "auracoder_pid": std::process::id(),
@@ -600,7 +600,7 @@ impl CodexTransport {
                 })
                 .collect::<Vec<_>>();
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "codex_websocket_connect_succeeded",
                 "url": url,
                 "auracoder_pid": std::process::id(),
@@ -654,7 +654,7 @@ impl CodexTransport {
                                 #[cfg(target_os = "macos")]
                                 crate::engines::codex::append_codex_transport_log(
                                     &serde_json::json!({
-                                        "at": Utc::now().to_rfc3339(),
+                                        "at": runtime_env::system_time_rfc3339(),
                                         "event": "codex_websocket_binary_decode_error",
                                         "error": error.to_string(),
                                         "payload_bytes": bytes.len(),
@@ -668,7 +668,7 @@ impl CodexTransport {
                         Ok(Message::Close(frame)) => {
                             #[cfg(target_os = "macos")]
                             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                                "at": Utc::now().to_rfc3339(),
+                                "at": runtime_env::system_time_rfc3339(),
                                 "event": "codex_websocket_closed",
                                 "close_code": frame
                                     .as_ref()
@@ -685,7 +685,7 @@ impl CodexTransport {
                             log::warn!("codex websocket read error: {error}");
                             #[cfg(target_os = "macos")]
                             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                                "at": Utc::now().to_rfc3339(),
+                                "at": runtime_env::system_time_rfc3339(),
                                 "event": "codex_websocket_read_error",
                                 "error": error.to_string(),
                             }))
@@ -736,7 +736,7 @@ impl CodexTransport {
     ) -> anyhow::Result<serde_json::Value> {
         let request_started_at = std::time::Instant::now();
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "codex_rpc_request_start",
             "method": method,
             "timeout_ms": timeout.as_millis(),
@@ -756,7 +756,7 @@ impl CodexTransport {
         if let Err(error) = self.write_payload(&payload).await {
             self.pending.lock().await.remove(&id);
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "codex_rpc_request_complete",
                 "request_id": id,
                 "method": method,
@@ -773,7 +773,7 @@ impl CodexTransport {
             Ok(Err(_)) => {
                 self.pending.lock().await.remove(&id);
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "codex_rpc_request_complete",
                     "request_id": id,
                     "method": method,
@@ -786,7 +786,7 @@ impl CodexTransport {
             Err(_) => {
                 self.pending.lock().await.remove(&id);
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "codex_rpc_request_complete",
                     "request_id": id,
                     "method": method,
@@ -800,7 +800,7 @@ impl CodexTransport {
 
         if let Some(error) = response.error {
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "codex_rpc_request_complete",
                 "request_id": id,
                 "method": method,
@@ -818,7 +818,7 @@ impl CodexTransport {
         }
 
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "codex_rpc_request_complete",
             "request_id": id,
             "method": method,
@@ -832,7 +832,7 @@ impl CodexTransport {
     pub async fn notify(&self, method: &str, params: serde_json::Value) -> anyhow::Result<()> {
         let started_at = std::time::Instant::now();
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "codex_rpc_notify_start",
             "method": method,
         }))
@@ -842,7 +842,7 @@ impl CodexTransport {
             .write_payload(&notification_payload(method, params))
             .await;
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "codex_rpc_notify_complete",
             "method": method,
             "result": if result.is_ok() { "ok" } else { "error" },
@@ -860,7 +860,7 @@ impl CodexTransport {
     ) -> anyhow::Result<()> {
         let started_at = std::time::Instant::now();
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "codex_rpc_response_start",
             "response_kind": "success",
         }))
@@ -870,7 +870,7 @@ impl CodexTransport {
             .write_payload(&response_success_payload(request_id, result))
             .await;
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "codex_rpc_response_complete",
             "response_kind": "success",
             "result": if result.is_ok() { "ok" } else { "error" },
@@ -890,7 +890,7 @@ impl CodexTransport {
     ) -> anyhow::Result<()> {
         let started_at = std::time::Instant::now();
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "codex_rpc_response_start",
             "response_kind": "error",
             "code": code,
@@ -901,7 +901,7 @@ impl CodexTransport {
             .write_payload(&response_error_payload(request_id, code, message, data))
             .await;
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "codex_rpc_response_complete",
             "response_kind": "error",
             "code": code,
@@ -971,7 +971,7 @@ impl CodexTransport {
         if let Some(writer) = self.websocket_writer.lock().await.as_mut() {
             #[cfg(target_os = "macos")]
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "codex_transport_outbound_payload",
                 "source": "websocket",
                 "payload": payload,
@@ -991,7 +991,7 @@ impl CodexTransport {
             .context("codex stdio transport is not available")?;
         #[cfg(target_os = "macos")]
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "codex_transport_outbound_payload",
             "source": "stdio",
             "payload": payload,
@@ -1019,7 +1019,7 @@ impl CodexTransport {
             {
                 #[cfg(target_os = "macos")]
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "codex_process_exited",
                     "auracoder_pid": std::process::id(),
                     "codex_pid": codex_pid,
@@ -1033,7 +1033,7 @@ impl CodexTransport {
         if !self.websocket_alive.load(Ordering::Relaxed) {
             #[cfg(target_os = "macos")]
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "codex_websocket_not_alive",
                 "auracoder_pid": std::process::id(),
             }))
@@ -1054,7 +1054,7 @@ async fn dispatch_websocket_line(
     let sequence = next_incoming_sequence.fetch_add(1, Ordering::Relaxed);
     #[cfg(target_os = "macos")]
     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-        "at": Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         "event": "codex_transport_inbound_payload",
         "source": "websocket",
         "sequence": sequence,
@@ -1065,7 +1065,7 @@ async fn dispatch_websocket_line(
         Ok(IncomingMessage::Response(response)) => {
             let diagnostics = CodexTransportEventDiagnostics {
                 sequence,
-                at: Utc::now().to_rfc3339(),
+                at: runtime_env::system_time_rfc3339(),
                 kind: "response".to_string(),
                 method: None,
                 id: Some(response.id.clone()),
@@ -1103,7 +1103,7 @@ async fn dispatch_websocket_line(
                 last_event,
                 CodexTransportEventDiagnostics {
                     sequence,
-                    at: Utc::now().to_rfc3339(),
+                    at: runtime_env::system_time_rfc3339(),
                     kind: "parse_error".to_string(),
                     method: Some("transport/parse_error".to_string()),
                     id: None,
@@ -1146,7 +1146,7 @@ async fn publish_transport_message(
     };
     let send_result = incoming_tx.send(envelope);
     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-        "at": Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         "event": "codex_broadcast_publish",
         "sequence": sequence,
         "capacity": INCOMING_EVENT_BUFFER_CAPACITY,
@@ -1187,7 +1187,7 @@ fn subagent_protocol_log_record(
 
     Some(serde_json::json!({
         // 记录生成时间，便于与现有 transport 日志按时间交叉查询。
-        "at": Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         // 固定事件名，便于从混合 transport 日志中筛选。
         "event": "codex_subagent_protocol_item",
         // 记录实际接收通道，stdio 与 websocket 保持相同字段结构。
@@ -1221,7 +1221,7 @@ fn codex_error_notification_log_record(
 
     Some(serde_json::json!({
         // 记录生成时间，便于与现有 transport 日志按时间交叉查询。
-        "at": Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         // 固定事件名，便于从混合 transport 日志中筛选 Codex error 通知。
         "event": "codex_error_notification",
         // 记录实际接收通道，stdio 与 websocket 保持相同字段结构。
@@ -1239,21 +1239,21 @@ fn diagnostics_for_message(message: &IncomingMessage) -> CodexTransportEventDiag
     match message {
         IncomingMessage::Response(response) => CodexTransportEventDiagnostics {
             sequence: 0,
-            at: Utc::now().to_rfc3339(),
+            at: runtime_env::system_time_rfc3339(),
             kind: "response".to_string(),
             method: None,
             id: Some(response.id.clone()),
         },
         IncomingMessage::Request { id, method, .. } => CodexTransportEventDiagnostics {
             sequence: 0,
-            at: Utc::now().to_rfc3339(),
+            at: runtime_env::system_time_rfc3339(),
             kind: "request".to_string(),
             method: Some(method.clone()),
             id: Some(id.clone()),
         },
         IncomingMessage::Notification { method, .. } => CodexTransportEventDiagnostics {
             sequence: 0,
-            at: Utc::now().to_rfc3339(),
+            at: runtime_env::system_time_rfc3339(),
             kind: "notification".to_string(),
             method: Some(method.clone()),
             id: None,

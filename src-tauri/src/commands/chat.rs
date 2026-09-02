@@ -96,7 +96,7 @@ async fn receive_engine_event_with_diagnostics(
     let queue_depth_before = event_rx.len();
     let started_at = Instant::now();
     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-        "at": chrono::Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         "event": "engine_event_consume_start",
         "receive_sequence": receive_sequence,
         "consumer": consumer,
@@ -110,7 +110,7 @@ async fn receive_engine_event_with_diagnostics(
         .as_ref()
         .map(crate::engines::codex::engine_event_kind);
     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-        "at": chrono::Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         "event": "engine_event_consume_complete",
         "receive_sequence": receive_sequence,
         "consumer": consumer,
@@ -1807,7 +1807,7 @@ pub async fn steer_message(
 
     let steer_started_at = Instant::now();
     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-        "at": chrono::Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         "event": "steer_submit_started",
         "thread_id": thread_id,
         "client_steer_id": client_steer_id,
@@ -1981,7 +1981,7 @@ pub async fn steer_message(
             }
 
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": chrono::Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "steer_rpc_failed",
                 "thread_id": thread.id,
                 "engine_thread_id": engine_thread_id,
@@ -1996,7 +1996,7 @@ pub async fn steer_message(
     };
     persistent_image_preview_batch.commit();
 
-    let accepted_at = chrono::Utc::now().to_rfc3339();
+    let accepted_at = runtime_env::system_time_rfc3339();
     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
         "at": accepted_at,
         "event": "steer_rpc_accepted",
@@ -3158,7 +3158,7 @@ async fn run_turn(
             TurnWait::Event(None) => {
                 event_channel_closed = true;
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "engine_event_channel_closed",
                     "consumer": "chat",
                     "thread_id": thread.id.clone(),
@@ -3579,7 +3579,7 @@ async fn run_turn(
             TurnObservationWait::Engine(Ok(Ok(()))) => {
                 engine_task_finished = true;
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "engine_task_complete",
                     "consumer": "chat",
                     "thread_id": thread.id.clone(),
@@ -3601,7 +3601,7 @@ async fn run_turn(
                     engine_thread_id,
                 );
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "chat",
                     "failure_kind": "engine_task",
@@ -3626,7 +3626,7 @@ async fn run_turn(
                     engine_thread_id,
                 );
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "chat",
                     "failure_kind": "engine_task_join",
@@ -3645,7 +3645,7 @@ async fn run_turn(
                 event_channel_closed = true;
                 let raw_error = "引擎事件接收通道已关闭";
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "engine_event_channel_closed",
                     "consumer": "chat",
                     "engine_id": thread.engine_id.clone(),
@@ -3721,7 +3721,7 @@ async fn run_turn(
                     engine_thread_id,
                 );
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "chat",
                     "failure_kind": "timeout",
@@ -3756,7 +3756,7 @@ async fn run_turn(
                     remote_attachment_cleanup_required = true;
                 }
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "chat",
                     "engine_id": thread.engine_id.clone(),
@@ -3801,7 +3801,7 @@ async fn run_turn(
                     _ => "unknown",
                 };
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_completion_observed",
                     "consumer": "chat",
                     "engine_id": thread.engine_id.clone(),
@@ -4050,7 +4050,7 @@ async fn run_turn(
     match engine_task.await {
         Ok(Ok(())) => {
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": chrono::Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "engine_task_complete",
                 "consumer": "chat",
                 "thread_id": thread.id.clone(),
@@ -4061,7 +4061,7 @@ async fn run_turn(
         Ok(Err(error)) => {
             engine_failed = true;
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": chrono::Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "engine_task_complete",
                 "consumer": "chat",
                 "thread_id": thread.id.clone(),
@@ -4118,7 +4118,7 @@ async fn run_turn(
                 }
             };
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": chrono::Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "engine_task_complete",
                 "consumer": "chat",
                 "thread_id": thread.id.clone(),
@@ -4166,7 +4166,7 @@ async fn run_turn(
             engine_thread_id,
         );
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": chrono::Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "engine_task_complete",
             "consumer": "chat",
             "thread_id": thread.id.clone(),
@@ -4287,7 +4287,7 @@ async fn run_turn(
     let turn_failure_message = match turn_outcome {
         TurnOutcome::Completed => {
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": chrono::Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "engine_task_complete",
                 "consumer": "chat",
                 "thread_id": thread.id.clone(),
@@ -4310,7 +4310,7 @@ async fn run_turn(
                 engine_thread_id,
             );
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": chrono::Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "engine_task_complete",
                 "consumer": "chat",
                 "thread_id": thread.id.clone(),
@@ -4539,7 +4539,7 @@ async fn run_turn(
                     engine_thread_id,
                 );
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "chat",
                     "failure_kind": "engine_task",
@@ -4562,7 +4562,7 @@ async fn run_turn(
                     engine_thread_id,
                 );
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "chat",
                     "failure_kind": "engine_task_join",
@@ -4584,7 +4584,7 @@ async fn run_turn(
                     engine_thread_id,
                 );
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "chat",
                     "failure_kind": "engine_task_cleanup_timeout",
@@ -4618,7 +4618,7 @@ async fn run_turn(
                         engine_thread_id,
                     );
                     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                        "at": chrono::Utc::now().to_rfc3339(),
+                        "at": runtime_env::system_time_rfc3339(),
                         "event": "turn_exception_observed",
                         "consumer": "chat",
                         "failure_kind": "engine_task_cleanup_timeout",
@@ -4639,7 +4639,7 @@ async fn run_turn(
             match engine_task_result {
             Ok(Ok(())) => {
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "engine_task_complete",
                     "consumer": "chat",
                     "thread_id": thread.id.clone(),
@@ -4659,7 +4659,7 @@ async fn run_turn(
                     engine_thread_id,
                 );
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "chat",
                     "failure_kind": "engine_task",
@@ -4682,7 +4682,7 @@ async fn run_turn(
                     engine_thread_id,
                 );
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "chat",
                     "failure_kind": "engine_task_join",
@@ -4719,7 +4719,7 @@ async fn run_turn(
             engine_thread_id,
         );
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": chrono::Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "turn_exception_observed",
             "consumer": "chat",
             "failure_kind": "interrupt",
@@ -5135,7 +5135,7 @@ async fn run_codex_review_turn(
 
         let Some(incoming_event) = incoming_event else {
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": chrono::Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "engine_event_channel_closed",
                 "consumer": "review",
                 "thread_id": review_thread.id.clone(),
@@ -5349,7 +5349,7 @@ async fn run_codex_review_turn(
     match engine_task.await {
         Ok(Ok(())) => {
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": chrono::Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "engine_task_complete",
                 "consumer": "review",
                 "thread_id": review_thread.id.clone(),
@@ -5359,7 +5359,7 @@ async fn run_codex_review_turn(
         }
         Ok(Err(error)) => {
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": chrono::Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "engine_task_complete",
                 "consumer": "review",
                 "thread_id": review_thread.id.clone(),
@@ -5389,7 +5389,7 @@ async fn run_codex_review_turn(
         }
         Err(error) => {
             crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                "at": chrono::Utc::now().to_rfc3339(),
+                "at": runtime_env::system_time_rfc3339(),
                 "event": "engine_task_complete",
                 "consumer": "review",
                 "thread_id": review_thread.id.clone(),
@@ -5548,7 +5548,7 @@ async fn run_codex_review_turn(
             ReviewObservationWait::Engine(Ok(Ok(()))) => {
                 engine_task_finished = true;
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "engine_task_complete",
                     "consumer": "review",
                     "thread_id": review_thread.id.clone(),
@@ -5569,7 +5569,7 @@ async fn run_codex_review_turn(
                     source_engine_thread_id,
                 );
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "review",
                     "failure_kind": "engine_task",
@@ -5593,7 +5593,7 @@ async fn run_codex_review_turn(
                     source_engine_thread_id,
                 );
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "review",
                     "failure_kind": "engine_task_join",
@@ -5612,7 +5612,7 @@ async fn run_codex_review_turn(
                 event_channel_closed = true;
                 let raw_error = "代码审查事件接收通道已关闭";
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "engine_event_channel_closed",
                     "consumer": "review",
                     "engine_id": review_thread.engine_id.clone(),
@@ -5685,7 +5685,7 @@ async fn run_codex_review_turn(
                     source_engine_thread_id,
                 );
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "review",
                     "failure_kind": "timeout",
@@ -5715,7 +5715,7 @@ async fn run_codex_review_turn(
             } => {
                 let raw_error = message.clone();
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "review",
                     "engine_id": review_thread.engine_id.clone(),
@@ -5751,7 +5751,7 @@ async fn run_codex_review_turn(
                     _ => "unknown",
                 };
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_completion_observed",
                     "consumer": "review",
                     "engine_id": review_thread.engine_id.clone(),
@@ -6007,7 +6007,7 @@ async fn run_codex_review_turn(
                         source_engine_thread_id,
                     );
                     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                        "at": chrono::Utc::now().to_rfc3339(),
+                        "at": runtime_env::system_time_rfc3339(),
                         "event": "turn_exception_observed",
                         "consumer": "review",
                         "failure_kind": "engine_task_cleanup_timeout",
@@ -6036,7 +6036,7 @@ async fn run_codex_review_turn(
                         source_engine_thread_id,
                     );
                     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                        "at": chrono::Utc::now().to_rfc3339(),
+                        "at": runtime_env::system_time_rfc3339(),
                         "event": "turn_exception_observed",
                         "consumer": "review",
                         "failure_kind": "engine_task_cleanup_timeout",
@@ -6058,7 +6058,7 @@ async fn run_codex_review_turn(
             match engine_task_result {
             Ok(Ok(())) => {
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "engine_task_complete",
                     "consumer": "review",
                     "thread_id": review_thread.id.clone(),
@@ -6077,7 +6077,7 @@ async fn run_codex_review_turn(
                     source_engine_thread_id,
                 );
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "review",
                     "failure_kind": "engine_task",
@@ -6099,7 +6099,7 @@ async fn run_codex_review_turn(
                     source_engine_thread_id,
                 );
                 crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-                    "at": chrono::Utc::now().to_rfc3339(),
+                    "at": runtime_env::system_time_rfc3339(),
                     "event": "turn_exception_observed",
                     "consumer": "review",
                     "failure_kind": "engine_task_join",
@@ -6367,7 +6367,7 @@ async fn process_stream_event(
         assistant_message_id,
     );
     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-        "at": chrono::Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         "event": "engine_event_processing_start",
         "process_sequence": process_sequence,
         "engine_id": thread.engine_id.clone(),
@@ -6670,7 +6670,7 @@ async fn process_stream_event(
     }
     let processing_ms = processing_started_at.elapsed().as_millis();
     let record = serde_json::json!({
-        "at": chrono::Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         "event": "engine_event_processing_complete",
         "process_sequence": process_sequence,
         "engine_id": thread.engine_id.clone(),
@@ -6778,7 +6778,7 @@ async fn flush_stream_state(
         force,
     );
     crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-        "at": chrono::Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         "event": "engine_stream_state_flush_start",
         "flush_sequence": flush_sequence,
         "engine_id": thread.engine_id.clone(),
@@ -6793,7 +6793,7 @@ async fn flush_stream_state(
     .await;
     if !*blocks_dirty && !*message_state_dirty && !*thread_status_dirty && !*turn_model_dirty {
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": chrono::Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "engine_stream_state_flush_complete",
             "flush_sequence": flush_sequence,
             "thread_id": thread.id.clone(),
@@ -6818,7 +6818,7 @@ async fn flush_stream_state(
 
     if !should_flush_blocks && !should_flush_state {
         crate::engines::codex::append_codex_transport_log(&serde_json::json!({
-            "at": chrono::Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "engine_stream_state_flush_complete",
             "flush_sequence": flush_sequence,
             "thread_id": thread.id.clone(),
@@ -6958,7 +6958,7 @@ async fn flush_stream_state(
 
     let flush_ms = flush_started_at.elapsed().as_millis();
     let record = serde_json::json!({
-        "at": chrono::Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         "event": "engine_stream_state_flush_complete",
         "flush_sequence": flush_sequence,
         "engine_id": thread.engine_id.clone(),

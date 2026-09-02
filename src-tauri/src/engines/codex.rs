@@ -231,7 +231,7 @@ fn spawn_codex_incoming_pump(
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             let receiver_queue_len = subscription.len();
                             append_codex_transport_log(&serde_json::json!({
-                                "at": Utc::now().to_rfc3339(),
+                                "at": runtime_env::system_time_rfc3339(),
                                 "event": "codex_broadcast_subscription_lagged",
                                 "consumer": consumer,
                                 "skipped_messages": skipped,
@@ -254,7 +254,7 @@ fn spawn_codex_incoming_pump(
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             append_codex_transport_log(&serde_json::json!({
-                                "at": Utc::now().to_rfc3339(),
+                                "at": runtime_env::system_time_rfc3339(),
                                 "event": "codex_broadcast_subscription_closed",
                                 "consumer": consumer,
                                 "last_received_sequence": last_received_sequence,
@@ -278,7 +278,7 @@ async fn log_codex_incoming_queue_receive(
 ) {
     let diagnostics = message.diagnostics();
     let record = serde_json::json!({
-        "at": Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         "event": "codex_incoming_queue_receive",
         "consumer": consumer,
         "sequence": diagnostics.sequence,
@@ -1119,7 +1119,7 @@ impl Engine for CodexEngine {
 
                         if let Some(pending) = pending_steer {
                           append_codex_transport_log(&serde_json::json!({
-                            "at": chrono::Utc::now().to_rfc3339(),
+                            "at": runtime_env::system_time_rfc3339(),
                             "event": "steer_applied",
                             "engine_thread_id": thread_id,
                             "expected_turn_id": pending.expected_turn_id,
@@ -1428,7 +1428,7 @@ impl Engine for CodexEngine {
                     receiver_queue_len,
                   }) => {
                     append_codex_transport_log(&serde_json::json!({
-                      "at": Utc::now().to_rfc3339(),
+                      "at": runtime_env::system_time_rfc3339(),
                       "event": "codex_incoming_queue_lagged_consumed",
                       "consumer": "turn",
                       "skipped_messages": skipped,
@@ -1478,7 +1478,7 @@ impl Engine for CodexEngine {
                   }
                   None => {
                     append_codex_transport_log(&serde_json::json!({
-                      "at": Utc::now().to_rfc3339(),
+                      "at": runtime_env::system_time_rfc3339(),
                       "event": "codex_incoming_queue_closed",
                       "consumer": "turn",
                     })).await;
@@ -2476,7 +2476,7 @@ impl CodexEngine {
                     receiver_queue_len,
                   }) => {
                     append_codex_transport_log(&serde_json::json!({
-                      "at": Utc::now().to_rfc3339(),
+                      "at": runtime_env::system_time_rfc3339(),
                       "event": "codex_incoming_queue_lagged_consumed",
                       "consumer": "review",
                       "skipped_messages": skipped,
@@ -2527,7 +2527,7 @@ impl CodexEngine {
                   }
                   None => {
                     append_codex_transport_log(&serde_json::json!({
-                      "at": Utc::now().to_rfc3339(),
+                      "at": runtime_env::system_time_rfc3339(),
                       "event": "codex_incoming_queue_closed",
                       "consumer": "review",
                     })).await;
@@ -3387,7 +3387,7 @@ impl CodexEngine {
                     let transport = Arc::new(transport);
                     let diagnostics = transport.diagnostics().await;
                     let record = serde_json::json!({
-                        "at": Utc::now().to_rfc3339(),
+                        "at": runtime_env::system_time_rfc3339(),
                         "event": "codex_transport_spawned",
                         "auracoder_pid": std::process::id(),
                         "transport": diagnostics,
@@ -3470,7 +3470,7 @@ impl CodexEngine {
         };
 
         let record = serde_json::json!({
-            "at": Utc::now().to_rfc3339(),
+            "at": runtime_env::system_time_rfc3339(),
             "event": "codex_transport_reset",
             "reason": reason,
             "reason_category": codex_transport_reset_category(reason),
@@ -4010,7 +4010,7 @@ impl CodexEngine {
                         receiver_queue_len,
                     }) => {
                         append_codex_transport_log(&serde_json::json!({
-                            "at": Utc::now().to_rfc3339(),
+                            "at": runtime_env::system_time_rfc3339(),
                             "event": "codex_incoming_queue_lagged_consumed",
                             "consumer": "runtime_monitor",
                             "skipped_messages": skipped,
@@ -4025,7 +4025,7 @@ impl CodexEngine {
                     }
                     None => {
                         append_codex_transport_log(&serde_json::json!({
-                            "at": Utc::now().to_rfc3339(),
+                            "at": runtime_env::system_time_rfc3339(),
                             "event": "codex_incoming_queue_closed",
                             "consumer": "runtime_monitor",
                         }))
@@ -7896,7 +7896,7 @@ async fn send_engine_event_with_diagnostics(
     let available_before = event_tx.capacity();
     let queued_before = max_capacity.saturating_sub(available_before);
     append_codex_transport_log(&serde_json::json!({
-        "at": Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         "event": "codex_engine_event_send_start",
         "event_sequence": event_sequence,
         "thread_id": thread_id,
@@ -7914,7 +7914,7 @@ async fn send_engine_event_with_diagnostics(
     let queued_after = max_capacity.saturating_sub(available_after);
 
     let record = serde_json::json!({
-        "at": Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         "event": "codex_engine_event_send_complete",
         "event_sequence": event_sequence,
         "thread_id": thread_id,
@@ -7944,7 +7944,7 @@ async fn send_engine_event_with_diagnostics(
 async fn log_transport_subscription_receive(message: &CodexTransportMessage, consumer: &str) {
     let diagnostics = message.diagnostics();
     let record = serde_json::json!({
-        "at": Utc::now().to_rfc3339(),
+        "at": runtime_env::system_time_rfc3339(),
         "event": "codex_broadcast_subscription_recv",
         "consumer": consumer,
         "sequence": diagnostics.sequence,
