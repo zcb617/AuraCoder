@@ -1929,6 +1929,8 @@ function updateTokenUsageFromStreamEvent(context, streamEvent) {
   }
 
   if (streamEvent.type === "message_start") {
+    // 每个新的 Claude assistant 消息重新计算本消息的终止原因。
+    context.stopReason = null;
     updateContextTokenUsage(context, {
       input: streamEvent.message?.usage?.input_tokens,
       output: streamEvent.message?.usage?.output_tokens,
@@ -2789,6 +2791,10 @@ async function handleQuery(req, persistentSession = null) {
       if (!allowMissingSdkResult && !context.sdkResultReceived) {
         return false;
       }
+      // tool_use 只表示当前 Claude 消息等待工具结果，不能结束整个逻辑轮次。
+      if (context.stopReason === "tool_use") {
+        return false;
+      }
 
       const authoritativeBackgroundTasksEmpty =
         context.authoritativeBackgroundTasksEmpty && context.backgroundTasks.size === 0;
@@ -3297,7 +3303,8 @@ async function handleQuery(req, persistentSession = null) {
     const hasPendingBackgroundContinuation =
       !context.authoritativeBackgroundTasksEmpty ||
       context.awaitingTaskNotification ||
-      context.backgroundContinuationResultCount < context.backgroundContinuationInjectedCount;
+      context.backgroundContinuationResultCount < context.backgroundContinuationInjectedCount ||
+      context.stopReason === "tool_use";
     if (!completedAfterIterator && !context.cancelled && hasPendingBackgroundContinuation) {
       // SDK 查询异常结束时明确失败，避免后台任务待处理却让 UI 永久保持 streaming。
       emit({
