@@ -6,25 +6,16 @@ import { fileURLToPath } from "node:url";
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
 const claudeSidecarDir = path.join(repoRoot, "src-tauri", "sidecar-dist");
-// 三平台统一:各平台都以 node_modules 内的 sdk.mjs 作为 Claude 运行组件标识。
-// 旧 Linux 分支保留留痕:Linux 曾以归档包 claude-sdk-node_modules.tar.gz 作为标识。
-// const claudeSdkRuntime =
-//   (process.env.PANES_CLAUDE_SDK_PLATFORM ?? process.platform) === "linux"
-//     ? path.join(claudeSidecarDir, "claude-sdk-node_modules.tar.gz")
-//     : path.join(
-//         claudeSidecarDir,
-//         "node_modules",
-//         "@anthropic-ai",
-//         "claude-agent-sdk",
-//         "sdk.mjs",
-//       );
-const claudeSdkRuntime = path.join(
-  claudeSidecarDir,
-  "node_modules",
-  "@anthropic-ai",
-  "claude-agent-sdk",
-  "sdk.mjs",
-);
+const claudeSdkRuntime =
+  (process.env.PANES_CLAUDE_SDK_PLATFORM ?? process.platform) === "linux"
+    ? path.join(claudeSidecarDir, "claude-sdk-node_modules.tar.gz")
+    : path.join(
+        claudeSidecarDir,
+        "node_modules",
+        "@anthropic-ai",
+        "claude-agent-sdk",
+        "sdk.mjs",
+      );
 const requiredClaudeComponents = [
   path.join(claudeSidecarDir, "claude-agent-sdk-server.mjs"),
   path.join(claudeSidecarDir, "claude-remote-session-server.mjs"),
