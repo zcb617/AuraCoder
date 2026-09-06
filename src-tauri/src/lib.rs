@@ -180,6 +180,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(update::UpdateManager::default())
         .manage(app_state)
         .manage(computer_control_sdk)
@@ -438,6 +439,7 @@ pub fn run() {
             commands::browser::browser_clear_all_annotations,
             commands::browser::browser_capture_annotation,
             commands::chat::save_pasted_image_attachment,
+            commands::chat::read_clipboard_image,
             commands::chat::read_attachment_preview,
             commands::chat::send_message,
             commands::chat::start_codex_review,

@@ -339,6 +339,60 @@ pub struct AttachmentPreviewPayload {
     pub data_base64: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardImagePayload {
+    pub file_name: String,
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
+/// 原生兜底命令：在 DataTransfer 拿不到剪贴板 image File 时（Linux 部分场景），
+/// 由原生侧读取系统剪贴板图片并编码为 PNG base64 返回；剪贴板无图片时不视为错误。
+#[tauri::command]
+pub async fn read_clipboard_image(app: AppHandle) -> Result<Option<ClipboardImagePayload>, String> {
+    tokio::task::spawn_blocking(move || {
+        use tauri_plugin_clipboard_manager::ClipboardExt;
+        let clipboard_image = match app.clipboard().read_image() {
+            Ok(image) => image,
+            Err(error) => {
+                // 剪贴板中没有图片（普通文本/文件复制）是本命令的正常探测结果，
+                // 原始错误记录到 debug 日志，按"无图片"返回 None，由前端继续默认粘贴。
+                log::debug!("读取系统剪贴板图片失败或无图片: {error}");
+                return Ok(None);
+            }
+        };
+        let width = clipboard_image.width();
+        let height = clipboard_image.height();
+        let rgba = clipboard_image.rgba();
+        let Some(rgba_image) = image::RgbaImage::from_raw(width, height, rgba.to_vec()) else {
+            log::error!(
+                "剪贴板图片 RGBA 数据与尺寸不匹配: width={width}, height={height}, bytes={}",
+                rgba.len()
+            );
+            return Err("剪贴板图片数据不完整，无法作为附件。".to_string());
+        };
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        if let Err(error) = rgba_image.write_to(&mut buffer, image::ImageFormat::Png) {
+            log::error!("剪贴板图片编码 PNG 失败: {error}");
+            return Err(format!("剪贴板图片编码失败: {error}"));
+        }
+        Ok(Some(ClipboardImagePayload {
+            file_name: format!(
+                "clipboard-image-{}.png",
+                chrono::Local::now().format("%Y%m%d%H%M%S")
+            ),
+            mime_type: "image/png".to_string(),
+            data_base64: BASE64.encode(buffer.into_inner()),
+        }))
+    })
+    .await
+    .map_err(|error| {
+        log::error!("读取剪贴板图片任务执行失败: {error}");
+        error.to_string()
+    })?
+}
+
 #[tauri::command]
 pub async fn save_pasted_image_attachment(
     file_name: String,

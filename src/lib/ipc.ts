@@ -100,6 +100,13 @@ import type {
 } from "../types";
 import type { ScheduledTask, ScheduledTaskInput } from "../types";
 
+/** 原生剪贴板图片读取结果；为 null 表示剪贴板中没有图片。 */
+export interface ClipboardImagePayload {
+  fileName: string;
+  mimeType: string;
+  dataBase64: string;
+}
+
 export const ipc = {
   /** 读取 MCP 服务当前运行状态，供设置页 about 分区只读展示。 */
   getMcpServiceStatus: () => invoke<McpServiceStatus>("get_mcp_service_status"),
@@ -620,6 +627,8 @@ export const ipc = {
       scope: scope ?? null,
       cwd: cwd ?? null,
     }),
+  readClipboardImage: () =>
+    invoke<ClipboardImagePayload | null>("read_clipboard_image"),
   savePastedImageAttachment: (fileName: string, mimeType: string, dataBase64: string) =>
     invoke<ChatAttachment>("save_pasted_image_attachment", {
       fileName,

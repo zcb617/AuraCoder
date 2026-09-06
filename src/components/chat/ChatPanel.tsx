@@ -3784,18 +3784,47 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
   }, [activeWorkspaceId, selectedEngineId, selectedModel, setAttachments, t]);
 
+  const appendNativeClipboardImage = useCallback(async () => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    const attachmentFilterConfig = getAttachmentFilterConfig(t, selectedEngineId, selectedModel);
+    if (!attachmentFilterConfig || !attachmentFilterConfig.imageExtensions.includes("png")) {
+      return;
+    }
+    try {
+      const payload = await ipc.readClipboardImage();
+      if (!payload) {
+        return;
+      }
+      const savedAttachment = await ipc.savePastedImageAttachment(
+        payload.fileName,
+        payload.mimeType,
+        payload.dataBase64,
+      );
+      setAttachments((prev) => {
+        if (prev.some((attachment) => attachment.filePath === savedAttachment.filePath)) {
+          return prev;
+        }
+        return [...prev, { ...savedAttachment, id: crypto.randomUUID() }];
+      });
+    } catch (error) {
+      console.warn("Failed to read native clipboard image", error);
+    }
+  }, [activeWorkspaceId, selectedEngineId, selectedModel, setAttachments, t]);
+
   const handleInputPaste = useCallback((event: ReactClipboardEvent<HTMLElement>) => {
     if (showSpecialInputComposer) {
       return;
     }
     const imageFiles = clipboardImageFiles(event.clipboardData);
-    if (imageFiles.length === 0) {
+    if (imageFiles.length > 0) {
+      event.preventDefault();
+      void appendPastedImageFiles(imageFiles);
       return;
     }
-
-    event.preventDefault();
-    void appendPastedImageFiles(imageFiles);
-  }, [appendPastedImageFiles, showSpecialInputComposer]);
+    void appendNativeClipboardImage();
+  }, [appendPastedImageFiles, appendNativeClipboardImage, showSpecialInputComposer]);
 
   useEffect(() => {
     const attachmentFilterConfig = getAttachmentFilterConfig(t, selectedEngineId, selectedModel);
