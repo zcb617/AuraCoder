@@ -3784,18 +3784,18 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
   }, [activeWorkspaceId, selectedEngineId, selectedModel, setAttachments, t]);
 
-  const appendNativeClipboardImage = useCallback(async () => {
+  const appendNativeClipboardImage = useCallback(async (): Promise<boolean> => {
     if (!activeWorkspaceId) {
-      return;
+      return false;
     }
     const attachmentFilterConfig = getAttachmentFilterConfig(t, selectedEngineId, selectedModel);
     if (!attachmentFilterConfig || attachmentFilterConfig.imageExtensions.length === 0) {
-      return;
+      return false;
     }
     try {
       const payloads = await ipc.readClipboardImage();
       if (payloads.length === 0) {
-        return;
+        return false;
       }
       const supportedImageExtensions = new Set(attachmentFilterConfig.imageExtensions);
       const supportedPayloads = payloads.filter((payload) => {
@@ -3803,7 +3803,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         return Boolean(extension && supportedImageExtensions.has(extension));
       });
       if (supportedPayloads.length === 0) {
-        return;
+        return false;
       }
       const nextAttachments = await Promise.all(
         supportedPayloads.map(async (payload) => {
@@ -3827,15 +3827,14 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         }
         return merged;
       });
-      // uri-list 兜底场景下，WebKitGTK 的默认粘贴会把路径文本插入输入框（同步启发式
-      // 不一定拦得住），附件挂上后把已知源路径文本从输入框精确移除。
+      // uri-list 兜底场景的安全网：历史实现下 WebKitGTK 的默认粘贴可能已把路径文本
+      // 插入输入框，附件挂上后把已知源路径文本从输入框精确移除。
+      // 当前 handleInputPaste 已完全接管默认粘贴（先 preventDefault），正常不会再有残留，
+      // 此段保留作为兜底。
       const pastedPaths = supportedPayloads
         .map((payload) => payload.sourcePath)
         .filter((value): value is string => Boolean(value));
-      if (pastedPaths.length > 0) {
-        if (!composerSessionKey) {
-          return;
-        }
+      if (pastedPaths.length > 0 && composerSessionKey) {
         const currentDraft =
           useChatComposerStore.getState().draftBySession[composerSessionKey] ?? "";
         let next = currentDraft;
@@ -3853,8 +3852,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
           setInput(next);
         }
       }
+      return true;
     } catch (error) {
       console.warn("Failed to read native clipboard image", error);
+      return false;
     }
   }, [activeWorkspaceId, selectedEngineId, selectedModel, setAttachments, composerSessionKey, setInput, t]);
 
@@ -3868,33 +3869,68 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       void appendPastedImageFiles(imageFiles);
       return;
     }
-    // Linux 文件管理器复制图片文件时，剪贴板只有 uri-list 文本（WebKitGTK 不提供 File）。
-    // 文本的每一行都是本地图片绝对路径/文件 URI 时，阻止默认粘贴（否则路径文本会进输入框），
-    // 交给原生兜底读取文件内容并挂为附件。
-    const clipboardText =
-      event.clipboardData.getData("text/uri-list") ||
-      event.clipboardData.getData("text/plain");
-    const clipboardTextLines = clipboardText
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0 && line !== "copy" && line !== "cut" && !line.startsWith("#"));
-    const clipboardTextIsImagePaths =
-      clipboardTextLines.length > 0 &&
-      clipboardTextLines.every((line) => {
-        const withoutScheme = line.startsWith("file://") ? line.slice("file://".length) : line;
-        let decodedLine = withoutScheme;
-        try {
-          decodedLine = decodeURIComponent(withoutScheme);
-        } catch {
-          // 非法编码时按原文判断。
+    // 完全接管 textarea 的默认粘贴：先阻止默认插入，等原生剪贴板检查返回后——
+    // 是图片（截图数据或文件管理器复制的图片文件）只挂附件，路径文本从根上不会进输入框；
+    // 不是图片再把纯文本手动插入光标处，行为与默认粘贴一致。
+    event.preventDefault();
+    const plainText = event.clipboardData.getData("text/plain");
+    const pasteTarget = event.target instanceof HTMLTextAreaElement ? event.target : inputRef.current;
+    const selectionStart = pasteTarget?.selectionStart ?? null;
+    const selectionEnd = pasteTarget?.selectionEnd ?? null;
+    void appendNativeClipboardImage().then((attached) => {
+      if (
+        attached ||
+        plainText.length === 0 ||
+        selectionStart === null ||
+        selectionEnd === null ||
+        !composerSessionKey
+      ) {
+        return;
+      }
+      const currentDraft =
+        useChatComposerStore.getState().draftBySession[composerSessionKey] ?? "";
+      const nextDraft =
+        currentDraft.slice(0, selectionStart) + plainText + currentDraft.slice(selectionEnd);
+      const nextCursor = selectionStart + plainText.length;
+      inputHistCursorRef.current = -1;
+      setInput(nextDraft);
+      handleSlashDetection(nextDraft, nextCursor);
+      handleThreadMentionDetection(nextDraft, nextCursor);
+      requestAnimationFrame(() => {
+        const element = inputRef.current;
+        if (!element) {
+          return;
         }
-        return decodedLine.startsWith("/") && /\.(png|jpe?g|gif|webp|bmp|tiff?|svg)$/i.test(decodedLine);
+        element.selectionStart = nextCursor;
+        element.selectionEnd = nextCursor;
       });
-    if (clipboardTextIsImagePaths) {
-      event.preventDefault();
-    }
-    void appendNativeClipboardImage();
-  }, [appendPastedImageFiles, appendNativeClipboardImage, showSpecialInputComposer]);
+    });
+    // 旧的"按剪贴板文本启发式判断是否全是图片路径再决定拦截"方案已停用：WebKitGTK
+    // 粘贴事件里剪贴板文本形态不稳定（实测启发式未命中，路径文本先插入再被异步移除，
+    // 用户看到"闪一下"）。旧实现注释保留备查：
+    // const clipboardText =
+    //   event.clipboardData.getData("text/uri-list") ||
+    //   event.clipboardData.getData("text/plain");
+    // const clipboardTextLines = clipboardText
+    //   .split(/\r?\n/)
+    //   .map((line) => line.trim())
+    //   .filter((line) => line.length > 0 && line !== "copy" && line !== "cut" && !line.startsWith("#"));
+    // const clipboardTextIsImagePaths =
+    //   clipboardTextLines.length > 0 &&
+    //   clipboardTextLines.every((line) => {
+    //     const withoutScheme = line.startsWith("file://") ? line.slice("file://".length) : line;
+    //     let decodedLine = withoutScheme;
+    //     try {
+    //       decodedLine = decodeURIComponent(withoutScheme);
+    //     } catch {
+    //       // 非法编码时按原文判断。
+    //     }
+    //     return decodedLine.startsWith("/") && /\.(png|jpe?g|gif|webp|bmp|tiff?|svg)$/i.test(decodedLine);
+    //   });
+    // if (clipboardTextIsImagePaths) {
+    //   event.preventDefault();
+    // }
+  }, [appendPastedImageFiles, appendNativeClipboardImage, showSpecialInputComposer, composerSessionKey, setInput]);
 
   useEffect(() => {
     const attachmentFilterConfig = getAttachmentFilterConfig(t, selectedEngineId, selectedModel);
