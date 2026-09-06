@@ -11,10 +11,10 @@
 - 配置加载代码：[`src/logging.rs`](src/logging.rs) 的 `initialize()`。
 - 应用启动入口：[`src/lib.rs`](src/lib.rs) 的 `run()`，先完成旧数据目录处理，再加载日志配置。
 - 运行时配置副本：`runtime_env::app_data_dir()/log4rs.yaml`；首次启动由 `initialize()` 生成，已有文件不会覆盖。
-- 当前统一日志文件：`logs/auracoder.log`。
-- 轮转文件：`logs/auracoder.1.log` 至 `logs/auracoder.100.log`。
+- 当前统一日志文件：`runtime_env::app_data_dir()/logs/auracoder.log`。
+- 轮转文件：同目录 `auracoder.1.log` 至 `auracoder.100.log`。
 - 当前配置：文件单个达到 5 MB 后轮转，最多保留 100 个历史文件；控制台输出 `info` 及以上，文件输出 `debug` 及以上。
-- `log4rs.yaml` 中的日志路径是相对路径，实际目录以进程工作目录为准；排查时先查进程工作目录下的 `logs` 目录。
+- `log4rs.yaml` 中的日志路径写的是相对路径 `logs/`，`logging.rs` 加载时统一替换为 `app_data_dir()/logs/` 绝对路径后写入 `log4rs.resolved.yaml` 再初始化；排查时直接查应用数据目录下的 `logs` 目录（Linux 开发版 `~/.agent-workspace-development/logs/`，正式版 `~/.agent-workspace/logs/`）。
 
 ## 统一调用方式
 
