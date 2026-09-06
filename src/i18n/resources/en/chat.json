@@ -440,6 +440,7 @@
     "emptyHint": "Open a folder and send a message to begin",
     "startConversation": "Start a conversation",
     "workspaceChatTitle": "Workspace Chat",
+    "permissionLoadFailed": "Failed to load permission settings. Please try again",
     "repoChatTitle": "{{name}} Chat",
     "renameThread": "Click to rename thread",
     "respondInCard": "Respond in the approval card below.",

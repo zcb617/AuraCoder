@@ -43,6 +43,7 @@
     "newThread": "New thread",
     "newThreadTitle": "New Thread",
     "newThreadFailed": "Failed to create a new conversation",
+    "newThreadNoCli": "No available CLI detected. Please install one first",
     "agents": "Agents",
     "extensions": "Extensions",
     "search": "Search",

@@ -278,6 +278,12 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
           }
         : resolveImplicitNewThreadRuntime(get(), workspaceId);
 
+    if (!effectiveRuntime) {
+      // 候选链未解析到已登记引擎（本机未检测到可用 CLI）时不创建线程，返回
+      // null 由调用方提示；不再以未知 codex 兜底创建不可用会话。
+      return null;
+    }
+
     set({ loading: true, error: undefined });
 
     try {
@@ -343,6 +349,10 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     title,
   }) => {
     const fallbackRuntime = resolveImplicitNewThreadRuntime(get(), workspaceId);
+    if (!fallbackRuntime) {
+      // 未解析到已登记引擎时无法确定会话范围，返回 null 由调用方处理。
+      return null;
+    }
     const effectiveEngine = engineId ?? fallbackRuntime.engineId;
     const effectiveModel = modelId ?? fallbackRuntime.modelId;
     const effectiveReasoningEffort =

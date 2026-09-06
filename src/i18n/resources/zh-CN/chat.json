@@ -440,6 +440,7 @@
     "emptyHint": "打开文件夹并发送消息以开始",
     "startConversation": "开始对话",
     "workspaceChatTitle": "工作区对话",
+    "permissionLoadFailed": "权限配置加载失败，请稍后重试",
     "repoChatTitle": "{{name}} 对话",
     "renameThread": "单击以重命名会话",
     "respondInCard": "请在下方的批准卡片中作答。",

@@ -43,6 +43,7 @@
     "newThread": "新建会话",
     "newThreadTitle": "新建会话",
     "newThreadFailed": "新建会话失败",
+    "newThreadNoCli": "本机未检测到可用 CLI，请先安装",
     "agents": "智能体",
     "extensions": "扩展",
     "search": "搜索",

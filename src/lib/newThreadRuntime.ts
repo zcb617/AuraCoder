@@ -77,12 +77,9 @@ function resolveRuntimeCandidate(
 
   const engine = engines.find((item) => item.id === engineId);
   if (!engine) {
-    return {
-      engineId,
-      modelId,
-      reasoningEffort: normalizeString(candidate.reasoningEffort),
-      serviceTier: engineId === "codex" ? normalizeServiceTier(candidate.serviceTier) : null,
-    };
+    // 候选引擎不在已登记/探测到的 engines 中时不再放行，避免为未安装的
+    // CLI 创建线程；候选链全部不可用时由调用方提示未检测到可用 CLI。
+    return null;
   }
 
   const model = engine.models.find((item) => item.id === modelId);
@@ -112,7 +109,7 @@ export function resolveNewThreadRuntime({
   composerRuntime,
   activeThread,
   onboardingSelection,
-}: ResolveNewThreadRuntimeInput): NewThreadRuntimeSelection {
+}: ResolveNewThreadRuntimeInput): NewThreadRuntimeSelection | null {
   const candidates: Array<NewThreadRuntimeSelection | null> = [
     composerRuntime ?? null,
     activeThread ? runtimeFromThread(activeThread) : null,
@@ -124,7 +121,9 @@ export function resolveNewThreadRuntime({
           serviceTier: null,
         }
       : null,
-    NEW_THREAD_FALLBACK_RUNTIME,
+    // 旧逻辑把 NEW_THREAD_FALLBACK_RUNTIME 作为最终候选，会在本机未装该 CLI
+    // 时仍按 codex 兜底创建线程，进而触发"未登记"报错；禁止恢复。
+    // NEW_THREAD_FALLBACK_RUNTIME,
   ];
 
   for (const candidate of candidates) {
@@ -134,5 +133,5 @@ export function resolveNewThreadRuntime({
     }
   }
 
-  return { ...NEW_THREAD_FALLBACK_RUNTIME };
+  return null;
 }

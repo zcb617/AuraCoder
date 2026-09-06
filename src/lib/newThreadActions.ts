@@ -48,6 +48,7 @@ export async function createAndActivateWorkspaceThread(
   }
 
   if (!threadId) {
+    toast.error(t("app:sidebar.newThreadNoCli"));
     return null;
   }
 

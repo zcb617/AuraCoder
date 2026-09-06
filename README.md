@@ -1,5 +1,9 @@
 ## Development
 
+### linux 编译环境
+sudo apt install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev build-essential pkg-config libglib2.0-dev
+
+### 命令和说明
 ```bash
 pnpm tauri:dev          # full desktop app in dev mode
 pnpm tauri:build        # native desktop bundles

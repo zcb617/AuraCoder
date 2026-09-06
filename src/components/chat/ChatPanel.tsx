@@ -2038,7 +2038,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const [commandPanelBusy, setCommandPanelBusy] = useState(false);
   const [commandPanelError, setCommandPanelError] = useState<string | null>(null);
   const commandPanelBusyRef = useRef(false);
-  const [selectedEngineId, setSelectedEngineId] = useState("codex");
+  // 旧逻辑默认选中 codex，会在本机未装 codex 时以不存在的 CLI 发起会话；
+  // 现在初始为空，等 engines 加载后由下方 effect 校正到实际引擎。
+  const [selectedEngineId, setSelectedEngineId] = useState("");
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [selectedEffort, setSelectedEffort] = useState("medium");
   const selectedEngineIdRef = useRef(selectedEngineId);
@@ -3187,7 +3189,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       })
       .catch((error) => {
         if (!disposed && permissionLoadRequestRef.current === requestId) {
-          toast.error(String(error));
+          // 旧逻辑把后端原始错误原文弹给用户（如"CLI 未在启动阶段登记"）；
+          // 原始错误记录日志，用户侧只展示业务语义文案。
+          console.error("Failed to load thread permissions:", error);
+          toast.error(t("panel.permissionLoadFailed"));
         }
       });
     return () => {
