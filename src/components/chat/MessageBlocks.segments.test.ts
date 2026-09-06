@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { ContentBlock } from "../../types";
-import { buildBlockSegments, getSubagentCardTitle } from "./MessageBlocks";
+import {
+  buildBlockSegments,
+  getSubagentCardTitle,
+  partitionClaudeBackgroundTasks,
+} from "./MessageBlocks";
 
 describe("buildBlockSegments", () => {
   it("excludes operations already assigned to a Claude background task from the foreground action list", () => {
@@ -65,6 +69,151 @@ describe("buildBlockSegments", () => {
     });
 
     expect(displayedActionIds).toEqual(["foreground-action"]);
+  });
+
+  it("keeps bash background task operations in the foreground action flow", () => {
+    const blocks: ContentBlock[] = [
+      {
+        type: "notice",
+        kind: "claude_background_tasks",
+        level: "info",
+        title: "Claude 后台任务",
+        message: "后台任务执行中",
+        metadata: {
+          backgroundTasks: [
+            {
+              taskId: "task-1",
+              taskType: "bash",
+              description: "后台命令",
+              status: "running",
+              startedAt: 1_000,
+            },
+          ],
+          activeTaskCount: 1,
+        },
+      },
+      {
+        type: "action",
+        actionId: "background-action",
+        actionType: "command",
+        summary: "后台检查命令",
+        details: {},
+        backgroundTaskId: "task-1",
+        outputChunks: [],
+        status: "running",
+      },
+      {
+        type: "action",
+        actionId: "foreground-action",
+        actionType: "search",
+        summary: "前台搜索",
+        details: {},
+        outputChunks: [],
+        status: "running",
+      },
+    ];
+
+    const segments = buildBlockSegments(blocks, true, "claude");
+    const displayedActionIds = segments.flatMap((segment) => {
+      if (segment.kind === "action-group") {
+        return segment.blocks.map((block) => block.actionId);
+      }
+      if (segment.kind === "action-card") {
+        return segment.segments.flatMap((inner) =>
+          inner.kind === "action-group"
+            ? inner.blocks.map((block) => block.actionId)
+            : inner.block.type === "action"
+              ? [inner.block.actionId]
+              : [],
+        );
+      }
+      return segment.kind === "single" && segment.block.type === "action"
+        ? [segment.block.actionId]
+        : [];
+    });
+
+    expect(displayedActionIds).toEqual(["background-action", "foreground-action"]);
+  });
+
+  it("excludes operations of agent-type background tasks from the foreground action flow", () => {
+    const blocks: ContentBlock[] = [
+      {
+        type: "notice",
+        kind: "claude_background_tasks",
+        level: "info",
+        title: "Claude 后台任务",
+        message: "后台任务执行中",
+        metadata: {
+          backgroundTasks: [
+            {
+              taskId: "task-agent",
+              taskType: "local_agent",
+              description: "子代理检查",
+              status: "running",
+              startedAt: 1_000,
+            },
+            {
+              taskId: "task-bash",
+              taskType: "bash",
+              description: "后台命令",
+              status: "running",
+              startedAt: 2_000,
+            },
+          ],
+          activeTaskCount: 2,
+        },
+      },
+      {
+        type: "action",
+        actionId: "agent-action",
+        actionType: "command",
+        summary: "子代理命令",
+        details: {},
+        backgroundTaskId: "task-agent",
+        outputChunks: [],
+        status: "running",
+      },
+      {
+        type: "action",
+        actionId: "bash-action",
+        actionType: "command",
+        summary: "后台命令",
+        details: {},
+        backgroundTaskId: "task-bash",
+        outputChunks: [],
+        status: "running",
+      },
+      {
+        type: "action",
+        actionId: "plain-action",
+        actionType: "search",
+        summary: "前台搜索",
+        details: {},
+        outputChunks: [],
+        status: "running",
+      },
+    ];
+
+    const segments = buildBlockSegments(blocks, true, "claude");
+    const displayedActionIds = segments.flatMap((segment) => {
+      if (segment.kind === "action-group") {
+        return segment.blocks.map((block) => block.actionId);
+      }
+      if (segment.kind === "action-card") {
+        return segment.segments.flatMap((inner) =>
+          inner.kind === "action-group"
+            ? inner.blocks.map((block) => block.actionId)
+            : inner.block.type === "action"
+              ? [inner.block.actionId]
+              : [],
+        );
+      }
+      return segment.kind === "single" && segment.block.type === "action"
+        ? [segment.block.actionId]
+        : [];
+    });
+
+    expect(displayedActionIds).toEqual(["bash-action", "plain-action"]);
   });
 
   it("keeps non-Codex hooks at their stream positions", () => {
@@ -594,5 +743,73 @@ describe("buildBlockSegments", () => {
       segments: [{ kind: "single", block: { actionId: "ordinary-result", result: { output: "可展开输出" } } }],
     });
     expect(segments[1]).toMatchObject({ kind: "hook-group", indices: [1] });
+  });
+});
+
+describe("partitionClaudeBackgroundTasks", () => {
+  it("splits subagent tasks from other background tasks", () => {
+    const metadata = {
+      backgroundTasks: [
+        {
+          taskId: "task-local-agent",
+          taskType: "local_agent",
+          description: "本地子代理",
+          status: "running" as const,
+          startedAt: 1_000,
+        },
+        {
+          taskId: "task-agent",
+          taskType: "agent",
+          description: "子代理",
+          status: "completed" as const,
+          startedAt: 2_000,
+          finishedAt: 3_000,
+        },
+        {
+          taskId: "task-remote-agent",
+          taskType: "remote_agent",
+          description: "远程子代理",
+          status: "running" as const,
+          startedAt: 4_000,
+        },
+        {
+          taskId: "task-bash",
+          taskType: "bash",
+          description: "后台命令",
+          status: "running" as const,
+          startedAt: 5_000,
+        },
+        {
+          taskId: "task-local-bash",
+          taskType: "local_bash",
+          description: "本地后台命令",
+          status: "completed" as const,
+          startedAt: 6_000,
+          finishedAt: 7_000,
+        },
+        {
+          taskId: "task-workflow",
+          taskType: "local_workflow",
+          description: "工作流任务",
+          status: "stopped" as const,
+          startedAt: 8_000,
+          finishedAt: 9_000,
+        },
+      ],
+      activeTaskCount: 3,
+    };
+
+    const { subagentTasks, otherTasks } = partitionClaudeBackgroundTasks(metadata);
+
+    expect(subagentTasks.map((task) => task.taskId)).toEqual([
+      "task-local-agent",
+      "task-agent",
+      "task-remote-agent",
+    ]);
+    expect(otherTasks.map((task) => task.taskId)).toEqual([
+      "task-bash",
+      "task-local-bash",
+      "task-workflow",
+    ]);
   });
 });

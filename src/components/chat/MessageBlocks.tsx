@@ -427,14 +427,20 @@ export function buildBlockSegments(
   };
 
   // Codex 按回复边界重排 Hook，确保同一回复段的工具调用保持连续。
+  const subagentTaskIds = collectClaudeSubagentTaskIds(blocks);
   const indexedBlocks: DisplayBlock[] = blocks
     .map((block, index) => ({ block, index }))
-    // 已归属到后台任务的操作只在对应任务卡片中展示，不能再混入前台统一汇总。
-    .filter(
-      (entry) =>
-        entry.block.type !== "action" ||
-        !(entry.block as ActionBlock).backgroundTaskId,
-    );
+    // 已归属到子代理类后台任务的操作只在对应子代理卡片中展示；非子代理任务的操作留在主流，参与文本分段的操作合集。
+    .filter((entry) => {
+      if (entry.block.type !== "action") {
+        return true;
+      }
+      const backgroundTaskId = (entry.block as ActionBlock).backgroundTaskId;
+      if (typeof backgroundTaskId !== "string" || backgroundTaskId.length === 0) {
+        return true;
+      }
+      return !subagentTaskIds.has(backgroundTaskId);
+    });
   const displayBlocks: DisplayBlock[] = [];
   const firstTextIndex = indexedBlocks.findIndex((entry) => entry.block.type === "text");
   if (engineId !== "codex" || firstTextIndex < 0) {
@@ -813,6 +819,44 @@ function isClaudeBackgroundTaskMetadata(
   });
 }
 
+/** 判断 Claude 后台任务类型是否为子代理类任务（Agent 工具启动的子代理）。 */
+function isClaudeSubagentTaskType(taskType: string): boolean {
+  return taskType === "agent" || taskType.endsWith("_agent");
+}
+
+/** 将 Claude 后台任务元数据拆成子代理任务和非子代理任务，保持原有顺序。 */
+export function partitionClaudeBackgroundTasks(
+  metadata: ClaudeBackgroundTaskMetadata,
+): {
+  subagentTasks: ClaudeBackgroundTask[];
+  otherTasks: ClaudeBackgroundTask[];
+} {
+  const subagentTasks = metadata.backgroundTasks.filter((task) =>
+    isClaudeSubagentTaskType(task.taskType),
+  );
+  const otherTasks = metadata.backgroundTasks.filter(
+    (task) => !isClaudeSubagentTaskType(task.taskType),
+  );
+  return { subagentTasks, otherTasks };
+}
+
+/** 收集消息中所有子代理类后台任务的标识，供主流过滤归属子代理的操作。 */
+function collectClaudeSubagentTaskIds(blocks: ContentBlock[]): Set<string> {
+  const taskIds = new Set<string>();
+  for (const block of blocks) {
+    if (block.type !== "notice" || block.kind !== "claude_background_tasks") {
+      continue;
+    }
+    if (!isClaudeBackgroundTaskMetadata(block.metadata)) {
+      continue;
+    }
+    for (const task of partitionClaudeBackgroundTasks(block.metadata).subagentTasks) {
+      taskIds.add(task.taskId);
+    }
+  }
+  return taskIds;
+}
+
 /** 将后台任务持续时间格式化为用户可读的分钟和秒。 */
 function formatClaudeBackgroundElapsed(startedAt: number, endedAt: number): string {
   const elapsedSeconds = Math.max(0, Math.floor((endedAt - startedAt) / 1000));
@@ -821,17 +865,19 @@ function formatClaudeBackgroundElapsed(startedAt: number, endedAt: number): stri
   return `${minutes}:${seconds}`;
 }
 
-/** 渲染 Claude 后台任务生命周期卡片，并保留用户手动控制的折叠状态。 */
+/* 旧逻辑保留，不执行，已由子代理独立卡片 ClaudeSubagentTasksView 替代：
+   （内部 JSDoc 定界符改为 // 行注释，避免提前闭合外层块注释；旧代码本体未动。）
+// 渲染 Claude 后台任务生命周期卡片，并保留用户手动控制的折叠状态。
 function ClaudeBackgroundTasksCard({
   metadata,
   actions,
   onLoadActionOutput,
 }: {
-  /** Claude 后台任务卡片的结构化展示数据。 */
+  // Claude 后台任务卡片的结构化展示数据。
   metadata: ClaudeBackgroundTaskMetadata;
-  /** 当前消息中已确认归属到后台任务的操作。 */
+  // 当前消息中已确认归属到后台任务的操作。
   actions: ActionBlock[];
-  /** 延迟加载某条操作完整结果的回调。 */
+  // 延迟加载某条操作完整结果的回调。
   onLoadActionOutput?: (actionId: string) => Promise<void>;
 }) {
   const tasks = metadata.backgroundTasks;
@@ -986,6 +1032,147 @@ function ClaudeBackgroundTasksCard({
     </div>
   );
 }
+*/
+
+/** 渲染 Claude 子代理任务，每个子代理一张独立卡片；没有子代理任务时不渲染。 */
+function ClaudeSubagentTasksView({
+  metadata,
+  actions,
+  onLoadActionOutput,
+}: {
+  /** Claude 后台任务卡片的结构化展示数据。 */
+  metadata: ClaudeBackgroundTaskMetadata;
+  /** 当前消息中已确认归属到后台任务的操作。 */
+  actions: ActionBlock[];
+  /** 延迟加载某条操作完整结果的回调。 */
+  onLoadActionOutput?: (actionId: string) => Promise<void>;
+}) {
+  const { subagentTasks } = partitionClaudeBackgroundTasks(metadata);
+  if (subagentTasks.length === 0) {
+    return null;
+  }
+  return (
+    <>
+      {subagentTasks.map((task) => (
+        <ClaudeSubagentTaskCard
+          key={task.taskId}
+          task={task}
+          actions={actions.filter((action) => action.backgroundTaskId === task.taskId)}
+          onLoadActionOutput={onLoadActionOutput}
+        />
+      ))}
+    </>
+  );
+}
+
+/** 渲染单个子代理任务卡片，标题为"子代理：{描述}"，并保留用户手动控制的折叠状态。 */
+function ClaudeSubagentTaskCard({
+  task,
+  actions,
+  onLoadActionOutput,
+}: {
+  /** 子代理任务的结构化展示数据。 */
+  task: ClaudeBackgroundTask;
+  /** 归属该子代理任务的操作。 */
+  actions: ActionBlock[];
+  /** 延迟加载某条操作完整结果的回调。 */
+  onLoadActionOutput?: (actionId: string) => Promise<void>;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  const [expanded, setExpanded] = useState(
+    task.status === "running" || task.status === "failed",
+  );
+  const previousStatusRef = useRef(task.status);
+
+  useEffect(() => {
+    if (task.status !== "running") {
+      return undefined;
+    }
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [task.status]);
+
+  useEffect(() => {
+    if (task.status === "failed" && previousStatusRef.current !== "failed") {
+      setExpanded(true);
+    }
+    previousStatusRef.current = task.status;
+  }, [task.status]);
+
+  const taskStatusLabel =
+    task.status === "running"
+      ? "执行中"
+      : task.status === "completed"
+        ? "已完成"
+        : task.status === "failed"
+          ? "失败"
+          : "已停止";
+  const taskStatusIcon =
+    task.status === "running"
+      ? <Loader2 size={11} style={{ animation: "spin 1s linear infinite" }} />
+      : task.status === "completed"
+        ? <CheckCircle2 size={11} />
+        : task.status === "failed"
+          ? <XCircle size={11} />
+          : <Circle size={11} />;
+  const taskStatusClass = `claude-background-task-status--${task.status}`;
+  const elapsedEnd = task.status === "running" ? now : task.finishedAt ?? now;
+  const failedActionCount = actions.filter((action) => action.status === "error").length;
+
+  return (
+    <div className="msg-action-card claude-background-tasks-card">
+      <MessageBlockHeader
+        icon={<Layers size={11} />}
+        label={`子代理：${task.description}`}
+        tileTone="info"
+        expanded={expanded}
+        onToggle={() => setExpanded((current) => !current)}
+        meta={
+          <span className={`claude-background-task-status ${taskStatusClass}`}>
+            {taskStatusIcon}
+            {taskStatusLabel}
+          </span>
+        }
+      />
+      {expanded && (
+        <div className="claude-background-tasks-body">
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <div className="claude-background-task-row">
+              <div className="claude-background-task-content">
+                {task.summary && (
+                  <div className="claude-background-task-summary" title={task.summary}>
+                    {task.summary}
+                  </div>
+                )}
+              </div>
+              <span className="claude-background-task-elapsed">
+                {formatClaudeBackgroundElapsed(task.startedAt, elapsedEnd)}
+              </span>
+            </div>
+            {actions.length > 0 && (
+              <div className="action-group-body action-group-body--expanded">
+                <div className="action-group-body-inner" style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                  <div className="msg-block-meta" style={{ padding: "3px 12px 1px" }}>
+                    {actions.length} 个操作{failedActionCount > 0 ? ` · ${failedActionCount} 个错误` : ""}
+                  </div>
+                  {actions.map((action) => (
+                    <ActionBlockView
+                      key={action.actionId}
+                      block={action}
+                      onLoadDeferredOutput={
+                        onLoadActionOutput ? () => onLoadActionOutput(action.actionId) : undefined
+                      }
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function NoticeBlockView({
   block,
@@ -1000,8 +1187,16 @@ function NoticeBlockView({
     block.kind === "claude_background_tasks" &&
     isClaudeBackgroundTaskMetadata(block.metadata)
   ) {
+    // 旧逻辑保留，不执行，已由子代理独立卡片替代：
+    // return (
+    //   <ClaudeBackgroundTasksCard
+    //     metadata={block.metadata}
+    //     actions={backgroundTaskActions}
+    //     onLoadActionOutput={onLoadActionOutput}
+    //   />
+    // );
     return (
-      <ClaudeBackgroundTasksCard
+      <ClaudeSubagentTasksView
         metadata={block.metadata}
         actions={backgroundTaskActions}
         onLoadActionOutput={onLoadActionOutput}
