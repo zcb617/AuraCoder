@@ -16,7 +16,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    claude_sidecar::{map_claude_models, with_legacy_claude_models, SidecarModelInfo},
+    claude_sidecar::{
+        build_claude_prompt, map_claude_models, with_legacy_claude_models, SidecarModelInfo,
+    },
     normalize_approval_response_for_engine, trim_action_output_delta_content, ActionResult,
     ActionType, ApprovalRequestRoute, Engine, EngineEvent, EngineSteerReceipt, EngineThread,
     ModelInfo, OutputStream, SandboxPolicy, ThreadScope, TurnCompletionStatus, TurnInput,
@@ -389,8 +391,9 @@ impl ClaudeRemoteEngine {
             message,
             attachments,
             plan_mode,
-            input_items: _,
+            input_items,
         } = input;
+        let prompt = build_claude_prompt(&message, &input_items);
         anyhow::ensure!(
             attachments.iter().all(|attachment| attachment.is_remote),
             "SSH 远端 Claude 只能接收已上传的远端附件路径"
@@ -407,7 +410,7 @@ impl ClaudeRemoteEngine {
             })
             .collect::<Vec<_>>();
         let mut params = serde_json::json!({
-            "prompt": message,
+            "prompt": prompt,
             "attachments": attachments,
             "cwd": cwd,
             "model": thread_config.model_id,
@@ -1035,8 +1038,9 @@ impl Engine for ClaudeRemoteEngine {
             message,
             attachments,
             plan_mode,
-            input_items: _,
+            input_items,
         } = input;
+        let prompt = build_claude_prompt(&message, &input_items);
         // 阶段计划 3 明确拒绝远端附件；阶段计划 4 已在发送前把本机文件上传并
         // 转换为远端绝对路径，因此这里只接受标记为远端缓存的附件。
         // anyhow::ensure!(
@@ -1059,7 +1063,7 @@ impl Engine for ClaudeRemoteEngine {
             })
             .collect::<Vec<_>>();
         let mut params = serde_json::json!({
-            "prompt": message,
+            "prompt": prompt,
             "attachments": attachments,
             "cwd": cwd,
             "model": thread_config.model_id,

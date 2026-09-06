@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildCodexInputItems, buildSelectedCodexInputItems } from "./codexInputItems";
+import { buildCodexInputItems, buildSelectedInputItems } from "./codexInputItems";
 
 describe("buildCodexInputItems", () => {
   it("converts matching $skill and $app tokens into typed input items", () => {
@@ -63,7 +63,7 @@ describe("buildCodexInputItems", () => {
 
   it("prepends classic picker references and ignores duplicate selections", () => {
     expect(
-      buildSelectedCodexInputItems("Run the checks", [
+      buildSelectedInputItems("Run the checks", [
         { type: "skill", name: "lint", path: "/skills/lint" },
         { type: "mention", name: "Docs", path: "app://docs" },
         { type: "skill", name: "lint", path: "/skills/lint" },

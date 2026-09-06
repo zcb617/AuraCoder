@@ -31,7 +31,7 @@ use super::{
     normalize_approval_response_for_engine, trim_action_output_delta_content, ActionResult,
     ActionType, ApprovalRequestRoute, Engine, EngineEvent, EngineSteerReceipt, EngineThread,
     ModelInfo, OutputStream, ReasoningEffortOption, SandboxPolicy, ThreadScope,
-    TurnCompletionStatus, TurnInput,
+    TurnCompletionStatus, TurnInput, TurnInputItem,
 };
 
 const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -46,6 +46,22 @@ const ARCHIVED_CLAUDE_SDK_NODE_MODULES: &str = "claude-sdk-node_modules.tar.gz";
 const SIDECAR_EVENT_BUFFER_CAPACITY: usize = 1024;
 const CLAUDE_EVENT_QUEUE_CAPACITY: usize = SIDECAR_EVENT_BUFFER_CAPACITY;
 const MINIMUM_NODE_VERSION: &str = "20.5";
+
+/// 将前端选中的结构化 Skill 转为 Claude 可执行的 slash 前缀，并保留原始消息正文。
+pub(crate) fn build_claude_prompt(message: &str, input_items: &[TurnInputItem]) -> String {
+    let skill_prefix = input_items
+        .iter()
+        .filter_map(|item| match item {
+            TurnInputItem::Skill { name, .. } => Some(format!("/{} ", name)),
+            TurnInputItem::Text { .. } | TurnInputItem::Mention { .. } => None,
+        })
+        .collect::<String>();
+    if skill_prefix.is_empty() {
+        return message.to_string();
+    }
+    format!("{}{}", skill_prefix, message)
+}
+
 const NODE_RUNTIME_PROBE_SCRIPT: &str = r#"
 const version = process.versions.node;
 const explicitResourceManagement =
@@ -2443,11 +2459,12 @@ impl Engine for ClaudeSidecarEngine {
             message,
             attachments,
             plan_mode,
-            input_items: _,
+            input_items,
         } = input;
+        let prompt = build_claude_prompt(&message, &input_items);
 
         let mut params = serde_json::json!({
-            "prompt": message,
+            "prompt": prompt,
             "attachments": attachments
                 .iter()
                 .map(|attachment| {

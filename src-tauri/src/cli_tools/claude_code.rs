@@ -2564,7 +2564,8 @@ impl CliTool for ClaudeCodeCli {
         for item in &mut items {
             match item.kind.as_str() {
                 "skill" => {
-                    item.insert_text = Some(format!("/{} ", item.name));
+                    // 旧逻辑会把 Skill 当作文本插入输入框，保留迁移留痕但不再执行：
+                    // item.insert_text = Some(format!("/{} ", item.name));
                     item.group = Some("skills".to_string());
                 }
                 "plugin" => {

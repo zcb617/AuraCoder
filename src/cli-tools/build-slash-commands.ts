@@ -93,7 +93,7 @@ function groupLabel(group: string | null | undefined, t: TFunction): string | un
 /// 把后端返回的统一 ExtensionItemDto 列表解析成斜杠菜单命令。
 /// 解析规则：
 /// - 图标：kind 映射，内置命令按 id 覆盖
-/// - 选中行为：insertText 非空 → 插入文本；kind=skill → 插入引用；panel=fast → fast 开关；其他 panel → 打开面板
+/// - 选中行为：kind=skill → 插入引用；非 Skill 的 insertText 非空 → 插入文本；panel=fast → fast 开关；其他 panel → 打开面板
 /// - 禁用：item.disabled 叠加运行时能力开关
 /// - classic 模式显示全部；非 classic 模式只显示 kind=command 的面板入口与内置命令
 export function buildSlashCommandsFromExtensions(
@@ -119,15 +119,15 @@ export function buildSlashCommandsFromExtensions(
     }
 
     let action: CliSlashCommand["action"];
-    if (item.insertText) {
-      action = { type: "insert", text: item.insertText };
-    } else if (item.kind === "skill") {
+    if (item.kind === "skill") {
       const reference: ChatInputReference = {
         type: "skill",
         name: item.name,
         path: item.path || item.id,
       };
       action = { type: "reference", reference };
+    } else if (item.insertText) {
+      action = { type: "insert", text: item.insertText };
     } else if (item.panel === "fast") {
       action = { type: "fast" };
     } else if (item.panel && PANEL_TYPES.has(item.panel as CliSlashCommandPanel["type"])) {

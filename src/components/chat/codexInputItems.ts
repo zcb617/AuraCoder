@@ -45,7 +45,8 @@ function pushTextItem(items: ChatInputItem[], text: string) {
   items.push({ type: "text", text });
 }
 
-export function buildSelectedCodexInputItems(
+/// 构建菜单已选引用与消息正文的统一输入项，供支持结构化引用的 CLI 发送链路使用。
+export function buildSelectedInputItems(
   message: string,
   references: ChatInputReference[],
 ): ChatInputItem[] {

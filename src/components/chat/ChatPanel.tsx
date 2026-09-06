@@ -101,7 +101,7 @@ import { recordPerfMetric } from "../../lib/perfTelemetry";
 import { isMacDesktop, usesCustomWindowFrame } from "../../lib/windowActions";
 import { MessageBlocks, shouldShowClaudeUnsupportedApproval } from "./MessageBlocks";
 import { resolveEngineCapabilities } from "./engineCapabilities";
-import { buildCodexInputItems, buildSelectedCodexInputItems } from "./codexInputItems";
+import { buildCodexInputItems, buildSelectedInputItems } from "./codexInputItems";
 import {
   filterClassicSlashItems,
   findClassicSlashQuery,
@@ -2361,7 +2361,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     (state) => state.setSessionReferences,
   );
   const canSubmitComposer = Boolean(
-    input.trim() || textAnnotations.length > 0 || hasImageAttachmentAnnotations(attachments),
+    input.trim()
+      || references.length > 0
+      || textAnnotations.length > 0
+      || hasImageAttachmentAnnotations(attachments),
   );
   const sendShortcut = useChatComposerStore((state) => state.sendShortcut);
   const chatInputMode = useChatComposerStore((state) => state.chatInputMode);
@@ -3019,18 +3022,23 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
   }, [activeWorkspaceId, selectedEngineId]);
 
-  const resolveCodexInputItems = useCallback(
+  // 统一将聊天文字和已选引用转换为 CLI 输入项；只有 Codex 继续解析 $token。
+  const resolveInputItems = useCallback(
     async (
       message: string,
       engineId: string,
       references: ChatInputReference[] = EMPTY_CHAT_INPUT_REFERENCES,
     ): Promise<ChatInputItem[] | undefined> => {
-      if (engineId !== "codex") {
+      if (engineId === "opencode") {
         return undefined;
       }
 
       if (references.length > 0 || chatInputMode === "classic") {
-        return buildSelectedCodexInputItems(message, references);
+        return buildSelectedInputItems(message, references);
+      }
+
+      if (engineId !== "codex") {
+        return engineId === "claude" ? [{ type: "text", text: message }] : undefined;
       }
 
       let skills = codexSkills;
@@ -5678,6 +5686,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     // if ((!submittedText.trim() && submittedTextAnnotations.length === 0) || !activeWorkspaceId) return false;
     if (
       (!submittedText.trim()
+        && submittedReferences.length === 0
         && submittedTextAnnotations.length === 0
         && !hasImageAttachmentAnnotations(submittedAttachments))
       || !activeWorkspaceId
@@ -5707,7 +5716,11 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         return false;
       }
 
-      const inputItems = await resolveCodexInputItems(text, "codex", currentReferences);
+      const inputItems = await resolveInputItems(
+        text,
+        activeThread?.engineId ?? selectedEngineId,
+        currentReferences,
+      );
       const steered = await steer(text, {
         threadIdOverride: activeThreadId,
         // attachments: currentAttachments.length > 0 ? currentAttachments : undefined,
@@ -5910,7 +5923,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     setThreadMessageSendMode(targetThreadId, sessionMessageSendMode);
     clearPendingMessageSendMode(activeWorkspaceId);
 
-    const inputItems = await resolveCodexInputItems(text, submitEngineId, currentReferences);
+    const inputItems = await resolveInputItems(text, submitEngineId, currentReferences);
 
 
     if (!createdThread) {
