@@ -4416,7 +4416,14 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     lastSyncedThreadIdRef.current = activeThread.id;
     manuallyOverrodeThreadSelectionRef.current = false;
     setHasExplicitComposerRuntime(false);
-    if (activeThread.engineId !== selectedEngineId) {
+    // 新建会话落库时引擎以 unknown 占位，等首发消息才确定真实引擎；占位值不在
+    // 已登记 engines 列表里，回写会被上方校正 effect 反复改回，形成无限 ping-pong
+    // （logo/文案高频闪烁）。引擎未落定前不回写，由校正 effect 维持可用引擎，
+    // 首发消息落库真实引擎后这里自然接管。
+    if (
+      activeThread.engineId !== selectedEngineId &&
+      engines.some((engine) => engine.id === activeThread.engineId)
+    ) {
       setSelectedEngineId(activeThread.engineId);
     }
     const threadEngine =
