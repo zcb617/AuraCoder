@@ -143,22 +143,25 @@ async function stageRemoteLinuxRuntime(sdkPackageDir, contentVersion) {
   console.log(`Built Claude SSH remote Linux runtime ${contentVersion}.`);
 }
 
-async function archiveLinuxSdkNodeModules() {
-  const targetPlatform = process.env.PANES_CLAUDE_SDK_PLATFORM ?? process.platform;
-  if (targetPlatform !== "linux") {
-    return;
-  }
-
-  await removeGeneratedSidecarPath(linuxSdkArchiveFile, { force: true });
-  await run("tar", ["-czf", path.basename(linuxSdkArchiveFile), "node_modules"], {
-    cwd: outDir,
-  });
-  await removeGeneratedSidecarPath(sdkDistNodeModulesDir, {
-    recursive: true,
-    force: true,
-  });
-  console.log("Archived Claude SDK node_modules for Linux runtime staging.");
-}
+// 三平台统一后不再调用:Linux 与 Win/Mac 一样直接随包分发 node_modules。
+// 旧逻辑保留留痕:Linux 曾将 node_modules 归档为 tar.gz 并从输出目录删除,
+// 运行时解压到用户缓存目录,导致 sidecar 裸导入 zod/v4 时无法解析。
+// async function archiveLinuxSdkNodeModules() {
+//   const targetPlatform = process.env.PANES_CLAUDE_SDK_PLATFORM ?? process.platform;
+//   if (targetPlatform !== "linux") {
+//     return;
+//   }
+//
+//   await removeGeneratedSidecarPath(linuxSdkArchiveFile, { force: true });
+//   await run("tar", ["-czf", path.basename(linuxSdkArchiveFile), "node_modules"], {
+//     cwd: outDir,
+//   });
+//   await removeGeneratedSidecarPath(sdkDistNodeModulesDir, {
+//     recursive: true,
+//     force: true,
+//   });
+//   console.log("Archived Claude SDK node_modules for Linux runtime staging.");
+// }
 
 if (process.argv.includes("--print-version")) {
   console.log(await calculateRemoteRuntimeVersion());
@@ -196,7 +199,8 @@ await stageClaudeSdkPlatformAssets({
 });
 const contentVersion = await calculateRemoteRuntimeVersion();
 await stageRemoteLinuxRuntime(sdkPackageDir, contentVersion);
-await archiveLinuxSdkNodeModules();
+// 三平台统一:Linux 不再归档删除 node_modules,直接留在输出目录随包分发。
+// await archiveLinuxSdkNodeModules();
 
 const output = await readFile(outFile, "utf8");
 if (!output.includes('import("@anthropic-ai/claude-agent-sdk")')) {
