@@ -25,6 +25,7 @@ dependencies = [
  "log",
  "log4rs",
  "notify",
+ "percent-encoding",
  "plist",
  "portable-pty",
  "qrcode",

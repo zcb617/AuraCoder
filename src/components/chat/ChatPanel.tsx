@@ -3789,29 +3789,74 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       return;
     }
     const attachmentFilterConfig = getAttachmentFilterConfig(t, selectedEngineId, selectedModel);
-    if (!attachmentFilterConfig || !attachmentFilterConfig.imageExtensions.includes("png")) {
+    if (!attachmentFilterConfig || attachmentFilterConfig.imageExtensions.length === 0) {
       return;
     }
     try {
-      const payload = await ipc.readClipboardImage();
-      if (!payload) {
+      const payloads = await ipc.readClipboardImage();
+      if (payloads.length === 0) {
         return;
       }
-      const savedAttachment = await ipc.savePastedImageAttachment(
-        payload.fileName,
-        payload.mimeType,
-        payload.dataBase64,
+      const supportedImageExtensions = new Set(attachmentFilterConfig.imageExtensions);
+      const supportedPayloads = payloads.filter((payload) => {
+        const extension = getFileExtension(payload.fileName);
+        return Boolean(extension && supportedImageExtensions.has(extension));
+      });
+      if (supportedPayloads.length === 0) {
+        return;
+      }
+      const nextAttachments = await Promise.all(
+        supportedPayloads.map(async (payload) => {
+          const savedAttachment = await ipc.savePastedImageAttachment(
+            payload.fileName,
+            payload.mimeType,
+            payload.dataBase64,
+          );
+          return { ...savedAttachment, id: crypto.randomUUID() };
+        }),
       );
       setAttachments((prev) => {
-        if (prev.some((attachment) => attachment.filePath === savedAttachment.filePath)) {
-          return prev;
+        const knownPaths = new Set(prev.map((attachment) => attachment.filePath));
+        const merged = [...prev];
+        for (const attachment of nextAttachments) {
+          if (knownPaths.has(attachment.filePath)) {
+            continue;
+          }
+          knownPaths.add(attachment.filePath);
+          merged.push(attachment);
         }
-        return [...prev, { ...savedAttachment, id: crypto.randomUUID() }];
+        return merged;
       });
+      // uri-list 兜底场景下，WebKitGTK 的默认粘贴会把路径文本插入输入框（同步启发式
+      // 不一定拦得住），附件挂上后把已知源路径文本从输入框精确移除。
+      const pastedPaths = supportedPayloads
+        .map((payload) => payload.sourcePath)
+        .filter((value): value is string => Boolean(value));
+      if (pastedPaths.length > 0) {
+        if (!composerSessionKey) {
+          return;
+        }
+        const currentDraft =
+          useChatComposerStore.getState().draftBySession[composerSessionKey] ?? "";
+        let next = currentDraft;
+        for (const pastedPath of pastedPaths) {
+          for (const variant of [
+            pastedPath,
+            `file://${pastedPath}`,
+            encodeURI(pastedPath),
+            `file://${encodeURI(pastedPath)}`,
+          ]) {
+            next = next.replace(variant, "");
+          }
+        }
+        if (next !== currentDraft) {
+          setInput(next);
+        }
+      }
     } catch (error) {
       console.warn("Failed to read native clipboard image", error);
     }
-  }, [activeWorkspaceId, selectedEngineId, selectedModel, setAttachments, t]);
+  }, [activeWorkspaceId, selectedEngineId, selectedModel, setAttachments, composerSessionKey, setInput, t]);
 
   const handleInputPaste = useCallback((event: ReactClipboardEvent<HTMLElement>) => {
     if (showSpecialInputComposer) {
@@ -3822,6 +3867,31 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       event.preventDefault();
       void appendPastedImageFiles(imageFiles);
       return;
+    }
+    // Linux 文件管理器复制图片文件时，剪贴板只有 uri-list 文本（WebKitGTK 不提供 File）。
+    // 文本的每一行都是本地图片绝对路径/文件 URI 时，阻止默认粘贴（否则路径文本会进输入框），
+    // 交给原生兜底读取文件内容并挂为附件。
+    const clipboardText =
+      event.clipboardData.getData("text/uri-list") ||
+      event.clipboardData.getData("text/plain");
+    const clipboardTextLines = clipboardText
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && line !== "copy" && line !== "cut" && !line.startsWith("#"));
+    const clipboardTextIsImagePaths =
+      clipboardTextLines.length > 0 &&
+      clipboardTextLines.every((line) => {
+        const withoutScheme = line.startsWith("file://") ? line.slice("file://".length) : line;
+        let decodedLine = withoutScheme;
+        try {
+          decodedLine = decodeURIComponent(withoutScheme);
+        } catch {
+          // 非法编码时按原文判断。
+        }
+        return decodedLine.startsWith("/") && /\.(png|jpe?g|gif|webp|bmp|tiff?|svg)$/i.test(decodedLine);
+      });
+    if (clipboardTextIsImagePaths) {
+      event.preventDefault();
     }
     void appendNativeClipboardImage();
   }, [appendPastedImageFiles, appendNativeClipboardImage, showSpecialInputComposer]);

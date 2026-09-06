@@ -345,21 +345,98 @@ pub struct ClipboardImagePayload {
     pub file_name: String,
     pub mime_type: String,
     pub data_base64: String,
+    /// uri-list 兜底分支的源图片本地路径（percent 解码后）；read_image 成功分支无此来源，为 None。
+    #[serde(default)]
+    pub source_path: Option<String>,
 }
 
 /// 原生兜底命令：在 DataTransfer 拿不到剪贴板 image File 时（Linux 部分场景），
 /// 由原生侧读取系统剪贴板图片并编码为 PNG base64 返回；剪贴板无图片时不视为错误。
 #[tauri::command]
-pub async fn read_clipboard_image(app: AppHandle) -> Result<Option<ClipboardImagePayload>, String> {
+pub async fn read_clipboard_image(app: AppHandle) -> Result<Vec<ClipboardImagePayload>, String> {
     tokio::task::spawn_blocking(move || {
         use tauri_plugin_clipboard_manager::ClipboardExt;
         let clipboard_image = match app.clipboard().read_image() {
             Ok(image) => image,
             Err(error) => {
-                // 剪贴板中没有图片（普通文本/文件复制）是本命令的正常探测结果，
-                // 原始错误记录到 debug 日志，按"无图片"返回 None，由前端继续默认粘贴。
+                // 剪贴板中没有图片数据（普通文本/文件复制）是本命令的正常探测结果，
+                // 原始错误记录到 debug 日志，继续尝试 uri-list 文本兜底。
                 log::debug!("读取系统剪贴板图片失败或无图片: {error}");
-                return Ok(None);
+                let text = match app.clipboard().read_text() {
+                    Ok(text) => text,
+                    Err(text_error) => {
+                        log::debug!("读取系统剪贴板文本失败或无文本: {text_error}");
+                        return Ok(Vec::new());
+                    }
+                };
+                let mut payloads = Vec::new();
+                for raw_line in text.lines() {
+                    let line = raw_line.trim();
+                    // 跳过空行、GNOME x-special/gnome-copied-files 的 copy/cut 首行、
+                    // 以及 text/uri-list 规范中的 # 注释行。
+                    if line.is_empty() || line == "copy" || line == "cut" || line.starts_with('#') {
+                        continue;
+                    }
+                    let without_scheme = line.strip_prefix("file://").unwrap_or(line);
+                    let decoded = match percent_encoding::percent_decode_str(without_scheme)
+                        .decode_utf8()
+                    {
+                        Ok(value) => value.into_owned(),
+                        Err(decode_error) => {
+                            log::warn!("剪贴板文件路径 URL 解码失败，已跳过: {line}，原始错误: {decode_error}");
+                            continue;
+                        }
+                    };
+                    let path = PathBuf::from(&decoded);
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let Some(extension) = path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .map(|value| value.to_lowercase())
+                    else {
+                        continue;
+                    };
+                    if !IMAGE_ATTACHMENT_EXTENSIONS.contains(&extension.as_str()) {
+                        continue;
+                    }
+                    let Some(mime_type) = image_mime_type_for_extension(&extension) else {
+                        continue;
+                    };
+                    let bytes = match std::fs::read(&path) {
+                        Ok(bytes) => bytes,
+                        Err(read_error) => {
+                            log::error!("读取剪贴板引用的图片文件失败: {decoded}，原始错误: {read_error}");
+                            continue;
+                        }
+                    };
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    if bytes.len() > MAX_PASTED_IMAGE_ATTACHMENT_BYTES {
+                        log::warn!("剪贴板引用的图片文件超过 10 MB 附件上限，已跳过: {decoded}");
+                        continue;
+                    }
+                    let file_name = path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| {
+                            format!(
+                                "clipboard-image-{}.{}",
+                                chrono::Local::now().format("%Y%m%d%H%M%S"),
+                                extension
+                            )
+                        });
+                    payloads.push(ClipboardImagePayload {
+                        file_name,
+                        mime_type: mime_type.to_string(),
+                        data_base64: BASE64.encode(&bytes),
+                        source_path: Some(decoded.clone()),
+                    });
+                }
+                return Ok(payloads);
             }
         };
         let width = clipboard_image.width();
@@ -377,14 +454,15 @@ pub async fn read_clipboard_image(app: AppHandle) -> Result<Option<ClipboardImag
             log::error!("剪贴板图片编码 PNG 失败: {error}");
             return Err(format!("剪贴板图片编码失败: {error}"));
         }
-        Ok(Some(ClipboardImagePayload {
+        Ok(vec![ClipboardImagePayload {
             file_name: format!(
                 "clipboard-image-{}.png",
                 chrono::Local::now().format("%Y%m%d%H%M%S")
             ),
             mime_type: "image/png".to_string(),
             data_base64: BASE64.encode(buffer.into_inner()),
-        }))
+            source_path: None,
+        }])
     })
     .await
     .map_err(|error| {

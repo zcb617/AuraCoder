@@ -105,6 +105,8 @@ export interface ClipboardImagePayload {
   fileName: string;
   mimeType: string;
   dataBase64: string;
+  /** uri-list 兜底场景下源图片的本地绝对路径；read_image 成功分支无此来源，为 null。 */
+  sourcePath?: string | null;
 }
 
 export const ipc = {
@@ -628,7 +630,7 @@ export const ipc = {
       cwd: cwd ?? null,
     }),
   readClipboardImage: () =>
-    invoke<ClipboardImagePayload | null>("read_clipboard_image"),
+    invoke<ClipboardImagePayload[]>("read_clipboard_image"),
   savePastedImageAttachment: (fileName: string, mimeType: string, dataBase64: string) =>
     invoke<ChatAttachment>("save_pasted_image_attachment", {
       fileName,
