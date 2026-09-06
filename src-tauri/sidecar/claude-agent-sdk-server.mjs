@@ -10,7 +10,8 @@ import { ChildProcess, execFile } from "node:child_process";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
-import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 // 旧静态导入保留迁移留痕：依赖加载已迁移到可捕获的启动流程。
 // import { fromJSONSchema } from "zod/v4";
@@ -66,8 +67,52 @@ let sdkVersion = null;
 let bundledClaudeCodeVersion = null;
 const sdkModuleSpecifier = process.env.CLAUDE_AGENT_SDK_MODULE;
 try {
+  // 旧的 zod 裸导入保留迁移留痕：Linux 安装版 node_modules 被归档为 tar.gz,
+  // 运行时解压到用户缓存目录，sidecar 自身目录下没有 node_modules，
+  // 裸导入 zod/v4 必失败。zod 必须先于 SDK 加载，保证 zod 缺失时优先报告
+  // zod 错误（startup probe 测试依赖该错误顺序）。
+  // try {
+  //   const zod = await import("zod/v4");
+  //   fromJSONSchema = zod.fromJSONSchema;
+  //   if (typeof fromJSONSchema !== "function") {
+  //     throw new Error("zod/v4 does not export fromJSONSchema");
+  //   }
+  // } catch (err) {
+  //   const detail = err instanceof Error ? err.message : String(err);
+  //   emitStartupDependencyError(`Failed to load zod/v4: ${detail}.`);
+  //   process.exit(1);
+  // }
+  // 现行做法：CLAUDE_AGENT_SDK_MODULE 指向具体文件（Linux 安装版解压缓存中的
+  // sdk.mjs）时，以该文件为锚点解析 zod（SDK 与 zod 同在解压目录的
+  // node_modules 中）；锚定不可用或锚定目录旁没有 zod（开发环境、散装布局、
+  // 测试夹具）时回退裸导入。
   try {
-    const zod = await import("zod/v4");
+    let zod = null;
+    const sdkAnchor =
+      sdkModuleSpecifier &&
+      (sdkModuleSpecifier.startsWith("file:") ||
+        path.isAbsolute(sdkModuleSpecifier))
+        ? sdkModuleSpecifier.startsWith("file:")
+          ? fileURLToPath(sdkModuleSpecifier)
+          : sdkModuleSpecifier
+        : null;
+    if (sdkAnchor) {
+      try {
+        const anchoredRequire = createRequire(sdkAnchor);
+        const zodPackageDir = path.dirname(
+          anchoredRequire.resolve("zod/package.json"),
+        );
+        zod = await import(
+          pathToFileURL(path.join(zodPackageDir, "v4", "index.js")).href,
+        );
+      } catch {
+        // 锚定目录旁解析不到 zod 时回退裸导入。
+        zod = null;
+      }
+    }
+    if (!zod) {
+      zod = await import("zod/v4");
+    }
     fromJSONSchema = zod.fromJSONSchema;
     if (typeof fromJSONSchema !== "function") {
       throw new Error("zod/v4 does not export fromJSONSchema");
@@ -100,6 +145,8 @@ try {
   } catch {
     // Runtime metadata is diagnostic only. Model discovery can continue without it.
   }
+  // zod 加载已迁移到 SDK import 之前（锚定 CLAUDE_AGENT_SDK_MODULE 解析、失败回退
+  // 裸导入），此处不再重复加载。
 } catch (err) {
   const detail = err instanceof Error ? err.message : String(err);
   emitStartupDependencyError(
