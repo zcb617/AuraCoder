@@ -1,5 +1,7 @@
-import type { EngineInfo, Thread } from "../types";
-import type { OnboardingPreferredChatSelection } from "./onboarding";
+// 新建会话不再解析依赖其他会话的运行环境，候选链函数已停用；
+// 仅保留 NEW_THREAD_FALLBACK_RUNTIME 常量与运行时类型供计划任务、composer 快照使用。
+// import type { EngineInfo, Thread } from "../types";
+// import type { OnboardingPreferredChatSelection } from "./onboarding";
 
 export type NewThreadServiceTier = "fast" | "flex";
 
@@ -19,6 +21,9 @@ export const NEW_THREAD_FALLBACK_RUNTIME: NewThreadRuntimeSelection = {
   serviceTier: null,
 };
 
+/*
+ * 新建会话=生成 ID：引擎/模型由业务过程确定，创建时以 unknown 占位，不再
+ * 依赖 composer/activeThread/onboarding 候选链解析运行环境。以下候选链已停用。
 interface ResolveNewThreadRuntimeInput {
   engines: ReadonlyArray<EngineInfo>;
   composerRuntime?: ComposerRuntimeSnapshot | null;
@@ -77,8 +82,6 @@ function resolveRuntimeCandidate(
 
   const engine = engines.find((item) => item.id === engineId);
   if (!engine) {
-    // 候选引擎不在已登记/探测到的 engines 中时不再放行，避免为未安装的
-    // CLI 创建线程；候选链全部不可用时由调用方提示未检测到可用 CLI。
     return null;
   }
 
@@ -121,8 +124,6 @@ export function resolveNewThreadRuntime({
           serviceTier: null,
         }
       : null,
-    // 旧逻辑把 NEW_THREAD_FALLBACK_RUNTIME 作为最终候选，会在本机未装该 CLI
-    // 时仍按 codex 兜底创建线程，进而触发"未登记"报错；禁止恢复。
     // NEW_THREAD_FALLBACK_RUNTIME,
   ];
 
@@ -135,3 +136,4 @@ export function resolveNewThreadRuntime({
 
   return null;
 }
+*/

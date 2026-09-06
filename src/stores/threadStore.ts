@@ -2,23 +2,26 @@ import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import {
   NEW_THREAD_FALLBACK_RUNTIME,
-  resolveNewThreadRuntime,
+  // 新建会话不再解析依赖其他会话的运行环境，resolveNewThreadRuntime 候选链已停用。
+  // resolveNewThreadRuntime,
   type NewThreadServiceTier,
 } from "../lib/newThreadRuntime";
-import { resolvePreferredOnboardingChatSelection } from "../lib/onboarding";
+// 新建会话不再继承 composer/activeThread/onboarding 作为运行环境，以下 import 已停用。
+// import { resolvePreferredOnboardingChatSelection } from "../lib/onboarding";
 import type { Thread } from "../types";
-import { useChatComposerStore } from "./chatComposerStore";
-import { useEngineStore } from "./engineStore";
-import { useOnboardingStore } from "./onboardingStore";
+// import { useChatComposerStore } from "./chatComposerStore";
+// import { useEngineStore } from "./engineStore";
+// import { useOnboardingStore } from "./onboardingStore";
 
-interface EnsureThreadInput {
-  workspaceId: string;
-  engineId?: string;
-  modelId?: string;
-  reasoningEffort?: string | null;
-  serviceTier?: NewThreadServiceTier | null;
-  title?: string;
-}
+// ensureThreadForScope 无任何调用点，整体停用注释；其专属输入类型一并注释。
+// interface EnsureThreadInput {
+//   workspaceId: string;
+//   engineId?: string;
+//   modelId?: string;
+//   reasoningEffort?: string | null;
+//   serviceTier?: NewThreadServiceTier | null;
+//   title?: string;
+// }
 
 interface CreateThreadInput {
   workspaceId: string;
@@ -38,7 +41,8 @@ interface ThreadState {
   error?: string;
   createThread: (input: CreateThreadInput) => Promise<string | null>;
   renameThread: (threadId: string, title: string) => Promise<void>;
-  ensureThreadForScope: (input: EnsureThreadInput) => Promise<string | null>;
+  // ensureThreadForScope 无调用点，声明随实现一并停用注释。
+  // ensureThreadForScope: (input: EnsureThreadInput) => Promise<string | null>;
   refreshThreads: (workspaceId: string) => Promise<void>;
   /** 仅从本地数据库重载指定 workspace 的线程，不触发远端会话发现。 */
   reloadThreadsFromLocalDatabase: (workspaceId: string) => Promise<void>;
@@ -70,6 +74,11 @@ interface ThreadState {
 
 const DEFAULT_ENGINE = NEW_THREAD_FALLBACK_RUNTIME.engineId;
 const DEFAULT_MODEL = NEW_THREAD_FALLBACK_RUNTIME.modelId;
+
+// 新建会话只生成 ID；引擎/模型属于业务过程产物，落库前以 unknown 占位，
+// 待用户选择 CLI/模型或发送消息时再更新为真实值。
+const UNKNOWN_ENGINE_ID = "unknown";
+const UNKNOWN_MODEL_ID = "unknown";
 
 function mergeWorkspaceThreads(
   current: Record<string, Thread[]>,
@@ -108,18 +117,20 @@ function applyThreadLastModel(
   };
 }
 
-function readThreadLastModelId(thread: Thread): string | null {
-  const raw = thread.modelId;
-  if (typeof raw !== "string") {
-    return null;
-  }
-  const normalized = raw.trim();
-  return normalized.length > 0 ? normalized : null;
-}
+// 历史遗留未使用的本地辅助函数，保持注释不参与编译。
+// function readThreadLastModelId(thread: Thread): string | null {
+//   const raw = thread.modelId;
+//   if (typeof raw !== "string") {
+//     return null;
+//   }
+//   const normalized = raw.trim();
+//   return normalized.length > 0 ? normalized : null;
+// }
 
-function threadMatchesRequestedModel(thread: Thread, modelId: string): boolean {
-  return thread.modelId === modelId;
-}
+// 仅 ensureThreadForScope 使用的辅助函数，随其停用注释。
+// function threadMatchesRequestedModel(thread: Thread, modelId: string): boolean {
+//   return thread.modelId === modelId;
+// }
 
 const LAST_THREAD_KEY = "auracoder:lastActiveThreadId";
 
@@ -227,6 +238,9 @@ async function discoverCodexRemoteThreads(
   return discovery;
 }
 
+/*
+ * 新建会话=生成 ID，不再从 composer/activeThread/onboarding 继承运行环境；
+ * 引擎/模型由业务过程确定，创建时以 unknown 占位。以下候选链解析已停用。
 function resolveImplicitNewThreadRuntime(
   state: Pick<ThreadState, "threads" | "activeThreadId">,
   workspaceId: string,
@@ -252,6 +266,7 @@ function resolveImplicitNewThreadRuntime(
     onboardingSelection,
   });
 }
+*/
 
 export const useThreadStore = create<ThreadState>((set, get) => ({
   threads: [],
@@ -268,21 +283,24 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     serviceTier,
     title,
   }) => {
-    const effectiveRuntime =
-      engineId || modelId || reasoningEffort || serviceTier
-        ? {
-            engineId: engineId ?? DEFAULT_ENGINE,
-            modelId: modelId ?? DEFAULT_MODEL,
-            reasoningEffort: reasoningEffort ?? null,
-            serviceTier: serviceTier ?? null,
-          }
-        : resolveImplicitNewThreadRuntime(get(), workspaceId);
-
-    if (!effectiveRuntime) {
-      // 候选链未解析到已登记引擎（本机未检测到可用 CLI）时不创建线程，返回
-      // null 由调用方提示；不再以未知 codex 兜底创建不可用会话。
-      return null;
-    }
+    // 新建会话=生成 ID：未显式指定引擎/模型时以 unknown 占位直接创建，
+    // 引擎/模型由后续业务过程（选择 CLI、发送消息）确定并更新。
+    const hasExplicitRuntime = Boolean(
+      engineId || modelId || reasoningEffort || serviceTier,
+    );
+    const effectiveRuntime = hasExplicitRuntime
+      ? {
+          engineId: engineId ?? DEFAULT_ENGINE,
+          modelId: modelId ?? DEFAULT_MODEL,
+          reasoningEffort: reasoningEffort ?? null,
+          serviceTier: serviceTier ?? null,
+        }
+      : {
+          engineId: UNKNOWN_ENGINE_ID,
+          modelId: UNKNOWN_MODEL_ID,
+          reasoningEffort: null,
+          serviceTier: null,
+        };
 
     set({ loading: true, error: undefined });
 
@@ -340,6 +358,8 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       set({ loading: false, error: String(error) });
     }
   },
+  /*
+   * ensureThreadForScope 无任何调用点，整体停用注释。
   ensureThreadForScope: async ({
     workspaceId,
     engineId,
@@ -348,16 +368,10 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     serviceTier,
     title,
   }) => {
-    const fallbackRuntime = resolveImplicitNewThreadRuntime(get(), workspaceId);
-    if (!fallbackRuntime) {
-      // 未解析到已登记引擎时无法确定会话范围，返回 null 由调用方处理。
-      return null;
-    }
-    const effectiveEngine = engineId ?? fallbackRuntime.engineId;
-    const effectiveModel = modelId ?? fallbackRuntime.modelId;
-    const effectiveReasoningEffort =
-      reasoningEffort ?? fallbackRuntime.reasoningEffort;
-    const effectiveServiceTier = serviceTier ?? fallbackRuntime.serviceTier;
+    const effectiveEngine = engineId ?? UNKNOWN_ENGINE_ID;
+    const effectiveModel = modelId ?? UNKNOWN_MODEL_ID;
+    const effectiveReasoningEffort = reasoningEffort ?? null;
+    const effectiveServiceTier = serviceTier ?? null;
 
     set({ loading: true, error: undefined });
 
@@ -403,6 +417,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       return null;
     }
   },
+  */
   refreshThreads: async (workspaceId) => {
     set({ loading: true, error: undefined });
     try {

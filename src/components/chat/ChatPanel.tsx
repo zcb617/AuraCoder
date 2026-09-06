@@ -3161,14 +3161,35 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const [defaultAutonomyPreset, setDefaultAutonomyPreset] =
     useState<AutonomyPresetId | null>(null);
   const workspaceTrustLevel: TrustLevel = activeWorkspace?.trustLevel ?? "standard";
+  // 新建会话以 unknown 占位引擎，未在已登记 engines 中时没有 CLI 实现类可翻译
+  // 权限默认值；加载/保存均不调后端，首次发送写回真实引擎后恢复原路径。
+  const activeThreadEngineRegistered = Boolean(
+    activeThread && engines.some((engine) => engine.id === activeThread.engineId),
+  );
 
   // 权限组件只依赖 AuraCoder 线程 ID；新建线程在发送前也立即显示统一默认值。
   useEffect(() => {
+    /** 在权限组件值上叠加本机覆盖项：工作区信任级别、新会话默认档位。 */
+    const mergeLocalPermissionOverrides = (
+      values: PermissionComponentJson,
+    ): PermissionComponentJson => ({
+      ...values,
+      trust: workspaceTrustLevel ? [workspaceTrustLevel] : values.trust,
+      defaultForNewThreads: autonomyPresetToComponentValue(defaultAutonomyPreset)
+        ? [autonomyPresetToComponentValue(defaultAutonomyPreset)!]
+        : values.defaultForNewThreads,
+    });
     const threadId = activeThread?.id;
     const requestId = permissionLoadRequestRef.current + 1;
     permissionLoadRequestRef.current = requestId;
     if (!threadId) {
       setPermissionComponent(EMPTY_PERMISSION_COMPONENT);
+      return;
+    }
+    // 引擎未确定的会话不调 getThreadPermissions（后端工厂无 unknown 实现会报错），
+    // 直接展示统一默认组件。
+    if (!activeThreadEngineRegistered) {
+      setPermissionComponent(mergeLocalPermissionOverrides(EMPTY_PERMISSION_COMPONENT));
       return;
     }
     let disposed = false;
@@ -3177,14 +3198,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       .getThreadPermissions(threadId)
       .then((values) => {
         if (!disposed && permissionLoadRequestRef.current === requestId) {
-          const repoTrust = workspaceTrustLevel;
-          setPermissionComponent({
-            ...values,
-            trust: repoTrust ? [repoTrust] : values.trust,
-            defaultForNewThreads: autonomyPresetToComponentValue(defaultAutonomyPreset)
-              ? [autonomyPresetToComponentValue(defaultAutonomyPreset)!]
-              : values.defaultForNewThreads,
-          });
+          setPermissionComponent(mergeLocalPermissionOverrides(values));
         }
       })
       .catch((error) => {
@@ -3198,7 +3212,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     return () => {
       disposed = true;
     };
-  }, [activeThread?.id, defaultAutonomyPreset, workspaceTrustLevel]);
+  }, [activeThread?.id, activeThreadEngineRegistered, defaultAutonomyPreset, workspaceTrustLevel]);
 
   function onPermissionComponentChange(next: PermissionComponentJson): Promise<boolean> {
     const thread = activeThread;
@@ -3235,6 +3249,11 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         const currentDefaultPreset = componentValueToAutonomyPreset(currentDefault);
         if (nextDefault !== currentDefaultPreset) {
           await onDefaultAutonomyPresetChange(nextDefault);
+        }
+        // 引擎未确定的会话不调 setThreadPermissions（后端工厂无 unknown 实现会
+        // 报错）；改动保留在本地组件状态，首次发送时随 permissionValues 一并提交。
+        if (!activeThreadEngineRegistered) {
+          return true;
         }
         const values = await ipc.setThreadPermissions(threadId, next);
         if (

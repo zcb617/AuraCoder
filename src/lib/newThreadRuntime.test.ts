@@ -1,4 +1,23 @@
 import { describe, expect, it } from "vitest";
+import { NEW_THREAD_FALLBACK_RUNTIME } from "./newThreadRuntime";
+
+describe("NEW_THREAD_FALLBACK_RUNTIME", () => {
+  it("keeps the codex fallback constant available for scheduled tasks", () => {
+    expect(NEW_THREAD_FALLBACK_RUNTIME).toEqual({
+      engineId: "codex",
+      modelId: "gpt-5.4",
+      reasoningEffort: "high",
+      serviceTier: null,
+    });
+  });
+});
+
+/*
+ * resolveNewThreadRuntime 候选链已停用（新建会话以 unknown 占位直接生成 ID），
+ * 原单测整体保留注释备查。
+ */
+/*
+import { describe, expect, it } from "vitest";
 import {
   NEW_THREAD_FALLBACK_RUNTIME,
   resolveNewThreadRuntime,
@@ -180,3 +199,4 @@ describe("resolveNewThreadRuntime", () => {
     ).toEqual(NEW_THREAD_FALLBACK_RUNTIME);
   });
 });
+*/

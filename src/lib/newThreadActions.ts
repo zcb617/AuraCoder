@@ -47,10 +47,11 @@ export async function createAndActivateWorkspaceThread(
     return null;
   }
 
-  if (!threadId) {
-    toast.error(t("app:sidebar.newThreadNoCli"));
-    return null;
-  }
+  // 新建会话以 unknown 占位直接生成 ID，不再因未检测到可用 CLI 而失败。
+  // if (!threadId) {
+  //   toast.error(t("app:sidebar.newThreadNoCli"));
+  //   return null;
+  // }
 
   await useChatStore.getState().setActiveThread(threadId);
   return threadId;
