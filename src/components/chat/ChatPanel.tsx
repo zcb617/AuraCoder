@@ -112,7 +112,8 @@ import {
   shouldPromptToImplementPlan,
 } from "./planModePrompt";
 import { buildComposerRuntimeSnapshot } from "./composerRuntime";
-import { canChangeUnstartedThreadEngine } from "./threadRuntimeState";
+import { canChangeUnstartedThreadEngine, collectThreadEnvironmentMismatches } from "./threadRuntimeState";
+import type { ThreadEnvironmentMismatch, ThreadEnvironmentMismatchKind } from "./threadRuntimeState";
 import { resolveReasoningEffortForModel } from "./reasoningEffort";
 import { resolveUsageStatusKey } from "./usageStatus";
 import { formatWorkingDuration } from "./workingDuration";
@@ -198,6 +199,13 @@ const EMPTY_PERMISSION_COMPONENT: PermissionComponentJson = {
   network: ["automatic"],
   defaultForNewThreads: [],
 };
+
+/** 已接入统一权限组件的 CLI 引擎标识；权限取数据库只依赖该标识，与 CLI 环境加载状态无关。 */
+const PERMISSION_COMPONENT_ENGINE_IDS: ReadonlySet<string> = new Set([
+  "codex",
+  "opencode",
+  "claude",
+]);
 
 /** 线程运行时五项可局部保存字段；权限字段不属于本契约。 */
 type ThreadRuntimeSelectionPatch = {
@@ -3161,10 +3169,17 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const [defaultAutonomyPreset, setDefaultAutonomyPreset] =
     useState<AutonomyPresetId | null>(null);
   const workspaceTrustLevel: TrustLevel = activeWorkspace?.trustLevel ?? "standard";
-  // 新建会话以 unknown 占位引擎，未在已登记 engines 中时没有 CLI 实现类可翻译
-  // 权限默认值；加载/保存均不调后端，首次发送写回真实引擎后恢复原路径。
-  const activeThreadEngineRegistered = Boolean(
-    activeThread && engines.some((engine) => engine.id === activeThread.engineId),
+  /*
+   * 旧实现把权限读写绑在 engines 环境注册状态上，已停用；按两条路架构，权限
+   * 取数据库只依赖 threads 表会话的引擎标识，与 CLI 环境加载无关。
+   * const activeThreadEngineRegistered = Boolean(
+   *   activeThread && engines.some((engine) => engine.id === activeThread.engineId),
+   * );
+   */
+  // 新建会话以 unknown 占位引擎；权限后端读写只要求引擎标识属于已接入的三个 CLI，
+  // unknown 占位的会话不调后端，首次发送写回真实引擎后恢复原路径。
+  const activeThreadHasPermissionBackend = Boolean(
+    activeThread && PERMISSION_COMPONENT_ENGINE_IDS.has(activeThread.engineId),
   );
 
   // 权限组件只依赖 AuraCoder 线程 ID；新建线程在发送前也立即显示统一默认值。
@@ -3186,9 +3201,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       setPermissionComponent(EMPTY_PERMISSION_COMPONENT);
       return;
     }
-    // 引擎未确定的会话不调 getThreadPermissions（后端工厂无 unknown 实现会报错），
-    // 直接展示统一默认组件。
-    if (!activeThreadEngineRegistered) {
+    // 引擎为 unknown 占位的会话不调 getThreadPermissions（后端工厂无 unknown 实现
+    // 会报错），直接展示统一默认组件；已接入 CLI 的会话不等环境加载，直接取数据库。
+    if (!activeThreadHasPermissionBackend) {
       setPermissionComponent(mergeLocalPermissionOverrides(EMPTY_PERMISSION_COMPONENT));
       return;
     }
@@ -3257,9 +3272,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         if (nextDefault !== currentDefaultPreset) {
           await onDefaultAutonomyPresetChange(nextDefault);
         }
-        // 引擎未确定的会话不调 setThreadPermissions（后端工厂无 unknown 实现会
-        // 报错）；改动保留在本地组件状态，首次发送时随 permissionValues 一并提交。
-        if (!activeThreadEngineRegistered) {
+        // 引擎为 unknown 占位的会话不调 setThreadPermissions（后端工厂无 unknown
+        // 实现会报错）；改动保留在本地组件状态，首次发送时随 permissionValues 一并提交。
+        if (!activeThreadHasPermissionBackend) {
           return true;
         }
         const values = await ipc.setThreadPermissions(threadId, next);
@@ -4135,10 +4150,17 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     if (!engines.length) {
       return;
     }
+    // 有真实库引擎的会话不自动校正：第一条路已把库值写上界面，
+    // 是否切换为默认引擎由第二条路询问用户决定。
+    // Thread.engineId 类型为 ChatEngineId，但新建会话落库前以 "unknown" 占位
+    // （见 threadStore.ts UNKNOWN_ENGINE_ID），比较处按 string 宽化。
+    if (activeThread && (activeThread.engineId as string) !== "unknown") {
+      return;
+    }
     if (!engines.some((engine) => engine.id === selectedEngineId)) {
       setSelectedEngineId(engines[0].id);
     }
-  }, [engines, selectedEngineId]);
+  }, [engines, selectedEngineId, activeThread?.engineId]);
 
   useEffect(() => {
     if (onboardingOpen || activeThread || !preferredOnboardingChatSelection) {
@@ -4428,20 +4450,23 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   ]);
 
   useEffect(() => {
-    if (!selectedModel) {
-      return;
-    }
-
-    const syncKey = `${activeThread?.id ?? "none"}:${selectedModel.id}`;
+    const syncKey = `${activeThread?.id ?? "none"}:${selectedModel?.id ?? "none"}`;
     if (effortSyncKeyRef.current === syncKey) {
       return;
     }
     effortSyncKeyRef.current = syncKey;
 
-    const nextEffort = resolveReasoningEffortForModel(
-      selectedModel,
-      activeThreadReasoningEffort ?? selectedEffort,
-    );
+    // 第一条路：threads 表 reasoning_effort 有值就原样显示（是否被当前环境支持由
+    // 第二条路比对后询问用户）；为空时回退当前模型默认强度，不沿用上个会话残留值。
+    /*
+     * 旧实现：库字段为空时沿用输入框残留值，且会把不被当前模型支持的库值静默钳制为默认：
+     * const nextEffort = resolveReasoningEffortForModel(
+     *   selectedModel,
+     *   activeThreadReasoningEffort ?? selectedEffort,
+     * );
+     */
+    const nextEffort =
+      activeThreadReasoningEffort ?? resolveReasoningEffortForModel(selectedModel, null);
 
     if (nextEffort && selectedEffort !== nextEffort) {
       setSelectedEffort(nextEffort);
@@ -4562,48 +4587,67 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     // 已登记 engines 列表里，回写会被上方校正 effect 反复改回，形成无限 ping-pong
     // （logo/文案高频闪烁）。引擎未落定前不回写，由校正 effect 维持可用引擎，
     // 首发消息落库真实引擎后这里自然接管。
-    if (
-      activeThread.engineId !== selectedEngineId &&
-      engines.some((engine) => engine.id === activeThread.engineId)
-    ) {
+    /*
+     * 停用原因：按两条路架构，第一条路直接回写 threads 表值，环境不一致的切换
+     * 由第二条路询问接管（collectThreadEnvironmentMismatches + ConfirmDialog）。
+     * 旧实现把引擎回写、模型存在性判断、本地静默 fallback、SSH toast+落库自动切换
+     * 揉在会话同步里，未经用户确认就改动界面并落库，且依赖环境列表就绪。
+     * if (
+     *   activeThread.engineId !== selectedEngineId &&
+     *   engines.some((engine) => engine.id === activeThread.engineId)
+     * ) {
+     *   setSelectedEngineId(activeThread.engineId);
+     * }
+     * const threadEngine =
+     *   engines.find((engine) => engine.id === activeThread.engineId) ?? null;
+     * const preferredModelId = activeThread.modelId;
+     * const preferredModelExists =
+     *   threadEngine?.models.some((model) => model.id === preferredModelId) ?? false;
+     * const threadModelExists =
+     *   threadEngine?.models.some((model) => model.id === activeThread.modelId) ?? false;
+     * if (preferredModelExists) {
+     *   setSelectedModelId(preferredModelId);
+     * } else if (threadModelExists) {
+     *   setSelectedModelId(activeThread.modelId);
+     * } else if (threadEngine && threadEngine.models.length > 0) {
+     *   const fallbackModel =
+     *     threadEngine.models.find((model) => model.isDefault && !model.hidden) ??
+     *     threadEngine.models.find((model) => !model.hidden) ??
+     *     threadEngine.models[0];
+     *   setSelectedModelId(fallbackModel.id);
+     *   if (activeWorkspace?.locationKind === "ssh") {
+     *     const noticeKey = `${activeThread.id}:${preferredModelId}:${fallbackModel.id}`;
+     *     if (unavailableSavedModelNoticeRef.current !== noticeKey) {
+     *       unavailableSavedModelNoticeRef.current = noticeKey;
+     *       toast.warning(
+     *         t("modelPicker.savedModelUnavailable", {
+     *           previous: preferredModelId,
+     *           fallback: fallbackModel.displayName,
+     *         }),
+     *       );
+     *     }
+     *     setThreadLastModelLocal(activeThread.id, fallbackModel.id);
+     *     void ipc
+     *       .setSshRemoteThreadSelectedModel(activeThread.id, fallbackModel.id)
+     *       .then((updatedThread) => applyThreadUpdateLocal(updatedThread))
+     *       .catch((error) => {
+     *         console.warn("Failed to persist SSH fallback model", error);
+     *       });
+     *   }
+     * }
+     */
+    // 第一条路：点击会话（含启动默认选中）直接取 threads 表显示，与 CLI 环境加载无关。
+    // unknown 是新会话落库前的占位值，不回写；环境不一致的切换由第二条路询问接管。
+    // Thread.engineId 类型为 ChatEngineId，运行时为 unknown 占位（见 threadStore.ts
+    // UNKNOWN_ENGINE_ID），比较处按 string 宽化。
+    if ((activeThread.engineId as string) === "unknown") {
+      return;
+    }
+    if (activeThread.engineId !== selectedEngineId) {
       setSelectedEngineId(activeThread.engineId);
     }
-    const threadEngine =
-      engines.find((engine) => engine.id === activeThread.engineId) ?? null;
-    const preferredModelId = activeThread.modelId;
-    const preferredModelExists =
-      threadEngine?.models.some((model) => model.id === preferredModelId) ?? false;
-    const threadModelExists =
-      threadEngine?.models.some((model) => model.id === activeThread.modelId) ?? false;
-    if (preferredModelExists) {
-      setSelectedModelId(preferredModelId);
-    } else if (threadModelExists) {
+    if (activeThread.modelId && activeThread.modelId !== "unknown") {
       setSelectedModelId(activeThread.modelId);
-    } else if (threadEngine && threadEngine.models.length > 0) {
-      const fallbackModel =
-        threadEngine.models.find((model) => model.isDefault && !model.hidden) ??
-        threadEngine.models.find((model) => !model.hidden) ??
-        threadEngine.models[0];
-      setSelectedModelId(fallbackModel.id);
-      if (activeWorkspace?.locationKind === "ssh") {
-        const noticeKey = `${activeThread.id}:${preferredModelId}:${fallbackModel.id}`;
-        if (unavailableSavedModelNoticeRef.current !== noticeKey) {
-          unavailableSavedModelNoticeRef.current = noticeKey;
-          toast.warning(
-            t("modelPicker.savedModelUnavailable", {
-              previous: preferredModelId,
-              fallback: fallbackModel.displayName,
-            }),
-          );
-        }
-        setThreadLastModelLocal(activeThread.id, fallbackModel.id);
-        void ipc
-          .setSshRemoteThreadSelectedModel(activeThread.id, fallbackModel.id)
-          .then((updatedThread) => applyThreadUpdateLocal(updatedThread))
-          .catch((error) => {
-            console.warn("Failed to persist SSH fallback model", error);
-          });
-      }
     }
   }, [
     activeThread?.id,
@@ -4617,6 +4661,85 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     setThreadLastModelLocal,
     t,
   ]);
+
+  // 第二条路：CLI 环境加载完成后与数据库比对，不一致时询问用户是否切换为默认。
+  // 用户确认前界面与数据库都保持原值；同一会话同一字段只询问一次。
+  const [envMismatchPrompt, setEnvMismatchPrompt] = useState<{
+    threadId: string;
+    mismatch: ThreadEnvironmentMismatch;
+  } | null>(null);
+  const envMismatchHandledRef = useRef<Map<string, Set<ThreadEnvironmentMismatchKind>>>(new Map());
+
+  useEffect(() => {
+    if (envMismatchPrompt && envMismatchPrompt.threadId !== activeThread?.id) {
+      setEnvMismatchPrompt(null);
+    }
+    if (!activeThread || engines.length === 0 || envMismatchPrompt) {
+      return;
+    }
+    const handled = envMismatchHandledRef.current.get(activeThread.id);
+    const mismatch = collectThreadEnvironmentMismatches({
+      engineId: activeThread.engineId,
+      modelId: activeThread.modelId,
+      reasoningEffort: activeThread.reasoningEffort,
+      engines,
+    }).find((item) => !handled?.has(item.kind));
+    if (mismatch) {
+      setEnvMismatchPrompt({ threadId: activeThread.id, mismatch });
+    }
+  }, [
+    activeThread?.id,
+    activeThread?.engineId,
+    activeThread?.modelId,
+    activeThread?.reasoningEffort,
+    engines,
+    envMismatchPrompt,
+  ]);
+
+  const markEnvMismatchHandled = (threadId: string, kind: ThreadEnvironmentMismatchKind) => {
+    const handled = envMismatchHandledRef.current.get(threadId) ?? new Set<ThreadEnvironmentMismatchKind>();
+    handled.add(kind);
+    envMismatchHandledRef.current.set(threadId, handled);
+  };
+
+  // 用户确认：切换为默认值并落库；SSH 远端工作区的模型沿用远端校验持久化路径。
+  const handleEnvMismatchConfirm = () => {
+    const prompt = envMismatchPrompt;
+    if (!prompt) {
+      return;
+    }
+    markEnvMismatchHandled(prompt.threadId, prompt.mismatch.kind);
+    const { kind, fallbackValue } = prompt.mismatch;
+    if (kind === "engine") {
+      setSelectedEngineId(fallbackValue);
+      void saveThreadRuntimeSelectionPatch(prompt.threadId, { engineId: fallbackValue });
+    } else if (kind === "model") {
+      setSelectedModelId(fallbackValue);
+      if (activeWorkspace?.locationKind === "ssh") {
+        void ipc
+          .setSshRemoteThreadSelectedModel(prompt.threadId, fallbackValue)
+          .then((updatedThread) => applyThreadUpdateLocal(updatedThread))
+          .catch((error) => {
+            console.warn("Failed to persist SSH fallback model", error);
+          });
+      } else {
+        void saveThreadRuntimeSelectionPatch(prompt.threadId, { modelId: fallbackValue });
+      }
+    } else {
+      setSelectedEffort(fallbackValue);
+      void saveThreadRuntimeSelectionPatch(prompt.threadId, { reasoningEffort: fallbackValue });
+    }
+    setEnvMismatchPrompt(null);
+  };
+
+  // 用户拒绝：保持数据库的值和界面显示不动，仅标记该字段不再询问。
+  const handleEnvMismatchCancel = () => {
+    const prompt = envMismatchPrompt;
+    if (prompt) {
+      markEnvMismatchHandled(prompt.threadId, prompt.mismatch.kind);
+    }
+    setEnvMismatchPrompt(null);
+  };
 
   useEffect(() => {
     if (!activeWorkspaceId) {
@@ -9256,6 +9379,30 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         </div>
       </div>
 
+      <ConfirmDialog
+        open={envMismatchPrompt !== null}
+        title={t("threadEnvMismatch.title")}
+        message={
+          envMismatchPrompt
+            ? t(
+                envMismatchPrompt.mismatch.kind === "engine"
+                  ? "threadEnvMismatch.engineMessage"
+                  : envMismatchPrompt.mismatch.kind === "model"
+                    ? "threadEnvMismatch.modelMessage"
+                    : "threadEnvMismatch.effortMessage",
+                {
+                  saved: envMismatchPrompt.mismatch.savedValue,
+                  fallback: envMismatchPrompt.mismatch.fallbackLabel,
+                },
+              )
+            : ""
+        }
+        confirmLabel={t("threadEnvMismatch.confirm")}
+        cancelLabel={t("threadEnvMismatch.cancel")}
+        confirmVariant="primary"
+        onConfirm={handleEnvMismatchConfirm}
+        onCancel={handleEnvMismatchCancel}
+      />
     </div>
   );
 }

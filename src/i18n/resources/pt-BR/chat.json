@@ -1,4 +1,12 @@
 {
+  "threadEnvMismatch": {
+    "title": "Configuração de execução salva indisponível",
+    "engineMessage": "A ferramenta de execução {{saved}} salva para esta conversa está indisponível no ambiente atual. Deseja mudar para a ferramenta padrão {{fallback}}?",
+    "modelMessage": "O modelo {{saved}} salvo para esta conversa está indisponível no ambiente atual. Deseja mudar para o modelo padrão {{fallback}}?",
+    "effortMessage": "A intensidade de raciocínio {{saved}} salva para esta conversa não é suportada pelo modelo atual. Deseja mudar para a intensidade padrão {{fallback}}?",
+    "confirm": "Mudar para o padrão",
+    "cancel": "Manter inalterado"
+  },
   "thinkingVariants": {
     "thinking": "Pensando",
     "reasoning": "Raciocinando",
@@ -496,6 +504,7 @@
     "planImplementationOptionImplementDescription": "Sair do modo de plano e pedir ao Codex que comece a executar este plano na thread atual.",
     "planImplementationOptionStay": "Continuar no modo de plano",
     "planImplementationOptionStayDescription": "Manter o modo de plano ativo para que a próxima mensagem continue em planejamento.",
+    "permissionLoadFailed": "Falha ao carregar as configurações de permissão. Tente novamente",
     "placeholders": {
       "plan": "Descreva o que você quer planejar...",
       "chat": "Peça alterações de continuação"

@@ -1,4 +1,12 @@
 {
+  "threadEnvMismatch": {
+    "title": "Saved runtime configuration unavailable",
+    "engineMessage": "The harness {{saved}} saved for this thread is unavailable in the current environment. Switch to the default harness {{fallback}}?",
+    "modelMessage": "The model {{saved}} saved for this thread is unavailable in the current environment. Switch to the default model {{fallback}}?",
+    "effortMessage": "The reasoning effort {{saved}} saved for this thread is not supported by the current model. Switch to the default effort {{fallback}}?",
+    "confirm": "Switch to default",
+    "cancel": "Keep unchanged"
+  },
   "thinkingVariants": {
     "thinking": "Thinking",
     "reasoning": "Reasoning",

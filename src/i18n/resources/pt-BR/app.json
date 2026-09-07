@@ -41,6 +41,7 @@
     "pin": "Fixar sidebar",
     "unpin": "Desafixar sidebar",
     "newThread": "Nova thread",
+    "newThreadNoCli": "Nenhuma CLI disponível detectada. Instale uma primeiro",
     "newThreadTitle": "Nova Thread",
     "newThreadFailed": "Falha ao criar uma nova conversa",
     "agents": "Agentes",

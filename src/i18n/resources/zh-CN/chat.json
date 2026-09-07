@@ -1,4 +1,12 @@
 {
+  "threadEnvMismatch": {
+    "title": "会话运行配置与当前环境不一致",
+    "engineMessage": "该会话保存的运行工具 {{saved}} 在当前环境不可用。是否切换为默认运行工具 {{fallback}}？",
+    "modelMessage": "该会话保存的模型 {{saved}} 在当前环境不可用。是否切换为默认模型 {{fallback}}？",
+    "effortMessage": "该会话保存的思考强度 {{saved}} 在当前模型下不受支持。是否切换为默认思考强度 {{fallback}}？",
+    "confirm": "切换为默认",
+    "cancel": "保持不变"
+  },
   "thinkingVariants": {
     "thinking": "思考中",
     "reasoning": "推理中",
