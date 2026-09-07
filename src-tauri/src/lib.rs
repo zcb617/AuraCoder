@@ -174,6 +174,12 @@ pub fn run() {
     };
 
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            log::info!("检测到第二个 AuraCoder 实例启动，唤起已有主窗口");
+            if let Some(main_window) = app.get_webview_window("main") {
+                show_main_window(&main_window);
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
