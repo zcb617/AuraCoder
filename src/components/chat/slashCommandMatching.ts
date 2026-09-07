@@ -78,13 +78,14 @@ export function filterClassicSlashItems<T extends SlashSearchItem>(
     return items;
   }
 
-  const groupOrder = new Map<string, number>();
-  for (const item of items) {
-    const group = item.group ?? "";
-    if (!groupOrder.has(group)) {
-      groupOrder.set(group, groupOrder.size);
-    }
-  }
+  // 修复：有搜索词时按匹配分数降序排序，分组顺序不再优先，避免名称命中的技能被排在靠前分组之后。
+  // const groupOrder = new Map<string, number>();
+  // for (const item of items) {
+  //   const group = item.group ?? "";
+  //   if (!groupOrder.has(group)) {
+  //     groupOrder.set(group, groupOrder.size);
+  //   }
+  // }
 
   return items
     .map((item, index) => {
@@ -96,12 +97,13 @@ export function filterClassicSlashItems<T extends SlashSearchItem>(
     })
     .filter((entry) => Number.isFinite(entry.score))
     .sort((left, right) => {
-      const groupDifference =
-        (groupOrder.get(left.item.group ?? "") ?? 0) -
-        (groupOrder.get(right.item.group ?? "") ?? 0);
-      if (groupDifference !== 0) {
-        return groupDifference;
-      }
+      // 旧逻辑：分组优先于匹配分数，导致相关结果被压在后面分组之下，停用。
+      // const groupDifference =
+      //   (groupOrder.get(left.item.group ?? "") ?? 0) -
+      //   (groupOrder.get(right.item.group ?? "") ?? 0);
+      // if (groupDifference !== 0) {
+      //   return groupDifference;
+      // }
       return right.score - left.score || left.index - right.index;
     })
     .map((entry) => entry.item);

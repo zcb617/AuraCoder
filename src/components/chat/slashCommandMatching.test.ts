@@ -20,7 +20,7 @@ describe("classic slash command matching", () => {
     });
   });
 
-  it("matches resource names with a fuzzy query and retains category order", () => {
+  it("matches resource names with a fuzzy query and ranks by score", () => {
     const items = [
       {
         id: "command:review",
@@ -47,8 +47,30 @@ describe("classic slash command matching", () => {
     ]);
     expect(filterClassicSlashItems(items, "r").map((item) => item.id)).toEqual([
       "command:review",
-      "skill:task-anchor",
       "mcp:filesystem",
+      "skill:task-anchor",
+    ]);
+  });
+
+  it("ranks stronger matches first regardless of group order when a query is present", () => {
+    const items = [
+      {
+        id: "plugin:brightsign",
+        name: "brightsign",
+        description: "make a choice",
+        group: "插件",
+      },
+      {
+        id: "skill:mac-release",
+        name: "mac-release",
+        description: "macOS 发布流程",
+        group: "技能",
+      },
+    ];
+
+    expect(filterClassicSlashItems(items, "mac").map((item) => item.id)).toEqual([
+      "skill:mac-release",
+      "plugin:brightsign",
     ]);
   });
 });
