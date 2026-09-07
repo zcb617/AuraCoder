@@ -3212,7 +3212,14 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     return () => {
       disposed = true;
     };
-  }, [activeThread?.id, activeThreadEngineRegistered, defaultAutonomyPreset, workspaceTrustLevel]);
+  // 权限组件只允许在初始化阶段被重置：新建会话、点击已存在会话（即线程 ID 变化）。
+  // 引擎注册翻转（发送时 unknown 落库为真实 CLI）和用户自己修改信任级别/默认档位
+  // 都不是初始化阶段，不允许再触发重置，否则会覆盖用户已选择的权限。
+  /*
+   * 旧依赖声明会把发送时的引擎注册翻转当成重置触发源，保留迁移记录：
+   * }, [activeThread?.id, activeThreadEngineRegistered, defaultAutonomyPreset, workspaceTrustLevel]);
+   */
+  }, [activeThread?.id]);
 
   function onPermissionComponentChange(next: PermissionComponentJson): Promise<boolean> {
     const thread = activeThread;
