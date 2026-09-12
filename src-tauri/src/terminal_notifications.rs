@@ -13,6 +13,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
+// Linux 下桌面通知绕过 tauri-plugin-notification 直调 notify-rust（见 show_desktop_notification_content），
+// 该 trait 只在 Windows/macOS 的插件路径中使用，故只在非 Linux 平台引入，避免 Linux 编译期 unused import 警告
+#[cfg(not(target_os = "linux"))]
 use tauri_plugin_notification::NotificationExt;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader},
@@ -1712,11 +1715,72 @@ fn show_desktop_notification_content(
     title: &str,
     body: &str,
 ) -> anyhow::Result<()> {
-    let mut desktop_notification = app.notification().builder().title(title).body(body);
-    if let Some(sound) = resolved_notification_sound() {
-        desktop_notification = desktop_notification.sound(sound);
+    // 下面两个 cfg 块按平台各取其一作为整个函数的返回值表达式，均不追加分号以免返回值丢失
+    #[cfg(target_os = "linux")]
+    {
+        // ===== 为什么 Linux 不走 tauri-plugin-notification，要在这里直调 notify-rust =====
+        // 出发点：修复 Linux（GNOME 45.5+，实测 Ubuntu 26.04）下桌面通知"发出即被系统销毁、肉眼从未弹出"的问题。
+        // 根因链（均有上游 issue 与源码佐证）：
+        //   1) tauri-plugin-notification 2.3.x 的 desktop.rs 是"发后即忘"：
+        //      `tauri::async_runtime::spawn(async move { let _ = notification.show(); }); Ok(())`
+        //      ——notify-rust 返回的 handle 被当场丢弃，且错误永远无法返回；
+        //   2) notify-rust 4.x 每次 show() 都新建一条 D-Bus 会话连接，handle 持有该连接，
+        //      handle 一丢连接立刻关闭（官方文档：handle 的作用就是"保持连接存活"）；
+        //   3) GNOME Shell 通知守护进程发现发送者的 D-Bus 名字消失，且通知能关联到
+        //      有窗口的应用（本应用有窗口和 .desktop 文件）时，立即销毁该通知
+        //      （gnome-shell notificationDaemon.js：`if (this.app) this.destroy()`）。
+        // 上游未修：gnome-shell #8797（点名 notify-rust 系应用）、notify-rust #218、
+        // tauri plugins-workspace #1562，全部 open；插件最新 2.4.0 源码相同，升级无效。
+        // 为何不 fork/改插件源码：notify-rust 本就是插件在 Linux 的底层后端（已在依赖树中），
+        // 在这里直调它没有引入任何新技术，Windows/macOS 继续走插件原生路径（下方非 Linux 分支逐字保留）。
+        // 回退方式：上游修复后删除本 cfg 块、恢复原函数体即可。
+        // appname 使用 tauri 配置的 productName（对应 /usr/share/applications/AuraCoder.desktop），
+        // 让 GNOME 正确关联应用图标与名称；连接已由下方线程持有，关联不再导致通知被销毁。
+        let appname = app
+            .config()
+            .product_name
+            .clone()
+            .unwrap_or_else(|| "AuraCoder".to_string());
+        let mut notification = notify_rust::Notification::new();
+        notification
+            .appname(&appname)
+            .summary(title)
+            .body(body)
+            // 与插件行为对齐：未显式指定 icon 时按可执行文件名自动匹配图标
+            .auto_icon();
+        if let Some(sound) = resolved_notification_sound() {
+            // 与插件行为对齐：声音通过 SoundName hint 传递，是否播放由系统决定
+            notification.sound_name(&sound);
+        }
+        match notification.show() {
+            Ok(handle) => {
+                // 关键修复：handle 持有 D-Bus 连接，把它挂到独立线程里一直持有到
+                // 通知被关闭（wait_for_action 阻塞至用户操作或系统关闭该通知），
+                // 连接不断，GNOME 就不会销毁通知。
+                // 代价是每条通知驻留一个线程直到通知关闭，线程开销极小，可接受；
+                // 若系统通知服务异常永不关闭，最多遗留一个空闲阻塞线程，不影响主流程。
+                std::thread::spawn(move || {
+                    handle.wait_for_action(|_| {});
+                });
+                Ok(())
+            }
+            Err(error) => {
+                // 插件原本会把这类错误静默吞掉（spawn 内 let _ =），这里显式记日志并向上返回，
+                // 保证以后 Linux 通知失败能在 auracoder.log 中查到证据
+                log::warn!("linux 桌面通知发送失败: {error}");
+                Err(error.into())
+            }
+        }
     }
-    desktop_notification.show().map_err(Into::into)
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Windows/macOS 维持 tauri-plugin-notification 原生路径，以下 4 行为原有实现，逐字保留未改
+        let mut desktop_notification = app.notification().builder().title(title).body(body);
+        if let Some(sound) = resolved_notification_sound() {
+            desktop_notification = desktop_notification.sound(sound);
+        }
+        desktop_notification.show().map_err(Into::into)
+    }
 }
 
 pub fn show_agent_desktop_notification(

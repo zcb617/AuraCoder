@@ -1,6 +1,6 @@
 [package]
 name = "AuraCoder"
-version = "1.0.11"
+version = "1.0.12"
 edition = "2021"
 authors = ["AuraCoder contributors"]
 license = "MIT"
@@ -74,6 +74,8 @@ winreg = "0.55"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5.13.2"
+# Linux 桌面通知绕过 tauri-plugin-notification 直接使用的后端（它本就是该插件在 Linux 的底层实现），见 terminal_notifications.rs 中 show_desktop_notification_content 的说明
+notify-rust = "4.12"
 
 [features]
 default = ["custom-protocol"]

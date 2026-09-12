@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "AuraCoder"
-version = "1.0.11"
+version = "1.0.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -25,6 +25,7 @@ dependencies = [
  "log",
  "log4rs",
  "notify",
+ "notify-rust",
  "percent-encoding",
  "plist",
  "portable-pty",
