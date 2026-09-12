@@ -176,6 +176,8 @@ fn permissions_from_thread(thread: &ThreadDto) -> Result<PermissionComponentJson
         (Some("default"), Some("workspace-write"), Some(false)) => Some("ask"),
         (Some("acceptEdits"), Some("workspace-write"), None) => Some("auto"),
         (Some("bypassPermissions"), Some("workspace-write"), Some(true)) => Some("full"),
+        // 完全访问=关闭沙箱：存储值 danger-full-access 读回预设 full，与 Codex 语义一致。
+        (Some("bypassPermissions"), Some("danger-full-access"), Some(true)) => Some("full"),
         (Some("restricted"), Some("read-only"), Some(false)) => Some("read-only"),
         (Some("standard"), Some("workspace-write"), Some(false)) => Some("ask"),
         (Some("trusted"), Some("workspace-write"), Some(true)) => Some("full"),
@@ -222,7 +224,9 @@ fn permissions_from_thread(thread: &ThreadDto) -> Result<PermissionComponentJson
         None => "automatic",
         Some("read-only") => "read-only",
         Some("workspace-write") => "workspace-write",
-        Some("full-access") | Some(_) => "",
+        // 存储值 danger-full-access 读回组件值 full-access；完全访问 = 关闭沙箱。
+        Some("danger-full-access") => "full-access",
+        Some(_) => "",
     };
     let sandbox_values: &[&str] = if sandbox_value.is_empty() {
         &[]
@@ -1729,10 +1733,12 @@ impl CliTool for ClaudeCodeCli {
             .get("autonomyPreset")
             .and_then(Value::as_array)
             .is_some_and(Vec::is_empty);
+        /* 旧行为：拒绝 full-access。完全访问档位语义已改为关闭沙箱（与 Codex 对齐），不再拒绝。
         anyhow::ensure!(
             sandbox != Some("full-access"),
             "Claude Code 不支持 full-access sandbox"
         );
+        */
         let (mode, sandbox_mode, allow_network) = match preset {
             Some("automatic") => (None, None, None),
             None if autonomy_is_empty
@@ -1745,7 +1751,7 @@ impl CliTool for ClaudeCodeCli {
             Some("auto") => (Some("acceptEdits"), Some("workspace-write"), None),
             Some("full") => (
                 Some("bypassPermissions"),
-                Some("workspace-write"),
+                Some("danger-full-access"),
                 Some(true),
             ),
             _ => (
@@ -1758,6 +1764,7 @@ impl CliTool for ClaudeCodeCli {
                 match sandbox {
                     Some("read-only") => Some("read-only"),
                     Some("workspace-write") => Some("workspace-write"),
+                    Some("full-access") => Some("danger-full-access"),
                     _ => None,
                 },
                 match network {
@@ -1810,10 +1817,12 @@ impl CliTool for ClaudeCodeCli {
             .get("autonomyPreset")
             .and_then(Value::as_array)
             .is_some_and(Vec::is_empty);
+        /* 旧行为：拒绝 full-access。完全访问档位语义已改为关闭沙箱（与 Codex 对齐），不再拒绝。
         anyhow::ensure!(
             sandbox != Some("full-access"),
             "Claude Code 不支持 full-access sandbox"
         );
+        */
         let (mode, sandbox_mode, allow_network) = match preset {
             Some("automatic") => (None, None, None),
             None if autonomy_is_empty
@@ -1826,7 +1835,7 @@ impl CliTool for ClaudeCodeCli {
             Some("auto") => (Some("acceptEdits"), Some("workspace-write"), None),
             Some("full") => (
                 Some("bypassPermissions"),
-                Some("workspace-write"),
+                Some("danger-full-access"),
                 Some(true),
             ),
             _ => (
@@ -1843,6 +1852,7 @@ impl CliTool for ClaudeCodeCli {
                 match sandbox {
                     Some("read-only") => Some("read-only"),
                     Some("workspace-write") => Some("workspace-write"),
+                    Some("full-access") => Some("danger-full-access"),
                     _ => None,
                 },
                 match network {
@@ -2022,6 +2032,9 @@ impl CliTool for ClaudeCodeCli {
                 let normalized = match value.trim().to_lowercase().as_str() {
                     "read-only" | "read_only" | "readonly" => "read-only",
                     "workspace-write" | "workspace_write" | "workspacewrite" => "workspace-write",
+                    "danger-full-access" | "danger_full_access" | "dangerfullaccess" => {
+                        "danger-full-access"
+                    }
                     _ => {
                         anyhow::bail!("Claude sandbox mode `{value}` is not supported")
                     }
@@ -2867,11 +2880,16 @@ mod tests {
                 "bypassPermissions",
                 "full",
                 "autonomous",
-                "workspace-write",
+                "full-access",
                 "enabled",
             ),
         ];
         for (mode, preset, approval, sandbox, network) in expected {
+            let stored_sandbox = if mode == "bypassPermissions" {
+                "danger-full-access"
+            } else {
+                sandbox
+            };
             let network_field = if mode == "acceptEdits" {
                 ""
             } else {
@@ -2889,7 +2907,7 @@ mod tests {
             };
             let values = permissions_from_thread(&permission_thread(
                 Some(&format!(
-                    r#"{{"permissionMode":"{mode}","sandboxMode":"{sandbox}"{network_field}}}"#
+                    r#"{{"permissionMode":"{mode}","sandboxMode":"{stored_sandbox}"{network_field}}}"#
                 )),
                 None,
             ))

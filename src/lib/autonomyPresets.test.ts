@@ -28,7 +28,7 @@ describe("autonomyPresetPatch", () => {
     });
     expect(autonomyPresetPatch("full", "claude")).toEqual({
       approvalPolicy: "trusted",
-      sandboxMode: "workspace-write",
+      sandboxMode: "danger-full-access",
       networkPolicy: "enabled",
     });
     expect(autonomyPresetPatch("full", "opencode")).toEqual({
@@ -44,8 +44,22 @@ describe("autonomyPresetPatch", () => {
     }
   });
 
+  /*
+  // 旧行为：Claude full 档不落 danger-full-access；现已改为完全访问=关沙箱。
   it("never requests a full-access sandbox for claude", () => {
     for (const preset of availableAutonomyPresets("claude")) {
+      expect(autonomyPresetPatch(preset, "claude").sandboxMode).not.toBe(
+        "danger-full-access",
+      );
+    }
+  });
+  */
+  it("requests a full-access sandbox for claude full autonomy", () => {
+    expect(autonomyPresetPatch("full", "claude").sandboxMode).toBe(
+      "danger-full-access",
+    );
+    for (const preset of availableAutonomyPresets("claude")) {
+      if (preset === "full") continue;
       expect(autonomyPresetPatch(preset, "claude").sandboxMode).not.toBe(
         "danger-full-access",
       );
@@ -95,7 +109,7 @@ describe("detectAutonomyPreset", () => {
     expect(
       detectAutonomyPreset("claude", {
         approvalPolicy: "trusted",
-        sandboxMode: "workspace-write",
+        sandboxMode: "danger-full-access",
         networkPolicy: "enabled",
       }),
     ).toBe("full");

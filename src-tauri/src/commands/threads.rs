@@ -5143,11 +5143,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_thread_execution_policy_rejects_claude_danger_full_access() {
+    async fn set_thread_execution_policy_allows_claude_danger_full_access() {
         let state = test_app_state();
         let thread = test_thread(&state, "claude", "claude-sonnet-4-6");
 
-        let error = set_thread_execution_policy_inner(
+        let updated = set_thread_execution_policy_inner(
             &state,
             thread.id.clone(),
             false,
@@ -5162,9 +5162,26 @@ mod tests {
             None,
         )
         .await
-        .expect_err("expected danger-full-access to be rejected");
+        .expect("expected danger-full-access to be accepted");
 
-        assert!(error.contains("Claude sandbox mode `danger-full-access` is not supported"));
+        let workspace =
+            crate::db::workspaces::find_workspace_by_id(&state.db, &thread.workspace_id)
+                .unwrap()
+                .expect("expected workspace");
+        let context = CliExecutionContext::from_workspace(&workspace).unwrap();
+        let claude = CliToolFactory::new(state.clone()).create("claude").unwrap();
+        let permissions = claude
+            .runtime_permissions(&context, &updated)
+            .await
+            .unwrap();
+        assert_eq!(
+            permissions.sandbox_mode.as_deref(),
+            Some("danger-full-access")
+        );
+        assert!(updated
+            .engine_metadata
+            .as_ref()
+            .is_none_or(|value| value.get("sandboxMode").is_none()));
     }
 
     #[tokio::test]

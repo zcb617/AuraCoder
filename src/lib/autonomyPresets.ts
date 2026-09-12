@@ -116,9 +116,8 @@ export function autonomyPresetPatch(
         // full autonomy, which pins the network on.
         return { approvalPolicy: "trusted", sandboxMode: "workspace-write", networkPolicy: "inherit" };
       case "full":
-        // Claude has no full-access sandbox in AuraCoder; full autonomy keeps
-        // workspace-write.
-        return { approvalPolicy: "trusted", sandboxMode: "workspace-write", networkPolicy: "enabled" };
+        // 完全访问 = 关闭沙箱，与 Codex full 语义一致（沙箱关、网络放开）。
+        return { approvalPolicy: "trusted", sandboxMode: "danger-full-access", networkPolicy: "enabled" };
       default:
         return { approvalPolicy: "inherit", sandboxMode: "inherit", networkPolicy: "inherit" };
     }

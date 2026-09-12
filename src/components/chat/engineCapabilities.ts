@@ -8,7 +8,8 @@ const CODEX_CAPABILITIES: EngineCapabilities = {
 
 const CLAUDE_CAPABILITIES: EngineCapabilities = {
   permissionModes: ["restricted", "standard", "trusted"],
-  sandboxModes: ["read-only", "workspace-write"],
+  // danger-full-access 表示完全访问=关闭沙箱，与 Codex 语义对齐。
+  sandboxModes: ["read-only", "workspace-write", "danger-full-access"],
   approvalDecisions: ["accept", "decline", "accept_for_session"],
 };
 

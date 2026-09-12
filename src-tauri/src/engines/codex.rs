@@ -8381,12 +8381,23 @@ fn is_known_codex_notification_method(normalized_method: &str) -> bool {
     )
 }
 
+// 实测结论（最小复现验证）：#[path] 写在内联 mod tests 里时，rustc 的解析基址是
+// "src/engines/codex/tests/"（文件 stem + 内联模块名拼成的目录），该目录在磁盘上不存在，
+// Linux 逐分量解析路径时遇到不存在的中间目录直接 ENOENT，任何数量的 "../" 都无法回退。
+// 因此与 factory.rs 同例，把 #[path] 声明放到文件顶层：基址变为真实存在的 src/engines/，
+// 两级回退正好命中 src-tauri/tests/unit/。
+#[cfg(test)]
+#[path = "../../tests/unit/codex_mcp_elicitation_tests.rs"]
+mod codex_mcp_elicitation_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[path = "../../../../tests/unit/codex_mcp_elicitation_tests.rs"]
-    mod codex_mcp_elicitation_tests;
+    // 旧声明在内联 mod tests 内部，解析基址 src/engines/codex/tests/ 不存在，必然 ENOENT；
+    // 已按 factory.rs 同例移到文件顶层，见上方模块声明。
+    // #[path = "../../../../tests/unit/codex_mcp_elicitation_tests.rs"]
+    // mod codex_mcp_elicitation_tests;
 
     use crate::engines::ActionResult;
     use serde_json::{json, Value};

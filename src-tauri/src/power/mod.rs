@@ -2210,7 +2210,10 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "/dev/null"));
         assert!(args
             .iter()
-            .any(|arg| arg == format!("--pid={}", std::process::id())));
+            // 旧写法 arg == format!(...) 是 &String == String，无对应 PartialEq 实现，编译不过；
+            // 该错误此前被 cli_tools/codex.rs 的 #[path] ENOENT 中止掩盖，随 #[path] 修复暴露。
+            // .any(|arg| arg == format!("--pid={}", std::process::id())));
+            .any(|arg| arg.as_str() == format!("--pid={}", std::process::id())));
     }
 
     #[test]

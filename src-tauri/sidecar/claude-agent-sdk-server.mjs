@@ -2014,9 +2014,11 @@ function normalizeSandboxMode(value) {
     return "workspace-write";
   }
   if (compact === "dangerfullaccess") {
-    throw new Error(
-      "Claude does not support sandboxMode=danger-full-access. Use read-only or workspace-write.",
-    );
+    // 旧行为：抛错拒绝。完全访问档位语义为关闭沙箱，与 Codex danger-full-access 对齐。
+    // throw new Error(
+    //   "Claude does not support sandboxMode=danger-full-access. Use read-only or workspace-write.",
+    // );
+    return "danger-full-access";
   }
 
   throw new Error(
@@ -2595,7 +2597,8 @@ async function handleQuery(req, persistentSession = null) {
         : ["user", "project"],
       strictMcpConfig: Boolean(strictMcpConfig),
       sandbox: {
-        enabled: true,
+        // 完全访问 = 关闭沙箱（danger-full-access），其余档位保持启用。
+        enabled: normalizedSandboxMode !== "danger-full-access",
         failIfUnavailable: process.platform !== "win32",
         autoAllowBashIfSandboxed: true,
         allowUnsandboxedCommands: false,

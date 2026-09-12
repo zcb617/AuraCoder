@@ -2047,36 +2047,75 @@ impl CliTool for CodexCli {
     }
 }
 
+// 实测结论（最小复现验证）：#[path] 写在内联 mod tests 里时，rustc 的解析基址是
+// "src/cli_tools/codex/tests/"（文件 stem + 内联模块名拼成的目录），该目录在磁盘上不存在，
+// Linux 逐分量解析路径时遇到不存在的中间目录直接 ENOENT，任何数量的 "../" 都无法回退。
+// 因此与 factory.rs 同例，把 #[path] 声明放到文件顶层：基址变为真实存在的 src/cli_tools/，
+// 两级回退正好命中 src-tauri/tests/unit/。
+#[cfg(test)]
+#[path = "../../tests/unit/codex_cli_permissions_tests.rs"]
+mod codex_cli_permissions_tests;
+
+// thread() 原来定义在内联 mod tests 里；#[path] 测试模块移到文件顶层后，
+// 其 use super::* 指向本模块，thread() 需与本模块同级才能被两处测试同时解析到。
+#[cfg(test)]
+fn thread(permission_mode: Option<&str>, metadata: Option<Value>) -> ThreadDto {
+    ThreadDto {
+        id: "thread".to_string(),
+        workspace_id: "workspace".to_string(),
+        engine_id: "codex".to_string(),
+        model_id: "model".to_string(),
+        engine_thread_id: None,
+        engine_metadata: metadata,
+        plan_mode: None,
+        send_method: None,
+        reasoning_effort: None,
+        permission_mode: permission_mode.map(str::to_string),
+        title: "thread".to_string(),
+        status: ThreadStatusDto::Idle,
+        message_count: 0,
+        total_tokens: 0,
+        context_current_tokens: None,
+        context_max_tokens: None,
+        context_usage_updated_at: None,
+        created_at: String::new(),
+        last_activity_at: String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[path = "../../../../tests/unit/codex_cli_permissions_tests.rs"]
-    mod codex_cli_permissions_tests;
+    // 旧声明在内联 mod tests 内部，解析基址 src/cli_tools/codex/tests/ 不存在，必然 ENOENT；
+    // 已按 factory.rs 同例移到文件顶层，见上方模块声明。
+    // #[path = "../../../../tests/unit/codex_cli_permissions_tests.rs"]
+    // mod codex_cli_permissions_tests;
 
-    fn thread(permission_mode: Option<&str>, metadata: Option<Value>) -> ThreadDto {
-        ThreadDto {
-            id: "thread".to_string(),
-            workspace_id: "workspace".to_string(),
-            engine_id: "codex".to_string(),
-            model_id: "model".to_string(),
-            engine_thread_id: None,
-            engine_metadata: metadata,
-            plan_mode: None,
-            send_method: None,
-            reasoning_effort: None,
-            permission_mode: permission_mode.map(str::to_string),
-            title: "thread".to_string(),
-            status: ThreadStatusDto::Idle,
-            message_count: 0,
-            total_tokens: 0,
-            context_current_tokens: None,
-            context_max_tokens: None,
-            context_usage_updated_at: None,
-            created_at: String::new(),
-            last_activity_at: String::new(),
-        }
-    }
+    // thread() 已上移到文件顶层（见上方），mod tests 通过 use super::* 继续解析到同一份定义。
+    // fn thread(permission_mode: Option<&str>, metadata: Option<Value>) -> ThreadDto {
+    //     ThreadDto {
+    //         id: "thread".to_string(),
+    //         workspace_id: "workspace".to_string(),
+    //         engine_id: "codex".to_string(),
+    //         model_id: "model".to_string(),
+    //         engine_thread_id: None,
+    //         engine_metadata: metadata,
+    //         plan_mode: None,
+    //         send_method: None,
+    //         reasoning_effort: None,
+    //         permission_mode: permission_mode.map(str::to_string),
+    //         title: "thread".to_string(),
+    //         status: ThreadStatusDto::Idle,
+    //         message_count: 0,
+    //         total_tokens: 0,
+    //         context_current_tokens: None,
+    //         context_max_tokens: None,
+    //         context_usage_updated_at: None,
+    //         created_at: String::new(),
+    //         last_activity_at: String::new(),
+    //     }
+    // }
 
     #[test]
     fn permissions_read_empty_as_automatic() {

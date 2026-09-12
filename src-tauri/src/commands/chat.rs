@@ -1483,14 +1483,15 @@ impl<'a> ChatMessageService<'a> {
         }
     };
 
-    let allow_network =
-        if thread.engine_id == "codex" && sandbox_mode.as_deref() == Some("danger-full-access") {
-            true
-        } else {
-            cli_permissions
-                .allow_network
-                .unwrap_or_else(|| allow_network_for_trust_level(&trust_level))
-        };
+    let allow_network = if (thread.engine_id == "codex" || thread.engine_id == "claude")
+        && sandbox_mode.as_deref() == Some("danger-full-access")
+    {
+        true
+    } else {
+        cli_permissions
+            .allow_network
+            .unwrap_or_else(|| allow_network_for_trust_level(&trust_level))
+    };
     let model_supports_selected_personality = if execution_workspace.location_kind == "ssh" {
         validation_catalog
             .as_deref()

@@ -5347,6 +5347,15 @@ fn opencode_sort_prefix_for_millis(now_ms: u64, counter: u64) -> String {
     )
 }
 
+// 实测结论（最小复现验证）：#[path] 写在内联 mod tests 里时，rustc 的解析基址是
+// "src/engines/opencode/tests/"（文件 stem + 内联模块名拼成的目录），该目录在磁盘上不存在，
+// Linux 逐分量解析路径时遇到不存在的中间目录直接 ENOENT，任何数量的 "../" 都无法回退。
+// 因此与 factory.rs 同例，把 #[path] 声明放到文件顶层：基址变为真实存在的 src/engines/，
+// 两级回退正好命中 src-tauri/tests/unit/。
+#[cfg(test)]
+#[path = "../../tests/unit/opencode_context_usage_tests.rs"]
+mod opencode_context_usage_tests;
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -5354,8 +5363,10 @@ mod tests {
     use super::*;
     use crate::engines::TurnAttachment;
 
-    #[path = "../../../../tests/unit/opencode_context_usage_tests.rs"]
-    mod opencode_context_usage_tests;
+    // 旧声明在内联 mod tests 内部，解析基址 src/engines/opencode/tests/ 不存在，必然 ENOENT；
+    // 已按 factory.rs 同例移到文件顶层，见上方模块声明。
+    // #[path = "../../../../tests/unit/opencode_context_usage_tests.rs"]
+    // mod opencode_context_usage_tests;
 
     fn test_remote_engine(base_url: String) -> OpenCodeEngine {
         let (event_bus, _) = broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
