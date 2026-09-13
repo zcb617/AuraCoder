@@ -1034,16 +1034,42 @@ function ClaudeBackgroundTasksCard({
 }
 */
 
+/**
+ * 子代理卡片展开状态表（模块级）。
+ * ChatPanel 消息虚拟化会卸载窗口外的整条消息组件，组件内 useState 在滚动后丢失用户手动收拢状态，
+ * 导致滚回来时卡片按默认值重新展开、高度突变、页面跳动；状态改挂到这里（键：卡片类别+消息 ID+子代理标识），
+ * 重挂载时读回。未手动操作过的卡片默认收拢（此前运行中/失败的子代理默认展开）。
+ */
+const subagentCardExpandedState = new Map<string, boolean>();
+
+/** 读取/写入子代理卡片展开状态；SubagentCardView 与 ClaudeSubagentTaskCard 两处调用。 */
+function useSubagentCardExpanded(stateKey: string): [boolean, (next: boolean) => void] {
+  const [expanded, setExpanded] = useState(
+    () => subagentCardExpandedState.get(stateKey) ?? false,
+  );
+  const setPersistedExpanded = useCallback(
+    (next: boolean) => {
+      subagentCardExpandedState.set(stateKey, next);
+      setExpanded(next);
+    },
+    [stateKey],
+  );
+  return [expanded, setPersistedExpanded];
+}
+
 /** 渲染 Claude 子代理任务，每个子代理一张独立卡片；没有子代理任务时不渲染。 */
 function ClaudeSubagentTasksView({
   metadata,
   actions,
+  messageId,
   onLoadActionOutput,
 }: {
   /** Claude 后台任务卡片的结构化展示数据。 */
   metadata: ClaudeBackgroundTaskMetadata;
   /** 当前消息中已确认归属到后台任务的操作。 */
   actions: ActionBlock[];
+  /** 所属消息 ID，用于拼接卡片展开状态键（虚拟化卸载后读回手动收拢状态）。 */
+  messageId?: string;
   /** 延迟加载某条操作完整结果的回调。 */
   onLoadActionOutput?: (actionId: string) => Promise<void>;
 }) {
@@ -1058,6 +1084,7 @@ function ClaudeSubagentTasksView({
           key={task.taskId}
           task={task}
           actions={actions.filter((action) => action.backgroundTaskId === task.taskId)}
+          stateKey={`subagent-task:${messageId ?? ""}:${task.taskId}`}
           onLoadActionOutput={onLoadActionOutput}
         />
       ))}
@@ -1069,19 +1096,21 @@ function ClaudeSubagentTasksView({
 function ClaudeSubagentTaskCard({
   task,
   actions,
+  stateKey,
   onLoadActionOutput,
 }: {
   /** 子代理任务的结构化展示数据。 */
   task: ClaudeBackgroundTask;
   /** 归属该子代理任务的操作。 */
   actions: ActionBlock[];
+  /** 展开状态持久键（卡片类别+消息 ID+任务 ID）。 */
+  stateKey: string;
   /** 延迟加载某条操作完整结果的回调。 */
   onLoadActionOutput?: (actionId: string) => Promise<void>;
 }) {
   const [now, setNow] = useState(() => Date.now());
-  const [expanded, setExpanded] = useState(
-    task.status === "running" || task.status === "failed",
-  );
+  // 默认收拢；用户手动展开/收拢的状态存模块级状态表，虚拟化滚动重挂载后读回。
+  const [expanded, setExpanded] = useSubagentCardExpanded(stateKey);
   const previousStatusRef = useRef(task.status);
 
   useEffect(() => {
@@ -1092,6 +1121,7 @@ function ClaudeSubagentTaskCard({
     return () => window.clearInterval(timer);
   }, [task.status]);
 
+  // 任务新转入失败时强制展开一次提醒用户查看；重挂载时 previousStatusRef 以当前状态初始化，不会重复强制展开。
   useEffect(() => {
     if (task.status === "failed" && previousStatusRef.current !== "failed") {
       setExpanded(true);
@@ -1126,7 +1156,7 @@ function ClaudeSubagentTaskCard({
         label={`子代理：${task.description}`}
         tileTone="info"
         expanded={expanded}
-        onToggle={() => setExpanded((current) => !current)}
+        onToggle={() => setExpanded(!expanded)}
         meta={
           <span className={`claude-background-task-status ${taskStatusClass}`}>
             {taskStatusIcon}
@@ -1177,10 +1207,13 @@ function ClaudeSubagentTaskCard({
 function NoticeBlockView({
   block,
   backgroundTaskActions = [],
+  messageId,
   onLoadActionOutput,
 }: {
   block: NoticeBlock;
   backgroundTaskActions?: ActionBlock[];
+  /** 所属消息 ID，仅子代理任务卡片用于拼接展开状态键。 */
+  messageId?: string;
   onLoadActionOutput?: (actionId: string) => Promise<void>;
 }) {
   if (
@@ -1199,6 +1232,7 @@ function NoticeBlockView({
       <ClaudeSubagentTasksView
         metadata={block.metadata}
         actions={backgroundTaskActions}
+        messageId={messageId}
         onLoadActionOutput={onLoadActionOutput}
       />
     );
@@ -1666,6 +1700,7 @@ function SubagentCardView({
   threadId,
   blocks,
   indices,
+  messageId,
   onLoadActionOutput,
 }: {
   /** 子代理线程标识。 */
@@ -1674,12 +1709,17 @@ function SubagentCardView({
   blocks: ContentBlock[];
   /** 对应原消息块索引。 */
   indices: number[];
+  /** 所属消息 ID，用于拼接卡片展开状态键（虚拟化卸载后读回手动收拢状态）。 */
+  messageId: string;
   /** 延迟加载动作完整输出的回调。 */
   onLoadActionOutput?: (actionId: string) => Promise<void>;
 }) {
   const { t } = useTranslation("chat");
   const status = getSubagentCardStatus(blocks);
-  const [expanded, setExpanded] = useState(status !== "done");
+  // 默认收拢；用户手动展开/收拢的状态存模块级状态表，虚拟化滚动重挂载后读回。
+  const [expanded, setExpanded] = useSubagentCardExpanded(
+    `subagent-card:${messageId}:${threadId}`,
+  );
   const [hooksExpanded, setHooksExpanded] = useState(false);
   const hooksContentId = useId();
   const title = getSubagentCardTitle(blocks, threadId);
@@ -1697,7 +1737,7 @@ function SubagentCardView({
         icon={<Layers size={11} />}
         label={title}
         expanded={expanded}
-        onToggle={() => setExpanded((value) => !value)}
+        onToggle={() => setExpanded(!expanded)}
         tileTone="info"
         meta={
           <>
@@ -2402,6 +2442,7 @@ function renderSingleBlock(
   backgroundTaskActions: ActionBlock[],
   onOpenDiffFile: ((filePath: string) => void) | undefined,
   onOpenImageAttachment: ((attachment: AttachmentBlock) => void) | undefined,
+  messageId: string,
 ) {
   const blockKey = getMessageBlockKey(block, index, safeBlocks);
 
@@ -2501,6 +2542,7 @@ function renderSingleBlock(
         key={blockKey}
         block={block}
         backgroundTaskActions={backgroundTaskActions}
+        messageId={messageId}
         onLoadActionOutput={onLoadActionOutput}
       />
     );
@@ -2634,6 +2676,7 @@ function MessageBlocksView({
               threadId={segment.threadId}
               blocks={segment.blocks}
               indices={segment.indices}
+              messageId={messageId}
               onLoadActionOutput={onLoadActionOutput}
             />
           );
@@ -2764,6 +2807,7 @@ function MessageBlocksView({
           backgroundTaskActions,
           onOpenDiffFile,
           onOpenImageAttachment,
+          messageId,
         );
       })}
     </div>
