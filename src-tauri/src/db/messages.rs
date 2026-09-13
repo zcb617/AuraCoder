@@ -1032,6 +1032,63 @@ pub fn mark_approval_block_resolved(
     Ok(true)
 }
 
+pub fn mark_approval_block_expired(
+    db: &Database,
+    message_id: &str,
+    approval_id: &str,
+) -> anyhow::Result<bool> {
+    let conn = db.connect()?;
+    let Some(raw_blocks): Option<String> = conn
+        .query_row(
+            "SELECT blocks_json FROM messages WHERE id = ?1",
+            params![message_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to load message blocks for approval expiry")?
+    else {
+        return Ok(false);
+    };
+
+    let mut blocks_value: Value =
+        serde_json::from_str(&raw_blocks).unwrap_or_else(|_| serde_json::json!([]));
+    let Some(items) = blocks_value.as_array_mut() else {
+        return Ok(false);
+    };
+
+    let mut changed = false;
+    for block in items.iter_mut() {
+        let Some(object) = block.as_object_mut() else {
+            continue;
+        };
+        if object.get("type").and_then(Value::as_str) != Some("approval") {
+            continue;
+        }
+        let block_approval_id = object
+            .get("approvalId")
+            .and_then(Value::as_str)
+            .or_else(|| object.get("approval_id").and_then(Value::as_str));
+        if block_approval_id != Some(approval_id) {
+            continue;
+        }
+        if object.get("status").and_then(Value::as_str) == Some("pending") {
+            object.insert("status".to_string(), Value::String("expired".to_string()));
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+
+    conn.execute(
+        "UPDATE messages SET blocks_json = ?1 WHERE id = ?2",
+        params![blocks_value.to_string(), message_id],
+    )
+    .context("failed to persist expired approval in message blocks")?;
+
+    Ok(true)
+}
+
 pub fn search_messages(
     db: &Database,
     workspace_id: &str,

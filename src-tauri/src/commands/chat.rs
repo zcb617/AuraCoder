@@ -2705,7 +2705,7 @@ pub(crate) async fn respond_to_approval_inner(
         }
     })
     .await?;
-    if thread.engine_id == "codex" {
+    let dispatch_result: Result<(), String> = if thread.engine_id == "codex" {
         let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
         let codex = CliToolFactory::new(state.clone())
             .create("codex")
@@ -2719,7 +2719,7 @@ pub(crate) async fn respond_to_approval_inner(
             approval_route,
         )
         .await
-        .map_err(err_to_string)?;
+        .map_err(err_to_string)
     } else if thread.engine_id == "opencode" {
         let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
         let opencode = CliToolFactory::new(state.clone())
@@ -2734,7 +2734,7 @@ pub(crate) async fn respond_to_approval_inner(
             approval_route,
         )
         .await
-        .map_err(err_to_string)?;
+        .map_err(err_to_string)
     } else if thread.engine_id == "claude" {
         let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
         let claude = CliToolFactory::new(state.clone())
@@ -2749,12 +2749,12 @@ pub(crate) async fn respond_to_approval_inner(
             approval_route,
         )
         .await
-        .map_err(err_to_string)?;
+        .map_err(err_to_string)
     } else if workspace.location_kind == "ssh" {
-        return Err(format!(
+        Err(format!(
             "SSH 远端项目当前阶段尚未接入 {} 审批回复",
             thread.engine_id
-        ));
+        ))
     } else {
         state
             .engines
@@ -2765,7 +2765,34 @@ pub(crate) async fn respond_to_approval_inner(
                 approval_route,
             )
             .await
-            .map_err(err_to_string)?;
+            .map_err(err_to_string)
+    };
+
+    if let Err(error) = dispatch_result {
+        // 引擎已确认该审批不再挂起（sidecar 回报 "unknown or no longer pending"）时，
+        // 把持久化审批块从 pending 改为 expired：前端对这条失败只做内存置灰（不落库），
+        // 重启后死卡会复活并挡住输入。此处补落库，与运行时 EngineEvent::ApprovalExpired
+        // 的置灰路径（本文件 EngineEvent::ApprovalExpired 分支）效果一致。
+        if error.contains("no longer pending") {
+            let expire_result = run_db(db.clone(), {
+                let approval_id = approval_id.clone();
+                move |db| {
+                    if let Some(message_id) =
+                        db::actions::find_approval_message_id(db, &approval_id)?
+                    {
+                        db::messages::mark_approval_block_expired(db, &message_id, &approval_id)?;
+                    }
+                    Ok(())
+                }
+            })
+            .await;
+            if let Err(expire_error) = expire_result {
+                log::error!(
+                    "failed to persist expired approval {approval_id}: {expire_error}"
+                );
+            }
+        }
+        return Err(error);
     }
 
     let decision = approval_response_decision_for_persistence(&normalized_response);
