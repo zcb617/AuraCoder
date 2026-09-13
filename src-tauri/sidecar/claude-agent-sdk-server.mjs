@@ -728,6 +728,9 @@ function createQueryContext(id, approvalPolicy = null, planMode = false) {
     streamToolUseIdsByIndex: new Map(),
     suppressedToolUseIds: new Set(),
     pendingApprovalIds: new Set(),
+    // 挂起审批期间到达的后台任务通知在此排队；立即注入会让 CLI 中止轮次、杀死审批卡（2026-09-13 事故实证），
+    // 必须等审批全部答复后由 flushDeferredTaskNotifications 补注入。
+    deferredTaskNotifications: [],
     cancelled: false,
     // 当前逻辑轮次是否已经向 AuraCoder 发出最终完成事件。
     turnCompleted: false,
@@ -935,6 +938,39 @@ function cleanupPendingApprovalsForQuery(queryId, denialMessage) {
     });
   }
   context.pendingApprovalIds.clear();
+  // 查询结束时丢弃延迟队列：轮次生命周期已终结，补注入没有意义；通知展示事件此前已正常发给前端。
+  context.deferredTaskNotifications.length = 0;
+}
+
+/**
+ * 审批全部答复后，把挂起期间排队的后台任务通知补注入 SDK 输入流。
+ * 根因：2026-09-13 审批卡死亡事故——子代理死亡通知在审批挂起期间立即注入输入流，
+ * CLI 会中止当前轮次，挂起的 AskUserQuestion/权限审批被杀（"Tool permission request aborted"），
+ * 用户迟到的回答因此报 "approval ID is unknown or no longer pending"。
+ * 所以对注入加闸门：有挂起审批先排队，审批答复后由本函数补注入；通知内容和顺序不变，只是晚到。
+ * 仅在两个审批等待函数的答复返回点调用；回退方式：删除注入点的排队分支并移除本函数调用即可恢复原行为。
+ */
+function flushDeferredTaskNotifications(context) {
+  if (
+    context.pendingApprovalIds.size > 0 ||
+    context.deferredTaskNotifications.length === 0
+  ) {
+    return;
+  }
+  if (!context.messageInput || context.cancelled || shuttingDown) {
+    // 输入流已不可用时丢弃队列，避免向已结束的查询注入。
+    context.deferredTaskNotifications.length = 0;
+    return;
+  }
+  const flushed = context.deferredTaskNotifications.splice(0);
+  for (const notification of flushed) {
+    context.backgroundContinuationInjectedCount += 1;
+    context.messageInput.push(notification);
+  }
+  traceClaudeSdk("deferred_task_notifications_flushed", {
+    requestId: context.id,
+    count: flushed.length,
+  });
 }
 
 function computerControlCallResultToClaudeContent(value) {
@@ -1224,6 +1260,8 @@ async function requestPermissionApproval(context, toolName, toolInput, suggestio
 
   context.pendingApprovalIds.delete(approvalId);
   pendingApprovals.delete(approvalId);
+  // 审批答复后补注入挂起期间排队的后台任务通知（详见 flushDeferredTaskNotifications 注释）。
+  flushDeferredTaskNotifications(context);
   return permission;
 }
 
@@ -1266,6 +1304,8 @@ async function requestAskUserQuestionApproval(context, toolInput) {
 
   context.pendingApprovalIds.delete(approvalId);
   pendingApprovals.delete(approvalId);
+  // 审批答复后补注入挂起期间排队的后台任务通知（详见 flushDeferredTaskNotifications 注释）。
+  flushDeferredTaskNotifications(context);
   return permission;
 }
 
@@ -3206,8 +3246,6 @@ async function handleQuery(req, persistentSession = null) {
           !persistentSession?.interruptRequested &&
           persistentSessionIsAlive;
         if (canInjectContinuation) {
-          // 记录已注入的 synthetic continuation，等待对应 SDK result 到达。
-          context.backgroundContinuationInjectedCount += 1;
           const syntheticTaskNotification = {
             type: "user",
             message: {
@@ -3229,7 +3267,21 @@ async function handleQuery(req, persistentSession = null) {
             shouldQuery: true,
             session_id: context.sessionId || message.session_id || "",
           };
-          context.messageInput.push(syntheticTaskNotification);
+          if (context.pendingApprovalIds.size > 0) {
+            // 有挂起未答的审批/提问：此时注入会让 CLI 中止轮次并杀死审批卡（2026-09-13 事故实证），
+            // 先排队，等审批答复后由 flushDeferredTaskNotifications 补注入；通知不丢、顺序不变，只是晚到。
+            // 回退方式：删掉本分支即恢复立即注入的旧行为。
+            context.deferredTaskNotifications.push(syntheticTaskNotification);
+            traceClaudeSdk("task_notification_deferred_pending_approval", {
+              requestId: id,
+              taskId,
+              pendingApprovalCount: context.pendingApprovalIds.size,
+            });
+          } else {
+            // 记录已注入的 synthetic continuation，等待对应 SDK result 到达。
+            context.backgroundContinuationInjectedCount += 1;
+            context.messageInput.push(syntheticTaskNotification);
+          }
         }
         maybeCompleteTurn();
       } else if (message.type === "result") {
