@@ -159,6 +159,13 @@ enum SidecarEvent {
         summary: String,
         details: Option<serde_json::Value>,
     },
+    /// Sidecar 在轮次结束/取消作废旧审批时发出的失效通知。
+    ApprovalExpired {
+        id: Option<String>,
+        #[serde(rename = "approvalId")]
+        approval_id: String,
+        reason: Option<String>,
+    },
     /// Sidecar 对审批响应命令的处理回执，用于让调用方确认审批是否真正结算。
     ApprovalResponseResult {
         /// 审批响应命令的顶层请求标识，用于过滤并发回执。
@@ -279,6 +286,7 @@ impl SidecarEvent {
             | SidecarEvent::ActionBackgroundTaskAssigned { id, .. }
             | SidecarEvent::ActionCompleted { id, .. }
             | SidecarEvent::ApprovalRequested { id, .. }
+            | SidecarEvent::ApprovalExpired { id, .. }
             | SidecarEvent::ApprovalResponseResult { id, .. }
             | SidecarEvent::PermissionPolicyUpdateResult { id, .. }
             | SidecarEvent::TurnCompleted { id, .. }
@@ -2785,6 +2793,19 @@ impl Engine for ClaudeSidecarEngine {
                                         .await
                                         .ok();
                                 }
+                                SidecarEvent::ApprovalExpired {
+                                    approval_id,
+                                    reason,
+                                    ..
+                                } => {
+                                    event_tx
+                                        .send(EngineEvent::ApprovalExpired {
+                                            approval_id,
+                                            reason: reason.unwrap_or_default(),
+                                        })
+                                        .await
+                                        .ok();
+                                }
                                 SidecarEvent::TurnCompleted {
                                     status,
                                     session_id,
@@ -3369,6 +3390,32 @@ mod tests {
                 assert_eq!(error.as_deref(), Some("approval-1 is unknown"));
             }
             other => panic!("unexpected event variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserializes_approval_expired_events() {
+        let event: SidecarEvent = serde_json::from_value(serde_json::json!({
+            "id": "req-1",
+            "type": "approval_expired",
+            "approvalId": "approval-1",
+            "reason": "Claude turn completed before approval was answered."
+        }))
+        .expect("approval_expired event should deserialize");
+        match event {
+            SidecarEvent::ApprovalExpired {
+                id,
+                approval_id,
+                reason,
+            } => {
+                assert_eq!(id.as_deref(), Some("req-1"));
+                assert_eq!(approval_id, "approval-1");
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("Claude turn completed before approval was answered.")
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 

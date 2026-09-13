@@ -7972,6 +7972,7 @@ pub(crate) fn engine_event_kind(event: &EngineEvent) -> &'static str {
         EngineEvent::ActionCompleted { .. } => "action_completed",
         EngineEvent::DiffUpdated { .. } => "diff_updated",
         EngineEvent::ApprovalRequested { .. } => "approval_requested",
+        EngineEvent::ApprovalExpired { .. } => "approval_expired",
         EngineEvent::UsageLimitsUpdated { .. } => "usage_limits_updated",
         EngineEvent::ModelRerouted { .. } => "model_rerouted",
         EngineEvent::Notice { .. } => "notice",

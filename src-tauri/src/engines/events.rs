@@ -170,6 +170,10 @@ pub enum EngineEvent {
         summary: String,
         details: serde_json::Value,
     },
+    ApprovalExpired {
+        approval_id: String,
+        reason: String,
+    },
     UsageLimitsUpdated {
         usage: UsageLimitsSnapshot,
     },

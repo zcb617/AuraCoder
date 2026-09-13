@@ -638,7 +638,7 @@ export interface ApprovalBlock {
   actionType: ActionType;
   summary: string;
   details: Record<string, unknown>;
-  status: "pending" | "answered";
+  status: "pending" | "answered" | "expired";
   decision?:
     | "accept"
     | "accept_for_session"
@@ -1669,6 +1669,12 @@ export interface ApprovalResolvedEvent {
   approval_id: string;
 }
 
+export interface ApprovalExpiredEvent {
+  type: "ApprovalExpired";
+  approval_id: string;
+  reason?: string;
+}
+
 export interface ErrorEvent {
   type: "Error";
   message: string;
@@ -1733,6 +1739,7 @@ export type StreamEvent =
   | DiffUpdatedEvent
   | ApprovalRequestedEvent
   | ApprovalResolvedEvent
+  | ApprovalExpiredEvent
   | ModelReroutedEvent
   | NoticeEvent
   | SteerAppliedEvent

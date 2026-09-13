@@ -1935,6 +1935,7 @@ function ToolInputApprovalCard({
   isPending: boolean;
 }) {
   const { t } = useTranslation("chat");
+  const isExpired = block.status === "expired";
   if (questions.length <= 0) return null;
 
   const rawAnswers = block.responseData?.answers;
@@ -1956,7 +1957,9 @@ function ToolInputApprovalCard({
         label={
           isPending
             ? t("messageBlocks.approval.pendingQuestions", { count: questions.length })
-            : t("messageBlocks.approval.answeredQuestions", { count: questions.length })
+            : isExpired
+              ? t("messageBlocks.approval.expiredQuestions", { count: questions.length })
+              : t("messageBlocks.approval.answeredQuestions", { count: questions.length })
         }
       />
       {hasAnswers && expanded && (
@@ -2011,6 +2014,7 @@ function ApprovalCard({
 }) {
   const { t } = useTranslation("chat");
   const isPending = block.status === "pending";
+  const isExpired = block.status === "expired";
   const isClaudeThread = engineId === "claude";
   const details = block.details ?? {};
   const isToolInputRequest = isRequestUserInputApproval(details);
@@ -2157,13 +2161,18 @@ function ApprovalCard({
                 <DecisionIcon size={11} />
                 {decisionLabel}
               </span>
+            ) : isExpired ? (
+              <span className="msg-block-status msg-block-status--danger">
+                <XCircle size={11} />
+                {t("messageBlocks.approval.decision.expired")}
+              </span>
             ) : null}
           </>
         }
       />
 
       {/* Details — collapsed for resolved approvals */}
-      {!isToolInputRequest && (command || displayReason || commandActionCount > 0 || requestedPermissions || mcpUrl || mcpSchema || hasRemainingDetails) && (isPending || !block.decision) && (
+      {!isToolInputRequest && (command || displayReason || commandActionCount > 0 || requestedPermissions || mcpUrl || mcpSchema || hasRemainingDetails) && (isPending || (!block.decision && !isExpired)) && (
         <div className="acard-details">
           {command && (
             <pre className="acard-command">{command}</pre>

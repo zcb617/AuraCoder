@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { t } from "../i18n";
 import type {
   ApprovalResponse,
   ChatProviderUsage,
@@ -1693,6 +1694,66 @@ describe("chatStore send", () => {
     vi.useRealTimers();
   });
 
+  it("marks approvals as expired when the backend expires them", async () => {
+    vi.useFakeTimers();
+
+    let streamHandler: ((event: StreamEvent) => void) | null = null;
+    mockListenThreadEvents.mockImplementationOnce(async (_threadId, onEvent) => {
+      streamHandler = onEvent;
+      return () => {};
+    });
+
+    mockIpc.getThreadMessagesWindow.mockResolvedValueOnce({
+      messages: [
+        {
+          id: "assistant-approval",
+          threadId: "thread-1",
+          role: "assistant",
+          status: "completed",
+          schemaVersion: 1,
+          blocks: [
+            {
+              type: "approval",
+              approvalId: "approval-runtime-2",
+              actionType: "command",
+              summary: "Run command",
+              details: {},
+              status: "pending",
+            },
+          ],
+          createdAt: new Date().toISOString(),
+          hydration: "full",
+          hasDeferredContent: false,
+        },
+      ],
+      nextCursor: null,
+    });
+
+    await useChatStore.getState().setActiveThread("thread-1");
+
+    expect(streamHandler).not.toBeNull();
+    streamHandler!({
+      type: "ApprovalExpired",
+      approval_id: "approval-runtime-2",
+      reason: "test",
+    });
+
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(useChatStore.getState().messages[0]?.blocks).toEqual([
+      {
+        type: "approval",
+        approvalId: "approval-runtime-2",
+        actionType: "command",
+        summary: "Run command",
+        details: {},
+        status: "expired",
+      },
+    ]);
+
+    vi.useRealTimers();
+  });
+
   it("preserves stdin chunks when hydrating deferred action output", async () => {
     useChatStore.setState({
       threadId: "thread-1",
@@ -2990,6 +3051,59 @@ describe("chatStore send", () => {
       { approvalId: "approval-1", status: "pending" },
     ]);
     expect(useChatStore.getState().error).toContain("approval failed");
+  });
+
+  it("marks approval expired and shows friendly error when the approval is no longer pending", async () => {
+    mockIpc.respondApproval.mockRejectedValueOnce(
+      new Error(
+        "Claude approval response failed for approval approval-1: Claude approval ID approval-1 is unknown or no longer pending.",
+      ),
+    );
+    useChatStore.setState({
+      threadId: "thread-1",
+      messages: [
+        {
+          id: "assistant-1",
+          threadId: "thread-1",
+          role: "assistant",
+          status: "completed",
+          schemaVersion: 1,
+          blocks: [
+            {
+              type: "approval",
+              approvalId: "approval-1",
+              actionType: "command",
+              summary: "Run command",
+              details: {},
+              status: "pending",
+            },
+          ],
+          createdAt: new Date().toISOString(),
+          hydration: "full",
+          hasDeferredContent: false,
+        },
+      ],
+      error: undefined,
+    });
+
+    const accepted = await useChatStore
+      .getState()
+      .respondApproval("approval-1", { decision: "accept" }, "thread-1");
+
+    expect(accepted).toBe(false);
+    expect(useChatStore.getState().messages[0]?.blocks).toEqual([
+      {
+        type: "approval",
+        approvalId: "approval-1",
+        actionType: "command",
+        summary: "Run command",
+        details: {},
+        status: "expired",
+      },
+    ]);
+    expect(useChatStore.getState().error).toBe(
+      t("chat:messageBlocks.approval.expiredError"),
+    );
   });
 
   it("keeps approval pending during delayed IPC and preserves concurrent messages", async () => {

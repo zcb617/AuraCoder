@@ -7798,6 +7798,18 @@ fn apply_event_to_blocks(
             progress.thread_status = Some(ThreadStatusDto::AwaitingApproval);
             progress.force_persist = true;
         }
+        EngineEvent::ApprovalExpired { approval_id, .. } => {
+            // 审批随轮次结束失效时，把持久化块从 pending 改为 expired，重进会话后仍展示已失效。
+            if let Some(index) = approval_index.get(approval_id).copied() {
+                if let Some(ContentBlock::Approval { status, .. }) = blocks.get_mut(index) {
+                    if status == "pending" {
+                        *status = "expired".to_string();
+                        progress.blocks_changed = true;
+                        progress.force_persist = true;
+                    }
+                }
+            }
+        }
         EngineEvent::Error {
             message,
             recoverable,
@@ -9493,6 +9505,40 @@ mod tests {
             ContentBlock::Text { content, .. } if content == "after hooks"
         ));
         assert_eq!(action_index.get("action-1"), Some(&2));
+    }
+
+    #[test]
+    fn approval_expired_marks_pending_approval_block() {
+        let mut blocks = Vec::new();
+        let mut action_index = HashMap::new();
+        let mut approval_index = HashMap::new();
+
+        apply_event_to_blocks(
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            &EngineEvent::ApprovalRequested {
+                approval_id: "approval-1".to_string(),
+                action_type: crate::engines::events::ActionType::Other,
+                summary: "Ask".to_string(),
+                details: serde_json::json!({}),
+            },
+            1000,
+        );
+        apply_event_to_blocks(
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            &EngineEvent::ApprovalExpired {
+                approval_id: "approval-1".to_string(),
+                reason: "test".to_string(),
+            },
+            1000,
+        );
+        assert!(matches!(
+            &blocks[0],
+            ContentBlock::Approval { status, .. } if status == "expired"
+        ));
     }
 
     #[test]

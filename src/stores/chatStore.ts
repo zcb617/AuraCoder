@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { ipc, listenThreadEvents } from "../lib/ipc";
 import { recordPerfMetric } from "../lib/perfTelemetry";
+import { t } from "../i18n";
 import { useThreadStore } from "./threadStore";
 import type {
   ApprovalResponse,
@@ -459,6 +460,41 @@ function resolveApprovalInMessages(
     return nextMessages;
   }
 
+  return messages;
+}
+
+function expireApprovalInMessages(
+  messages: Message[],
+  approvalId: string,
+): Message[] {
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+    const message = messages[messageIndex];
+    const blocks = message.blocks;
+    if (!blocks) {
+      continue;
+    }
+    const approvalIndex = blocks.findIndex(
+      (block) => block.type === "approval" && block.approvalId === approvalId,
+    );
+    if (approvalIndex < 0) {
+      continue;
+    }
+    const approvalBlock = blocks[approvalIndex] as ApprovalBlock;
+    if (approvalBlock.status !== "pending") {
+      return messages;
+    }
+    const nextBlocks = [...blocks];
+    nextBlocks[approvalIndex] = {
+      ...approvalBlock,
+      status: "expired" as const,
+    };
+    const nextMessages = [...messages];
+    nextMessages[messageIndex] = {
+      ...message,
+      blocks: nextBlocks,
+    };
+    return nextMessages;
+  }
   return messages;
 }
 
@@ -1534,6 +1570,10 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
 
   if (event.type === "ApprovalResolved") {
     return resolveApprovalInMessages(messages, String(event.approval_id ?? ""));
+  }
+
+  if (event.type === "ApprovalExpired") {
+    return expireApprovalInMessages(messages, String(event.approval_id ?? ""));
   }
 
   // Error 事件只作为过程观察，不写入用户消息，也不改变本轮终态。
@@ -2965,11 +3005,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
       return true;
     } catch (error) {
+      const rawError = String(error);
+      // 审批已随轮次结束被后端作废（sidecar 回执 "unknown or no longer pending"）时，卡片直接置灰并提示业务文案。
+      const approvalStale = rawError.includes("no longer pending");
       set((state) => ({
-        ...(previousApproval && state.threadId === threadId
-          ? { messages: restoreApprovalInMessages(state.messages, approvalId, previousApproval) }
+        ...(state.threadId === threadId
+          ? approvalStale
+            ? { messages: expireApprovalInMessages(state.messages, approvalId) }
+            : previousApproval
+              ? { messages: restoreApprovalInMessages(state.messages, approvalId, previousApproval) }
+              : {}
           : {}),
-        error: String(error),
+        error: approvalStale ? t("chat:messageBlocks.approval.expiredError") : rawError,
       }));
       return false;
     }

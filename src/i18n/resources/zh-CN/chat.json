@@ -677,7 +677,8 @@
         "answered": "已回答",
         "denied": "已拒绝",
         "canceled": "已取消",
-        "approved": "已批准"
+        "approved": "已批准",
+        "expired": "已失效"
       },
       "invalidJson": "JSON 无效：{{error}}",
       "payloadMustBeObject": "负载必须是 JSON 对象。",
@@ -692,6 +693,9 @@
       "pendingQuestions_other": "有 {{count}} 个问题等待输入。",
       "answeredQuestions_one": "已回答 {{count}} 个问题。",
       "answeredQuestions_other": "已回答 {{count}} 个问题。",
+      "expiredQuestions_one": "有 {{count}} 个问题已随会话结束而失效。",
+      "expiredQuestions_other": "有 {{count}} 个问题已随会话结束而失效。",
+      "expiredError": "该审批已随会话结束而失效，请发送新消息继续。",
       "dynamicToolPrompt": "无需手写 JSON 即可响应动态工具调用。",
       "mcpElicitationPrompt": "此 MCP 服务正在请求授权。",
       "showAdvancedJson": "显示高级 JSON",

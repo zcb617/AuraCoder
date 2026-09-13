@@ -927,6 +927,8 @@ function cleanupPendingApprovalsForQuery(queryId, denialMessage) {
       continue;
     }
     pendingApprovals.delete(approvalId);
+    // 审批随查询结束作废时同步通知前端置灰卡片；必须早于 turn_completed 发出，Rust 事件泵在 turn_completed 后即停止转发。
+    emit({ id: queryId, type: "approval_expired", approvalId, reason: denialMessage });
     pending.resolve({
       behavior: "deny",
       message: denialMessage,
@@ -2831,10 +2833,14 @@ async function handleQuery(req, persistentSession = null) {
         return true;
       }
       if (forceStatus) {
+        // 轮次结束前先作废未回答审批，保证 approval_expired 先于 turn_completed 到达前端。
+        cleanupPendingApprovalsForQuery(context.id, "Claude turn completed before approval was answered.");
         emitTurnCompleted(context, forceStatus);
         return true;
       }
       if (context.cancelled || persistentSession?.interruptRequested) {
+        // 轮次结束前先作废未回答审批，保证 approval_expired 先于 turn_completed 到达前端。
+        cleanupPendingApprovalsForQuery(context.id, "Claude turn completed before approval was answered.");
         emitTurnCompleted(context, "interrupted");
         return true;
       }
@@ -2858,6 +2864,8 @@ async function handleQuery(req, persistentSession = null) {
         return false;
       }
 
+      // 轮次结束前先作废未回答审批，保证 approval_expired 先于 turn_completed 到达前端。
+      cleanupPendingApprovalsForQuery(context.id, "Claude turn completed before approval was answered.");
       emitTurnCompleted(context, context.sdkTerminalStatus || terminalStatus);
       if (!persistentSession) {
         context.messageInput?.push(null);
@@ -3384,6 +3392,8 @@ async function handleQuery(req, persistentSession = null) {
       recoverable: false,
     });
     setContextSessionId(context, actualSessionId);
+    // 先于 turn_completed 作废挂起审批，保证 approval_expired 事件能被仍在监听的事件泵转发。
+    cleanupPendingApprovalsForQuery(id, "Claude query failed before approval was answered.");
     emitTurnCompleted(context, "failed");
   } finally {
     traceClaudeSdk("handle_query_finally", { requestId: id, context });

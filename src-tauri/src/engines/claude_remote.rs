@@ -89,6 +89,13 @@ enum RemoteClaudeEvent {
         summary: String,
         details: Option<serde_json::Value>,
     },
+    /// 远端 sidecar 在轮次结束/取消作废旧审批时发出的失效通知。
+    ApprovalExpired {
+        id: Option<String>,
+        #[serde(rename = "approvalId")]
+        approval_id: String,
+        reason: Option<String>,
+    },
     TurnCompleted {
         id: Option<String>,
         status: String,
@@ -161,6 +168,7 @@ impl RemoteClaudeEvent {
             | Self::ActionProgressUpdated { id, .. }
             | Self::ActionCompleted { id, .. }
             | Self::ApprovalRequested { id, .. }
+            | Self::ApprovalExpired { id, .. }
             | Self::TurnCompleted { id, .. }
             | Self::Notice { id, .. }
             | Self::UsageLimitsUpdated { id, .. }
@@ -548,6 +556,18 @@ impl ClaudeRemoteEngine {
                             action_type: Self::parse_action_type(&action_type),
                             summary,
                             details: details.unwrap_or_else(|| serde_json::json!({})),
+                        })
+                        .await;
+                }
+                RemoteClaudeEvent::ApprovalExpired {
+                    approval_id,
+                    reason,
+                    ..
+                } => {
+                    let _ = event_tx
+                        .send(EngineEvent::ApprovalExpired {
+                            approval_id,
+                            reason: reason.unwrap_or_default(),
                         })
                         .await;
                 }
@@ -1171,6 +1191,12 @@ impl Engine for ClaudeRemoteEngine {
                                 action_type: Self::parse_action_type(&action_type),
                                 summary,
                                 details: details.unwrap_or_else(|| serde_json::json!({})),
+                            }).await;
+                        }
+                        RemoteClaudeEvent::ApprovalExpired { approval_id, reason, .. } => {
+                            let _ = event_tx.send(EngineEvent::ApprovalExpired {
+                                approval_id,
+                                reason: reason.unwrap_or_default(),
                             }).await;
                         }
                         RemoteClaudeEvent::Notice { kind, level, title, message, metadata, .. } => {
