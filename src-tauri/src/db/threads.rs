@@ -905,6 +905,37 @@ pub fn reconcile_runtime_state(db: &Database) -> anyhow::Result<RuntimeRecoveryR
     })
 }
 
+/// 审批被判死（消息块置灰落库）后调用：线程若仍停在 awaiting_approval，
+/// 按与启动恢复相同的规则重推状态——还有其他待答审批则维持不变，
+/// 否则复位（最后一条 assistant 消息为 interrupted 时归 idle）。
+/// 正在 streaming 的新轮次不动。
+pub fn refresh_thread_status_after_approval_expired(
+    db: &Database,
+    thread_id: &str,
+) -> anyhow::Result<bool> {
+    let conn = db.connect()?;
+    let current_status: String = conn
+        .query_row(
+            "SELECT status FROM threads WHERE id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )
+        .context("failed to load thread status for approval expiry refresh")?;
+    if current_status != ThreadStatusDto::AwaitingApproval.as_str() {
+        return Ok(false);
+    }
+    let next_status = derive_thread_status_for_recovery(&conn, thread_id)?;
+    if next_status == ThreadStatusDto::AwaitingApproval {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE threads SET status = ?1 WHERE id = ?2",
+        params![next_status.as_str(), thread_id],
+    )
+    .context("failed to refresh thread status after approval expired")?;
+    Ok(true)
+}
+
 fn derive_thread_status_for_recovery(
     conn: &rusqlite::Connection,
     thread_id: &str,

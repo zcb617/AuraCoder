@@ -3011,13 +3011,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set((state) => ({
         ...(state.threadId === threadId
           ? approvalStale
-            ? { messages: expireApprovalInMessages(state.messages, approvalId) }
+            ? {
+                messages: expireApprovalInMessages(state.messages, approvalId),
+                // 审批已被后端判死，挂着它的轮次早已结束；若当前状态仍停在 awaiting_approval
+                //（例如重启后从旧数据恢复出的假进行中），一并复位解锁输入框；
+                // 正在 streaming 的新轮次不动。
+                ...(state.status === "awaiting_approval"
+                  ? { status: "idle" as const, streaming: false }
+                  : {}),
+              }
             : previousApproval
               ? { messages: restoreApprovalInMessages(state.messages, approvalId, previousApproval) }
               : {}
           : {}),
         error: approvalStale ? t("chat:messageBlocks.approval.expiredError") : rawError,
       }));
+      // 侧边栏线程状态同步复位（仅当它还停在 awaiting_approval）。
+      if (approvalStale) {
+        const threadState = useThreadStore.getState();
+        const staleThread = threadState.threads.find((thread) => thread.id === threadId);
+        if (staleThread && staleThread.status === "awaiting_approval") {
+          threadState.applyThreadUpdateLocal({ ...staleThread, status: "idle" });
+        }
+      }
       return false;
     }
   },

@@ -103,6 +103,25 @@ pub fn answer_approval(db: &Database, approval_id: &str, decision: &str) -> anyh
     Ok(())
 }
 
+/// 把 approvals 表中仍为 pending 的审批记录置为 expired。
+///
+/// 审批被引擎判死（运行时 ApprovalExpired 事件或回答时回执 "no longer pending"）后调用，
+/// 避免启动恢复（derive_thread_status_for_recovery）凭这条 pending 记录把线程误判回
+/// awaiting_approval，导致重启后输入框被终止键锁死。返回是否实际发生了状态变更。
+pub fn expire_approval(db: &Database, approval_id: &str) -> anyhow::Result<bool> {
+    let conn = db.connect()?;
+    let changed = conn
+        .execute(
+            "UPDATE approvals
+       SET status = 'expired'
+       WHERE id = ?1
+         AND status = 'pending'",
+            params![approval_id],
+        )
+        .context("failed to expire approval")?;
+    Ok(changed > 0)
+}
+
 #[cfg(test)]
 pub fn resolve_approval(db: &Database, approval_id: &str) -> anyhow::Result<()> {
     let conn = db.connect()?;

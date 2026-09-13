@@ -2776,12 +2776,18 @@ pub(crate) async fn respond_to_approval_inner(
         if error.contains("no longer pending") {
             let expire_result = run_db(db.clone(), {
                 let approval_id = approval_id.clone();
+                let thread_id = thread_id.clone();
                 move |db| {
+                    // 三张纸一起划掉：approvals 表、消息块、线程状态。只划消息块会留下
+                    // approvals 表 pending 记录，启动恢复据此把线程误判回 awaiting_approval，
+                    // 重启后输入框被终止键锁死（2026-09-13 实证）。
+                    db::actions::expire_approval(db, &approval_id)?;
                     if let Some(message_id) =
                         db::actions::find_approval_message_id(db, &approval_id)?
                     {
                         db::messages::mark_approval_block_expired(db, &message_id, &approval_id)?;
                     }
+                    db::threads::refresh_thread_status_after_approval_expired(db, &thread_id)?;
                     Ok(())
                 }
             })
@@ -6801,6 +6807,19 @@ async fn process_stream_event(
             .await
             {
                 log::warn!("failed to persist approval: {error}");
+            }
+        }
+        EngineEvent::ApprovalExpired { approval_id, .. } => {
+            // 审批随轮次结束被判死时，同步划掉 approvals 表里的 pending 记录：
+            // 否则启动恢复（derive_thread_status_for_recovery）会凭这条记录把线程
+            // 误判回 awaiting_approval，重启后输入框被终止键锁死（2026-09-13 实证）。
+            if let Err(error) = run_db(state.db.clone(), {
+                let approval_id = approval_id.clone();
+                move |db| db::actions::expire_approval(db, &approval_id)
+            })
+            .await
+            {
+                log::warn!("failed to persist approval expiry: {error}");
             }
         }
         _ => {}

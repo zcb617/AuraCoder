@@ -3059,6 +3059,28 @@ describe("chatStore send", () => {
         "Claude approval response failed for approval approval-1: Claude approval ID approval-1 is unknown or no longer pending.",
       ),
     );
+    const staleThread = {
+      id: "thread-1",
+      workspaceId: "workspace-1",
+      engineId: "codex" as const,
+      modelId: "gpt-5.3-codex",
+      engineThreadId: "engine-thread-1",
+      engineMetadata: {},
+      title: "Thread 1",
+      status: "awaiting_approval" as const,
+      messageCount: 1,
+      totalTokens: 0,
+      createdAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+    };
+    useThreadStore.setState({
+      threads: [staleThread],
+      threadsByWorkspace: { "workspace-1": [staleThread] },
+      archivedThreadsByWorkspace: {},
+      activeThreadId: "thread-1",
+      loading: false,
+      error: undefined,
+    });
     useChatStore.setState({
       threadId: "thread-1",
       messages: [
@@ -3083,6 +3105,8 @@ describe("chatStore send", () => {
           hasDeferredContent: false,
         },
       ],
+      status: "awaiting_approval",
+      streaming: true,
       error: undefined,
     });
 
@@ -3104,6 +3128,11 @@ describe("chatStore send", () => {
     expect(useChatStore.getState().error).toBe(
       t("chat:messageBlocks.approval.expiredError"),
     );
+    expect(useChatStore.getState().status).toBe("idle");
+    expect(useChatStore.getState().streaming).toBe(false);
+    expect(
+      useThreadStore.getState().threads.find((thread) => thread.id === "thread-1")?.status,
+    ).toBe("idle");
   });
 
   it("keeps approval pending during delayed IPC and preserves concurrent messages", async () => {
