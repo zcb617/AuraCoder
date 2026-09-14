@@ -20,6 +20,8 @@ import type {
 } from "../../workers/markdownParser.types";
 
 const MARKDOWN_WORKER_THRESHOLD_CHARS = 1000;
+// 流式回复期间控制 Markdown 全量解析频率，避免每个 delta 都占用渲染主线程。
+const STREAM_PARSE_INTERVAL_MS = 300;
 const MARKDOWN_CACHE_LIMIT = 280;
 const MARKDOWN_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -232,7 +234,17 @@ export default function MarkdownContent({
 }: MarkdownContentProps) {
   const [workerHtml, setWorkerHtml] = useState<string | null>(null);
   const [workerError, setWorkerError] = useState(false);
+  // 通过版本号触发到点后的流式 Markdown 重新渲染。
+  const [streamParseVersion, setStreamParseVersion] = useState(0);
   const parseStartedAtRef = useRef(0);
+  // 保存流式窗口内最近一次全量解析得到的 HTML，供节流间隔内复用。
+  const streamParsedHtmlRef = useRef<string | null>(null);
+  // 记录最近一次流式全量解析对应的内容，避免把旧 HTML 写入新内容缓存。
+  const streamParsedContentRef = useRef<string | null>(null);
+  // 记录最近一次流式 Markdown 全量解析的时间，用于计算下一次刷新时间。
+  const streamLastParsedAtRef = useRef<number | null>(null);
+  // 保存流式解析定时器，保证组件卸载或流式结束时能够清理。
+  const streamParseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hasStreamedRef = useRef(streaming);
   const { openLocalFileContextMenu, contextMenu } = useChatFileContextMenu();
 
@@ -255,8 +267,66 @@ export default function MarkdownContent({
     if (showWorkerPlaceholder) {
       return null;
     }
-    return renderMarkdownToHtml(content);
-  }, [cachedHtml, content, showWorkerPlaceholder]);
+    if (!streaming) {
+      streamParsedHtmlRef.current = null;
+      streamParsedContentRef.current = null;
+      streamLastParsedAtRef.current = null;
+      return renderMarkdownToHtml(content);
+    }
+
+    const now = performance.now();
+    const lastParsedAt = streamLastParsedAtRef.current;
+    if (
+      lastParsedAt === null ||
+      now - lastParsedAt >= STREAM_PARSE_INTERVAL_MS
+    ) {
+      const html = renderMarkdownToHtml(content);
+      streamParsedHtmlRef.current = html;
+      streamParsedContentRef.current = content;
+      streamLastParsedAtRef.current = now;
+      return html;
+    }
+
+    return streamParsedHtmlRef.current;
+  }, [cachedHtml, content, showWorkerPlaceholder, streaming, streamParseVersion]);
+
+  // 流式期间安排下一次节流刷新，并在流式结束或组件卸载时清理定时器。
+  useEffect(() => {
+    if (!streaming) {
+      streamParsedHtmlRef.current = null;
+      streamParsedContentRef.current = null;
+      streamLastParsedAtRef.current = null;
+    }
+    if (!streaming || cachedHtml !== null || showWorkerPlaceholder) {
+      if (streamParseTimerRef.current !== null) {
+        clearTimeout(streamParseTimerRef.current);
+        streamParseTimerRef.current = null;
+      }
+      return;
+    }
+
+    const lastParsedAt = streamLastParsedAtRef.current;
+    const elapsed = lastParsedAt === null
+      ? STREAM_PARSE_INTERVAL_MS
+      : performance.now() - lastParsedAt;
+    const delay = Math.max(0, STREAM_PARSE_INTERVAL_MS - elapsed);
+    if (delay === 0) {
+      setStreamParseVersion((version) => version + 1);
+      return;
+    }
+
+    streamParseTimerRef.current = setTimeout(() => {
+      streamParseTimerRef.current = null;
+      setStreamParseVersion((version) => version + 1);
+    }, delay);
+
+    return () => {
+      if (streamParseTimerRef.current !== null) {
+        clearTimeout(streamParseTimerRef.current);
+        streamParseTimerRef.current = null;
+      }
+    };
+  }, [cachedHtml, content, showWorkerPlaceholder, streaming, streamParseVersion]);
 
   useEffect(() => {
     if (!streaming) {
@@ -266,11 +336,14 @@ export default function MarkdownContent({
   }, [streaming]);
 
   useEffect(() => {
-    if (immediateHtml === null) {
+    if (
+      immediateHtml === null ||
+      (streaming && streamParsedContentRef.current !== content)
+    ) {
       return;
     }
     writeCachedMarkdownHtml(cacheKey, immediateHtml);
-  }, [cacheKey, immediateHtml]);
+  }, [cacheKey, content, immediateHtml, streaming]);
 
   useEffect(() => {
     if (!workerEligible || streaming || hasStreamed) {
