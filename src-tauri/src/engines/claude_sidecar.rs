@@ -245,6 +245,15 @@ enum SidecarEvent {
         error_type: Option<String>,
         #[serde(rename = "isAuthError")]
         is_auth_error: Option<bool>,
+        /// 统一异常码（后端权威定义见 events.rs ERROR_CODE_*）：-99=上下文压缩失败，未知异常为 -1。
+        #[serde(default)]
+        code: Option<i32>,
+        /// 上游 API 状态码（如 413），仅 API 类异常携带。
+        #[serde(default, rename = "apiErrorStatus")]
+        api_error_status: Option<u16>,
+        /// 原始错误详情原文，供日志与排查，一个字符不改。
+        #[serde(default, rename = "errorDetails")]
+        error_details: Option<String>,
     },
     Version {
         id: Option<String>,
@@ -525,6 +534,9 @@ impl ClaudeTransport {
                                         recoverable: Some(false),
                                         error_type: Some("event_parse_error".to_string()),
                                         is_auth_error: Some(false),
+                                        code: None,
+                                        api_error_status: None,
+                                        error_details: None,
                                     };
                                     if let Some(sender) = startup_tx.take() {
                                         let _ = sender.send(event.clone());
@@ -542,6 +554,9 @@ impl ClaudeTransport {
                                 recoverable: Some(false),
                                 error_type: Some("event_stream_closed".to_string()),
                                 is_auth_error: Some(false),
+                                code: None,
+                                api_error_status: None,
+                                error_details: None,
                             };
                             if let Some(sender) = startup_tx.take() {
                                 let _ = sender.send(event.clone());
@@ -557,6 +572,9 @@ impl ClaudeTransport {
                                 recoverable: Some(false),
                                 error_type: Some("event_read_error".to_string()),
                                 is_auth_error: Some(false),
+                                code: None,
+                                api_error_status: None,
+                                error_details: None,
                             };
                             if let Some(sender) = startup_tx.take() {
                                 let _ = sender.send(event.clone());
@@ -2921,6 +2939,9 @@ impl Engine for ClaudeSidecarEngine {
                                     recoverable,
                                     error_type,
                                     is_auth_error,
+                                    code,
+                                    api_error_status,
+                                    error_details,
                                     ..
                                 } => {
                                     if Self::is_claude_auth_error(
@@ -2941,13 +2962,60 @@ impl Engine for ClaudeSidecarEngine {
                                         drop(state);
                                         transport.kill().await;
                                     }
-                                    event_tx
-                                        .send(EngineEvent::Error {
-                                            message,
-                                            recoverable: recoverable.unwrap_or(false),
-                                        })
-                                        .await
-                                        .ok();
+                                    // 上下文压缩失败（上游 413 拒绝）为已知异常码 -99：识别并转换为业务化 Notice 上报前端，
+                                    // 同时用 error 级日志记录完整原始错误，供排查。
+                                    let is_context_compact_failed = code
+                                        == Some(super::ERROR_CODE_CONTEXT_COMPACT_FAILED)
+                                        || api_error_status == Some(413)
+                                        || error_details
+                                            .as_deref()
+                                            .map(|details| details.contains("request_too_large"))
+                                            .unwrap_or(false);
+                                    if is_context_compact_failed {
+                                        log::error!(
+                                            "claude 上下文压缩失败(code={:?}): status={:?} details={:?} recoverable={:?} msg={}",
+                                            code,
+                                            api_error_status,
+                                            error_details,
+                                            recoverable,
+                                            message
+                                        );
+                                        event_tx
+                                            .send(EngineEvent::Notice {
+                                                kind: "context_compact_failed".to_string(),
+                                                level: "error".to_string(),
+                                                title: "上下文压缩失败".to_string(),
+                                                message: "上下文压缩失败：会话中累积的图片和附件使请求超出上游大小限制。请移除部分图片或稍后重试，然后可手动结束本轮。".to_string(),
+                                                metadata: Some(serde_json::json!({
+                                                    "code": super::ERROR_CODE_CONTEXT_COMPACT_FAILED
+                                                })),
+                                            })
+                                            .await
+                                            .ok();
+                                    } else {
+                                        // default：其它一切未命中具体码的异常统一归系统通用异常 -1，
+                                        // 记完整原始错误日志，并转换为业务化 Notice 上报前端（与 -99 同形态）。
+                                        log::error!(
+                                            "claude 系统通用异常(code={:?}): status={:?} details={:?} recoverable={:?} msg={}",
+                                            code,
+                                            api_error_status,
+                                            error_details,
+                                            recoverable,
+                                            message
+                                        );
+                                        event_tx
+                                            .send(EngineEvent::Notice {
+                                                kind: "system_generic_error".to_string(),
+                                                level: "error".to_string(),
+                                                title: "系统通用异常".to_string(),
+                                                message: "系统通用异常：执行出现未预期的错误。请稍后重试，或可手动结束本轮。".to_string(),
+                                                metadata: Some(serde_json::json!({
+                                                    "code": super::ERROR_CODE_SYSTEM_GENERIC
+                                                })),
+                                            })
+                                            .await
+                                            .ok();
+                                    }
                                 }
                                 SidecarEvent::Ready
                                 | SidecarEvent::ApprovalResponseResult { .. }

@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use super::{TurnAttachment, TurnInputItem};
 
+/// 统一异常码：未知异常固定为系统通用异常。
+pub const ERROR_CODE_SYSTEM_GENERIC: i32 = -1;
+/// 统一异常码：上下文压缩失败（上游以 HTTP 413 拒绝请求体过大的压缩请求）。
+pub const ERROR_CODE_CONTEXT_COMPACT_FAILED: i32 = -99;
+
 pub const ACTION_OUTPUT_DELTA_MAX_CHARS: usize = 16 * 1024;
 pub const STREAMED_DIFF_MAX_CHARS: usize = 128 * 1024;
 const ACTION_OUTPUT_DELTA_TRUNCATED_PREFIX: &str = "... [output truncated; showing tail]\n";

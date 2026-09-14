@@ -17,6 +17,11 @@ import { promisify } from "node:util";
 // import { fromJSONSchema } from "zod/v4";
 let fromJSONSchema;
 
+// 统一异常码（后端权威定义，与 Rust src-tauri/src/engines/events.rs 的 ERROR_CODE_* 保持一致）：
+// -1 = 系统通用异常；-99 = 上下文压缩失败。sidecar 是独立 Node 进程无法 import Rust 常量，故在此同步维护，语义权威在后端。
+const ERROR_CODE_SYSTEM_GENERIC = -1;
+const ERROR_CODE_CONTEXT_COMPACT_FAILED = -99;
+
 // 启动阶段依赖失败必须先输出结构化错误，便于宿主保留真实失败上下文。
 function emitStartupDependencyError(message) {
   process.stdout.write(
@@ -1982,11 +1987,30 @@ function formatAssistantMessageError(message) {
         recoverable: true,
       };
     case "invalid_request":
+      // 上下文压缩因请求体过大被上游以 413 拒绝（request_too_large）：返回专用的业务化错误，
+      // code=-99 供后端统一归类和前端按码识别；其余 invalid_request 保持原笼统文案并带通用码 -1。
+      if (
+        message.apiErrorStatus === 413 &&
+        typeof message.errorDetails === "string" &&
+        message.errorDetails.includes("request_too_large")
+      ) {
+        return {
+          errorType: "context_compact_request_too_large",
+          isAuthError: false,
+          message:
+            "上下文压缩失败：会话中累积的图片和附件使请求超出上游大小限制。",
+          recoverable: false,
+          code: ERROR_CODE_CONTEXT_COMPACT_FAILED,
+          apiErrorStatus: message.apiErrorStatus,
+          errorDetails: message.errorDetails,
+        };
+      }
       return {
         errorType,
         isAuthError: false,
         message: "Claude rejected the request as invalid.",
         recoverable: false,
+        code: ERROR_CODE_SYSTEM_GENERIC,
       };
     case "server_error":
       return {
@@ -2990,6 +3014,14 @@ async function handleQuery(req, persistentSession = null) {
           recoverable: assistantError.recoverable,
           errorType: assistantError.errorType,
           isAuthError: assistantError.isAuthError,
+          // 透传统一异常码与 SDK 原始字段，供后端归类与完整记日志（仅当 CHG-01 返回了对应字段才透传）。
+          ...(assistantError.code !== undefined ? { code: assistantError.code } : {}),
+          ...(assistantError.apiErrorStatus !== undefined
+            ? { apiErrorStatus: assistantError.apiErrorStatus }
+            : {}),
+          ...(assistantError.errorDetails !== undefined
+            ? { errorDetails: assistantError.errorDetails }
+            : {}),
         });
       } else if (message.type === "rate_limit_event") {
         const usage = buildRateLimitUsageSnapshot(message);
