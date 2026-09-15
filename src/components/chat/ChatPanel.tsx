@@ -100,6 +100,7 @@ import { ChatStatusBar } from "./ChatStatusBar";
 import { ChatTitlebar } from "./ChatTitlebar";
 import { ChatMessageArea } from "./ChatMessageArea";
 import { ApprovalBanner } from "./ApprovalBanner";
+import { ChatComposerInput } from "./ChatComposerInput";
 import {
   canBatchApproveApproval,
   canUseApprovalDecisionActions,
@@ -190,12 +191,9 @@ import {
 import { PermissionPicker } from "./PermissionPicker";
 import { OpenCodeAgentPicker } from "./OpenCodeAgentPicker";
 // CodexReviewPicker and CodexThreadPicker replaced by slash commands (ChatSlashMenu + ChatCommandPanel)
-import { ChatSlashMenu } from "./ChatSlashMenu";
-import { ChatThreadMentionMenu } from "./ChatThreadMentionMenu";
 import { ChatCommandPanel, type ActiveSlashCommand } from "./ChatCommandPanel";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
 import { Dropdown } from "../shared/Dropdown";
-import { shouldSubmitChatInput } from "./chatInputShortcuts";
 import type {
   ApprovalBlock,
   ApprovalResponse,
@@ -5668,170 +5666,43 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                   />
                 )}
 
-                <textarea
-                  ref={inputRef}
-                  rows={3}
-                  value={input}
-                  onChange={(e) => {
-                    inputHistCursorRef.current = -1;
-                    setInput(e.target.value);
-                    handleSlashDetection(
-                      e.target.value,
-                      e.target.selectionStart ?? e.target.value.length,
-                    );
-                    handleThreadMentionDetection(
-                      e.target.value,
-                      e.target.selectionStart ?? e.target.value.length,
-                    );
-                  }}
-                  onKeyDown={(e) => {
-                    /* ── AuraCoder 会话 @ 菜单键盘导航 ── */
-                    if (threadMentionMenuOpen && threadMentionCandidates.length > 0) {
-                      if (e.key === "ArrowDown") {
-                        e.preventDefault();
-                        setThreadMentionActiveIndex((index) =>
-                          Math.min(index + 1, threadMentionCandidates.length - 1),
-                        );
-                        return;
-                      }
-                      if (e.key === "ArrowUp") {
-                        e.preventDefault();
-                        setThreadMentionActiveIndex((index) => Math.max(index - 1, 0));
-                        return;
-                      }
-                      if (e.key === "Enter" || e.key === "Tab") {
-                        e.preventDefault();
-                        const thread = threadMentionCandidates[
-                          Math.min(threadMentionActiveIndex, threadMentionCandidates.length - 1)
-                        ];
-                        if (thread) handleThreadMentionSelect(thread);
-                        return;
-                      }
-                      if (e.key === "Escape") {
-                        e.preventDefault();
-                        setThreadMentionMenuOpen(false);
-                        return;
-                      }
-                    }
-                    /* ── Slash menu keyboard nav ── */
-                    if (slashMenuOpen) {
-                      if (e.key === "ArrowDown") {
-                        e.preventDefault();
-                        setSlashMenuActiveIndex((i) =>
-                          Math.min(i + 1, filteredSlashCommands.length - 1),
-                        );
-                        return;
-                      }
-                      if (e.key === "ArrowUp") {
-                        e.preventDefault();
-                        setSlashMenuActiveIndex((i) => Math.max(i - 1, 0));
-                        return;
-                      }
-                      if (e.key === "Enter" || e.key === "Tab") {
-                        e.preventDefault();
-                        const cmd = filteredSlashCommands[Math.min(slashMenuActiveIndex, filteredSlashCommands.length - 1)];
-                        if (cmd) handleSlashCommandSelect(cmd.id);
-                        return;
-                      }
-                      if (e.key === "Escape") {
-                        e.preventDefault();
-                        setSlashMenuOpen(false);
-                        return;
-                      }
-                    }
-                    /* ── Command panel dismiss ── */
-                    if (activeCommandPanel && e.key === "Escape") {
-                      e.preventDefault();
-                      setActiveCommandPanel(null);
-                      setCommandPanelError(null);
-                      return;
-                    }
-                    /* ── Input history cycling (Option+Up / Option+Down) ── */
-                    if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
-                      const history = inputHistoryRef.current;
-                      if (history.length === 0) return;
-                      e.preventDefault();
-                      if (e.key === "ArrowUp") {
-                        if (inputHistCursorRef.current === -1) {
-                          inputLiveDraftRef.current = input;
-                        }
-                        const next = Math.min(inputHistCursorRef.current + 1, history.length - 1);
-                        inputHistCursorRef.current = next;
-                        setInput(history[next]);
-                      } else {
-                        const next = inputHistCursorRef.current - 1;
-                        inputHistCursorRef.current = next;
-                        if (next < 0) {
-                          setInput(inputLiveDraftRef.current);
-                        } else {
-                          setInput(history[next]);
-                        }
-                      }
-                      return;
-                    }
-                    if (shouldSubmitChatInput({
-                      key: e.key,
-                      ctrlKey: e.ctrlKey,
-                      metaKey: e.metaKey,
-                      shiftKey: e.shiftKey,
-                      isComposing: e.nativeEvent.isComposing,
-                    }, sendShortcut)) {
-                      e.preventDefault();
-                      if (streaming && !canSteerActiveTurn && sessionMessageSendMode !== "flexible") {
-                        return;
-                      }
-                      void onSubmit(e);
-                    }
-                    if (e.shiftKey && e.key === "Tab") {
-                      e.preventDefault();
-                      if (activeWorkspaceId && !isOpenCodeEngine) {
-                        const nextPlanMode = !planMode;
-                        setPlanMode(nextPlanMode);
-                        void saveThreadRuntimeSelectionPatch(
-                          activeThread?.id ?? activeChatSessionId,
-                          { planMode: nextPlanMode },
-                        );
-                      }
-                    }
-                  }}
-                  placeholder={
-                    activePlanMode
-                      ? t("panel.placeholders.plan")
-                      : t("panel.placeholders.chat")
-                  }
-                  disabled={!activeWorkspaceId}
-                  style={{
-                    width: "100%",
-                    padding: "12px 14px",
-                    background: "transparent",
-                    color: "var(--text-1)",
-                    fontSize: 13,
-                    lineHeight: 1.6,
-                    resize: "none",
-                    fontFamily: "inherit",
-                    caretColor: activePlanMode ? "var(--accent-2)" : "var(--accent)",
-                  }}
-                />
-
-                <ChatThreadMentionMenu
-                  visible={threadMentionMenuOpen && threadMentionCandidates.length > 0}
-                  threads={threadMentionCandidates}
-                  anchorRef={inputRef}
-                  activeIndex={threadMentionActiveIndex}
-                  onSelect={handleThreadMentionSelect}
-                  onDismiss={() => setThreadMentionMenuOpen(false)}
-                  onActiveChange={setThreadMentionActiveIndex}
-                />
-
-                {/* Slash command menu (portal) */}
-                <ChatSlashMenu
-                  visible={slashMenuOpen && filteredSlashCommands.length > 0}
-                  commands={filteredSlashCommands}
-                  anchorRef={inputRef}
-                  activeIndex={slashMenuActiveIndex}
-                  onSelect={handleSlashCommandSelect}
-                  onDismiss={() => setSlashMenuOpen(false)}
-                  onActiveChange={setSlashMenuActiveIndex}
+                <ChatComposerInput
+                  input={input}
+                  inputRef={inputRef}
+                  activeWorkspaceId={activeWorkspaceId}
+                  activePlanMode={activePlanMode}
+                  planMode={planMode}
+                  isOpenCodeEngine={isOpenCodeEngine}
+                  streaming={streaming}
+                  canSteerActiveTurn={canSteerActiveTurn}
+                  sessionMessageSendMode={sessionMessageSendMode}
+                  sendShortcut={sendShortcut}
+                  threadMentionMenuOpen={threadMentionMenuOpen}
+                  threadMentionCandidates={threadMentionCandidates}
+                  threadMentionActiveIndex={threadMentionActiveIndex}
+                  slashMenuOpen={slashMenuOpen}
+                  filteredSlashCommands={filteredSlashCommands}
+                  slashMenuActiveIndex={slashMenuActiveIndex}
+                  activeCommandPanel={activeCommandPanel}
+                  activeThread={activeThread}
+                  activeChatSessionId={activeChatSessionId}
+                  inputHistoryRef={inputHistoryRef}
+                  inputHistCursorRef={inputHistCursorRef}
+                  inputLiveDraftRef={inputLiveDraftRef}
+                  setInput={setInput}
+                  setPlanMode={setPlanMode}
+                  setThreadMentionMenuOpen={setThreadMentionMenuOpen}
+                  setThreadMentionActiveIndex={setThreadMentionActiveIndex}
+                  setSlashMenuOpen={setSlashMenuOpen}
+                  setSlashMenuActiveIndex={setSlashMenuActiveIndex}
+                  setActiveCommandPanel={setActiveCommandPanel}
+                  setCommandPanelError={setCommandPanelError}
+                  handleSlashDetection={handleSlashDetection}
+                  handleThreadMentionDetection={handleThreadMentionDetection}
+                  handleThreadMentionSelect={handleThreadMentionSelect}
+                  handleSlashCommandSelect={handleSlashCommandSelect}
+                  onSubmit={onSubmit}
+                  saveThreadRuntimeSelectionPatch={saveThreadRuntimeSelectionPatch}
                 />
               </>
             )}
