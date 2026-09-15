@@ -79,7 +79,7 @@ import {
 } from "../../lib/parseDiff";
 import { getActionGroupId, getMessageBlockKey } from "./messageBlockKeys";
 import {
-  VirtualizedDiffBody,
+  StaticDiffBody,
   useParsedDiff,
 } from "../shared/DiffViewer";
 import MarkdownContent from "./MarkdownContent";
@@ -695,7 +695,7 @@ function MessageDiffBlock({
             border: "1px solid var(--border)",
             background: "var(--code-bg)",
           }}>
-            <VirtualizedDiffBody parsed={parseResult.parsed} foldContext />
+            <StaticDiffBody parsed={parseResult.parsed} foldContext />
           </div>
         ) : (
           <div style={{ padding: "4px 14px", fontSize: 11.5, color: "var(--text-3)" }}>

@@ -515,3 +515,89 @@ export function VirtualizedDiffBody({
     </div>
   );
 }
+
+interface StaticDiffBodyProps {
+  /** 已解析的 diff 行，作为静态 DOM 的完整渲染数据源。 */
+  parsed: ParsedLine[];
+  /** 是否让 diff 容器填充父级剩余高度。 */
+  fillAvailableHeight?: boolean;
+  /** 静态 diff 容器在非填充模式下允许的最大高度。 */
+  maxHeight?: number;
+  /** 传给静态 diff 容器的附加样式。 */
+  style?: CSSProperties;
+  /** 是否折叠连续的未变更上下文行。 */
+  foldContext?: boolean;
+}
+
+/**
+ * 将消息中的已解析 diff 一次性渲染为完整 DOM，并保留上下文折叠交互。
+ */
+export function StaticDiffBody({
+  parsed,
+  fillAvailableHeight = false,
+  maxHeight = DIFF_VIEWPORT_FALLBACK_HEIGHT,
+  style,
+  foldContext = false,
+}: StaticDiffBodyProps) {
+  const { t } = useTranslation("common");
+  const [expandedFolds, setExpandedFolds] = useState<ReadonlySet<number>>(
+    () => new Set<number>(),
+  );
+
+  useEffect(() => {
+    setExpandedFolds(new Set<number>());
+  }, [parsed]);
+
+  const rows = useMemo(
+    () => buildDisplayRows(parsed, foldContext, expandedFolds),
+    [parsed, foldContext, expandedFolds],
+  );
+
+  const viewportStyle: CSSProperties = fillAvailableHeight
+    ? {
+        overflow: "auto",
+        flex: 1,
+        minHeight: 0,
+        ...style,
+      }
+    : {
+        overflow: "auto",
+        maxHeight,
+        ...style,
+      };
+
+  return (
+    <div style={viewportStyle}>
+      <div
+        style={{
+          width: "fit-content",
+          minWidth: "100%",
+          padding: `${DIFF_CONTENT_VERTICAL_PADDING}px 0`,
+        }}
+      >
+        {rows.map((row) => {
+          if (row.kind === "fold") {
+            return (
+              <button
+                key={`fold-${row.id}`}
+                type="button"
+                className="git-diff-fold"
+                onClick={() =>
+                  setExpandedFolds((current) => {
+                    const next = new Set(current);
+                    next.add(row.id);
+                    return next;
+                  })
+                }
+              >
+                <UnfoldVertical size={11} />
+                {t("diff.unchangedLines", { count: row.count })}
+              </button>
+            );
+          }
+          return renderDiffLine(row.line, row.key);
+        })}
+      </div>
+    </div>
+  );
+}
