@@ -9,7 +9,6 @@ import {
   useState,
   type ClipboardEvent as ReactClipboardEvent,
   type MouseEvent as ReactMouseEvent,
-  type ReactNode,
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { TFunction } from "i18next";
@@ -231,8 +230,6 @@ import type {
   TrustLevel,
 } from "../../types";
 
-const MESSAGE_VIRTUALIZATION_THRESHOLD = 40;
-const MESSAGE_ESTIMATED_ROW_HEIGHT = 220;
 const MESSAGE_ROW_GAP = 12;
 const EMPTY_CHAT_ATTACHMENTS: ChatAttachment[] = [];
 const EMPTY_CHAT_INPUT_REFERENCES: ChatInputReference[] = [];
@@ -312,7 +309,6 @@ function createPendingSubmissionMessage(
     hasDeferredContent: false,
   };
 }
-const MESSAGE_OVERSCAN_PX = 700;
 const LazyTerminalPanel = lazy(() =>
   import("../terminal/TerminalPanel").then((module) => ({
     default: module.TerminalPanel,
@@ -338,41 +334,6 @@ function approvalRowIcon(actionType: ActionType) {
       return <Shield size={13} />;
   }
 }
-
-interface MeasuredMessageRowProps {
-  messageId: string;
-  onHeightChange: (messageId: string, height: number) => void;
-  children: ReactNode;
-}
-
-
-function MeasuredMessageRow({ messageId, onHeightChange, children }: MeasuredMessageRowProps) {
-  const rowRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const element = rowRef.current;
-    if (!element) {
-      return;
-    }
-
-    const publishHeight = () => {
-      onHeightChange(messageId, element.getBoundingClientRect().height);
-    };
-
-    publishHeight();
-
-    if (typeof ResizeObserver === "undefined") {
-      return;
-    }
-
-    const observer = new ResizeObserver(() => publishHeight());
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [messageId, onHeightChange]);
-
-  return <div ref={rowRef}>{children}</div>;
-}
-
 
 interface CodexReferenceCatalogState {
   skillsLoaded: boolean;
@@ -431,21 +392,6 @@ function prewarmEngineTransport(
 
 
 
-
-function estimateMessageOffset(
-  messages: Message[],
-  index: number,
-  measuredHeights: Map<string, number>,
-): number {
-  let offset = 0;
-  for (let current = 0; current < index; current += 1) {
-    const currentMessageId = messages[current].id;
-    const rowHeight =
-      measuredHeights.get(currentMessageId) ?? MESSAGE_ESTIMATED_ROW_HEIGHT;
-    offset += rowHeight + MESSAGE_ROW_GAP;
-  }
-  return offset;
-}
 
 interface ChatPanelProps {
   embedded?: boolean;
@@ -1058,16 +1004,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const prependLoadInFlightRef = useRef(false);
   const threadActivatedAtRef = useRef(0);
   const initialScrollThreadRef = useRef<string | null>(null);
-  const messageHeightsRef = useRef<Map<string, number>>(new Map());
-  const layoutVersionRafRef = useRef<number | null>(null);
   const threadExecutionPolicyRequestIdsRef = useRef<Record<string, number>>({});
   // 保存每个线程正在执行的权限持久化任务，普通消息发送必须等待同线程任务完成。
   const threadExecutionPolicyRequestsRef = useRef<Record<string, Promise<boolean> | undefined>>({});
   // 保存每个线程正在执行的五项运行选择局部更新，保证同一线程按顺序落库。
   const threadRuntimeSelectionRequestsRef = useRef<Record<string, Promise<boolean> | undefined>>({});
-  const [listLayoutVersion, setListLayoutVersion] = useState(0);
   const [viewportScrollTop, setViewportScrollTop] = useState(0);
-  const [viewportHeight, setViewportHeight] = useState(0);
   const [textAnnotationPopover, setTextAnnotationPopover] =
     useState<TextAnnotationPopover | null>(null);
   const [textAnnotationComment, setTextAnnotationComment] = useState("");
@@ -2417,16 +2359,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
   }, []);
 
-  const scheduleListLayoutVersionBump = useCallback(() => {
-    if (layoutVersionRafRef.current !== null) {
-      return;
-    }
-    layoutVersionRafRef.current = window.requestAnimationFrame(() => {
-      layoutVersionRafRef.current = null;
-      setListLayoutVersion((version) => version + 1);
-    });
-  }, []);
-
   useEffect(() => {
     if (activeWorkspaceId) {
       void syncTerminalSessions(activeWorkspaceId);
@@ -2508,12 +2440,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 120;
       setAutoScrollLocked(!nearBottom);
     };
-    const updateHeight = () => {
-      setViewportHeight(viewport.clientHeight);
-    };
-
     updateScroll();
-    updateHeight();
 
     const onScroll = () => {
       if (rafId !== 0) {
@@ -2527,45 +2454,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
     viewport.addEventListener("scroll", onScroll, { passive: true });
 
-    let resizeObserver: ResizeObserver | null = null;
-    if (typeof ResizeObserver !== "undefined") {
-      resizeObserver = new ResizeObserver(() => updateHeight());
-      resizeObserver.observe(viewport);
-    } else {
-      window.addEventListener("resize", updateHeight);
-    }
-
     return () => {
       viewport.removeEventListener("scroll", onScroll);
       if (rafId !== 0) {
         window.cancelAnimationFrame(rafId);
       }
-      if (resizeObserver) {
-        resizeObserver.disconnect();
-      } else {
-        window.removeEventListener("resize", updateHeight);
-      }
     };
   }, []);
-
-  useEffect(() => {
-    messageHeightsRef.current.clear();
-    scheduleListLayoutVersionBump();
-  }, [activeThread?.id, scheduleListLayoutVersionBump]);
-
-  useEffect(() => {
-    const existingIds = new Set(messages.map((message) => message.id));
-    let changed = false;
-    for (const messageId of messageHeightsRef.current.keys()) {
-      if (!existingIds.has(messageId)) {
-        messageHeightsRef.current.delete(messageId);
-        changed = true;
-      }
-    }
-    if (changed) {
-      scheduleListLayoutVersionBump();
-    }
-  }, [messages, scheduleListLayoutVersionBump]);
 
   useEffect(() => {
     if (!editingThreadTitle) {
@@ -3358,28 +3253,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
 
     const targetMessageId = messages[targetIndex].id;
-    const targetHeight =
-      messageHeightsRef.current.get(targetMessageId) ??
-      MESSAGE_ESTIMATED_ROW_HEIGHT;
-    const targetTopOffset = estimateMessageOffset(
-      messages,
-      targetIndex,
-      messageHeightsRef.current,
+    const targetElement = viewport.querySelector<HTMLElement>(
+      `[data-message-id="${targetMessageId}"]`,
     );
-    const centeredTop = Math.max(
-      0,
-      targetTopOffset - Math.max((viewport.clientHeight - targetHeight) / 2, 0),
-    );
-
-    viewport.scrollTo({ top: centeredTop, behavior: "smooth" });
-    window.setTimeout(() => {
-      const targetElement = viewport.querySelector<HTMLElement>(
-        `[data-message-id="${targetMessageId}"]`,
-      );
-      if (targetElement) {
-        targetElement.scrollIntoView({ block: "center", behavior: "smooth" });
-      }
-    }, 120);
+    if (targetElement) {
+      targetElement.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
     setHighlightedMessageId(targetMessageId);
 
     if (highlightTimeoutRef.current !== null) {
@@ -3407,10 +3286,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     return () => {
       if (highlightTimeoutRef.current !== null) {
         window.clearTimeout(highlightTimeoutRef.current);
-      }
-      if (layoutVersionRafRef.current !== null) {
-        window.cancelAnimationFrame(layoutVersionRafRef.current);
-        layoutVersionRafRef.current = null;
       }
     };
   }, []);
@@ -5438,34 +5313,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     setAttachments((prev) => prev.filter((a) => a.id !== id));
   }
 
-  const onMessageRowHeightChange = useCallback(
-    (messageId: string, height: number) => {
-      const normalizedHeight = Math.max(56, Math.ceil(height));
-      const previousHeight = messageHeightsRef.current.get(messageId);
-      if (
-        previousHeight !== undefined &&
-        Math.abs(previousHeight - normalizedHeight) < 2
-      ) {
-        return;
-      }
-
-      messageHeightsRef.current.set(messageId, normalizedHeight);
-      scheduleListLayoutVersionBump();
-    },
-    [scheduleListLayoutVersionBump],
-  );
-
-  const virtualizationEnabled =
-    messages.length >= MESSAGE_VIRTUALIZATION_THRESHOLD;
-
   useEffect(() => {
     recordPerfMetric("chat.render.commit.ms", performance.now() - renderStartedAtRef.current, {
       threadId,
       messageCount: messages.length,
-      virtualized: virtualizationEnabled,
       streaming,
     });
-  }, [messages.length, streaming, threadId, virtualizationEnabled]);
+  }, [messages.length, streaming, threadId]);
 
   const handleApproval = useCallback(
     (approvalId: string, response: ApprovalResponse) => {
@@ -5522,89 +5376,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     [activeWorkspaceId, diffFileRootPath, openFileInEditor],
   );
 
-  const virtualizedLayout = useMemo(() => {
-    if (!virtualizationEnabled || messages.length === 0) {
-      return null;
-    }
-
-    const rowCount = messages.length;
-    const offsets = new Array<number>(rowCount + 1);
-    offsets[0] = 0;
-
-    for (let index = 0; index < rowCount; index += 1) {
-      const messageId = messages[index].id;
-      const measuredHeight = messageHeightsRef.current.get(messageId);
-      const rowHeight = measuredHeight ?? MESSAGE_ESTIMATED_ROW_HEIGHT;
-      offsets[index + 1] =
-        offsets[index] + rowHeight + (index < rowCount - 1 ? MESSAGE_ROW_GAP : 0);
-    }
-
-    return {
-      offsets,
-      rowCount,
-    };
-  }, [messages, virtualizationEnabled, listLayoutVersion]);
-
-  const virtualWindow = useMemo(() => {
-    if (!virtualizedLayout) {
-      return null;
-    }
-
-    const { offsets, rowCount } = virtualizedLayout;
-
-    const visibleStart = Math.max(0, viewportScrollTop - MESSAGE_OVERSCAN_PX);
-    const visibleEnd =
-      viewportScrollTop + viewportHeight + MESSAGE_OVERSCAN_PX;
-
-    // Binary search: find first row whose bottom edge (offsets[i+1]) >= visibleStart
-    let lo = 0;
-    let hi = rowCount;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if (offsets[mid + 1] < visibleStart) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    const startIndex = lo;
-
-    // Binary search: find first row whose top edge (offsets[i]) > visibleEnd
-    lo = startIndex;
-    hi = rowCount;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if (offsets[mid] <= visibleEnd) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    let endIndexExclusive = lo;
-
-    if (endIndexExclusive <= startIndex) {
-      endIndexExclusive = Math.min(rowCount, startIndex + 1);
-    }
-
-    return {
-      startIndex,
-      endIndexExclusive,
-      topSpacerHeight: offsets[startIndex],
-      bottomSpacerHeight: offsets[rowCount] - offsets[endIndexExclusive],
-    };
-  }, [
-    virtualizedLayout,
-    viewportHeight,
-    viewportScrollTop,
-  ]);
-
-  const visibleMessages = useMemo(() => {
-    if (!virtualizationEnabled || !virtualWindow) {
-      return messages;
-    }
-
-    return messages.slice(virtualWindow.startIndex, virtualWindow.endIndexExclusive);
-  }, [messages, virtualWindow, virtualizationEnabled]);
+  const visibleMessages = messages;
 
   const assistantIdentityByMessageId = useMemo(() => {
     const identityByMessageId = new Map<
@@ -6159,62 +5931,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
               <span style={{ opacity: 0.5, padding: "0 5px" }}>·</span>
               <span className="chat-empty-kbd">/</span> {t("panel.emptyHintSlash")}
             </p>
-          </div>
-        ) : virtualizationEnabled && virtualWindow ? (
-          <div style={{ display: "flex", flexDirection: "column" }}>
-            {virtualWindow.topSpacerHeight > 0 && (
-              <div style={{ height: virtualWindow.topSpacerHeight }} />
-            )}
-
-            <div style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}>
-              {visibleMessages.map((message, relativeIndex) => {
-                  const absoluteIndex = virtualWindow.startIndex + relativeIndex;
-                  const assistantIdentity = assistantIdentityByMessageId.get(message.id);
-                  return (
-                    <MeasuredMessageRow
-                      key={message.id}
-                      messageId={message.id}
-                      onHeightChange={onMessageRowHeightChange}
-                    >
-                      <MessageRow
-                        message={message}
-                        index={absoluteIndex}
-                        isHighlighted={message.id === highlightedMessageId}
-                        assistantLabel={assistantIdentity?.label ?? ""}
-                        assistantEngineId={assistantIdentity?.engineId ?? ""}
-                        assistantEngineName={assistantIdentity?.engineName ?? ""}
-                        allowInitialPreparation={
-                          !sessionReady && message.id === messages[messages.length - 1]?.id
-                        }
-                        allowTurnStartedThinking={
-                          sessionReady && message.id === messages[messages.length - 1]?.id
-                        }
-                        preparingLabel={
-                          activeWorkspace?.locationKind === "ssh" &&
-                          preparingAttachments &&
-                          message.id === messages[messages.length - 1]?.id
-                            ? t("panel.uploadingRemoteAttachments")
-                            : activeWorkspace?.locationKind === "ssh" &&
-                                !sessionReady &&
-                                preparingEngineId === "claude" &&
-                                message.id === messages[messages.length - 1]?.id
-                              ? t("panel.preparingRemoteEngine", { engine: "Claude Code" })
-                              : undefined
-                        }
-                        onApproval={handleApproval}
-                        onLoadActionOutput={handleLoadActionOutput}
-                        onEditResend={handleEditResend}
-                        onOpenDiffFile={handleOpenDiffFile}
-                        onOpenImageAttachment={handleOpenImageAttachment}
-                      />
-                    </MeasuredMessageRow>
-                  );
-                })}
-            </div>
-
-            {virtualWindow.bottomSpacerHeight > 0 && (
-              <div style={{ height: virtualWindow.bottomSpacerHeight }} />
-            )}
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}>
