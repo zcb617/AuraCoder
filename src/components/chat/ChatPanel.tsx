@@ -9,22 +9,14 @@ import {
   type ClipboardEvent as ReactClipboardEvent,
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { TFunction } from "i18next";
 import {
-  Send,
-  Loader2,
-  Square,
   GitBranch,
   MessageSquare,
-  Pencil,
   AtSign,
   DollarSign,
   Puzzle,
-  Plus,
-  ListChecks,
   Zap,
   RotateCcw,
-  Minimize2,
   Search,
   Scissors,
   Sparkles,
@@ -101,6 +93,7 @@ import { ChatTitlebar } from "./ChatTitlebar";
 import { ChatMessageArea } from "./ChatMessageArea";
 import { ApprovalBanner } from "./ApprovalBanner";
 import { ChatComposerInput } from "./ChatComposerInput";
+import { ChatComposerToolbar } from "./ChatComposerToolbar";
 import {
   canBatchApproveApproval,
   canUseApprovalDecisionActions,
@@ -135,7 +128,6 @@ import {
 } from "./attachmentUtils";
 import {
   encodeModelOptionValue,
-  formatContextUsage,
   formatEngineModelLabel,
   resolveClaudeModelFamily,
   serializePrettyJson,
@@ -180,20 +172,15 @@ import {
   isPermissionsRequestApproval,
   parseToolInputQuestions,
 } from "./toolInputApproval";
-import { ModelPicker } from "./ModelPicker";
-import { RuntimeTargetPicker } from "./RuntimeTargetPicker";
 import { AttachmentChip } from "./AttachmentChip";
 import {
   type CodexConfigPatch,
   type CodexPersonalityValue,
   type CodexServiceTierValue,
 } from "./CodexConfigPicker";
-import { PermissionPicker } from "./PermissionPicker";
-import { OpenCodeAgentPicker } from "./OpenCodeAgentPicker";
 // CodexReviewPicker and CodexThreadPicker replaced by slash commands (ChatSlashMenu + ChatCommandPanel)
 import { ChatCommandPanel, type ActiveSlashCommand } from "./ChatCommandPanel";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
-import { Dropdown } from "../shared/Dropdown";
 import type {
   ApprovalBlock,
   ApprovalResponse,
@@ -5708,508 +5695,70 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
             )}
 
             {/* Input toolbar with selectors */}
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                padding: "6px 10px",
-                gap: 6,
-              }}
-            >
-              {/* Attach file button */}
-              {!showSpecialInputComposer && (
-                <button
-                  type="button"
-                  className="chat-toolbar-btn chat-toolbar-btn-bordered"
-                  onClick={() => void handleAddAttachment()}
-                  disabled={!activeWorkspaceId}
-                  title={t("panel.attachFiles")}
-                >
-                  <Plus size={12} />
-                  <span style={{ fontSize: 11 }}>{t("panel.attachShort")}</span>
-                  {attachments.length > 0 && (
-                    <span className="chat-toolbar-badge">{attachments.length}</span>
-                  )}
-                </button>
-              )}
-
-              {!showSpecialInputComposer && (
-                isOpenCodeEngine ? (
-                  <OpenCodeAgentPicker
-                    agents={openCodeSelectableAgents}
-                    selectedAgent={selectedOpenCodeAgent}
-                    onAgentChange={(agent) => void onOpenCodeAgentChange(agent)}
-                    disabled={!openCodeCatalogLoaded && openCodeSelectableAgents.length === 0}
-                  />
-                ) : (
-                  <button
-                    type="button"
-                    className={`chat-toolbar-btn chat-toolbar-btn-bordered ${activePlanMode ? "chat-toolbar-btn-active" : ""}`}
-                    onClick={() => {
-                      const nextPlanMode = !planMode;
-                      setPlanMode(nextPlanMode);
-                      void saveThreadRuntimeSelectionPatch(
-                        activeThread?.id ?? activeChatSessionId,
-                        { planMode: nextPlanMode },
-                      );
-                    }}
-                    disabled={!activeWorkspaceId}
-                    title={
-                      selectedEngineId === "codex"
-                        ? activePlanMode
-                          ? t("panel.disablePlanModeCodex")
-                          : t("panel.enablePlanModeCodex")
-                        : activePlanMode
-                          ? t("panel.disablePlanMode")
-                          : t("panel.enablePlanMode")
-                    }
-                  >
-                    <ListChecks size={12} />
-                    <span style={{ fontSize: 11 }}>{t("panel.planShort")}</span>
-                  </button>
-                )
-              )}
-
-              {!showSpecialInputComposer && (
-                <Dropdown
-                  options={[
-                    {
-                      value: "classic",
-                      label: t("panel.messageSendModes.classic"),
-                    },
-                    {
-                      value: "flexible",
-                      label: t("panel.messageSendModes.flexible"),
-                    },
-                  ]}
-                  value={sessionMessageSendMode}
-                  onChange={(nextMessageSendMode) => {
-                    if (
-                      nextMessageSendMode !== "classic" &&
-                      nextMessageSendMode !== "flexible"
-                    ) {
-                      return;
-                    }
-                    if (activeChatSessionId) {
-                      setThreadMessageSendMode(
-                        activeChatSessionId,
-                        nextMessageSendMode,
-                      );
-                      void saveThreadRuntimeSelectionPatch(activeChatSessionId, {
-                        sendMethod: nextMessageSendMode,
-                      });
-                      return;
-                    }
-                    if (activeWorkspaceId) {
-                      setPendingMessageSendMode(activeWorkspaceId, nextMessageSendMode);
-                    }
-                  }}
-                  disabled={!activeWorkspaceId}
-                  title={t("panel.sessionMessageSendMode")}
-                  selectedLabel={t(`panel.messageSendModes.${sessionMessageSendMode}`)}
-                />
-              )}
-
-              {!showSpecialInputComposer && <div className="chat-toolbar-divider" />}
-
-              {/* Engine + Model + Effort selector */}
-              {!showSpecialInputComposer && (
-                <>
-                  <RuntimeTargetPicker
-                    engineId={selectedEngineId}
-                    engineName={
-                      selectedEngineId === "claude"
-                        ? "Claude Code"
-                        : selectedEngine?.name ?? selectedEngineId
-                    }
-                    codexSkills={codexSkills}
-                    codexPlugins={codexPlugins}
-                    /* Apps/连接器不属于 AuraCoder 管理的运行时能力。
-                    codexApps={codexApps} */
-                    openCodeCatalog={openCodeCatalog}
-                    capabilitiesLoading={
-                      selectedEngineId === "opencode"
-                        ? openCodeCatalogLoading
-                        : selectedEngineId === "codex"
-                          ? codexReferenceCatalogLoading
-                          : false
-                    }
-                    capabilitiesError={
-                      selectedEngineId === "opencode"
-                        ? openCodeCatalogError
-                        : selectedEngineId === "codex"
-                          ? codexReferenceCatalogError
-                          : null
-                    }
-                    capabilitiesPartial={
-                      selectedEngineId === "codex" &&
-                      Boolean(codexReferenceCatalogError) &&
-                      (codexReferenceCatalogState.skillsLoaded ||
-                        codexReferenceCatalogState.appsLoaded)
-                    }
-                    onRefreshCapabilities={
-                      selectedEngineId === "opencode"
-                        ? loadOpenCodeRuntimeCatalog
-                        : selectedEngineId === "codex"
-                          ? refreshCodexReferenceCatalogs
-                          : undefined
-                    }
-                    disabled={!activeWorkspaceId}
-                  />
-                  <ModelPicker
-                    engines={
-                      activeThreadRuntimeLocked
-                        ? engines.filter((engine) => engine.id === activeThread?.engineId)
-                        : engines
-                    }
-                    health={health}
-                    selectedEngineId={selectedEngineId}
-                    selectedModelId={selectedModelId ?? selectedModel?.id ?? ""}
-                    selectedEffort={selectedEffort}
-                    selectedServiceTier={selectedServiceTier}
-                    onEngineModelChange={(engineId, modelId) => {
-                      if (
-                        activeThreadRuntimeLocked &&
-                        engineId !== activeThread?.engineId
-                      ) {
-                        return;
-                      }
-                      const previousEngineId = selectedEngineId;
-                      const previousModelId =
-                        selectedModelId ?? selectedModel?.id ?? selectedModelIdRef.current;
-                      const previousEffort = selectedEffort;
-                      manuallyOverrodeThreadSelectionRef.current = true;
-                      setHasExplicitComposerRuntime(true);
-                      selectedEngineIdRef.current = engineId;
-                      const runtimePatch: ThreadRuntimeSelectionPatch = {};
-                      if (engineId !== previousEngineId) {
-                        runtimePatch.engineId = engineId;
-                      }
-                      if (modelId !== previousModelId) {
-                        runtimePatch.modelId = modelId;
-                      }
-                      if (engineId === "opencode" && planMode) {
-                        setPlanMode(false);
-                        runtimePatch.planMode = false;
-                      }
-                      if (engineId !== selectedEngineId) setSelectedEngineId(engineId);
-                      const nextEngine =
-                        engines.find((engine) => engine.id === engineId) ?? null;
-                      const nextModel =
-                        nextEngine?.models.find((model) => model.id === modelId) ?? null;
-                      const nextEffort = resolveReasoningEffortForModel(
-                        nextModel,
-                        selectedEffortRef.current,
-                      );
-                      selectedModelIdRef.current = modelId;
-                      setSelectedModelId(modelId);
-                      if (nextEffort && nextEffort !== selectedEffort) {
-                        selectedEffortRef.current = nextEffort;
-                        setSelectedEffort(nextEffort);
-                        if (nextEffort !== previousEffort) {
-                          runtimePatch.reasoningEffort = nextEffort;
-                        }
-                      }
-                      void saveThreadRuntimeSelectionPatch(
-                        activeThread?.id ?? activeChatSessionId,
-                        runtimePatch,
-                      );
-                      if (
-                        activeWorkspace?.locationKind === "ssh" &&
-                        activeThread?.workspaceId === activeWorkspaceId &&
-                        activeThread.engineId === engineId
-                      ) {
-                        setThreadLastModelLocal(activeThread.id, modelId);
-                        void ipc
-                          .setSshRemoteThreadSelectedModel(activeThread.id, modelId)
-                          .then((updatedThread) => {
-                            if (selectedModelIdRef.current === modelId) {
-                              applyThreadUpdateLocal(updatedThread);
-                            }
-                          })
-                          .catch((error) => {
-                            toast.error(String(error));
-                          });
-                      }
-                    }}
-                    onEffortChange={(effort) => void onReasoningEffortChange(effort)}
-                    onServiceTierChange={(serviceTier) => {
-                      const updateServiceTier = (): Promise<unknown> =>
-                        onCodexConfigSave({
-                          updatePersonality: false,
-                          personality: null,
-                          updateServiceTier: true,
-                          serviceTier: serviceTier === "inherit" ? null : serviceTier,
-                          updateOutputSchema: false,
-                          outputSchema: null,
-                          updateApprovalPolicy: false,
-                          approvalPolicy: null,
-                        }).catch((error) => {
-                          toast.error(String(error), {
-                            title: t("panel.toasts.speedChangeFailed"),
-                            action: {
-                              label: t("panel.toasts.retry"),
-                              onClick: () => void updateServiceTier(),
-                            },
-                          });
-                        });
-                      void updateServiceTier();
-                    }}
-                    loading={enginesLoading}
-                    error={engineLoadError}
-                    onRetry={() => loadEngines(activeWorkspaceId)}
-                    disabled={!activeWorkspaceId}
-                  />
-                </>
-              )}
-
-              {!showSpecialInputComposer && Boolean(activeThread?.id) && (
-                <>
-                  <div className="chat-toolbar-divider" />
-                  {/*
-                   * 旧实现的完整 PermissionPicker 调用保留如下，不参与编译：
-                   *
-                   * {!showSpecialInputComposer &&
-                   *   (activeRepo ||
-                   *     repos.length > 0 ||
-                   *     activeThread?.engineId === "codex" ||
-                   *     activeThread?.engineId === "claude" ||
-                   *     activeThread?.engineId === "opencode") && (
-                   *     <>
-                   *       <div className="chat-toolbar-divider" />
-                   *       <PermissionPicker
-                   *         engineId={activeThreadAutonomyEngineId}
-                   *         presetValue={activeThreadAutonomyPreset}
-                   *         codexExternalSandbox={codexExternalSandboxActive}
-                   *         onPresetChange={
-                   *           activeThreadAutonomyEngineId ? onAutonomyPresetChange : undefined
-                   *         }
-                   *         defaultPreset={defaultAutonomyPreset}
-                   *         onDefaultPresetChange={(preset) =>
-                   *           void onDefaultAutonomyPresetChange(preset)
-                   *         }
-                   *         trustScopeLabel={
-                   *           activeRepo
-                   *             ? t("panel.repoAccess")
-                   *             : repos.length > 0
-                   *               ? t("panel.workspaceAccess")
-                   *               : undefined
-                   *         }
-                   *         trustValue={
-                   *           activeRepo?.trustLevel ??
-                   *           (repos.length > 0 ? workspaceTrustLevel : undefined)
-                   *         }
-                   *         trustOptions={trustLevelOptions}
-                   *         onTrustChange={
-                   *           activeRepo
-                   *             ? (value) => void onRepoTrustLevelChange(value)
-                   *             : repos.length > 0
-                   *               ? (value) => void onWorkspaceTrustLevelChange(value)
-                   *               : undefined
-                   *         }
-                   *         customPolicyCount={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude" ||
-                   *           activeThread?.engineId === "opencode"
-                   *             ? threadPolicyCustomCount
-                   *             : 0
-                   *         }
-                   *         approvalTitle={
-                   *           activeThread?.engineId ? activeThreadApprovalTitle : undefined
-                   *         }
-                   *         approvalValue={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude" ||
-                   *           activeThread?.engineId === "opencode"
-                   *             ? activeThreadApprovalPolicy
-                   *             : undefined
-                   *         }
-                   *         approvalSelectedLabel={
-                   *           activeThread?.engineId === "codex"
-                   *             ? activeThreadApprovalSelectedLabel
-                   *             : undefined
-                   *         }
-                   *         approvalOptions={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude" ||
-                   *           activeThread?.engineId === "opencode"
-                   *             ? activeThreadApprovalOptions
-                   *             : undefined
-                   *         }
-                   *         onApprovalChange={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude" ||
-                   *           activeThread?.engineId === "opencode"
-                   *             ? (value) => {
-                   *                 if (activeThread?.engineId === "codex") {
-                   *                   setCustomApprovalPolicyText("");
-                   *                 }
-                   *                 void onThreadExecutionPolicyChange({
-                   *                   approvalPolicy: value as ThreadApprovalPolicyValue,
-                   *                 });
-                   *               }
-                   *             : undefined
-                   *         }
-                   *         sandboxValue={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude"
-                   *             ? activeThreadSandboxMode
-                   *             : undefined
-                   *         }
-                   *         sandboxOptions={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude"
-                   *             ? threadSandboxModeOptions
-                   *             : undefined
-                   *         }
-                   *         onSandboxChange={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude"
-                   *             ? (value) =>
-                   *                 void onThreadExecutionPolicyChange({
-                   *                   sandboxMode: value as ThreadSandboxModeValue,
-                   *                 })
-                   *             : undefined
-                   *         }
-                   *         sandboxSelectedLabel={activeThreadSandboxSelectedLabel}
-                   *         sandboxNotice={activeThreadSandboxNotice}
-                   *         networkValue={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude"
-                   *             ? activeThreadNetworkPolicy
-                   *             : undefined
-                   *         }
-                   *         networkOptions={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude"
-                   *             ? threadNetworkPolicyOptions
-                   *             : undefined
-                   *         }
-                   *         onNetworkChange={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude"
-                   *             ? (value) =>
-                   *                 void onThreadExecutionPolicyChange({
-                   *                   networkPolicy: value as ThreadNetworkPolicyValue,
-                   *                 })
-                   *             : undefined
-                   *         }
-                   *         networkDisabled={
-                   *           activeThread?.engineId === "codex" &&
-                   *           activeThreadSandboxMode === "danger-full-access"
-                   *         }
-                   *         networkNotice={
-                   *           activeThread?.engineId === "codex" &&
-                   *           activeThreadSandboxMode === "danger-full-access"
-                   *             ? t("policy.fullAccessNotice")
-                   *             : null
-                   *         }
-                   *       />
-                   *     </>
-                   *   )}
-                   *
-                   * 现在组件只接收完整 PermissionComponentJson 和 onChange，前端不参与 CLI 适配，
-                   * 且仅在存在 AuraCoder 线程 ID 时展示。
-                   */}
-                  <PermissionPicker
-                    disabled={!activeThread?.id}
-                    value={permissionComponent}
-                    onChange={(next) => void onPermissionComponentChange(next)}
-                  />
-                </>
-              )}
-
-              <div style={{ flex: 1 }} />
-
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                {!showSpecialInputComposer &&
-                  contextUsage?.currentTokens != null &&
-                  contextUsage.maxContextTokens != null &&
-                  contextUsage.contextPercent != null && (
-                  <button
-                    type="button"
-                    className={`chat-context-ring${
-                      contextUsage.contextPercent <= 10
-                        ? " chat-context-ring--critical"
-                        : contextUsage.contextPercent <= 25
-                          ? " chat-context-ring--warning"
-                          : ""
-                    }`}
-                    onClick={openUsageLimitsModal}
-                    title={t("status.contextRingTitle", {
-                      usage: formatContextUsage(contextUsage),
-                    })}
-                    aria-label={t("status.contextRingTitle", {
-                      usage: formatContextUsage(contextUsage),
-                    })}
-                    aria-busy={contextUsageLoading}
-                  >
-                    <svg width="16" height="16" viewBox="0 0 16 16" style={{ transform: "rotate(-90deg)" }} aria-hidden="true">
-                      <circle className="chat-context-ring-track" cx="8" cy="8" r="6" strokeWidth="2" />
-                      <circle
-                        className="chat-context-ring-value"
-                        cx="8"
-                        cy="8"
-                        r="6"
-                        strokeWidth="2"
-                        strokeDasharray={2 * Math.PI * 6}
-                        strokeDashoffset={
-                          2 * Math.PI * 6 * (1 - Math.max(0, Math.min(100, contextUsage.contextPercent)) / 100)
-                        }
-                      />
-                    </svg>
-                    <span>{formatContextUsage(contextUsage)}</span>
-                  </button>
-                )}
-
-                {streaming && !showSpecialInputComposer && (
-                  <button
-                    type="button"
-                    className="chat-stop-btn"
-                    onClick={() => void cancel()}
-                    title={t("panel.stop")}
-                    aria-label={t("panel.stop")}
-                  >
-                    <Square size={11} fill="currentColor" />
-                  </button>
-                )}
-
-                {!streaming && !showSpecialInputComposer && (
-                <button
-                  type="submit"
-                  /* className used input text only before image annotations */
-                  className={`chat-send-btn${activeWorkspaceId && canSubmitComposer ? " chat-send-btn--ready" : ""}`}
-                  /* disabled used input text only before image annotations */
-                  disabled={!activeWorkspaceId || !canSubmitComposer || isSubmitting}
-                  title={
-                    isSubmitting
-                      ? t("panel.sendingMessage")
-                      : streaming
-                        ? t("panel.sendFollowUp")
-                      : sessionMessageSendMode === "flexible"
-                        ? t("panel.cacheMessage")
-                        : t("panel.sendMessage")
-                  }
-                  aria-label={
-                    isSubmitting
-                      ? t("panel.sendingMessage")
-                      : streaming
-                        ? t("panel.sendFollowUp")
-                      : sessionMessageSendMode === "flexible"
-                        ? t("panel.cacheMessage")
-                        : t("panel.sendMessage")
-                  }
-                  aria-busy={isSubmitting}
-                >
-                  {isSubmitting ? (
-                    <Loader2 size={13} className="chat-send-spinner" aria-hidden="true" />
-                  ) : (
-                    <Send size={13} aria-hidden="true" />
-                  )}
-                </button>
-                )}
-              </div>
-            </div>
+            <ChatComposerToolbar
+              showSpecialInputComposer={showSpecialInputComposer}
+              activeWorkspaceId={activeWorkspaceId}
+              attachments={attachments}
+              handleAddAttachment={handleAddAttachment}
+              isOpenCodeEngine={isOpenCodeEngine}
+              openCodeSelectableAgents={openCodeSelectableAgents}
+              selectedOpenCodeAgent={selectedOpenCodeAgent}
+              onOpenCodeAgentChange={onOpenCodeAgentChange}
+              openCodeCatalogLoaded={openCodeCatalogLoaded}
+              openCodeCatalog={openCodeCatalog}
+              openCodeCatalogLoading={openCodeCatalogLoading}
+              openCodeCatalogError={openCodeCatalogError}
+              codexSkills={codexSkills}
+              codexPlugins={codexPlugins}
+              codexReferenceCatalogLoading={codexReferenceCatalogLoading}
+              codexReferenceCatalogError={codexReferenceCatalogError}
+              codexReferenceCatalogState={codexReferenceCatalogState}
+              activePlanMode={activePlanMode}
+              planMode={planMode}
+              sessionMessageSendMode={sessionMessageSendMode}
+              activeChatSessionId={activeChatSessionId}
+              activeThread={activeThread}
+              activeWorkspace={activeWorkspace}
+              activeThreadRuntimeLocked={activeThreadRuntimeLocked}
+              engines={engines}
+              health={health}
+              selectedEngineId={selectedEngineId}
+              selectedEngine={selectedEngine}
+              selectedModelId={selectedModelId}
+              selectedModel={selectedModel}
+              selectedEffort={selectedEffort}
+              selectedServiceTier={selectedServiceTier}
+              enginesLoading={enginesLoading}
+              engineLoadError={engineLoadError}
+              permissionComponent={permissionComponent}
+              contextUsage={contextUsage}
+              contextUsageLoading={contextUsageLoading}
+              streaming={streaming}
+              canSubmitComposer={canSubmitComposer}
+              isSubmitting={isSubmitting}
+              selectedModelIdRef={selectedModelIdRef}
+              selectedEngineIdRef={selectedEngineIdRef}
+              selectedEffortRef={selectedEffortRef}
+              manuallyOverrodeThreadSelectionRef={manuallyOverrodeThreadSelectionRef}
+              setPlanMode={setPlanMode}
+              saveThreadRuntimeSelectionPatch={saveThreadRuntimeSelectionPatch}
+              setThreadMessageSendMode={setThreadMessageSendMode}
+              setPendingMessageSendMode={setPendingMessageSendMode}
+              loadOpenCodeRuntimeCatalog={loadOpenCodeRuntimeCatalog}
+              refreshCodexReferenceCatalogs={refreshCodexReferenceCatalogs}
+              setHasExplicitComposerRuntime={setHasExplicitComposerRuntime}
+              setSelectedEngineId={setSelectedEngineId}
+              setSelectedModelId={setSelectedModelId}
+              setSelectedEffort={setSelectedEffort}
+              setThreadLastModelLocal={setThreadLastModelLocal}
+              applyThreadUpdateLocal={applyThreadUpdateLocal}
+              onReasoningEffortChange={onReasoningEffortChange}
+              onCodexConfigSave={onCodexConfigSave}
+              loadEngines={loadEngines}
+              onPermissionComponentChange={onPermissionComponentChange}
+              openUsageLimitsModal={openUsageLimitsModal}
+              cancel={cancel}
+            />
           </div>
 
           <ChatStatusBar
