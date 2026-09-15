@@ -7,7 +7,6 @@ import {
   useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
-  type MouseEvent as ReactMouseEvent,
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { TFunction } from "i18next";
@@ -82,8 +81,6 @@ import {
 import { resolvePreferredOnboardingChatSelection } from "../../lib/onboarding";
 import { recordPerfMetric } from "../../lib/perfTelemetry";
 import { isMacDesktop, usesCustomWindowFrame } from "../../lib/windowActions";
-import { FlexibleMessageGroup } from "./FlexibleMessageGroup";
-import { MessageRow, WorkingDurationIndicator } from "./MessageRow";
 import { createPendingSubmissionMessage } from "./pendingSubmissionMessage";
 import {
   EMPTY_CHAT_ATTACHMENTS,
@@ -91,7 +88,6 @@ import {
   EMPTY_CHAT_TEXT_ANNOTATIONS,
   EMPTY_PENDING_FLEXIBLE_MESSAGES,
   EMPTY_PERMISSION_COMPONENT,
-  MESSAGE_ROW_GAP,
   PERMISSION_COMPONENT_ENGINE_IDS,
 } from "./chatPanelConstants";
 import type {
@@ -102,6 +98,7 @@ import type {
 import { LazyTerminalPanel, LazyEditorWithExplorer } from "./lazyPanels";
 import { ChatStatusBar } from "./ChatStatusBar";
 import { ChatTitlebar } from "./ChatTitlebar";
+import { ChatMessageArea } from "./ChatMessageArea";
 import { ApprovalBanner } from "./ApprovalBanner";
 import {
   canBatchApproveApproval,
@@ -5409,332 +5406,47 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
             outlineOffset: isFileDropOver ? "-8px" : undefined,
           }}
         >
-            {isFileDropOver && (
-              <div
-                style={{
-                  position: "absolute",
-                  inset: 12,
-                  borderRadius: "var(--radius-md)",
-                  border: "1px solid var(--info-border)",
-                  background: "var(--info-surface)",
-                  color: "var(--text-1)",
-                  fontSize: 13,
-                  fontWeight: 600,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  pointerEvents: "none",
-                  zIndex: 5,
-                }}
-              >
-                {t("panel.dropFiles")}
-              </div>
-            )}
-            {/* ── Messages ── */}
-            {streaming && turnStartedAt !== null && (
-              <WorkingDurationIndicator startedAt={turnStartedAt} />
-            )}
-            <div
-              ref={viewportRef}
-              className="chat-message-viewport"
-              onMouseUp={(event: ReactMouseEvent<HTMLDivElement>) => {
-                if (!activeWorkspaceId || event.button !== 0) {
-                  return;
-                }
-                const selection = window.getSelection();
-                const selectedText = selection?.toString().trim() ?? "";
-                const viewport = viewportRef.current;
-                const target = event.target instanceof Element ? event.target : null;
-                if (
-                  !selection ||
-                  selection.rangeCount === 0 ||
-                  !selectedText ||
-                  !viewport?.contains(selection.getRangeAt(0).commonAncestorContainer) ||
-                  !target?.closest(".msg-row")
-                ) {
-                  setTextAnnotationPopover(null);
-                  setTextAnnotationComment("");
-                  return;
-                }
-                setTextAnnotationComment("");
-                setTextAnnotationPopover({
-                  selectedText,
-                  left: Math.max(
-                    12,
-                    Math.min(event.clientX + 12, window.innerWidth - 292),
-                  ),
-                  top: Math.max(
-                    12,
-                    Math.min(event.clientY + 12, window.innerHeight - 152),
-                  ),
-                  stage: "actions",
-                });
-              }}
-              style={{
-                position: "relative",
-                flex: 1,
-                overflow: "auto",
-                padding: "20px 24px",
-              }}
-            >
-        {messages.length === 0 && !pendingSubmission ? (
-          <div
-            className="animate-fade-in"
-            style={{
-              height: "100%",
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "center",
-              justifyContent: "center",
-              gap: 14,
-              color: "var(--text-3)",
-              textAlign: "center",
-            }}
-          >
-            <div className="chat-empty-tile">
-              <MessageSquare size={18} />
-            </div>
-            <div>
-              <p style={{ margin: "0 0 4px", fontSize: 14, fontWeight: 500, color: "var(--text-2)" }}>
-                {t("panel.startConversation")}
-              </p>
-              <p style={{ margin: 0, fontSize: 12.5 }}>
-                {activeWorkspaceId && gitStatus?.branch
-                  ? t("panel.emptyScopeRepoBranch", { repo: workspaceName, branch: gitStatus.branch })
-                  : t("panel.emptyHint")}
-              </p>
-            </div>
-            {activeWorkspaceId && (
-              <div className="chat-empty-suggestions">
-                <button
-                  type="button"
-                  className="chat-empty-suggestion"
-                  onClick={() => handleEditResend(t("panel.emptySuggestionSummarize"))}
-                >
-                  {t("panel.emptySuggestionSummarize")}
-                </button>
-                <button
-                  type="button"
-                  className="chat-empty-suggestion"
-                  onClick={() => handleEditResend(t("panel.emptySuggestionTests"))}
-                >
-                  {t("panel.emptySuggestionTests")}
-                </button>
-              </div>
-            )}
-            <p style={{ margin: 0, fontSize: 11 }}>
-              <span className="chat-empty-kbd">⌘K</span> {t("panel.emptyHintCommands")}
-              <span style={{ opacity: 0.5, padding: "0 5px" }}>·</span>
-              <span className="chat-empty-kbd">/</span> {t("panel.emptyHintSlash")}
-            </p>
-          </div>
-        ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}>
-            {visibleMessages.map((message, index) => {
-              const assistantIdentity = assistantIdentityByMessageId.get(message.id);
-              return (
-                <MessageRow
-                  key={message.id}
-                  message={message}
-                  index={index}
-                  isHighlighted={message.id === highlightedMessageId}
-                  assistantLabel={assistantIdentity?.label ?? ""}
-                  assistantEngineId={assistantIdentity?.engineId ?? ""}
-                  assistantEngineName={assistantIdentity?.engineName ?? ""}
-                  threadEngineId={activeThread?.engineId}
-                  allowInitialPreparation={
-                    !sessionReady && message.id === messages[messages.length - 1]?.id
-                  }
-                  allowTurnStartedThinking={
-                    sessionReady && message.id === messages[messages.length - 1]?.id
-                  }
-                  preparingLabel={
-                    activeWorkspace?.locationKind === "ssh" &&
-                    preparingAttachments &&
-                    message.id === messages[messages.length - 1]?.id
-                      ? t("panel.uploadingRemoteAttachments")
-                      : activeWorkspace?.locationKind === "ssh" &&
-                          !sessionReady &&
-                          preparingEngineId === "claude" &&
-                          message.id === messages[messages.length - 1]?.id
-                        ? t("panel.preparingRemoteEngine", { engine: "Claude Code" })
-                        : undefined
-                  }
-                  onApproval={handleApproval}
-                  onLoadActionOutput={handleLoadActionOutput}
-                  onEditResend={handleEditResend}
-                  onOpenDiffFile={handleOpenDiffFile}
-                  onOpenImageAttachment={handleOpenImageAttachment}
-                />
-              );
-            })}
-          </div>
-        )}
-
-        {hasPendingFlexibleMessages && !pendingSubmission && (
-          <div
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              marginTop: messages.length > 0 ? MESSAGE_ROW_GAP : 0,
-            }}
-          >
-            <FlexibleMessageGroup
-              messages={pendingFlexibleMessages}
-              confirmDisabled={flexibleMessageConfirmDisabled}
-              confirmTitle={flexibleMessageConfirmTitle}
-              onConfirm={() => void submitFlexibleMessages()}
-              onWithdraw={withdrawFlexibleMessage}
+            <ChatMessageArea
+              isFileDropOver={isFileDropOver}
+              streaming={streaming}
+              turnStartedAt={turnStartedAt}
+              viewportRef={viewportRef}
+              activeWorkspaceId={activeWorkspaceId}
+              activeWorkspace={activeWorkspace}
+              workspaceName={workspaceName}
+              gitStatus={gitStatus}
+              messages={messages}
+              visibleMessages={visibleMessages}
+              pendingSubmission={pendingSubmission}
+              assistantIdentityByMessageId={assistantIdentityByMessageId}
+              highlightedMessageId={highlightedMessageId}
+              activeThread={activeThread}
+              sessionReady={sessionReady}
+              preparingAttachments={preparingAttachments}
+              preparingEngineId={preparingEngineId}
+              hasPendingFlexibleMessages={hasPendingFlexibleMessages}
+              pendingFlexibleMessages={pendingFlexibleMessages}
+              flexibleMessageConfirmDisabled={flexibleMessageConfirmDisabled}
+              flexibleMessageConfirmTitle={flexibleMessageConfirmTitle}
+              autoScrollLocked={autoScrollLocked}
+              textAnnotationPopover={textAnnotationPopover}
+              textAnnotationComment={textAnnotationComment}
+              textAnnotationPopoverRef={textAnnotationPopoverRef}
+              annotationCommentInputRef={annotationCommentInputRef}
+              inputRef={inputRef}
+              setTextAnnotationPopover={setTextAnnotationPopover}
+              setTextAnnotationComment={setTextAnnotationComment}
+              setTextAnnotations={setTextAnnotations}
+              setAutoScrollLocked={setAutoScrollLocked}
+              scrollViewportToBottom={scrollViewportToBottom}
+              handleEditResend={handleEditResend}
+              handleApproval={handleApproval}
+              handleLoadActionOutput={handleLoadActionOutput}
+              handleOpenDiffFile={handleOpenDiffFile}
+              handleOpenImageAttachment={handleOpenImageAttachment}
+              submitFlexibleMessages={submitFlexibleMessages}
+              withdrawFlexibleMessage={withdrawFlexibleMessage}
             />
-          </div>
-        )}
-
-        {pendingSubmission && !streaming && (
-          <div
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: 6,
-              marginTop: messages.length > 0 ? MESSAGE_ROW_GAP : 0,
-            }}
-          >
-            <MessageRow
-              message={pendingSubmission}
-              index={messages.length}
-              isHighlighted={false}
-              assistantLabel=""
-              assistantEngineId=""
-              assistantEngineName=""
-              threadEngineId={activeThread?.engineId}
-              allowInitialPreparation={false}
-              allowTurnStartedThinking={false}
-              onApproval={handleApproval}
-              onLoadActionOutput={handleLoadActionOutput}
-              onOpenImageAttachment={handleOpenImageAttachment}
-            />
-            <div
-              role="status"
-              aria-live="polite"
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                alignSelf: "flex-start",
-                gap: 7,
-                padding: "4px 14px 8px",
-                color: "var(--text-3)",
-                fontSize: 12,
-              }}
-            >
-              <Loader2
-                size={12}
-                className="chat-send-spinner"
-                aria-hidden="true"
-                style={{ color: "var(--info)" }}
-              />
-              <span>{t("panel.sendingMessage")}</span>
-            </div>
-          </div>
-        )}
-
-        {autoScrollLocked && messages.length > 0 && (
-          <button
-            type="button"
-            className={`chat-jump-pill${streaming ? " chat-jump-pill--activity" : ""}`}
-            onClick={() => {
-              setAutoScrollLocked(false);
-              scrollViewportToBottom("smooth");
-            }}
-          >
-            {streaming && <span className="chat-jump-pill-dot" />}
-            {streaming ? t("panel.newActivity") : t("panel.jumpToLatest")}
-          </button>
-        )}
-            </div>
-
-            {textAnnotationPopover && (
-              <div
-                ref={textAnnotationPopoverRef}
-                className="chat-text-annotation-popover"
-                style={{
-                  left: textAnnotationPopover.left,
-                  top: textAnnotationPopover.top,
-                }}
-                role="dialog"
-                aria-label={t("panel.textAnnotations.dialogLabel")}
-              >
-                {textAnnotationPopover.stage === "actions" ? (
-                  <button
-                    type="button"
-                    className="chat-text-annotation-add-button"
-                    onClick={() => {
-                      setTextAnnotationPopover((current) =>
-                        current ? { ...current, stage: "comment" } : null,
-                      );
-                    }}
-                  >
-                    {t("panel.textAnnotations.addToChat")}
-                  </button>
-                ) : (
-                  <form
-                    className="chat-text-annotation-comment-form"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      const comment = textAnnotationComment.trim();
-                      if (!comment) {
-                        return;
-                      }
-                      setTextAnnotations((current) => [
-                        ...current,
-                        {
-                          id: crypto.randomUUID(),
-                          selectedText: textAnnotationPopover.selectedText,
-                          comment,
-                        },
-                      ]);
-                      setTextAnnotationPopover(null);
-                      setTextAnnotationComment("");
-                      window.getSelection()?.removeAllRanges();
-                      inputRef.current?.focus();
-                    }}
-                  >
-                    <input
-                      ref={annotationCommentInputRef}
-                      value={textAnnotationComment}
-                      onChange={(event) => setTextAnnotationComment(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key !== "Escape") {
-                          return;
-                        }
-                        event.preventDefault();
-                        setTextAnnotationPopover(null);
-                        setTextAnnotationComment("");
-                      }}
-                      placeholder={t("panel.textAnnotations.placeholder")}
-                      aria-label={t("panel.textAnnotations.placeholder")}
-                    />
-                    <div className="chat-text-annotation-comment-actions">
-                      <button
-                        type="submit"
-                        className="chat-text-annotation-confirm-button"
-                        disabled={!textAnnotationComment.trim()}
-                      >
-                        {t("panel.textAnnotations.confirm")}
-                      </button>
-                      <button
-                        type="button"
-                        className="chat-text-annotation-cancel-button"
-                        onClick={() => {
-                          setTextAnnotationPopover(null);
-                          setTextAnnotationComment("");
-                        }}
-                      >
-                        {t("panel.textAnnotations.cancel")}
-                      </button>
-                    </div>
-                  </form>
-                )}
-              </div>
-            )}
 
             {/* ── Input Area ── */}
             <div className="chat-composer-surface">
