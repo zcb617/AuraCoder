@@ -734,6 +734,10 @@ function createQueryContext(id, approvalPolicy = null, planMode = false) {
     streamToolUseIdsByIndex: new Map(),
     suppressedToolUseIds: new Set(),
     pendingApprovalIds: new Set(),
+    // 当前是否正处于上下文压缩（system/status status=compacting 开始、status=requesting 结束）。
+    // 压缩期间注入后台任务通知会让 CLI 中止压缩中的主轮（2026-09-16 aborted_streaming 事故实证），
+    // 与挂起审批同理必须先排队，等压缩收尾后由 flushDeferredTaskNotifications 补注入。
+    compacting: false,
     // 挂起审批期间到达的后台任务通知在此排队；立即注入会让 CLI 中止轮次、杀死审批卡（2026-09-13 事故实证），
     // 必须等审批全部答复后由 flushDeferredTaskNotifications 补注入。
     deferredTaskNotifications: [],
@@ -949,16 +953,21 @@ function cleanupPendingApprovalsForQuery(queryId, denialMessage) {
 }
 
 /**
- * 审批全部答复后，把挂起期间排队的后台任务通知补注入 SDK 输入流。
- * 根因：2026-09-13 审批卡死亡事故——子代理死亡通知在审批挂起期间立即注入输入流，
+ * 挂起审批全部答复、且不在上下文压缩期时，把排队期间的后台任务通知补注入 SDK 输入流。
+ * 根因1：2026-09-13 审批卡死亡事故——子代理死亡通知在审批挂起期间立即注入输入流，
  * CLI 会中止当前轮次，挂起的 AskUserQuestion/权限审批被杀（"Tool permission request aborted"），
  * 用户迟到的回答因此报 "approval ID is unknown or no longer pending"。
- * 所以对注入加闸门：有挂起审批先排队，审批答复后由本函数补注入；通知内容和顺序不变，只是晚到。
- * 仅在两个审批等待函数的答复返回点调用；回退方式：删除注入点的排队分支并移除本函数调用即可恢复原行为。
+ * 根因2：2026-09-16 压缩期主流断流事故——子代理通知在上下文压缩（compacting）期间注入，
+ * 把压缩中的主轮掐成 aborted_streaming。
+ * 所以对注入加闸门：挂起审批 OR 压缩期先排队，审批答复/压缩收尾后由本函数补注入；
+ * 通知内容和顺序不变，只是晚到。
+ * 调用点：两个审批等待函数的答复返回点、压缩收尾（status=requesting）处；
+ * 回退方式：删除注入点的排队分支并移除本函数调用即可恢复原行为。
  */
 function flushDeferredTaskNotifications(context) {
   if (
     context.pendingApprovalIds.size > 0 ||
+    context.compacting ||
     context.deferredTaskNotifications.length === 0
   ) {
     return;
@@ -3038,6 +3047,14 @@ async function handleQuery(req, persistentSession = null) {
         const toolUseId = typeof message.tool_use_id === "string" ? message.tool_use_id : "";
         associateActionWithBackgroundTask(context, id, toolUseId, taskId);
       } else if (message.type === "system" && message.subtype === "status") {
+        // 维护压缩期标志：compacting 开始、requesting（或其它非压缩状态）结束。
+        // 压缩收尾时补注入压缩期间排队的后台任务通知（详见 flushDeferredTaskNotifications 注释）。
+        if (message.status === "compacting") {
+          context.compacting = true;
+        } else if (context.compacting) {
+          context.compacting = false;
+          flushDeferredTaskNotifications(context);
+        }
         const notice = buildStatusNotice(message);
         if (notice) {
           emit({
@@ -3300,15 +3317,18 @@ async function handleQuery(req, persistentSession = null) {
             shouldQuery: true,
             session_id: context.sessionId || message.session_id || "",
           };
-          if (context.pendingApprovalIds.size > 0) {
-            // 有挂起未答的审批/提问：此时注入会让 CLI 中止轮次并杀死审批卡（2026-09-13 事故实证），
-            // 先排队，等审批答复后由 flushDeferredTaskNotifications 补注入；通知不丢、顺序不变，只是晚到。
+          if (context.pendingApprovalIds.size > 0 || context.compacting) {
+            // 有挂起未答的审批/提问、或正处于上下文压缩期：此时注入会让 CLI 中止轮次
+            // （2026-09-13 审批卡死亡、2026-09-16 压缩期主流 aborted_streaming 两起事故实证），
+            // 先排队，等审批答复/压缩收尾后由 flushDeferredTaskNotifications 补注入；
+            // 通知不丢、顺序不变，只是晚到。
             // 回退方式：删掉本分支即恢复立即注入的旧行为。
             context.deferredTaskNotifications.push(syntheticTaskNotification);
-            traceClaudeSdk("task_notification_deferred_pending_approval", {
+            traceClaudeSdk("task_notification_deferred", {
               requestId: id,
               taskId,
               pendingApprovalCount: context.pendingApprovalIds.size,
+              compacting: context.compacting,
             });
           } else {
             // 记录已注入的 synthetic continuation，等待对应 SDK result 到达。
