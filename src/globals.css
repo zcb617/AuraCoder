@@ -14270,3 +14270,26 @@ button.chat-context-section:hover {
     transition: none;
   }
 }
+
+/* === 临时调试：高亮所有正在跑无限动画的元素，定位 100% CPU 凶手。 === */
+/* 根因已定位为 AppImage 自带 Mesa/EGL 栈与宿主机 GPU 驱动不兼容，WebKit 退化为纯 CPU 软件渲染，
+   并非前端无限动画（实测本调试样式无任何红框）。调试样式整体停用，仅注释保留以便日后排查复用。 */
+/*
+*[style*="infinite"],
+.chat-send-spinner,
+.chat-streaming-dots span,
+.msg-shimmer,
+.thinking-icon-active,
+.animate-pulse-soft,
+.sb-thread-status-ring--running,
+.app-startup-spinner,
+.mp-loading-spinner,
+.git-spin,
+.em-spin,
+.usp-spin,
+.ssh-spin,
+.claude-background-tasks-status--running {
+  outline: 3px solid red !important;
+  box-shadow: 0 0 12px 4px rgba(255, 0, 0, 0.7) !important;
+}
+*/

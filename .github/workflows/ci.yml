@@ -563,9 +563,10 @@ jobs:
           tag_name: ${{ github.ref_name }}
           files: |
             src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/appimage/*.AppImage
             src-tauri/target/release/bundle/deb/*.deb.sig
-            src-tauri/target/release/bundle/appimage/*.AppImage.sig
+            # AppImage 已停用：自带 Mesa/EGL 栈与宿主机 GPU 驱动不兼容，WebKit 退化为纯 CPU 软件渲染导致 100% CPU，改用 DEB。
+            # src-tauri/target/release/bundle/appimage/*.AppImage
+            # src-tauri/target/release/bundle/appimage/*.AppImage.sig
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}

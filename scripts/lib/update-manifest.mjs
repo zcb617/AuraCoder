@@ -6,18 +6,19 @@ export const UPDATER_PLATFORM_DEFINITIONS = [
     platforms: ["darwin-aarch64", "darwin-x86_64"],
   },
   {
+    // AppImage 已停用：自带 Mesa/EGL 栈与宿主机 GPU 驱动不兼容，WebKit 退化为纯 CPU 软件渲染导致 100% CPU。
+    // 不再产出 AppImage 包；保留本定义仅为兼容历史 Release 资产匹配，主目标 linux-x86_64 已移交 DEB。
     bundleMatch: /\.AppImage$/,
     signatureMatch: /\.AppImage\.sig$/,
     label: "Linux AppImage updater bundle",
-    // Keep the legacy linux-x86_64 target pointing to AppImage for compatibility
-    // with older clients and with Tauri's still-simplified public docs.
-    platforms: ["linux-x86_64-appimage", "linux-x86_64"],
+    platforms: ["linux-x86_64-appimage"],
   },
   {
     bundleMatch: /\.deb$/,
     signatureMatch: /\.deb\.sig$/,
     label: "Linux Debian updater bundle",
-    platforms: ["linux-x86_64-deb"],
+    // linux-x86_64 主目标指向 DEB（原指向 AppImage，已随 AppImage 停用移交）。
+    platforms: ["linux-x86_64-deb", "linux-x86_64"],
   },
   {
     bundleMatch: /-setup\.exe$/,

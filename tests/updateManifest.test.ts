@@ -39,7 +39,7 @@ describe("resolveUpdaterAssetPairs", () => {
     });
   });
 
-  it("maps AppImage to bundle-specific and compatibility Linux targets", () => {
+  it("maps AppImage to its bundle-specific Linux target only", () => {
     const resolved = resolveUpdaterAssetPairs([
       {
         name: "AuraCoder.AppImage",
@@ -60,14 +60,10 @@ describe("resolveUpdaterAssetPairs", () => {
         signature: "linux-signature",
         url: "https://example.com/AuraCoder.AppImage",
       },
-      "linux-x86_64": {
-        signature: "linux-signature",
-        url: "https://example.com/AuraCoder.AppImage",
-      },
     });
   });
 
-  it("maps Debian updater bundles to linux-x86_64-deb", () => {
+  it("maps Debian updater bundles to linux-x86_64-deb and the primary linux-x86_64 target", () => {
     const resolved = resolveUpdaterAssetPairs([
       {
         name: "AuraCoder_0.42.0_amd64.deb",
@@ -85,6 +81,10 @@ describe("resolveUpdaterAssetPairs", () => {
       }),
     ).toEqual({
       "linux-x86_64-deb": {
+        signature: "deb-signature",
+        url: "https://example.com/AuraCoder_0.42.0_amd64.deb",
+      },
+      "linux-x86_64": {
         signature: "deb-signature",
         url: "https://example.com/AuraCoder_0.42.0_amd64.deb",
       },
@@ -229,7 +229,7 @@ describe("generate-update-manifest", () => {
     );
   });
 
-  it("builds bundle-aware Linux updater targets when AppImage and Debian assets are present", async () => {
+  it("builds bundle-aware Linux updater targets with AppImage on its own target and Debian as primary", async () => {
     const fetchImpl = vi.fn(async (url: string) => {
       if (url.endsWith("/releases/tags/v0.42.0")) {
         return {
@@ -291,11 +291,11 @@ describe("generate-update-manifest", () => {
           signature: "linux-signature",
           url: "https://example.com/AuraCoder.AppImage",
         },
-        "linux-x86_64": {
-          signature: "linux-signature",
-          url: "https://example.com/AuraCoder.AppImage",
-        },
         "linux-x86_64-deb": {
+          signature: "deb-signature",
+          url: "https://example.com/AuraCoder_0.42.0_amd64.deb",
+        },
+        "linux-x86_64": {
           signature: "deb-signature",
           url: "https://example.com/AuraCoder_0.42.0_amd64.deb",
         },
@@ -350,10 +350,6 @@ describe("generate-update-manifest", () => {
 
     expect(manifest.platforms).toEqual({
       "linux-x86_64-appimage": {
-        signature: "linux-signature",
-        url: "https://example.com/AuraCoder.AppImage",
-      },
-      "linux-x86_64": {
         signature: "linux-signature",
         url: "https://example.com/AuraCoder.AppImage",
       },
