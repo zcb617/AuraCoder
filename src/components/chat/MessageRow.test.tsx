@@ -71,4 +71,40 @@ describe("isClaudeSystemInjectedUserMessage", () => {
 
     expect(isClaudeSystemInjectedUserMessage("claude", message)).toBe(true);
   });
+
+  it("识别带 system-reminder 前缀的子代理回传消息", () => {
+    const message = createMessage({
+      content:
+        "<system-reminder>\nAnother Claude session sent a message while you were working:\n<agent-message from=...>",
+    });
+
+    expect(isClaudeSystemInjectedUserMessage("claude", message)).toBe(true);
+  });
+
+  it("识别上下文压缩总结消息", () => {
+    const message = createMessage({
+      content:
+        "This session is being continued from a previous conversation that ran out of context. ...",
+    });
+
+    expect(isClaudeSystemInjectedUserMessage("claude", message)).toBe(true);
+  });
+
+  it("识别 skill 重载通知消息", () => {
+    const message = createMessage({
+      content:
+        "(Re-invocation of /zhang-dev-plugins:zhang-code-development — the skill instructions were previously loaded...)",
+    });
+
+    expect(isClaudeSystemInjectedUserMessage("claude", message)).toBe(true);
+  });
+
+  it("压缩总结前缀在 Codex 会话不识别", () => {
+    const message = createMessage({
+      content:
+        "This session is being continued from a previous conversation that ran out of context. ...",
+    });
+
+    expect(isClaudeSystemInjectedUserMessage("codex", message)).toBe(false);
+  });
 });
