@@ -12,6 +12,7 @@ import {
   Check,
   Compass,
   Copy,
+  ChevronRight,
   DollarSign,
   Eye,
   Lightbulb,
@@ -273,6 +274,7 @@ function MessageRowView({
     (block) => block.type === "steer" && block.deliveryStatus === "accepted",
   );
   const thinkingVariant = useThinkingVariant(showThinkingPlaceholder);
+  const [systemNoticeExpanded, setSystemNoticeExpanded] = useState(false);
 
   if (isSystemInjected) {
     const noticeText = (typeof message.content === "string" && message.content)
@@ -289,8 +291,21 @@ function MessageRowView({
       >
         <div className="msg-notice">
           <div className="msg-notice-content">
-            <div className="msg-notice-title">{t("panel.systemInjectedNotice", { defaultValue: "系统 / 子代理消息" })}</div>
-            <div className="msg-notice-message">{noticeText}</div>
+            <button
+              type="button"
+              className="msg-notice-title msg-notice-title--toggle"
+              aria-expanded={systemNoticeExpanded}
+              onClick={() => setSystemNoticeExpanded((prev) => !prev)}
+            >
+              <ChevronRight
+                size={11}
+                className={`msg-block-chevron${systemNoticeExpanded ? " msg-block-chevron-open" : ""}`}
+              />
+              {t("panel.systemInjectedNotice", { defaultValue: "系统 / 子代理消息" })}
+            </button>
+            {systemNoticeExpanded ? (
+              <div className="msg-notice-message">{noticeText}</div>
+            ) : null}
           </div>
         </div>
       </div>

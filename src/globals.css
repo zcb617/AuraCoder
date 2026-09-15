@@ -1873,6 +1873,18 @@ button.linux-window-update-control:hover {
   font-size: 11.5px; font-weight: 550; color: var(--text-1);
   line-height: 1.4;
 }
+.msg-notice-title--toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  background: none;
+  border: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
 .msg-notice-message {
   font-size: 12px; color: var(--text-2); line-height: 1.55;
   max-width: 70ch;
