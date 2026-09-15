@@ -422,6 +422,114 @@ function findUnclosedFenceStart(markdown: string): number | null {
 }
 
 /**
+ * 在流式尾部新增段中查找最后一个未闭合的行内定界符起点，用于暂缓半截行内结构渲染。
+ */
+function findUnclosedInlineDelimiterStart(
+  markdown: string,
+  searchFromIndex: number,
+): number | null {
+  if (markdown.length === 0 || searchFromIndex >= markdown.length) {
+    return null;
+  }
+
+  const tailMarkdown = markdown.slice(searchFromIndex);
+  const lines = splitLinesWithEndings(tailMarkdown);
+  const fenceRanges: Array<[number, number]> = [];
+  let lineOffset = 0;
+  let unclosedFenceOffset: number | null = null;
+
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const opening = parseFenceOpening(lines[lineIndex]);
+    if (!opening) {
+      lineOffset += lines[lineIndex].length;
+      continue;
+    }
+
+    let closingIndex = -1;
+    for (let scanIndex = lineIndex + 1; scanIndex < lines.length; scanIndex += 1) {
+      if (isFenceClosing(lines[scanIndex], opening.markerChar, opening.markerLength)) {
+        closingIndex = scanIndex;
+        break;
+      }
+    }
+
+    if (closingIndex < 0) {
+      unclosedFenceOffset = lineOffset;
+      break;
+    }
+
+    let closingEndOffset = lineOffset;
+    for (let consumedIndex = lineIndex; consumedIndex <= closingIndex; consumedIndex += 1) {
+      closingEndOffset += lines[consumedIndex].length;
+    }
+    fenceRanges.push([lineOffset, closingEndOffset]);
+    lineOffset = closingEndOffset;
+    lineIndex = closingIndex;
+  }
+
+  let backtickStart: number | null = null;
+  let boldStart: number | null = null;
+  const bracketStarts: number[] = [];
+  const parenthesisStarts: number[] = [];
+  const chineseParenthesisStarts: number[] = [];
+  let fenceRangeIndex = 0;
+  let index = 0;
+
+  while (index < tailMarkdown.length) {
+    const currentFenceRange = fenceRanges[fenceRangeIndex];
+    if (currentFenceRange && index >= currentFenceRange[0]) {
+      index = currentFenceRange[1];
+      fenceRangeIndex += 1;
+      continue;
+    }
+    if (unclosedFenceOffset !== null && index >= unclosedFenceOffset) {
+      break;
+    }
+
+    const current = tailMarkdown[index];
+    const absoluteIndex = searchFromIndex + index;
+    if (current === "`") {
+      backtickStart = backtickStart === null ? absoluteIndex : null;
+      index += 1;
+      continue;
+    }
+    if (current === "*" && tailMarkdown[index + 1] === "*") {
+      boldStart = boldStart === null ? absoluteIndex : null;
+      index += 2;
+      continue;
+    }
+    if (current === "[") {
+      bracketStarts.push(absoluteIndex);
+    } else if (current === "]" && bracketStarts.length > 0) {
+      bracketStarts.pop();
+    } else if (current === "(") {
+      parenthesisStarts.push(absoluteIndex);
+    } else if (current === ")" && parenthesisStarts.length > 0) {
+      parenthesisStarts.pop();
+    } else if (current === "（") {
+      chineseParenthesisStarts.push(absoluteIndex);
+    } else if (current === "）" && chineseParenthesisStarts.length > 0) {
+      chineseParenthesisStarts.pop();
+    }
+    index += 1;
+  }
+
+  const unclosedStarts: number[] = [];
+  if (backtickStart !== null) {
+    unclosedStarts.push(backtickStart);
+  }
+  if (boldStart !== null) {
+    unclosedStarts.push(boldStart);
+  }
+  unclosedStarts.push(...bracketStarts, ...parenthesisStarts, ...chineseParenthesisStarts);
+  if (unclosedFenceOffset !== null) {
+    unclosedStarts.push(searchFromIndex + unclosedFenceOffset);
+  }
+
+  return unclosedStarts.length > 0 ? Math.min(...unclosedStarts) : null;
+}
+
+/**
  * 按流式状态解析 Markdown，并返回已稳定 HTML 与暂缓尾部原文。
  */
 export function renderStableMarkdownToHtml(
@@ -487,7 +595,7 @@ export function createStreamingMarkdownAppender(): StreamingMarkdownAppender {
   };
 
   /**
-   * 追加当前累积文本中已经形成完整块的部分，暂缓未闭合代码围栏尾部。
+   * 追加当前累积文本中已经形成完整块的部分，暂缓未闭合代码围栏和行内定界符尾部。
    */
   const push = (fullMarkdownSoFar: string): { html: string } => {
     if (
@@ -498,7 +606,15 @@ export function createStreamingMarkdownAppender(): StreamingMarkdownAppender {
     }
 
     const unclosedFenceStart = findUnclosedFenceStart(fullMarkdownSoFar);
-    const stableMarkdownEnd = unclosedFenceStart ?? fullMarkdownSoFar.length;
+    const unclosedInlineStart = findUnclosedInlineDelimiterStart(
+      fullMarkdownSoFar,
+      lockedMarkdownLength,
+    );
+    const candidates = [unclosedFenceStart, unclosedInlineStart].filter(
+      (v): v is number => v !== null,
+    );
+    const stableMarkdownEnd =
+      candidates.length > 0 ? Math.min(...candidates) : fullMarkdownSoFar.length;
 
     if (stableMarkdownEnd > lockedMarkdownLength) {
       const stableDelta = fullMarkdownSoFar.slice(
@@ -524,6 +640,8 @@ export const markdownParserCoreInternals = {
   splitLinesWithEndings,
   tokenizeFences,
   findUnclosedFenceStart,
+  // 提供行内定界符检测逻辑，供 Markdown 核心行为测试复用。
+  findUnclosedInlineDelimiterStart,
   // 提供流式增量解析器，供 Markdown 核心行为测试复用。
   createStreamingMarkdownAppender,
 };

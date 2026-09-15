@@ -4,7 +4,10 @@ import {
   renderMarkdownToHtml,
 } from "./markdownParserCore";
 
-const { createStreamingMarkdownAppender } = markdownParserCoreInternals;
+const {
+  createStreamingMarkdownAppender,
+  findUnclosedInlineDelimiterStart,
+} = markdownParserCoreInternals;
 
 describe("renderMarkdownToHtml 代码块排版", () => {
   it("代码块输出为独立 <pre>，不被 <p> 包裹，前后段落各自成段", () => {
@@ -62,5 +65,52 @@ describe("createStreamingMarkdownAppender 纯 append 流式解析", () => {
     const first = appender.push("固定内容\n\n");
     const second = appender.push("固定内容\n\n");
     expect(second.html).toBe(first.html);
+  });
+
+  it("未闭合反引号憋住，闭合后增量 append", () => {
+    const appender = createStreamingMarkdownAppender();
+
+    const open = appender.push("`addBatch(Custom");
+    expect(open.html).not.toContain("addBatch");
+
+    const closed = appender.push("`addBatch(Custom`sReceipt cr)` 已闭合\n\n");
+    expect(closed.html).toContain("addBatch");
+    expect(closed.html.startsWith(open.html)).toBe(true);
+  });
+
+  it("未闭合中文括号憋住", () => {
+    const appender = createStreamingMarkdownAppender();
+
+    const open = appender.push("前文\n\n结果（");
+    expect(open.html).not.toContain("（");
+
+    const closed = appender.push("前文\n\n结果（507行）\n\n");
+    expect(closed.html).toContain("507行");
+  });
+
+  it("未闭合粗体憋住", () => {
+    const appender = createStreamingMarkdownAppender();
+
+    const open = appender.push("前面 **加粗内容");
+    expect(open.html).not.toContain("加粗内容");
+
+    const closed = appender.push("前面 **加粗内容** 完成\n\n");
+    expect(closed.html).toContain("加粗内容");
+  });
+
+  it("全闭合时正常放行", () => {
+    const appender = createStreamingMarkdownAppender();
+
+    const result = appender.push("正常 `code` 文本（括号）**粗体**\n\n");
+    expect(result.html).toContain("code");
+    expect(result.html).toContain("括号");
+    expect(result.html).toContain("粗体");
+  });
+
+  it("代码围栏内反引号不误扣", () => {
+    const appender = createStreamingMarkdownAppender();
+
+    const result = appender.push("```js\nconst s = `模板`\n```\n\n后文\n\n");
+    expect(result.html).toContain("后文");
   });
 });
