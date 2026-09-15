@@ -83,6 +83,8 @@ import {
   useParsedDiff,
 } from "../shared/DiffViewer";
 import MarkdownContent from "./MarkdownContent";
+import { CodeBlock } from "./blocks/CodeBlock";
+import { TextBlock } from "./blocks/TextBlock";
 import { AttachmentChip } from "./AttachmentChip";
 import { useChatFileContextMenu } from "./useChatFileContextMenu";
 import {
@@ -125,32 +127,6 @@ function dedupeDiffBlocksByScope(blocks: ContentBlock[]): ContentBlock[] {
     }
     return latestDiffIndexByScope.get(String(block.scope ?? "turn")) === index;
   });
-}
-
-function CodeBlockCopyButton({ content }: { content: string }) {
-  const [copied, setCopied] = useState(false);
-  const handleCopy = useCallback(() => {
-    navigator.clipboard.writeText(content).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
-  }, [content]);
-  return (
-    <button
-      type="button"
-      onClick={handleCopy}
-      style={{
-        marginLeft: "auto", flexShrink: 0, cursor: "pointer",
-        background: "none", border: "none", padding: "2px",
-        color: copied ? "var(--success)" : "var(--text-3)",
-        opacity: copied ? 1 : 0.5,
-        transition: "color var(--duration-fast) var(--ease-out), opacity var(--duration-fast) var(--ease-out)",
-      }}
-      aria-label="Copy code"
-    >
-      {copied ? <Check size={12} /> : <Copy size={12} />}
-    </button>
-  );
 }
 
 function handleToggleKeyDown(e: React.KeyboardEvent, toggle: () => void) {
@@ -2452,23 +2428,11 @@ function renderSingleBlock(
     const isLastBlock = index === safeBlocks.length - 1;
     const isStreamingText = status === "streaming" && isLastBlock;
 
-    if (isStreamingText) {
-      return (
-        <MarkdownContent
-          key={blockKey}
-          content={textContent}
-          streaming
-          enableFileContextMenu
-          className="prose"
-          style={{ fontSize: 13, padding: "6px 14px" }}
-        />
-      );
-    }
-
     return (
-      <MarkdownContent
+      <TextBlock
         key={blockKey}
         content={textContent}
+        streaming={isStreamingText ? true : undefined}
         enableFileContextMenu
         className="prose"
         style={{ fontSize: 13, padding: "6px 14px" }}
@@ -2478,51 +2442,13 @@ function renderSingleBlock(
 
   /* ── Code ── */
   if (block.type === "code") {
-    const lang = String(block.language ?? "text");
     return (
-      <div
+      <CodeBlock
         key={blockKey}
-        style={{
-          borderRadius: "var(--radius-sm)",
-          border: "1px solid var(--border)",
-          overflow: "hidden",
-          background: "var(--code-bg)",
-        }}
-      >
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 6,
-            padding: "6px 12px",
-            borderBottom: "1px solid var(--border)",
-            fontSize: 11,
-            color: "var(--text-3)",
-            fontFamily: '"Geist Mono", ui-monospace, monospace',
-          }}
-        >
-          <FileCode2 size={12} style={{ opacity: 0.5 }} />
-          <span style={{ flex: 1 }}>
-            <LinkifiedPlainText text={block.filename || lang} />
-          </span>
-          <CodeBlockCopyButton content={String(block.content ?? "")} />
-        </div>
-        <pre
-          style={{
-            margin: 0,
-            padding: "12px 14px",
-            fontSize: 12.5,
-            lineHeight: 1.6,
-            fontFamily: '"Geist Mono", ui-monospace, monospace',
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-word",
-            overflow: "auto",
-            maxHeight: 400,
-          }}
-        >
-          <code className={`language-${lang}`}>{String(block.content ?? "")}</code>
-        </pre>
-      </div>
+        content={String(block.content ?? "")}
+        language={String(block.language ?? "text")}
+        filename={block.filename ? String(block.filename) : undefined}
+      />
     );
   }
 
