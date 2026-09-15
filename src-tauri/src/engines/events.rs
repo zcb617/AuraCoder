@@ -6,6 +6,8 @@ use super::{TurnAttachment, TurnInputItem};
 pub const ERROR_CODE_SYSTEM_GENERIC: i32 = -1;
 /// 统一异常码：上下文压缩失败（上游以 HTTP 413 拒绝请求体过大的压缩请求）。
 pub const ERROR_CODE_CONTEXT_COMPACT_FAILED: i32 = -99;
+/// 统一异常码：Claude 鉴权失效（凭证过期或未登录，需重新登录/刷新凭证）。
+pub const ERROR_CODE_AUTH_INVALID: i32 = -98;
 
 pub const ACTION_OUTPUT_DELTA_MAX_CHARS: usize = 16 * 1024;
 pub const STREAMED_DIFF_MAX_CHARS: usize = 128 * 1024;

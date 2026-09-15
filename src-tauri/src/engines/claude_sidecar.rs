@@ -2961,6 +2961,27 @@ impl Engine for ClaudeSidecarEngine {
                                         }
                                         drop(state);
                                         transport.kill().await;
+                                        log::error!(
+                                            "claude 鉴权失效(code={:?}): status={:?} details={:?} recoverable={:?} msg={}",
+                                            code,
+                                            api_error_status,
+                                            error_details,
+                                            recoverable,
+                                            message
+                                        );
+                                        event_tx
+                                            .send(EngineEvent::Notice {
+                                                kind: "auth_invalid".to_string(),
+                                                level: "error".to_string(),
+                                                title: "登录已失效".to_string(),
+                                                message: "Claude 登录已失效，请重新登录或刷新凭证后重试。".to_string(),
+                                                metadata: Some(serde_json::json!({
+                                                    "code": super::ERROR_CODE_AUTH_INVALID
+                                                })),
+                                            })
+                                            .await
+                                            .ok();
+                                        continue;
                                     }
                                     // 上下文压缩失败（上游 413 拒绝）为已知异常码 -99：识别并转换为业务化 Notice 上报前端，
                                     // 同时用 error 级日志记录完整原始错误，供排查。

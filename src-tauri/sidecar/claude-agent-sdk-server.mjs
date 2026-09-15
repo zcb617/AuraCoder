@@ -18,9 +18,10 @@ import { promisify } from "node:util";
 let fromJSONSchema;
 
 // 统一异常码（后端权威定义，与 Rust src-tauri/src/engines/events.rs 的 ERROR_CODE_* 保持一致）：
-// -1 = 系统通用异常；-99 = 上下文压缩失败。sidecar 是独立 Node 进程无法 import Rust 常量，故在此同步维护，语义权威在后端。
+// -1 = 系统通用异常；-99 = 上下文压缩失败；-98 = Claude 鉴权失效。sidecar 是独立 Node 进程无法 import Rust 常量，故在此同步维护，语义权威在后端。
 const ERROR_CODE_SYSTEM_GENERIC = -1;
 const ERROR_CODE_CONTEXT_COMPACT_FAILED = -99;
+const ERROR_CODE_AUTH_INVALID = -98;
 
 // 启动阶段依赖失败必须先输出结构化错误，便于宿主保留真实失败上下文。
 function emitStartupDependencyError(message) {
