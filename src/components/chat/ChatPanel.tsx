@@ -5945,6 +5945,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                   assistantLabel={assistantIdentity?.label ?? ""}
                   assistantEngineId={assistantIdentity?.engineId ?? ""}
                   assistantEngineName={assistantIdentity?.engineName ?? ""}
+                  threadEngineId={activeThread?.engineId}
                   allowInitialPreparation={
                     !sessionReady && message.id === messages[messages.length - 1]?.id
                   }
@@ -6008,6 +6009,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
               assistantLabel=""
               assistantEngineId=""
               assistantEngineName=""
+              threadEngineId={activeThread?.engineId}
               allowInitialPreparation={false}
               allowTurnStartedThinking={false}
               onApproval={handleApproval}

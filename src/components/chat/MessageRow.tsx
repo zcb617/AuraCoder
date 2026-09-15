@@ -29,6 +29,38 @@ import { MessageBlocks } from "./MessageBlocks";
 import { AttachmentChip } from "./AttachmentChip";
 import { formatWorkingDuration } from "./workingDuration";
 
+const CLAUDE_SYSTEM_INJECTED_PREFIXES = [
+  "Another Claude session sent a message:",
+  "[MESSAGE FROM NON-USER SOURCE",
+];
+
+/**
+ * 判断是否为 Claude 会话里被底层标成 user 的系统/子代理注入消息。
+ * 仅当会话引擎为 claude、角色为 user、且文本以固定前缀开头时命中。
+ */
+export function isClaudeSystemInjectedUserMessage(
+  threadEngineId: string | undefined,
+  message: Message,
+): boolean {
+  if (threadEngineId !== "claude" || message.role !== "user") {
+    return false;
+  }
+  const textParts: string[] = [];
+  if (typeof message.content === "string" && message.content) {
+    textParts.push(message.content);
+  }
+  for (const block of message.blocks ?? []) {
+    if (block.type === "text" && typeof block.content === "string" && block.content) {
+      textParts.push(block.content);
+    }
+  }
+  const text = textParts.join("\n").trimStart();
+  if (!text) {
+    return false;
+  }
+  return CLAUDE_SYSTEM_INJECTED_PREFIXES.some((prefix) => text.startsWith(prefix));
+}
+
 /** 消息行组件的输入参数，负责描述消息展示及消息行内操作所需的业务数据。 */
 export interface MessageRowProps {
   /** 当前需要展示的消息数据。 */
@@ -43,6 +75,8 @@ export interface MessageRowProps {
   assistantEngineId: string;
   /** 当前消息回合实际使用的 CLI 名称，用于运行状态文案。 */
   assistantEngineName: string;
+  /** 当前会话所在线程的引擎标识，用于识别 Claude 系统注入的假用户消息。 */
+  threadEngineId?: string;
   /** 允许当前尾部空流式助手显示首轮会话准备占位。 */
   allowInitialPreparation: boolean;
   /** 允许当前尾部空流式助手在会话就绪后显示已收到消息并思考状态。 */
@@ -161,6 +195,7 @@ function MessageRowView({
   assistantLabel,
   assistantEngineId,
   assistantEngineName,
+  threadEngineId,
   allowInitialPreparation,
   allowTurnStartedThinking,
   preparingLabel,
@@ -172,6 +207,7 @@ function MessageRowView({
 }: MessageRowProps) {
   const { t, i18n } = useTranslation("chat");
   const isUser = message.role === "user";
+  const isSystemInjected = isClaudeSystemInjectedUserMessage(threadEngineId, message);
   const messageTimestamp = useMemo(
     () => formatMessageTimestamp(message.createdAt, i18n.language),
     [i18n.language, message.createdAt],
@@ -234,6 +270,29 @@ function MessageRowView({
     (block) => block.type === "steer" && block.deliveryStatus === "accepted",
   );
   const thinkingVariant = useThinkingVariant(showThinkingPlaceholder);
+
+  if (isSystemInjected) {
+    const noticeText = (typeof message.content === "string" && message.content)
+      ? message.content
+      : (message.blocks ?? [])
+          .filter((block) => block.type === "text")
+          .map((block) => block.content)
+          .join("\n");
+    return (
+      <div
+        data-message-id={message.id}
+        className="msg-row"
+        style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", maxWidth: "100%" }}
+      >
+        <div className="msg-notice">
+          <div className="msg-notice-content">
+            <div className="msg-notice-title">{t("panel.systemInjectedNotice", { defaultValue: "系统 / 子代理消息" })}</div>
+            <div className="msg-notice-message">{noticeText}</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (!isUser && !showAssistantShell) {
     return null;
@@ -427,6 +486,7 @@ export const MessageRow = memo(
     prev.assistantLabel === next.assistantLabel &&
     prev.assistantEngineId === next.assistantEngineId &&
     prev.assistantEngineName === next.assistantEngineName &&
+    prev.threadEngineId === next.threadEngineId &&
     prev.allowInitialPreparation === next.allowInitialPreparation &&
     prev.allowTurnStartedThinking === next.allowTurnStartedThinking &&
     prev.preparingLabel === next.preparingLabel &&
