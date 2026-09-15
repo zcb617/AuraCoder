@@ -4,6 +4,7 @@ import {
   getWorkspacePaneLeafIdFromEventTarget,
   navigateLinkTarget,
 } from "../../../lib/fileLinkNavigation";
+import { ipc } from "../../../lib/ipc";
 import {
   createStreamingMarkdownAppender,
   renderMarkdownToHtml,
@@ -119,6 +120,15 @@ export function TextBlock({
       appenderRef.current.reset();
     }
     html = appenderRef.current.push(content).html;
+    // === 临时调试：抓流式中途每帧累积文本与解析结果，落进 auracoder.log。定位"中途竖排、结束横排"。调试验证完后整段注释。 ===
+    void ipc.appendStreamRenderDebug(
+      JSON.stringify({
+        len: content.length,
+        contentTail: content.slice(-100),
+        htmlTail: html.slice(-200),
+        pCount: (html.match(/<p[ >]/g) ?? []).length,
+      }),
+    ).catch(() => undefined);
     previousContentRef.current = content;
   } else {
     appenderRef.current.reset();

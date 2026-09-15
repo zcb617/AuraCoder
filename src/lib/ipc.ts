@@ -893,6 +893,9 @@ export const ipc = {
     content,
     expectedVersion: expectedVersion ?? null,
   }),
+  // 临时调试：流式渲染埋点上送，落进 Rust 日志。调试验证完后整段注释。
+  appendStreamRenderDebug: (payload: string) =>
+    invoke<void>("append_stream_render_debug", { payload }),
   watchGitRepo: (workspaceId: string) => invoke<void>("watch_git_repo", { workspaceId }),
   addGitWorktree: (workspaceId: string, worktreePath: string, branchName: string, baseRef?: string | null) =>
     invoke<GitWorktree>("add_git_worktree", { workspaceId, worktreePath, branchName, baseRef: baseRef ?? null }),

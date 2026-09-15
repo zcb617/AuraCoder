@@ -350,6 +350,13 @@ pub struct ClipboardImagePayload {
     pub source_path: Option<String>,
 }
 
+/// 临时调试：接收前端流式渲染埋点数据并落盘到日志，用于定位"中途竖排、结束横排"。调试验证完后整段注释。
+#[tauri::command]
+pub fn append_stream_render_debug(payload: &str) -> Result<(), String> {
+    log::info!("[STREAM-RENDER-DEBUG] {}", payload);
+    Ok(())
+}
+
 /// 原生兜底命令：在 DataTransfer 拿不到剪贴板 image File 时（Linux 部分场景），
 /// 由原生侧读取系统剪贴板图片并编码为 PNG base64 返回；剪贴板无图片时不视为错误。
 #[tauri::command]

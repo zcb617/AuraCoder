@@ -445,6 +445,7 @@ pub fn run() {
             commands::browser::browser_clear_all_annotations,
             commands::browser::browser_capture_annotation,
             commands::chat::save_pasted_image_attachment,
+            commands::chat::append_stream_render_debug,
             commands::chat::read_clipboard_image,
             commands::chat::read_attachment_preview,
             commands::chat::send_message,
