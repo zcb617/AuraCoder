@@ -22,13 +22,11 @@ import {
   MessageSquare,
   FilePen,
   Pencil,
-  AlertTriangle,
   AtSign,
   DollarSign,
   Puzzle,
   Plus,
   ListChecks,
-  Clock,
   Zap,
   RotateCcw,
   Minimize2,
@@ -108,6 +106,7 @@ import type {
   ThreadRuntimeSelectionPatch,
 } from "./chatPanelTypes";
 import { LazyTerminalPanel, LazyEditorWithExplorer } from "./lazyPanels";
+import { ChatStatusBar } from "./ChatStatusBar";
 import {
   canBatchApproveApproval,
   canUseApprovalDecisionActions,
@@ -144,12 +143,8 @@ import {
   encodeModelOptionValue,
   formatContextUsage,
   formatEngineModelLabel,
-  formatResetTime,
-  formatUsagePercent,
   resolveClaudeModelFamily,
   serializePrettyJson,
-  usagePercentToWidth,
-  usageProgressLevelClass,
 } from "./formatters";
 import {
   autonomyPresetToComponentValue,
@@ -178,7 +173,6 @@ import { buildComposerRuntimeSnapshot } from "./composerRuntime";
 import { canChangeUnstartedThreadEngine, collectThreadEnvironmentMismatches } from "./threadRuntimeState";
 import type { ThreadEnvironmentMismatch, ThreadEnvironmentMismatchKind } from "./threadRuntimeState";
 import { resolveReasoningEffortForModel } from "./reasoningEffort";
-import { resolveUsageStatusKey } from "./usageStatus";
 import { formatTextAnnotationsForSubmission } from "./textAnnotations";
 import {
   formatImageAttachmentAnnotationsForSubmission,
@@ -7250,123 +7244,19 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
             </div>
           </div>
 
-          {/* Bottom status bar with context usage */}
-          <div className="chat-status-bar">
-            {(isCodexEngine || selectedEngineId === "claude") && (
-              usageLimits ? (
-                <div className="chat-status-usage">
-                  <button
-                    type="button"
-                    className="chat-context-section"
-                    onClick={openUsageLimitsModal}
-                    title={t("status.openUsageLimits")}
-                  >
-                    <Clock size={10} />
-                    <span>{t("status.windowFiveHoursLeft")}</span>
-                    <div className="chat-context-progress">
-                      <div
-                        className={`chat-context-progress-fill${usageProgressLevelClass(usageLimits.windowFiveHourPercent)}`}
-                        style={{ width: usagePercentToWidth(usageLimits.windowFiveHourPercent) }}
-                      />
-                    </div>
-                    <span className="chat-context-percent">
-                      {formatUsagePercent(usageLimits.windowFiveHourPercent)}
-                    </span>
-                    {usageLimits.windowFiveHourResetsAt && (
-                      <span className="chat-context-reset">
-                        {t("status.resets", {
-                          time: formatResetTime(t, usageLimits.windowFiveHourResetsAt),
-                        })}
-                      </span>
-                    )}
-                  </button>
-
-                  <span className="chat-context-divider">&middot;</span>
-
-                  <button
-                    type="button"
-                    className="chat-context-section"
-                    onClick={openUsageLimitsModal}
-                    title={t("status.openUsageLimits")}
-                  >
-                    <Clock size={10} />
-                    <span>{t("status.windowWeeklyLeft")}</span>
-                    <div className="chat-context-progress">
-                      <div
-                        className={`chat-context-progress-fill${usageProgressLevelClass(usageLimits.windowWeeklyPercent)}`}
-                        style={{ width: usagePercentToWidth(usageLimits.windowWeeklyPercent) }}
-                      />
-                    </div>
-                    <span className="chat-context-percent">
-                      {formatUsagePercent(usageLimits.windowWeeklyPercent)}
-                    </span>
-                    {usageLimits.windowWeeklyResetsAt && (
-                      <span className="chat-context-reset">
-                        {t("status.resets", {
-                          time: formatResetTime(t, usageLimits.windowWeeklyResetsAt),
-                        })}
-                      </span>
-                    )}
-                  </button>
-
-                  {selectedClaudeWeeklyUsage && (
-                    <>
-                      <span className="chat-context-divider">&middot;</span>
-
-                      <button
-                        type="button"
-                        className="chat-context-section"
-                        onClick={openUsageLimitsModal}
-                        title={t("status.openUsageLimits")}
-                      >
-                        <Clock size={10} />
-                        <span>{selectedClaudeWeeklyUsage.label}</span>
-                        <div className="chat-context-progress">
-                          <div
-                            className={`chat-context-progress-fill${usageProgressLevelClass(selectedClaudeWeeklyUsage.percent)}`}
-                            style={{ width: usagePercentToWidth(selectedClaudeWeeklyUsage.percent) }}
-                          />
-                        </div>
-                        <span className="chat-context-percent">
-                          {formatUsagePercent(selectedClaudeWeeklyUsage.percent)}
-                        </span>
-                        {selectedClaudeWeeklyUsage.resetsAt && (
-                          <span className="chat-context-reset">
-                            {t("status.resets", {
-                              time: formatResetTime(t, selectedClaudeWeeklyUsage.resetsAt),
-                            })}
-                          </span>
-                        )}
-                      </button>
-                    </>
-                  )}
-                </div>
-              ) : (
-                <div className="chat-context-section">
-                  <Clock size={10} />
-                  <span>
-                    {t(resolveUsageStatusKey(hasUserMessage, streaming || usageLimitsLoading))}
-                  </span>
-                </div>
-              )
-            )}
-
-            {/* Branch */}
-            {gitStatus?.branch && (
-              <span className="chat-status-branch">
-                <GitBranch size={11} />
-                {gitStatus.branch}
-              </span>
-            )}
-          </div>
+          <ChatStatusBar
+            isCodexEngine={isCodexEngine}
+            selectedEngineId={selectedEngineId}
+            usageLimits={usageLimits}
+            usageLimitsLoading={usageLimitsLoading}
+            selectedClaudeWeeklyUsage={selectedClaudeWeeklyUsage}
+            hasUserMessage={hasUserMessage}
+            streaming={streaming}
+            gitStatus={gitStatus}
+            error={error}
+            onOpenUsageLimits={openUsageLimitsModal}
+          />
         </form>
-
-              {error && (
-                <div className="msg-error-block" style={{ marginTop: 8, fontSize: 12 }}>
-                  <AlertTriangle size={14} style={{ flexShrink: 0, marginTop: 2 }} />
-                  {error}
-                </div>
-              )}
             </div>
         </div>
 
