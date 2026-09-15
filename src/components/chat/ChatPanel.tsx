@@ -1,7 +1,6 @@
 import {
   FormEvent,
   Suspense,
-  lazy,
   useCallback,
   useEffect,
   useMemo,
@@ -92,6 +91,23 @@ import { isMacDesktop, usesCustomWindowFrame } from "../../lib/windowActions";
 import { shouldShowClaudeUnsupportedApproval } from "./MessageBlocks";
 import { FlexibleMessageGroup } from "./FlexibleMessageGroup";
 import { MessageRow, WorkingDurationIndicator } from "./MessageRow";
+import { createPendingSubmissionMessage } from "./pendingSubmissionMessage";
+import { approvalRowIcon } from "./approvalRowIcon";
+import {
+  EMPTY_CHAT_ATTACHMENTS,
+  EMPTY_CHAT_INPUT_REFERENCES,
+  EMPTY_CHAT_TEXT_ANNOTATIONS,
+  EMPTY_PENDING_FLEXIBLE_MESSAGES,
+  EMPTY_PERMISSION_COMPONENT,
+  MESSAGE_ROW_GAP,
+  PERMISSION_COMPONENT_ENGINE_IDS,
+} from "./chatPanelConstants";
+import type {
+  CodexReferenceCatalogState,
+  TextAnnotationPopover,
+  ThreadRuntimeSelectionPatch,
+} from "./chatPanelTypes";
+import { LazyTerminalPanel, LazyEditorWithExplorer } from "./lazyPanels";
 import {
   canBatchApproveApproval,
   canUseApprovalDecisionActions,
@@ -204,7 +220,6 @@ import { Dropdown } from "../shared/Dropdown";
 import { handleDragMouseDown, handleDragDoubleClick } from "../../lib/windowDrag";
 import { shouldSubmitChatInput } from "./chatInputShortcuts";
 import type {
-  ActionType,
   ApprovalBlock,
   ApprovalResponse,
   AttachmentBlock,
@@ -217,7 +232,6 @@ import type {
   CodexApp,
   CodexPlugin,
   CodexSkill,
-  ContentBlock,
   EngineHealth,
   EngineModel,
   ExtensionItem,
@@ -230,116 +244,12 @@ import type {
   TrustLevel,
 } from "../../types";
 
-const MESSAGE_ROW_GAP = 12;
-const EMPTY_CHAT_ATTACHMENTS: ChatAttachment[] = [];
-const EMPTY_CHAT_INPUT_REFERENCES: ChatInputReference[] = [];
-const EMPTY_CHAT_TEXT_ANNOTATIONS: ChatTextAnnotation[] = [];
-const EMPTY_PENDING_FLEXIBLE_MESSAGES: PendingFlexibleMessage[] = [];
-const EMPTY_PERMISSION_COMPONENT: PermissionComponentJson = {
-  autonomyPreset: ["automatic"],
-  trust: ["automatic"],
-  approval: ["automatic"],
-  sandbox: ["automatic"],
-  network: ["automatic"],
-  defaultForNewThreads: [],
-};
-
-/** 已接入统一权限组件的 CLI 引擎标识；权限取数据库只依赖该标识，与 CLI 环境加载状态无关。 */
-const PERMISSION_COMPONENT_ENGINE_IDS: ReadonlySet<string> = new Set([
-  "codex",
-  "opencode",
-  "claude",
-]);
-
-/** 线程运行时五项可局部保存字段；权限字段不属于本契约。 */
-type ThreadRuntimeSelectionPatch = {
-  engineId?: string | null;
-  modelId?: string | null;
-  planMode?: boolean | null;
-  sendMethod?: string | null;
-  reasoningEffort?: string | null;
-};
-
-
-
 // 旧的经典输入菜单项目结构保留在此处作为迁移记录；现在由 CLI 菜单契约统一描述选择动作。
 // type ClassicSlashCommand = SlashCommand & {
 //   reference?: ChatInputReference;
 //   panel?: ActiveSlashCommand;
 //   insertText?: string;
 // };
-
-interface TextAnnotationPopover {
-  selectedText: string;
-  left: number;
-  top: number;
-  stage: "actions" | "comment";
-}
-
-function createPendingSubmissionMessage(
-  threadId: string,
-  text: string,
-  attachments: ChatAttachment[],
-  references: ChatInputReference[],
-  planMode: boolean,
-): Message {
-  const blocks: ContentBlock[] = [
-    ...references.map((reference) => ({ ...reference })),
-    ...attachments.map((attachment) => ({
-      type: "attachment" as const,
-      fileName: attachment.fileName,
-      filePath: attachment.filePath,
-      sizeBytes: attachment.sizeBytes,
-      mimeType: attachment.mimeType,
-      browserAnnotation: attachment.browserAnnotation,
-    })),
-  ];
-  blocks.push({ type: "text", content: text, planMode: planMode || undefined });
-
-  return {
-    id: `pending-${crypto.randomUUID()}`,
-    threadId,
-    role: "user",
-    content: text,
-    blocks,
-    status: "completed",
-    schemaVersion: 1,
-    createdAt: new Date().toISOString(),
-    hydration: "full",
-    hasDeferredContent: false,
-  };
-}
-const LazyTerminalPanel = lazy(() =>
-  import("../terminal/TerminalPanel").then((module) => ({
-    default: module.TerminalPanel,
-  })),
-);
-const LazyEditorWithExplorer = lazy(() =>
-  import("../editor/EditorWithExplorer").then((module) => ({
-    default: module.EditorWithExplorer,
-  })),
-);
-
-function approvalRowIcon(actionType: ActionType) {
-  switch (actionType) {
-    case "command":
-      return <SquareTerminal size={13} />;
-    case "file_write":
-    case "file_edit":
-    case "file_delete":
-      return <FilePen size={13} />;
-    case "git":
-      return <GitBranch size={13} />;
-    default:
-      return <Shield size={13} />;
-  }
-}
-
-interface CodexReferenceCatalogState {
-  skillsLoaded: boolean;
-  appsLoaded: boolean;
-}
-
 
 const ENGINE_PREWARM_THROTTLE_MS = 30_000;
 const lastPrewarmAttemptAtByEngine = new Map<string, number>();
