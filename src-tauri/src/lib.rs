@@ -746,6 +746,9 @@ fn create_main_window(app: &tauri::AppHandle) -> anyhow::Result<WebviewWindow> {
                 log::warn!("failed to hide main window on close: {error}");
             }
         }
+        if let WindowEvent::Focused(true) = event {
+            crate::terminal_notifications::close_all_desktop_notifications();
+        }
     });
 
     Ok(main_window)

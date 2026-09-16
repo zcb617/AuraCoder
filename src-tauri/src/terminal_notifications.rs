@@ -39,6 +39,13 @@ const CLEAR_NOTIFICATION_SUBCOMMAND: &str = "clear-notification";
 const TERMINAL_NOTIFY_SUBCOMMAND: &str = "notify";
 const CODEX_NOTIFICATION_TITLE: &str = "Codex";
 const CODEX_NOTIFICATION_KIND_TURN_COMPLETE: &str = "agent-turn-complete";
+
+// Linux 下记录本应用已发出且仍由驻留线程持有的桌面通知 ID，供窗口聚焦时批量关闭。
+#[cfg(target_os = "linux")]
+static ACTIVE_DESKTOP_NOTIFICATION_IDS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<u32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
 const CLAUDE_NOTIFICATION_TITLE: &str = "Claude";
 const CLAUDE_NOTIFICATION_ERROR_TITLE: &str = "Claude Error";
 const CLAUDE_NOTIFICATION_KIND_DEFAULT: &str = "notification";
@@ -1710,6 +1717,56 @@ fn resolved_notification_sound() -> Option<String> {
     config.notification_sound().map(|s| s.to_string())
 }
 
+// 按通知 ID 关闭本应用当前仍处于活动状态的全部 Linux 桌面通知，清除窗口聚焦后的系统未读徽标。
+pub fn close_all_desktop_notifications() {
+    #[cfg(target_os = "linux")]
+    {
+        let notification_ids = match ACTIVE_DESKTOP_NOTIFICATION_IDS.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(error) => {
+                log::warn!("获取活动桌面通知 ID 失败，无法批量关闭: {error}");
+                return;
+            }
+        };
+        if notification_ids.is_empty() {
+            return;
+        }
+
+        let count = notification_ids.len();
+        std::thread::spawn(move || {
+            zbus::block_on(async move {
+                let connection = match zbus::Connection::session().await {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        log::warn!("创建关闭桌面通知的 D-Bus 连接失败: {error}");
+                        return;
+                    }
+                };
+                for id in notification_ids {
+                    if let Err(error) = connection
+                        .call_method(
+                            Some("org.freedesktop.Notifications"),
+                            "/org/freedesktop/Notifications",
+                            Some("org.freedesktop.Notifications"),
+                            "CloseNotification",
+                            &(id),
+                        )
+                        .await
+                    {
+                        log::warn!("关闭桌面通知失败，通知 ID {id}: {error}");
+                    }
+                }
+            });
+            log::info!("窗口聚焦，已请求关闭 {count} 条桌面通知");
+        });
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // 非 Linux 平台的桌面通知由系统负责聚焦清理，本模块不改变其行为。
+    }
+}
+
 fn show_desktop_notification_content(
     app: &AppHandle,
     title: &str,
@@ -1759,8 +1816,25 @@ fn show_desktop_notification_content(
                 // 连接不断，GNOME 就不会销毁通知。
                 // 代价是每条通知驻留一个线程直到通知关闭，线程开销极小，可接受；
                 // 若系统通知服务异常永不关闭，最多遗留一个空闲阻塞线程，不影响主流程。
+                let notification_id = handle.id();
+                match ACTIVE_DESKTOP_NOTIFICATION_IDS.lock() {
+                    Ok(mut guard) => {
+                        guard.insert(notification_id);
+                    }
+                    Err(error) => {
+                        log::warn!("记录活动桌面通知 ID {notification_id} 失败: {error}");
+                    }
+                }
                 std::thread::spawn(move || {
                     handle.wait_for_action(|_| {});
+                    match ACTIVE_DESKTOP_NOTIFICATION_IDS.lock() {
+                        Ok(mut guard) => {
+                            guard.remove(&notification_id);
+                        }
+                        Err(error) => {
+                            log::warn!("移除已关闭桌面通知 ID {notification_id} 失败: {error}");
+                        }
+                    }
                 });
                 Ok(())
             }
