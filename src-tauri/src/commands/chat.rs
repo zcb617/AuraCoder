@@ -7635,6 +7635,44 @@ fn apply_event_to_blocks(
             }
 
             for block in blocks.iter_mut() {
+                let ContentBlock::Notice { metadata, .. } = block else {
+                    continue;
+                };
+                let Some(raw) = metadata else {
+                    continue;
+                };
+                let Ok(mut value) = serde_json::from_str::<Value>(raw.get()) else {
+                    continue;
+                };
+                let Some(background_tasks) = value
+                    .get_mut("backgroundTasks")
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+
+                let mut blocks_changed = false;
+                for task in background_tasks.iter_mut() {
+                    if task.get("status").and_then(Value::as_str) != Some("running") {
+                        continue;
+                    }
+                    let Some(status) = task.get_mut("status") else {
+                        continue;
+                    };
+                    *status = Value::String("stopped".to_string());
+                    blocks_changed = true;
+                }
+                if !blocks_changed {
+                    continue;
+                }
+                let Ok(updated_metadata) = RawValue::from_string(value.to_string()) else {
+                    continue;
+                };
+                *metadata = Some(updated_metadata);
+                progress.blocks_changed = true;
+            }
+
+            for block in blocks.iter_mut() {
                 let ContentBlock::Steer {
                     delivery_status, ..
                 } = block

@@ -1148,6 +1148,32 @@ function normalizeBlocks(blocks?: ContentBlock[]): ContentBlock[] | undefined {
       };
       continue;
     }
+    if (
+      block.type === "notice" &&
+      block.kind === "claude_background_tasks" &&
+      block.metadata?.backgroundTasks
+    ) {
+      const hasRunningTask = block.metadata.backgroundTasks.some(
+        (task) => task.status === "running",
+      );
+      if (!hasRunningTask) {
+        normalized.push(block);
+        continue;
+      }
+
+      normalized.push({
+        ...block,
+        metadata: {
+          ...block.metadata,
+          backgroundTasks: block.metadata.backgroundTasks.map((task) =>
+            task.status === "running"
+              ? { ...task, status: "stopped" as const }
+              : task,
+          ),
+        },
+      });
+      continue;
+    }
     normalized.push(block);
   }
 
@@ -1970,26 +1996,52 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
     let finalizedBlocksChanged = blocks !== currentBlocks;
     const finalizedBlocks = blocks.map((block) => {
       if (
-        block.type !== "action" ||
-        (block.status !== "running" && block.status !== "pending")
+        block.type === "action" &&
+        (block.status === "running" || block.status === "pending")
       ) {
-        return block;
+        finalizedBlocksChanged = true;
+        return {
+          ...block,
+          status: (actionSucceeded ? "done" : "error") as ActionBlock["status"],
+          ...(actionSucceeded
+            ? {}
+            : {
+                result: {
+                  success: false,
+                  error: actionError,
+                  durationMs: 0,
+                },
+              }),
+        };
       }
 
-      finalizedBlocksChanged = true;
-      return {
-        ...block,
-        status: (actionSucceeded ? "done" : "error") as ActionBlock["status"],
-        ...(actionSucceeded
-          ? {}
-          : {
-              result: {
-                success: false,
-                error: actionError,
-                durationMs: 0,
-              },
-            }),
-      };
+      if (
+        block.type === "notice" &&
+        block.kind === "claude_background_tasks" &&
+        block.metadata?.backgroundTasks
+      ) {
+        const hasRunningTask = block.metadata.backgroundTasks.some(
+          (task) => task.status === "running",
+        );
+        if (!hasRunningTask) {
+          return block;
+        }
+
+        finalizedBlocksChanged = true;
+        return {
+          ...block,
+          metadata: {
+            ...block.metadata,
+            backgroundTasks: block.metadata.backgroundTasks.map((task) =>
+              task.status === "running"
+                ? { ...task, status: "stopped" as const }
+                : task,
+            ),
+          },
+        };
+      }
+
+      return block;
     });
     if (finalizedBlocksChanged) {
       assistant.blocks = finalizedBlocks;
