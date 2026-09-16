@@ -652,6 +652,7 @@ impl Engine for CodexEngine {
     async fn start_thread(
         &self,
         scope: ThreadScope,
+        _runtime_thread_id: &str,
         resume_engine_thread_id: Option<&str>,
         model: &str,
         sandbox: SandboxPolicy,
@@ -727,7 +728,14 @@ impl Engine for CodexEngine {
                     );
                     self.store_thread_runtime(&engine_thread_id, runtime).await;
 
+                    /*
+                    // 旧单字段返回值保留迁移留痕，现返回内部运行键和外部原生 ID。
                     return Ok(EngineThread { engine_thread_id });
+                    */
+                    return Ok(EngineThread {
+                        runtime_thread_id: engine_thread_id.clone(),
+                        external_engine_thread_id: Some(engine_thread_id),
+                    });
                 }
                 Err(error) => {
                     if matches!(&self.transport_target, CodexTransportTarget::WebSocket(_)) {
@@ -799,7 +807,14 @@ impl Engine for CodexEngine {
         );
         self.store_thread_runtime(&engine_thread_id, runtime).await;
 
+        /*
+        // 旧单字段返回值保留迁移留痕，现返回内部运行键和外部原生 ID。
         Ok(EngineThread { engine_thread_id })
+        */
+        Ok(EngineThread {
+            runtime_thread_id: engine_thread_id.clone(),
+            external_engine_thread_id: Some(engine_thread_id),
+        })
     }
 
     async fn send_message(

@@ -434,9 +434,13 @@ impl ClaudeRemoteEngine {
         });
         if let Some(session_id) = thread_config.agent_session_id.as_ref() {
             params["resume"] = serde_json::Value::String(session_id.clone());
-        } else {
+        }
+        /*
+        // 旧逻辑把内部运行键伪装成 Claude sessionId，保留迁移留痕但不再执行。
+        if thread_config.agent_session_id.is_none() {
             params["sessionId"] = serde_json::Value::String(engine_thread_id.to_string());
         }
+        */
         Ok(ClaudePersistentTurn { params, events })
     }
 
@@ -993,6 +997,7 @@ impl Engine for ClaudeRemoteEngine {
     async fn start_thread(
         &self,
         scope: ThreadScope,
+        runtime_thread_id: &str,
         resume_engine_thread_id: Option<&str>,
         model: &str,
         sandbox: SandboxPolicy,
@@ -1003,7 +1008,7 @@ impl Engine for ClaudeRemoteEngine {
                 .lock()
                 .await
                 .threads
-                .get(resume_id)
+                .get(runtime_thread_id)
                 .and_then(|config| config.agent_session_id.clone());
             if cached.is_none() {
                 let cwd = match &scope {
@@ -1013,22 +1018,44 @@ impl Engine for ClaudeRemoteEngine {
             }
             cached.or_else(|| Some(resume_id.to_string()))
         } else {
-            None
+            self.state
+                .lock()
+                .await
+                .threads
+                .get(runtime_thread_id)
+                .and_then(|config| config.agent_session_id.clone())
         };
-        let engine_thread_id = existing_session
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
         self.state.lock().await.threads.insert(
-            engine_thread_id.clone(),
+            runtime_thread_id.to_string(),
             RemoteClaudeThreadConfig {
                 scope,
                 model_id: model.to_string(),
                 sandbox,
-                agent_session_id: existing_session,
+                agent_session_id: existing_session.clone(),
                 active_request_id: None,
             },
         );
-        Ok(EngineThread { engine_thread_id })
+        /*
+        // 旧单字段返回值保留迁移留痕，远端 Claude 运行键不再由 session ID 派生。
+        Ok(EngineThread { engine_thread_id: runtime_thread_id.to_string() })
+        */
+        Ok(EngineThread {
+            runtime_thread_id: runtime_thread_id.to_string(),
+            external_engine_thread_id: existing_session,
+        })
+    }
+
+    /// 从 SSH 远端 Claude 内存配置读取 sidecar 返回的真实 session ID。
+    async fn current_external_engine_thread_id(
+        &self,
+        runtime_thread_id: &str,
+    ) -> Result<Option<String>, anyhow::Error> {
+        let state = self.state.lock().await;
+        Ok(state
+            .threads
+            .get(runtime_thread_id)
+            .and_then(|config| config.agent_session_id.clone())
+            .filter(|session_id| !session_id.trim().is_empty()))
     }
 
     async fn send_message(
@@ -1099,9 +1126,13 @@ impl Engine for ClaudeRemoteEngine {
         });
         if let Some(session_id) = thread_config.agent_session_id.as_ref() {
             params["resume"] = serde_json::Value::String(session_id.clone());
-        } else {
+        }
+        /*
+        // 旧逻辑把内部运行键伪装成 Claude sessionId，保留迁移留痕但不再执行。
+        if thread_config.agent_session_id.is_none() {
             params["sessionId"] = serde_json::Value::String(engine_thread_id.to_string());
         }
+        */
         let mut events = transport.subscribe();
         transport
             .send_command(&serde_json::json!({
@@ -1321,12 +1352,19 @@ impl Engine for ClaudeRemoteEngine {
 
     async fn interrupt(&self, engine_thread_id: &str) -> Result<(), anyhow::Error> {
         let transport = self.ensure_transport().await?;
-        let request_id = self
-            .state
-            .lock()
-            .await
-            .threads
-            .get(engine_thread_id)
+        let state = self.state.lock().await;
+        let runtime_thread_id = if state.threads.contains_key(engine_thread_id) {
+            Some(engine_thread_id.to_string())
+        } else {
+            state
+                .threads
+                .iter()
+                .find(|(_, config)| config.agent_session_id.as_deref() == Some(engine_thread_id))
+                .map(|(runtime_thread_id, _)| runtime_thread_id.clone())
+        };
+        let request_id = runtime_thread_id
+            .as_deref()
+            .and_then(|runtime_thread_id| state.threads.get(runtime_thread_id))
             .and_then(|config| config.active_request_id.clone());
         let Some(request_id) = request_id else {
             return Ok(());
@@ -1340,7 +1378,19 @@ impl Engine for ClaudeRemoteEngine {
     }
 
     async fn archive_thread(&self, engine_thread_id: &str) -> Result<(), anyhow::Error> {
-        self.state.lock().await.threads.remove(engine_thread_id);
+        let mut state = self.state.lock().await;
+        let runtime_thread_id = if state.threads.contains_key(engine_thread_id) {
+            Some(engine_thread_id.to_string())
+        } else {
+            state
+                .threads
+                .iter()
+                .find(|(_, config)| config.agent_session_id.as_deref() == Some(engine_thread_id))
+                .map(|(runtime_thread_id, _)| runtime_thread_id.clone())
+        };
+        if let Some(runtime_thread_id) = runtime_thread_id {
+            state.threads.remove(&runtime_thread_id);
+        }
         Ok(())
     }
 

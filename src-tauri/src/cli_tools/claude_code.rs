@@ -2094,6 +2094,7 @@ impl CliTool for ClaudeCodeCli {
                 return Engine::start_thread(
                     engine.as_ref(),
                     scope,
+                    &thread.id,
                     resume_engine_thread_id,
                     model,
                     sandbox,
@@ -2107,6 +2108,7 @@ impl CliTool for ClaudeCodeCli {
             return Engine::start_thread(
                 service_use.engine().as_ref(),
                 scope,
+                &thread.id,
                 resume_engine_thread_id,
                 model,
                 sandbox,
@@ -2120,11 +2122,46 @@ impl CliTool for ClaudeCodeCli {
         Engine::start_thread(
             engine.as_ref(),
             scope,
+            &thread.id,
             thread.engine_thread_id.as_deref(),
             model,
             sandbox,
         )
         .await
+    }
+
+    /// 从本机或 SSH Claude 引擎读取当前运行键对应的真实外部 session ID。
+    async fn current_external_engine_thread_id(
+        &self,
+        context: &CliExecutionContext,
+        thread: &ThreadDto,
+        runtime_thread_id: &str,
+    ) -> Result<Option<String>> {
+        let workspace = self.load_workspace(context).await?;
+        if context.location_kind == CliLocationKind::Ssh {
+            if self.uses_reuse_session(context) && self.session_handles.contains(&thread.id).await {
+                match self.session_handles.session_runtime(&thread.id).await {
+                    Ok((engine, _)) => {
+                        return Engine::current_external_engine_thread_id(
+                            engine.as_ref(),
+                            runtime_thread_id,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "SSH Claude 复用句柄读取真实 session 失败，回退远端运行时服务: thread_id={} error={error:#}",
+                            thread.id
+                        );
+                    }
+                }
+            }
+            let engine = remote_project_claude_runtime_service::runtime(&workspace).await?;
+            return Engine::current_external_engine_thread_id(engine.as_ref(), runtime_thread_id)
+                .await;
+        }
+        let engine = self.local_engine().await?;
+        Engine::current_external_engine_thread_id(engine.as_ref(), runtime_thread_id).await
     }
 
     async fn send_message(
@@ -2333,7 +2370,7 @@ impl CliTool for ClaudeCodeCli {
         &self,
         context: &CliExecutionContext,
         thread: &ThreadDto,
-        _engine_thread_id: &str,
+        engine_thread_id: &str,
     ) -> Result<()> {
         let workspace = self.load_workspace(context).await?;
         if context.location_kind == CliLocationKind::Ssh {
@@ -2343,17 +2380,25 @@ impl CliTool for ClaudeCodeCli {
                 }
                 Ok(())
             } else {
-                let Some(engine_thread_id) = thread.engine_thread_id.as_deref() else {
-                    return Ok(());
+                let runtime_thread_id = if engine_thread_id == "default"
+                    && thread.engine_thread_id.is_none()
+                {
+                    thread.id.as_str()
+                } else {
+                    engine_thread_id
                 };
                 let engine = remote_project_claude_runtime_service::runtime(&workspace).await?;
-                Engine::interrupt(engine.as_ref(), engine_thread_id)
+                Engine::interrupt(engine.as_ref(), runtime_thread_id)
                     .await
                     .with_context(|| format!("SSH 远端 Claude 取消失败: thread_id={}", thread.id))
             }
         } else {
-            let engine_thread_id = thread.engine_thread_id.as_deref().unwrap_or("default");
-            Engine::interrupt(self.local_engine().await?.as_ref(), engine_thread_id).await
+            let runtime_thread_id = if engine_thread_id == "default" && thread.engine_thread_id.is_none() {
+                thread.id.as_str()
+            } else {
+                engine_thread_id
+            };
+            Engine::interrupt(self.local_engine().await?.as_ref(), runtime_thread_id).await
         }
     }
 

@@ -443,6 +443,7 @@ pub trait CliTool: Send + Sync {
     }
 
     /// 用户新建会话或继续已有会话时，在当前 CLI 和当前项目中建立正式会话；恢复失败时不得创建替代会话。
+    /// 用户新建会话或继续已有会话时，在当前 CLI 和当前项目中建立正式会话；恢复失败时不得创建替代会话。
     async fn start_thread(
         &self,
         context: &CliExecutionContext,
@@ -452,6 +453,16 @@ pub trait CliTool: Send + Sync {
         model: &str,
         sandbox: SandboxPolicy,
     ) -> Result<EngineThread>;
+
+    /// 读取当前 CLI 运行键对应的引擎原生外部会话标识，供上层收口持久化。
+    async fn current_external_engine_thread_id(
+        &self,
+        _context: &CliExecutionContext,
+        _thread: &ThreadDto,
+        _runtime_thread_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
 
     /// 用户发送消息后，让当前 CLI 会话处理文字、附件和输入项，并把回答过程持续显示在当前消息区。
     async fn send_message(

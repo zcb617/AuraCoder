@@ -693,7 +693,7 @@ function emitClaudeBackgroundNotice(id, subtype, task = null, tasks = null, cont
 /**
  * 将一个 AuraCoder 用户输入写入 Claude SDK 的可持续输入流，供初始轮次和后续轮次复用。
  */
-async function pushClaudePromptInput(messageInput, input, sessionId) {
+async function pushClaudePromptInput(messageInput, input, sessionId, manualStop = 0) {
   if (typeof input === "string") {
     messageInput.push({
       type: "user",
@@ -703,12 +703,15 @@ async function pushClaudePromptInput(messageInput, input, sessionId) {
       },
       parent_tool_use_id: null,
       session_id: sessionId || "",
+      ...(manualStop === 1 ? { priority: "now", shouldQuery: true } : {}),
     });
     return;
   }
 
   for await (const message of input) {
-    messageInput.push(message);
+    messageInput.push(manualStop === 1
+      ? { ...message, priority: "now", shouldQuery: true }
+      : message);
   }
 }
 
@@ -2667,6 +2670,7 @@ async function handleQuery(req, persistentSession = null) {
     settingSources,
     strictMcpConfig,
     enforceApprovalRouting,
+    manualStop = 0,
   } = params;
 
   const resolvedApprovalPolicy = approvalPolicy ?? (sandboxMode === "read-only" ? "restricted" : null);
@@ -3024,6 +3028,7 @@ async function handleQuery(req, persistentSession = null) {
         messageInput,
         initialInput,
         sessionId || resume || "",
+        manualStop,
       );
       promptInput = messageInput;
     }

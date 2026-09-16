@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::engines::claude_sidecar::MANUAL_STOP;
 use crate::{
     cli_tools::{
         factory::CliToolFactory, CliExecutionContext, CliLocationKind, CliRuntimePermissions,
@@ -1548,7 +1549,7 @@ impl<'a> ChatMessageService<'a> {
     };
 
     // SSH 远端 CLI 的持续占用已在模型读取前取得，避免模型查询结束时关闭服务。
-    let engine_thread_id = if let (Some(codex), Some(context)) =
+    let engine_thread = if let (Some(codex), Some(context)) =
         (codex_cli.as_ref(), codex_context.as_ref())
     {
         let cli: &dyn CliTool = codex.as_ref();
@@ -1561,7 +1562,6 @@ impl<'a> ChatMessageService<'a> {
             sandbox,
         )
         .await
-        .map(|engine_thread| engine_thread.engine_thread_id)
         .map_err(err_to_string)?
     } else if let (Some(opencode), Some(context)) =
         (opencode_cli.as_ref(), opencode_context.as_ref())
@@ -1576,7 +1576,6 @@ impl<'a> ChatMessageService<'a> {
             sandbox,
         )
         .await
-        .map(|engine_thread| engine_thread.engine_thread_id)
         .map_err(err_to_string)?
     } else if let (Some(claude), Some(context)) = (claude_cli.as_ref(), claude_context.as_ref()) {
         let cli: &dyn CliTool = claude.as_ref();
@@ -1589,7 +1588,6 @@ impl<'a> ChatMessageService<'a> {
             sandbox,
         )
         .await
-        .map(|engine_thread| engine_thread.engine_thread_id)
         .map_err(err_to_string)?
     } else {
         state
@@ -1598,19 +1596,32 @@ impl<'a> ChatMessageService<'a> {
             .await
             .map_err(err_to_string)?
     };
+    let runtime_thread_id = engine_thread.runtime_thread_id.clone();
 
-    if thread.engine_thread_id.as_deref() != Some(&engine_thread_id) {
-        run_db(db.clone(), {
-            let thread_id = thread.id.clone();
-            let engine_thread_id = engine_thread_id.clone();
-            move |db| db::threads::set_engine_thread_id(db, &thread_id, &engine_thread_id)
-        })
-        .await?;
-        thread.engine_thread_id = Some(engine_thread_id.clone());
+    if let Some(external_engine_thread_id) = engine_thread
+        .external_engine_thread_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        if thread.engine_thread_id.as_deref() != Some(external_engine_thread_id) {
+            run_db(db.clone(), {
+                let thread_id = thread.id.clone();
+                let external_engine_thread_id = external_engine_thread_id.to_string();
+                move |db| {
+                    db::threads::set_engine_thread_id(
+                        db,
+                        &thread_id,
+                        &external_engine_thread_id,
+                    )
+                }
+            })
+            .await?;
+            thread.engine_thread_id = Some(external_engine_thread_id.to_string());
+        }
     }
     state.auracoder_thread_mcp_service.bind_engine_thread(
         &thread.engine_id,
-        &engine_thread_id,
+        &runtime_thread_id,
         &thread.workspace_id,
     );
 
@@ -1751,7 +1762,7 @@ impl<'a> ChatMessageService<'a> {
             app_handle,
             state_cloned,
             thread_for_task,
-            engine_thread_id,
+            runtime_thread_id,
             assistant_message_id,
             initial_turn_model_id,
             turn_input_for_task,
@@ -2596,6 +2607,7 @@ pub async fn restart_remote_cli_service(
 
 pub(crate) async fn cancel_turn_inner(state: &AppState, thread_id: String) -> Result<(), String> {
     // 用户点击终止只登记取消请求，实际远端中断由 run_turn 的唯一收尾出口执行。
+    MANUAL_STOP.store(1, Ordering::SeqCst);
     state.turns.cancel(&thread_id).await;
 
     /*
@@ -3059,7 +3071,7 @@ async fn run_turn(
     app: tauri::AppHandle,
     state: AppState,
     thread: crate::models::ThreadDto,
-    engine_thread_id: String,
+    runtime_thread_id: String,
     assistant_message_id: String,
     initial_turn_model_id: String,
     turn_input: TurnInput,
@@ -3070,6 +3082,8 @@ async fn run_turn(
     remote_attachment_batch: Option<RemoteAttachmentBatch>,
     cancellation: CancellationToken,
 ) {
+    // 兼容本函数既有收尾分支，统一将传入值作为引擎内部运行键使用。
+    let engine_thread_id = runtime_thread_id;
     let max_output_chars = state.config.debug.max_action_output_chars;
     log::info!(
         "chat run_turn entered: thread_id={}, engine_id={}, engine_thread_id={}, assistant_message_id={}, client_turn_id={:?}, turn_input={turn_input:?}, codex_cli_present={}, opencode_cli_present={}, claude_cli_present={}",
@@ -3084,6 +3098,7 @@ async fn run_turn(
     );
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAPACITY);
 
+    let db = state.db.clone();
     let engines = state.engines.clone();
     let thread_for_engine = thread.clone();
     let input_for_engine = turn_input.clone();
@@ -4869,6 +4884,51 @@ async fn run_turn(
                 emit_safe_turn_notice!();
             }
         }
+        }
+    }
+
+    // 引擎任务已完成并清理后读取真实外部 ID，覆盖 SessionInit/TurnCompleted 的消费竞态。
+    let external_engine_thread_id_result = if let Some((cli, context)) = cli_turn.as_ref() {
+        cli.current_external_engine_thread_id(context, &thread, &engine_thread_id)
+            .await
+    } else {
+        engines
+            .current_external_engine_thread_id(&thread, &engine_thread_id)
+            .await
+    };
+    match external_engine_thread_id_result {
+        Ok(Some(external_engine_thread_id)) if !external_engine_thread_id.trim().is_empty() => {
+            if thread.engine_thread_id.as_deref() != Some(external_engine_thread_id.as_str()) {
+                let thread_id = thread.id.clone();
+                // 为数据库异步闭包复制真实外部 ID，保留原值用于失败日志输出。
+                let external_engine_thread_id_for_db = external_engine_thread_id.clone();
+                if let Err(error) = run_db(db.clone(), move |db| {
+                    db::threads::set_engine_thread_id(
+                        db,
+                        &thread_id,
+                        &external_engine_thread_id_for_db,
+                    )
+                })
+                .await
+                {
+                    log::error!(
+                        "持久化 Claude 真实外部 session ID 失败: engine_id={}, thread_id={}, runtime_thread_id={}, external_engine_thread_id={}, raw_error={error:#}",
+                        thread.engine_id,
+                        thread.id,
+                        engine_thread_id,
+                        external_engine_thread_id,
+                    );
+                }
+            }
+        }
+        Ok(Some(_)) | Ok(None) => {}
+        Err(error) => {
+            log::error!(
+                "读取引擎真实外部 session ID 失败: engine_id={}, thread_id={}, runtime_thread_id={}, raw_error={error:#}",
+                thread.engine_id,
+                thread.id,
+                engine_thread_id,
+            );
         }
     }
 

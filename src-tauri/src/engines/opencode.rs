@@ -821,6 +821,7 @@ impl Engine for OpenCodeEngine {
     async fn start_thread(
         &self,
         scope: ThreadScope,
+        _runtime_thread_id: &str,
         resume_engine_thread_id: Option<&str>,
         model: &str,
         sandbox: SandboxPolicy,
@@ -844,8 +845,15 @@ impl Engine for OpenCodeEngine {
                         existing.reasoning_effort = reasoning_effort.clone();
                         existing.agent = agent.clone();
                     }
+                    /*
+                    // 旧单字段返回值保留迁移留痕，现返回内部运行键和外部原生 ID。
                     return Ok(EngineThread {
                         engine_thread_id: existing_id.to_string(),
+                    });
+                    */
+                    return Ok(EngineThread {
+                        runtime_thread_id: existing_id.to_string(),
+                        external_engine_thread_id: Some(existing_id.to_string()),
                     });
                 }
 
@@ -871,7 +879,14 @@ impl Engine for OpenCodeEngine {
                             connection: existing.connection,
                         },
                     );
+                    /*
+                    // 旧单字段返回值保留迁移留痕，现返回内部运行键和外部原生 ID。
                     return Ok(EngineThread { engine_thread_id });
+                    */
+                    return Ok(EngineThread {
+                        runtime_thread_id: engine_thread_id.clone(),
+                        external_engine_thread_id: Some(engine_thread_id),
+                    });
                 }
 
                 if self.is_remote_target() {
@@ -943,7 +958,14 @@ impl Engine for OpenCodeEngine {
             );
         }
 
+        /*
+        // 旧单字段返回值保留迁移留痕，现返回内部运行键和外部原生 ID。
         Ok(EngineThread { engine_thread_id })
+        */
+        Ok(EngineThread {
+            runtime_thread_id: engine_thread_id.clone(),
+            external_engine_thread_id: Some(engine_thread_id),
+        })
     }
 
     async fn send_message(

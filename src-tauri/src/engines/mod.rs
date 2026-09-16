@@ -335,7 +335,14 @@ pub(crate) fn map_engine_capabilities(capabilities: EngineCapabilities) -> Engin
 
 #[derive(Debug, Clone)]
 pub struct EngineThread {
+    /// 引擎内部路由、线程映射和 MCP 上下文使用的运行键。
+    pub runtime_thread_id: String,
+    /// 引擎原生返回的外部会话标识；尚未由引擎返回时保持为空。
+    pub external_engine_thread_id: Option<String>,
+    /*
+    // 旧字段保留迁移留痕，运行键与外部引擎 ID 已拆分为两个字段。
     pub engine_thread_id: String,
+    */
 }
 
 #[derive(Debug, Clone)]
@@ -443,13 +450,23 @@ pub trait Engine: Send + Sync {
 
     async fn is_available(&self) -> bool;
 
+    /// 创建或恢复引擎线程，并返回内部运行键与引擎原生外部会话标识。
     async fn start_thread(
         &self,
         scope: ThreadScope,
+        runtime_thread_id: &str,
         resume_engine_thread_id: Option<&str>,
         model: &str,
         sandbox: SandboxPolicy,
     ) -> Result<EngineThread, anyhow::Error>;
+
+    /// 读取当前运行键对应的引擎原生外部会话标识，未观测到时返回空值。
+    async fn current_external_engine_thread_id(
+        &self,
+        _runtime_thread_id: &str,
+    ) -> Result<Option<String>, anyhow::Error> {
+        Ok(None)
+    }
 
     async fn send_message(
         &self,
@@ -831,36 +848,37 @@ impl EngineManager {
             .await
     }
 
+    /// 为业务线程建立当前引擎线程，并完整返回内部运行键和外部原生 ID。
     pub async fn ensure_engine_thread(
         &self,
         thread: &ThreadDto,
         model_id: Option<&str>,
         scope: ThreadScope,
         sandbox: SandboxPolicy,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<EngineThread> {
         let resume_id = thread.engine_thread_id.as_deref();
         let effective_model_id = model_id.unwrap_or(thread.model_id.as_str());
 
         let result = match thread.engine_id.as_str() {
             "codex" => self
                 .codex
-                .start_thread(scope, resume_id, effective_model_id, sandbox)
+                .start_thread(scope, &thread.id, resume_id, effective_model_id, sandbox)
                 .await
                 .context("failed to start codex thread")?,
             "claude" => self
                 .claude
-                .start_thread(scope, resume_id, effective_model_id, sandbox)
+                .start_thread(scope, &thread.id, resume_id, effective_model_id, sandbox)
                 .await
                 .context("failed to start claude thread")?,
             "opencode" => self
                 .opencode
-                .start_thread(scope, resume_id, effective_model_id, sandbox)
+                .start_thread(scope, &thread.id, resume_id, effective_model_id, sandbox)
                 .await
                 .context("failed to start opencode thread")?,
             _ => anyhow::bail!("unsupported engine_id {}", thread.engine_id),
         };
 
-        Ok(result.engine_thread_id)
+        Ok(result)
     }
 
     pub async fn send_message(
@@ -887,6 +905,20 @@ impl EngineManager {
                 .send_message(engine_thread_id, input, event_tx, cancellation)
                 .await
                 .context("opencode send_message failed"),
+            _ => anyhow::bail!("unsupported engine_id {}", thread.engine_id),
+        }
+    }
+
+    /// 读取当前业务线程对应引擎的真实外部会话 ID，供消息收尾统一持久化。
+    pub async fn current_external_engine_thread_id(
+        &self,
+        thread: &ThreadDto,
+        runtime_thread_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        match thread.engine_id.as_str() {
+            "codex" => self.codex.current_external_engine_thread_id(runtime_thread_id).await,
+            "claude" => self.claude.current_external_engine_thread_id(runtime_thread_id).await,
+            "opencode" => self.opencode.current_external_engine_thread_id(runtime_thread_id).await,
             _ => anyhow::bail!("unsupported engine_id {}", thread.engine_id),
         }
     }
@@ -947,7 +979,10 @@ impl EngineManager {
     }
 
     pub async fn interrupt(&self, thread: &ThreadDto) -> anyhow::Result<()> {
-        let engine_thread_id = thread.engine_thread_id.as_deref().unwrap_or("default");
+        let engine_thread_id = thread
+            .engine_thread_id
+            .as_deref()
+            .unwrap_or(thread.id.as_str());
         match thread.engine_id.as_str() {
             "codex" => self.codex.interrupt(engine_thread_id).await,
             "claude" => self.claude.interrupt(engine_thread_id).await,
@@ -957,9 +992,10 @@ impl EngineManager {
     }
 
     pub async fn archive_thread(&self, thread: &ThreadDto) -> anyhow::Result<()> {
-        let Some(engine_thread_id) = thread.engine_thread_id.as_deref() else {
-            return Ok(());
-        };
+        let engine_thread_id = thread
+            .engine_thread_id
+            .as_deref()
+            .unwrap_or(thread.id.as_str());
 
         match thread.engine_id.as_str() {
             "codex" => self.codex.archive_thread(engine_thread_id).await,
@@ -970,9 +1006,10 @@ impl EngineManager {
     }
 
     pub async fn unarchive_thread(&self, thread: &ThreadDto) -> anyhow::Result<()> {
-        let Some(engine_thread_id) = thread.engine_thread_id.as_deref() else {
-            return Ok(());
-        };
+        let engine_thread_id = thread
+            .engine_thread_id
+            .as_deref()
+            .unwrap_or(thread.id.as_str());
 
         match thread.engine_id.as_str() {
             "codex" => self.codex.unarchive_thread(engine_thread_id).await,

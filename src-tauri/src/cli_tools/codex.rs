@@ -1398,6 +1398,7 @@ impl CliTool for CodexCli {
             return Engine::start_thread(
                 engine.as_ref(),
                 scope,
+                &thread.id,
                 resume_engine_thread_id,
                 model,
                 sandbox,
@@ -1409,6 +1410,7 @@ impl CliTool for CodexCli {
         Engine::start_thread(
             engine.as_ref(),
             scope,
+            &thread.id,
             thread.engine_thread_id.as_deref(),
             model,
             sandbox,

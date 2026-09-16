@@ -5,7 +5,7 @@ use std::{
     // ffi::OsString,
     fs::{self, File},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{atomic::{AtomicU8, Ordering}, Arc, Mutex as StdMutex},
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -33,6 +33,8 @@ use super::{
     ModelInfo, OutputStream, ReasoningEffortOption, SandboxPolicy, ThreadScope,
     TurnCompletionStatus, TurnInput, TurnInputItem,
 };
+
+pub(crate) static MANUAL_STOP: AtomicU8 = AtomicU8::new(0);
 
 const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const NODE_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2364,43 +2366,52 @@ impl Engine for ClaudeSidecarEngine {
     async fn start_thread(
         &self,
         scope: ThreadScope,
+        runtime_thread_id: &str,
         resume_engine_thread_id: Option<&str>,
         model: &str,
         sandbox: SandboxPolicy,
     ) -> Result<EngineThread, anyhow::Error> {
-        let (engine_thread_id, existing_session) = {
+        let existing_session = {
             let state = self.state.lock().await;
-            let session_id = resume_engine_thread_id.and_then(|id| {
-                state
-                    .threads
-                    .get(id)
-                    .and_then(|config| config.agent_session_id.clone())
-                    .or_else(|| {
-                        if Uuid::parse_str(id).is_ok() {
-                            Some(id.to_string())
-                        } else {
-                            None
-                        }
-                    })
-            });
-            let engine_thread_id = session_id
-                .clone()
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
-            (engine_thread_id, session_id)
+            state
+                .threads
+                .get(runtime_thread_id)
+                .and_then(|config| config.agent_session_id.clone())
+                .or_else(|| resume_engine_thread_id.map(ToOwned::to_owned))
         };
 
         let config = ThreadConfig {
             scope,
             model_id: model.to_string(),
             sandbox,
-            agent_session_id: existing_session,
+            agent_session_id: existing_session.clone(),
             active_request_id: None,
         };
 
         let mut state = self.state.lock().await;
-        state.threads.insert(engine_thread_id.clone(), config);
+        state.threads.insert(runtime_thread_id.to_string(), config);
 
-        Ok(EngineThread { engine_thread_id })
+        /*
+        // 旧单字段返回值保留迁移留痕，Claude 运行键不再由外部 session ID 派生。
+        Ok(EngineThread { engine_thread_id: runtime_thread_id.to_string() })
+        */
+        Ok(EngineThread {
+            runtime_thread_id: runtime_thread_id.to_string(),
+            external_engine_thread_id: existing_session,
+        })
+    }
+
+    /// 从 Claude 内存线程配置读取 sidecar 返回的真实 session ID，未返回时保持为空。
+    async fn current_external_engine_thread_id(
+        &self,
+        runtime_thread_id: &str,
+    ) -> Result<Option<String>, anyhow::Error> {
+        let state = self.state.lock().await;
+        Ok(state
+            .threads
+            .get(runtime_thread_id)
+            .and_then(|config| config.agent_session_id.clone())
+            .filter(|session_id| !session_id.trim().is_empty()))
     }
 
     async fn send_message(
@@ -2488,6 +2499,7 @@ impl Engine for ClaudeSidecarEngine {
             input_items,
         } = input;
         let prompt = build_claude_prompt(&message, &input_items);
+        let manual_stop = MANUAL_STOP.load(Ordering::SeqCst);
 
         let mut params = serde_json::json!({
             "prompt": prompt,
@@ -2515,6 +2527,7 @@ impl Engine for ClaudeSidecarEngine {
             "sandboxMode": thread_config.sandbox.sandbox_mode.clone(),
             "reasoningEffort": thread_config.sandbox.reasoning_effort.clone(),
             "planMode": plan_mode,
+            "manualStop": manual_stop,
             "threadId": engine_thread_id,
             // 旧实现保留迁移留痕：统一 Gateway 接替进程内工具规格。
             // "computerControlTools": computer_control_tools,
@@ -2528,9 +2541,13 @@ impl Engine for ClaudeSidecarEngine {
 
         if let Some(ref session_id) = thread_config.agent_session_id {
             params["resume"] = serde_json::Value::String(session_id.clone());
-        } else {
+        }
+        /*
+        // 旧逻辑把内部运行键伪装成 Claude sessionId，保留迁移留痕但不再执行。
+        if thread_config.agent_session_id.is_none() {
             params["sessionId"] = serde_json::Value::String(engine_thread_id.to_string());
         }
+        */
 
         let command = serde_json::json!({
             "id": request_id,
@@ -2545,6 +2562,9 @@ impl Engine for ClaudeSidecarEngine {
 
         let mut incoming_rx = spawn_claude_incoming_pump(Arc::clone(&transport));
         transport.send_command(&command).await?;
+        if manual_stop == 1 {
+            MANUAL_STOP.store(0, Ordering::SeqCst);
+        }
 
         let engine_thread_id_owned = engine_thread_id.to_string();
         let state_ref = Arc::clone(&self.state);
@@ -3222,9 +3242,18 @@ impl Engine for ClaudeSidecarEngine {
         let Some(ref transport) = state.transport else {
             return Ok(());
         };
-        let request_id = state
-            .threads
-            .get(engine_thread_id)
+        let runtime_thread_id = if state.threads.contains_key(engine_thread_id) {
+            Some(engine_thread_id.to_string())
+        } else {
+            state
+                .threads
+                .iter()
+                .find(|(_, config)| config.agent_session_id.as_deref() == Some(engine_thread_id))
+                .map(|(runtime_thread_id, _)| runtime_thread_id.clone())
+        };
+        let request_id = runtime_thread_id
+            .as_deref()
+            .and_then(|runtime_thread_id| state.threads.get(runtime_thread_id))
             .and_then(|config| config.active_request_id.clone());
         if let Some(request_id) = request_id {
             let cancel_cmd = serde_json::json!({
@@ -3238,7 +3267,18 @@ impl Engine for ClaudeSidecarEngine {
 
     async fn archive_thread(&self, engine_thread_id: &str) -> Result<(), anyhow::Error> {
         let mut state = self.state.lock().await;
-        state.threads.remove(engine_thread_id);
+        let runtime_thread_id = if state.threads.contains_key(engine_thread_id) {
+            Some(engine_thread_id.to_string())
+        } else {
+            state
+                .threads
+                .iter()
+                .find(|(_, config)| config.agent_session_id.as_deref() == Some(engine_thread_id))
+                .map(|(runtime_thread_id, _)| runtime_thread_id.clone())
+        };
+        if let Some(runtime_thread_id) = runtime_thread_id {
+            state.threads.remove(&runtime_thread_id);
+        }
         Ok(())
     }
 
