@@ -881,7 +881,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const threadExecutionPolicyRequestsRef = useRef<Record<string, Promise<boolean> | undefined>>({});
   // 保存每个线程正在执行的五项运行选择局部更新，保证同一线程按顺序落库。
   const threadRuntimeSelectionRequestsRef = useRef<Record<string, Promise<boolean> | undefined>>({});
-  const [viewportScrollTop, setViewportScrollTop] = useState(0);
+  const viewportScrollTopRef = useRef(0);
   const [textAnnotationPopover, setTextAnnotationPopover] =
     useState<TextAnnotationPopover | null>(null);
   const [textAnnotationComment, setTextAnnotationComment] = useState("");
@@ -2307,10 +2307,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
     let rafId = 0;
     const updateScroll = () => {
-      setViewportScrollTop(viewport.scrollTop);
+      viewportScrollTopRef.current = viewport.scrollTop;
       const nearBottom =
         viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 120;
-      setAutoScrollLocked(!nearBottom);
+      const nextAutoScrollLocked = !nearBottom;
+      setAutoScrollLocked((prev) =>
+        prev === nextAutoScrollLocked ? prev : nextAutoScrollLocked,
+      );
     };
     updateScroll();
 
@@ -3067,7 +3070,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     if (performance.now() - threadActivatedAtRef.current < 700) {
       return;
     }
-    if (viewportScrollTop > 80 || prependLoadInFlightRef.current) {
+    if (viewportScrollTopRef.current > 80 || prependLoadInFlightRef.current) {
       return;
     }
 
@@ -3095,7 +3098,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     loadOlderMessages,
     loadingOlderMessages,
     threadId,
-    viewportScrollTop,
   ]);
 
   useEffect(() => {
@@ -5435,6 +5437,20 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
             {/* ── Input Area ── */}
             <div className="chat-composer-surface">
+            {/* 跳至最新：钉在输入框上沿（bottom:100%），移出滚动容器避免干扰 overlay 滚动条 */}
+            {autoScrollLocked && messages.length > 0 && (
+              <button
+                type="button"
+                className={`chat-jump-pill${streaming ? " chat-jump-pill--activity" : ""}`}
+                onClick={() => {
+                  setAutoScrollLocked(false);
+                  scrollViewportToBottom("smooth");
+                }}
+              >
+                {streaming && <span className="chat-jump-pill-dot" />}
+                {streaming ? t("panel.newActivity") : t("panel.jumpToLatest")}
+              </button>
+            )}
         <form
           onSubmit={onSubmit}
           style={{

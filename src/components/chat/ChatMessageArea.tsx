@@ -386,20 +386,6 @@ export function ChatMessageArea({
             </div>
           </div>
         )}
-
-        {autoScrollLocked && messages.length > 0 && (
-          <button
-            type="button"
-            className={`chat-jump-pill${streaming ? " chat-jump-pill--activity" : ""}`}
-            onClick={() => {
-              setAutoScrollLocked(false);
-              scrollViewportToBottom("smooth");
-            }}
-          >
-            {streaming && <span className="chat-jump-pill-dot" />}
-            {streaming ? t("panel.newActivity") : t("panel.jumpToLatest")}
-          </button>
-        )}
             </div>
 
             {textAnnotationPopover && (

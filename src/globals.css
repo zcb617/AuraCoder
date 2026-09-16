@@ -939,6 +939,8 @@ button, input, textarea, select {
 /* ── Ambient Background (disabled for pitch black) ── */
 
 /* ── Scrollbar ── */
+/* 自定义滚动条样式已停用：恢复 WebKitGTK 原生滚动条行为，排查聊天区滚动条显示异常 */
+/*
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -959,6 +961,7 @@ button, input, textarea, select {
 ::-webkit-scrollbar-corner {
   background: transparent;
 }
+*/
 
 /* ── Glassmorphism ── */
 .glass {
@@ -6040,6 +6043,7 @@ button.linux-window-update-control:hover {
 }
 
 .chat-composer-surface {
+  position: relative;
   padding: 8px 14px 10px;
   border-top: 1px solid var(--divider);
   background: var(--content-bg);
@@ -9436,10 +9440,11 @@ button.linux-window-update-control:hover {
 /* ── Jump-to-latest pill ── */
 
 .chat-jump-pill {
-  position: sticky;
-  left: 100%;
-  bottom: 10px;
-  margin-left: auto;
+  /* 移出滚动容器，相对 .chat-composer-surface（position:relative）absolute 定位，
+     bottom:100% 钉在输入框上沿（原 sticky 视觉位置）；不参与滚动流，避免干扰 overlay 滚动条 */
+  position: absolute;
+  right: 24px;
+  bottom: calc(100% + 10px);
   display: inline-flex;
   align-items: center;
   gap: 6px;
