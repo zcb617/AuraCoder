@@ -253,6 +253,7 @@ export function SettingsPage() {
 
   const [query, setQuery] = useState("");
   const [terminalAcceleratedRendering, setTerminalAcceleratedRendering] = useState(true);
+  const [gpuAccelerationEnabled, setGpuAccelerationEnabled] = useState(false);
   const [terminalFontSize, setTerminalFontSize] = useState(DEFAULT_TERMINAL_FONT_SIZE);
   const [updatingTerminalPreference, setUpdatingTerminalPreference] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
@@ -280,6 +281,10 @@ export function SettingsPage() {
 
   useEffect(() => {
     void getVersion().then(setAppVersion).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    void ipc.getGpuAccelerationEnabled().then(setGpuAccelerationEnabled);
   }, []);
 
   useEffect(() => {
@@ -582,6 +587,12 @@ export function SettingsPage() {
       toast.error(t("app:sidebar.languageFailed"));
     }
   }
+
+  /** 保存外观分区中用户选择的 GPU 加速开关状态。 */
+  const handleGpuAccelerationChange = (enabled: boolean) => {
+    setGpuAccelerationEnabled(enabled);
+    void ipc.setGpuAccelerationEnabled(enabled);
+  };
 
   async function changeTheme(theme: ThemePreference) {
     if (theme === themePreference) return;
@@ -1025,6 +1036,17 @@ export function SettingsPage() {
                     }))}
                     onChange={(value) => void changeLocale(value as AppLocale)}
                     triggerStyle={{ minWidth: 154, height: 32 }}
+                  />
+                </SettingsRow>
+                <SettingsRow
+                  icon={<Zap size={17} />}
+                  title={t("app:settingsPage.appearance.gpuAcceleration")}
+                  description={t("app:settingsPage.appearance.gpuAccelerationDescription")}
+                >
+                  <Toggle
+                    checked={gpuAccelerationEnabled}
+                    label={t("app:settingsPage.appearance.gpuAcceleration")}
+                    onChange={handleGpuAccelerationChange}
                   />
                 </SettingsRow>
               </div>

@@ -103,7 +103,7 @@ fn plan_has_work(plan: &WebkitWorkaroundPlan) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-pub fn apply_webkit_display_workarounds() {
+pub fn apply_webkit_display_workarounds(gpu_acceleration_enabled: bool) {
     use std::{env, os::unix::process::CommandExt, path::Path, process::Command};
 
     fn find_system_wayland_client_path() -> Option<&'static str> {
@@ -153,7 +153,14 @@ pub fn apply_webkit_display_workarounds() {
         dmabuf_renderer_configured: env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some(),
         compositing_mode_configured: env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_some(),
     };
-    let plan = plan_webkit_workarounds(&env_snapshot, find_system_wayland_client_path());
+    let mut plan = plan_webkit_workarounds(&env_snapshot, find_system_wayland_client_path());
+    if gpu_acceleration_enabled {
+        plan.disable_dmabuf_renderer = false;
+        plan.disable_compositing_mode = false;
+    } else {
+        env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    }
 
     if plan.restore_original_ld_preload {
         restore_original_ld_preload();
@@ -233,7 +240,7 @@ pub fn apply_webkit_display_workarounds() {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn apply_webkit_display_workarounds() {}
+pub fn apply_webkit_display_workarounds(_gpu_acceleration_enabled: bool) {}
 
 #[cfg(test)]
 mod tests {

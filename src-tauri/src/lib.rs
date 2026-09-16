@@ -96,7 +96,18 @@ pub fn run() {
         eprintln!("AuraCoder 启动时初始化日志失败: {error:#}");
         return;
     }
-    linux_webkit::apply_webkit_display_workarounds();
+    let gpu_acceleration_enabled = AppConfig::load_or_create()
+        .map(|config| {
+            config.general.gpu_acceleration_enabled.unwrap_or_else(|| {
+                // 平台默认值：Linux 关闭，其他开启
+                !cfg!(target_os = "linux")
+            })
+        })
+        .unwrap_or_else(|error| {
+            log::warn!("failed to load GPU acceleration config, using platform default: {}", error);
+            !cfg!(target_os = "linux")
+        });
+    linux_webkit::apply_webkit_display_workarounds(gpu_acceleration_enabled);
     let tauri_context = tauri::generate_context!();
 
     let db = match Database::init() {
@@ -417,6 +428,8 @@ pub fn run() {
             commands::power::set_power_settings,
             commands::power::get_helper_status,
             commands::power::register_keep_awake_helper,
+            commands::general_settings::get_gpu_acceleration_enabled,
+            commands::general_settings::set_gpu_acceleration_enabled,
             commands::remote::get_remote_access_status,
             commands::remote::set_remote_access_enabled,
             commands::remote::regenerate_remote_access_identity,

@@ -11,7 +11,7 @@ pub struct Migration {
 pub const BASELINE_VERSION: u64 = 100;
 
 // 当前程序版本明确支持的数据库版本，不通过迁移清单最后一项推断。
-pub const SUPPORTED_DATABASE_VERSION: u64 = 109;
+pub const SUPPORTED_DATABASE_VERSION: u64 = 110;
 
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -75,6 +75,13 @@ pub const MIGRATIONS: &[Migration] = &[
         file: "109.sql",
         sql: include_str!("109.sql"),
         reason: "Codex thread context usage snapshot",
+        requires_foreign_keys_off: false,
+    },
+    Migration {
+        version: 110,
+        file: "110.sql",
+        sql: include_str!("110.sql"),
+        reason: "gpu-acceleration-config",
         requires_foreign_keys_off: false,
     },
 ];

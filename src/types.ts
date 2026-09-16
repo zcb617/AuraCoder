@@ -149,6 +149,12 @@ export interface PowerSettings {
   preventClosedDisplaySleep: boolean;
 }
 
+/** GPU 加速设置 */
+export interface GpuAccelerationSettings {
+  /** 是否启用 GPU 加速 */
+  enabled: boolean;
+}
+
 export interface PowerSettingsInput {
   keepAwakeEnabled: boolean;
   preventDisplaySleep: boolean;

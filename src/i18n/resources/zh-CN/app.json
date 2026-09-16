@@ -748,7 +748,9 @@
       "displayScale": "界面缩放",
       "displayScaleDescription": "按比例调整整个 AuraCoder 界面，并立即生效。",
       "displayScaleFailed": "界面缩放保存失败。",
-      "languageDescription": "用于导航、对话框和状态消息。"
+      "languageDescription": "用于导航、对话框和状态消息。",
+      "gpuAcceleration": "GPU 加速",
+      "gpuAccelerationDescription": "启用硬件加速以提高渲染性能。更改需要重启应用生效。"
     },
     "chat": {
       "composer": "消息输入",

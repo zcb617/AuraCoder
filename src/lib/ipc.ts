@@ -181,6 +181,11 @@ export const ipc = {
   getPowerSettings: () => invoke<PowerSettings>("get_power_settings"),
   setPowerSettings: (settings: PowerSettingsInput) =>
     invoke<KeepAwakeState>("set_power_settings", { settings }),
+  /** 读取后端持久化的 GPU 加速开关状态。 */
+  getGpuAccelerationEnabled: () => invoke<boolean>("get_gpu_acceleration_enabled"),
+  /** 保存用户选择的 GPU 加速开关状态。 */
+  setGpuAccelerationEnabled: (enabled: boolean) =>
+    invoke<void>("set_gpu_acceleration_enabled", { enabled }),
   getHelperStatus: () => invoke<HelperStatus>("get_helper_status"),
   registerKeepAwakeHelper: () => invoke<HelperStatus>("register_keep_awake_helper"),
   getTerminalAcceleratedRendering: () =>

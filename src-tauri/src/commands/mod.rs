@@ -17,3 +17,4 @@ pub mod terminal;
 pub mod threads;
 pub mod update;
 pub mod workspace;
+pub mod general_settings;

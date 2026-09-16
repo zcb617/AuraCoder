@@ -749,7 +749,9 @@
       "displayScale": "Display scale",
       "displayScaleDescription": "Scale the entire AuraCoder interface. Changes apply immediately.",
       "displayScaleFailed": "Failed to save the display scale.",
-      "languageDescription": "Used across navigation, dialogs, and status messages."
+      "languageDescription": "Used across navigation, dialogs, and status messages.",
+      "gpuAcceleration": "GPU Acceleration",
+      "gpuAccelerationDescription": "Enable hardware acceleration to improve rendering performance. Changes require restart to take effect."
     },
     "chat": {
       "composer": "Message composition",

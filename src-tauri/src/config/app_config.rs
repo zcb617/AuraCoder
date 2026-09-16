@@ -16,7 +16,7 @@ use crate::runtime_env;
 
 /// 配置字典中允许由 AppConfig 读写的固定键集合，未知键由数据库保留。
 #[cfg(test)]
-const CONFIG_KEYS: [&str; 34] = [
+const CONFIG_KEYS: [&str; 35] = [
     "general.theme",
     "general.default_engine",
     "general.default_model",
@@ -51,6 +51,7 @@ const CONFIG_KEYS: [&str; 34] = [
     "remote_access.devices",
     "remote_access.device_credential",
     "harnesses.launch_args",
+    "general.gpu_acceleration_enabled",
 ];
 
 /// 将配置字典中的单个 JSON 文本应用到目标字段，损坏值只影响当前字段。
@@ -125,6 +126,9 @@ pub struct GeneralConfig {
     /// opening. `None` keeps the operating system's default application.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_file_open_target: Option<String>,
+    /// GPU 加速开关；`None` 时使用平台默认值（Linux 关闭，其他开启）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_acceleration_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +301,7 @@ impl Default for GeneralConfig {
             notification_sound: None,
             default_autonomy_preset: None,
             default_file_open_target: None,
+            gpu_acceleration_enabled: None,
         }
     }
 }
@@ -703,6 +708,9 @@ fn load_config_dictionary(connection: &Connection) -> anyhow::Result<AppConfig> 
             "general.default_file_open_target" => {
                 apply_config_json!(&key, raw, config.general.default_file_open_target)
             }
+            "general.gpu_acceleration_enabled" => {
+                apply_config_json!(&key, raw, config.general.gpu_acceleration_enabled)
+            }
             "ui.sidebar_width" => apply_config_json!(&key, raw, config.ui.sidebar_width),
             "ui.git_panel_width" => apply_config_json!(&key, raw, config.ui.git_panel_width),
             "ui.font_size" => apply_config_json!(&key, raw, config.ui.font_size),
@@ -774,7 +782,7 @@ fn save_config_dictionary(connection: &mut Connection, config: &AppConfig) -> an
         "INSERT INTO config(config_key, config_value) VALUES (?1, ?2)\
          ON CONFLICT(config_key) DO UPDATE SET config_value = excluded.config_value",
     )?;
-    // 34 个固定字段统一使用 JSON 文本写入字典表，未知键不会被触碰。
+    // 35 个固定字段统一使用 JSON 文本写入字典表，未知键不会被触碰。
     macro_rules! upsert {
         ($key:expr, $value:expr $(,)?) => {{
             let serialized = serde_json::to_string($value)?;
@@ -814,6 +822,10 @@ fn save_config_dictionary(connection: &mut Connection, config: &AppConfig) -> an
     upsert!(
         "general.default_file_open_target",
         &config.general.default_file_open_target,
+    )?;
+    upsert!(
+        "general.gpu_acceleration_enabled",
+        &config.general.gpu_acceleration_enabled,
     )?;
     upsert!("ui.sidebar_width", &config.ui.sidebar_width)?;
     upsert!("ui.git_panel_width", &config.ui.git_panel_width)?;
@@ -1424,7 +1436,7 @@ notification_sound = "Glass"
         save_config_dictionary(&mut connection, &config).expect("config should save");
         let restored = load_config_dictionary(&connection).expect("config should load");
 
-        assert_eq!(CONFIG_KEYS.len(), 34);
+        assert_eq!(CONFIG_KEYS.len(), 35);
         assert_eq!(config.general.theme, restored.general.theme);
         assert_eq!(config.general.locale, restored.general.locale);
         assert_eq!(config.ui.sidebar_width, restored.ui.sidebar_width);
