@@ -31,6 +31,7 @@
     "created": "创建时间"
   },
   "trust": {
+    "label": "信任级别",
     "trusted": "可信",
     "standard": "标准",
     "restricted": "受限"

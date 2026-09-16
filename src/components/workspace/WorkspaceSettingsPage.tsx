@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useWorkspaceStore } from "../../stores/workspaceStore";
 import { useUiStore } from "../../stores/uiStore";
+import { Dropdown } from "../shared/Dropdown";
 import { WorkspaceStartupSection } from "./WorkspaceStartupSection";
 import type { TrustLevel } from "../../types";
 
@@ -25,23 +26,28 @@ export function WorkspaceSettingsPage({ embedded = false, section: controlledSec
   const trustOptions: TrustLevel[] = ["trusted", "standard", "restricted"];
   return (
     <div className={embedded ? "workspace-settings embedded" : "workspace-settings"}>
-      <nav className="workspace-settings-nav">
-        <button type="button" onClick={() => setActiveView("chat")}>{t("nav.back")}</button>
-        <button type="button" onClick={() => setLocalSection("general")}>{t("nav.general")}</button>
-        <button type="button" onClick={() => setLocalSection("startup")}>{t("nav.startup")}</button>
+      <nav className="workspace-settings-nav" style={{ display: "none" }}>
+        <button type="button" onClick={() => setActiveView("chat")}>{t("actions.back")}</button>
+        <button className="workspace-settings-section-nav" type="button" onClick={() => setLocalSection("general")}>{t("nav.general")}</button>
+        <button className="workspace-settings-section-nav" type="button" onClick={() => setLocalSection("startup")}>{t("nav.startup")}</button>
       </nav>
       {section === "startup" ? <WorkspaceStartupSection workspace={workspace} /> : (
         <section className="workspace-settings-content">
-          <h2>{workspace.name}</h2>
-          <p>{workspace.rootPath}</p>
+        <button type="button" style={{ width: "100px" }} className="ws-prop-btn ws-prop-btn-accent" onClick={() => setActiveView("chat")}>
+          <div style={{ width: "100%" }}>前往对话页</div>
+        </button>
           <label>
             {t("trust.label")}
-            <select value={workspace.trustLevel} onChange={(event) => void setWorkspaceTrustLevel(workspace.id, event.target.value as TrustLevel)}>
-              {trustOptions.map((level) => <option key={level} value={level}>{t(`trust.${level}`)}</option>)}
-            </select>
+            <Dropdown
+              value={workspace.trustLevel}
+              options={trustOptions.map((level) => ({ value: level, label: t(`trust.${level}`) }))}
+              onChange={(value) => void setWorkspaceTrustLevel(workspace.id, value as TrustLevel)}
+              triggerStyle={{ width: "100%", justifyContent: "space-between" }}
+            />
           </label>
         </section>
       )}
+
     </div>
   );
 }
