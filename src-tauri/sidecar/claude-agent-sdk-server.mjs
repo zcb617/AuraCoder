@@ -784,6 +784,8 @@ function createQueryContext(id, approvalPolicy = null, planMode = false) {
     backgroundTaskIdsByActionId: new Map(),
     // Hook 中子代理标识的缓存；当前 SDK 后台任务标识与子代理标识一致时用于补齐早到的操作。
     agentIdsByToolUseId: new Map(),
+    // 按 agent 标识保存已知后台任务的稳定 taskId，不随权威快照刷新而清除。
+    backgroundTaskIdsByAgentId: new Map(),
     streamToolUseIdsByIndex: new Map(),
     suppressedToolUseIds: new Set(),
     pendingApprovalIds: new Set(),
@@ -919,6 +921,32 @@ function getTaskIdFromToolInput(toolName, toolInput) {
   return null;
 }
 
+/**
+ * 登记后台任务与 agent 标识的稳定关系，避免权威任务快照刷新后丢失归属依据。
+ * 已存在的冲突关系不会被覆盖，防止不同并发子代理交叉复用 taskId。
+ */
+function registerBackgroundTaskIdentity(context, taskId, agentIds = []) {
+  if (typeof taskId !== "string" || taskId.length === 0) {
+    return;
+  }
+
+  const identityKeys = new Set([taskId, ...agentIds]);
+  for (const identityKey of identityKeys) {
+    if (typeof identityKey !== "string" || identityKey.length === 0) {
+      continue;
+    }
+    const existingTaskId = context.backgroundTaskIdsByAgentId.get(identityKey);
+    if (existingTaskId && existingTaskId !== taskId) {
+      continue;
+    }
+    context.backgroundTaskIdsByAgentId.set(identityKey, taskId);
+  }
+}
+
+/**
+ * 根据当前已缓存的 toolUseId、TaskOutput 输入或 agent 标识解析后台任务归属。
+ * 解析只使用明确的稳定标识，不依赖最后一个任务、全局当前任务或 UI 顺序。
+ */
 function getKnownBackgroundTaskId(context, toolUseId, toolName, toolInput, agentId) {
   const taskIdFromInput = getTaskIdFromToolInput(toolName, toolInput);
   if (taskIdFromInput) {
@@ -930,6 +958,18 @@ function getKnownBackgroundTaskId(context, toolUseId, toolName, toolInput, agent
       return taskId;
     }
   }
+  if (typeof agentId === "string" && agentId.length > 0) {
+    const taskId = context.backgroundTaskIdsByAgentId.get(agentId);
+    if (taskId) {
+      return taskId;
+    }
+    // 保留权威快照直接以 taskId 作为 agentId 的兼容回退路径。
+    if (context.backgroundTasks.has(agentId)) {
+      return agentId;
+    }
+  }
+  /*
+  // 旧逻辑只查询权威快照，task_started 与快照之间无法解析 agentId；保留代码作为回退语义记录。
   if (
     typeof agentId === "string" &&
     agentId.length > 0 &&
@@ -937,9 +977,14 @@ function getKnownBackgroundTaskId(context, toolUseId, toolName, toolInput, agent
   ) {
     return agentId;
   }
+  */
   return null;
 }
 
+/**
+ * 保存 toolUseId 与后台任务的稳定关系，并在 Action 已创建时立即补发归属事件。
+ * 该函数同时兼容 assignment 先于 ActionStarted 和 ActionStarted 先于 assignment 的事件顺序。
+ */
 function associateActionWithBackgroundTask(context, requestId, toolUseId, taskId) {
   if (
     typeof toolUseId !== "string" ||
@@ -963,12 +1008,26 @@ function associateActionWithBackgroundTask(context, requestId, toolUseId, taskId
   }
 }
 
+/**
+ * 扫描已缓存的子代理 Action，在 task_started 或全量快照登记任务身份后立即补齐归属。
+ * 每个 toolUseId 只按自身 agentId 查找，避免并发 local_agent 之间交叉绑定。
+ */
 function associateKnownSubagentActions(context, requestId) {
+  for (const [toolUseId, agentId] of context.agentIdsByToolUseId) {
+    const taskId = context.backgroundTaskIdsByAgentId.get(agentId) ||
+      (context.backgroundTasks.has(agentId) ? agentId : null);
+    if (taskId) {
+      associateActionWithBackgroundTask(context, requestId, toolUseId, taskId);
+    }
+  }
+  /*
+  // 旧逻辑只在 background_tasks_changed 后检查权威集合，保留代码说明本次补偿路径的缺口。
   for (const [toolUseId, agentId] of context.agentIdsByToolUseId) {
     if (context.backgroundTasks.has(agentId)) {
       associateActionWithBackgroundTask(context, requestId, toolUseId, agentId);
     }
   }
+  */
 }
 
 function formatSdkResultError(message) {
@@ -3175,6 +3234,12 @@ async function handleQuery(req, persistentSession = null) {
             continue;
           }
           currentTaskIds.add(taskId);
+          // 快照中的 taskId 和可选 agent 标识都登记为稳定归属键；后续空快照不能清除该映射。
+          registerBackgroundTaskIdentity(context, taskId, [
+            task?.agent_id,
+            task?.agentID,
+            task?.agentId,
+          ]);
           context.backgroundTasks.set(taskId, {
             // 记录后台任务的稳定标识，用于后续通知关联。
             task_id: taskId,
@@ -3231,6 +3296,12 @@ async function handleQuery(req, persistentSession = null) {
         // task_started 只负责发送生命周期通知，权威任务集合仍由 background_tasks_changed 提供。
         const taskId = typeof message.task_id === "string" ? message.task_id : "";
         if (taskId) {
+          // 启动事件先登记稳定身份，使早于快照到达的 PreToolUse 可以立即归属。
+          registerBackgroundTaskIdentity(context, taskId, [
+            message.agent_id,
+            message.agentID,
+            message.agentId,
+          ]);
           const existingDisplayTask = context.backgroundTaskDisplay.get(taskId);
           if (existingDisplayTask) {
             // task_started 重新标记活动任务，但保留首次开始时间供耗时计算。
@@ -3263,6 +3334,8 @@ async function handleQuery(req, persistentSession = null) {
               startedAt: Date.now(),
             });
           }
+          // task_started 建立身份后立即补齐所有已缓存的 agent/toolUse Action。
+          associateKnownSubagentActions(context, id);
         }
         emitClaudeBackgroundNotice(id, message.subtype, message, null, context);
       } else if (message.type === "system" && message.subtype === "task_updated") {

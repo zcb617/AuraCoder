@@ -2659,6 +2659,375 @@ describe("claude-agent-sdk-server sidecar", () => {
     );
   });
 
+  it("binds subagent actions from task_started without waiting for a task snapshot", async () => {
+    const harness = await spawnHarness({
+      steps: [
+        {
+          // 先到达 task_started，验证任务身份可以立即用于后续 Action 归属。
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "task_started",
+            task_id: "task-start-first",
+            task_type: "local_agent",
+            description: "先启动的子代理",
+          },
+        },
+        {
+          // task_started 后到达的 PreToolUse 必须立即得到同一个 taskId。
+          type: "hook",
+          hook: "PreToolUse",
+          input: {
+            tool_name: "Read",
+            tool_input: { file_path: "/tmp/start-first.txt" },
+            tool_use_id: "tool-start-first",
+            agent_id: "task-start-first",
+          },
+        },
+        {
+          // 快照到达后仍应保持既有身份映射，并补偿普通全量关联路径。
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "background_tasks_changed",
+            tasks: [
+              {
+                task_id: "task-start-first",
+                task_type: "local_agent",
+                description: "先启动的子代理",
+              },
+            ],
+          },
+        },
+        {
+          // 空快照模拟活动列表刷新，稳定身份映射不能因此丢失。
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "background_tasks_changed",
+            tasks: [],
+          },
+        },
+        {
+          // PreToolUse 早于 task_started 时先缓存 agent/toolUse 关联。
+          type: "hook",
+          hook: "PreToolUse",
+          input: {
+            tool_name: "Read",
+            tool_input: { file_path: "/tmp/task-start-later.txt" },
+            tool_use_id: "tool-start-later",
+            agent_id: "task-start-later",
+          },
+        },
+        {
+          // task_started 到达后必须补发此前缓存 Action 的归属事件。
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "task_started",
+            task_id: "task-start-later",
+            task_type: "local_agent",
+            description: "后启动的子代理",
+          },
+        },
+        {
+          // 该任务没有任何活动快照，仍必须依靠 task_started 身份完成归属。
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "task_started",
+            task_id: "task-without-snapshot",
+            task_type: "local_agent",
+            description: "没有及时快照的子代理",
+          },
+        },
+        {
+          type: "hook",
+          hook: "PreToolUse",
+          input: {
+            tool_name: "Read",
+            tool_input: { file_path: "/tmp/no-snapshot.txt" },
+            tool_use_id: "tool-without-snapshot",
+            agent_id: "task-without-snapshot",
+          },
+        },
+        {
+          // 两个并发子代理分别先缓存 Action，再按各自 task_started 绑定。
+          type: "hook",
+          hook: "PreToolUse",
+          input: {
+            tool_name: "Read",
+            tool_input: { file_path: "/tmp/agent-one.txt" },
+            tool_use_id: "tool-agent-one",
+            agent_id: "task-agent-one",
+          },
+        },
+        {
+          type: "hook",
+          hook: "PreToolUse",
+          input: {
+            tool_name: "Read",
+            tool_input: { file_path: "/tmp/agent-two.txt" },
+            tool_use_id: "tool-agent-two",
+            agent_id: "task-agent-two",
+          },
+        },
+        {
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "task_started",
+            task_id: "task-agent-one",
+            task_type: "local_agent",
+            description: "并发子代理一",
+          },
+        },
+        {
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "task_started",
+            task_id: "task-agent-two",
+            task_type: "local_agent",
+            description: "并发子代理二",
+          },
+        },
+        {
+          type: "yield",
+          message: makeSuccessResult({ session_id: "session-task-identity-race" }),
+        },
+      ],
+    });
+
+    harness.send({
+      id: "query-task-identity-race",
+      method: "query",
+      params: {
+        prompt: "verify task identity races",
+        cwd: repoRoot,
+      },
+    });
+
+    await harness.waitFor(
+      (event) => event.id === "query-task-identity-race" && event.type === "turn_completed",
+    );
+
+    const actionStartedByToolUseId = new Map(
+      harness.events
+        .filter(
+          (event) =>
+            event.id === "query-task-identity-race" && event.type === "action_started",
+        )
+        .map((event) => [
+          (event.details as Record<string, unknown> | undefined)?.file_path,
+          event.actionId,
+        ]),
+    );
+    const assignments = harness.events.filter(
+      (event) =>
+        event.id === "query-task-identity-race" &&
+        event.type === "action_background_task_assigned",
+    );
+    const assignmentByActionId = new Map(
+      assignments.map((event) => [event.actionId, event.taskId]),
+    );
+
+    expect(assignments).toHaveLength(5);
+    expect(assignmentByActionId.get(actionStartedByToolUseId.get("/tmp/start-first.txt"))).toBe(
+      "task-start-first",
+    );
+    expect(assignmentByActionId.get(actionStartedByToolUseId.get("/tmp/task-start-later.txt"))).toBe(
+      "task-start-later",
+    );
+    expect(
+      assignmentByActionId.get(actionStartedByToolUseId.get("/tmp/no-snapshot.txt")),
+    ).toBe("task-without-snapshot");
+    expect(assignmentByActionId.get(actionStartedByToolUseId.get("/tmp/agent-one.txt"))).toBe(
+      "task-agent-one",
+    );
+    expect(assignmentByActionId.get(actionStartedByToolUseId.get("/tmp/agent-two.txt"))).toBe(
+      "task-agent-two",
+    );
+    expect(new Set(assignments.map((event) => event.taskId))).toEqual(
+      new Set([
+        "task-start-first",
+        "task-start-later",
+        "task-without-snapshot",
+        "task-agent-one",
+        "task-agent-two",
+      ]),
+    );
+  });
+
+  it("preserves background task assignment when progress and ActionStarted arrive in either order", async () => {
+    const harness = await spawnHarness({
+      steps: [
+        {
+          // tool_progress 先到达时，只缓存明确的 toolUseId/taskId 关系。
+          type: "yield",
+          message: {
+            type: "tool_progress",
+            tool_use_id: "tool-progress-before-action",
+            task_id: "task-progress-before-action",
+          },
+        },
+        {
+          // 后续 PreToolUse 必须使用缓存关系补发 assignment。
+          type: "hook",
+          hook: "PreToolUse",
+          input: {
+            tool_name: "Bash",
+            tool_input: { command: "printf before" },
+            tool_use_id: "tool-progress-before-action",
+          },
+        },
+        {
+          // 该场景反向验证 ActionStarted 先于 tool_progress 的路径。
+          type: "hook",
+          hook: "PreToolUse",
+          input: {
+            tool_name: "Bash",
+            tool_input: { command: "printf after" },
+            tool_use_id: "tool-progress-after-action",
+          },
+        },
+        {
+          type: "yield",
+          message: {
+            type: "tool_progress",
+            tool_use_id: "tool-progress-after-action",
+            task_id: "task-progress-after-action",
+          },
+        },
+        {
+          type: "yield",
+          message: makeSuccessResult({ session_id: "session-assignment-order" }),
+        },
+      ],
+    });
+
+    harness.send({
+      id: "query-assignment-order",
+      method: "query",
+      params: {
+        prompt: "verify assignment order",
+        cwd: repoRoot,
+      },
+    });
+
+    await harness.waitFor(
+      (event) => event.id === "query-assignment-order" && event.type === "turn_completed",
+    );
+
+    const started = harness.events.filter(
+      (event) => event.id === "query-assignment-order" && event.type === "action_started",
+    );
+    const assignments = harness.events.filter(
+      (event) =>
+        event.id === "query-assignment-order" &&
+        event.type === "action_background_task_assigned",
+    );
+    const actionByCommand = new Map(
+      started.map((event) => [
+        (event.details as Record<string, unknown> | undefined)?.command,
+        event.actionId,
+      ]),
+    );
+    expect(assignments).toHaveLength(2);
+    expect(assignments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          actionId: actionByCommand.get("printf before"),
+          taskId: "task-progress-before-action",
+        }),
+        expect.objectContaining({
+          actionId: actionByCommand.get("printf after"),
+          taskId: "task-progress-after-action",
+        }),
+      ]),
+    );
+  });
+
+  it("does not reuse a task identity or cross-bind concurrent local agents", async () => {
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "task_started",
+            task_id: "task-local-agent-a",
+            task_type: "local_agent",
+            description: "并发代理 A",
+          },
+        },
+        {
+          type: "yield",
+          message: {
+            type: "system",
+            subtype: "task_started",
+            task_id: "task-local-agent-b",
+            task_type: "local_agent",
+            description: "并发代理 B",
+          },
+        },
+        {
+          type: "hook",
+          hook: "PreToolUse",
+          input: {
+            tool_name: "Read",
+            tool_input: { file_path: "/tmp/local-agent-a.txt" },
+            tool_use_id: "tool-local-agent-a",
+            agent_id: "task-local-agent-a",
+          },
+        },
+        {
+          type: "hook",
+          hook: "PreToolUse",
+          input: {
+            tool_name: "Read",
+            tool_input: { file_path: "/tmp/local-agent-b.txt" },
+            tool_use_id: "tool-local-agent-b",
+            agent_id: "task-local-agent-b",
+          },
+        },
+        {
+          type: "yield",
+          message: makeSuccessResult({ session_id: "session-local-agent-isolation" }),
+        },
+      ],
+    });
+
+    harness.send({
+      id: "query-local-agent-isolation",
+      method: "query",
+      params: {
+        prompt: "verify local agent isolation",
+        cwd: repoRoot,
+      },
+    });
+
+    await harness.waitFor(
+      (event) => event.id === "query-local-agent-isolation" && event.type === "turn_completed",
+    );
+
+    const assignments = harness.events.filter(
+      (event) =>
+        event.id === "query-local-agent-isolation" &&
+        event.type === "action_background_task_assigned",
+    );
+    expect(assignments).toHaveLength(2);
+    expect(assignments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ taskId: "task-local-agent-a" }),
+        expect.objectContaining({ taskId: "task-local-agent-b" }),
+      ]),
+    );
+    expect(new Set(assignments.map((event) => event.taskId))).toEqual(
+      new Set(["task-local-agent-a", "task-local-agent-b"]),
+    );
+  });
+
   it("uses tool_response and emits action output deltas", async () => {
     const harness = await spawnHarness({
       steps: [
