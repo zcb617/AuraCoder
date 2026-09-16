@@ -32,6 +32,7 @@ import { formatWorkingDuration } from "./workingDuration";
 
 const CLAUDE_SYSTEM_INJECTED_PREFIXES = [
   "Another Claude session sent a message:",
+  "<task-notification>",
   "<system-reminder>\nAnother Claude session sent a message while you were working:",
   "[MESSAGE FROM NON-USER SOURCE",
   "This session is being continued",
