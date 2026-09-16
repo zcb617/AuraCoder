@@ -277,6 +277,18 @@ function MessageRowView({
   const thinkingVariant = useThinkingVariant(showThinkingPlaceholder);
   const [systemNoticeExpanded, setSystemNoticeExpanded] = useState(false);
 
+  /** 根据当前消息行的悬停状态，控制时间戳和操作按钮的显示方式。 */
+  const setHoverActionsVisible = (visible: boolean) => {
+    const row = document.querySelector(`[data-message-id="${message.id}"]`);
+    if (!row) return;
+    row.querySelectorAll<HTMLElement>(".msg-row-timestamp").forEach((el) => {
+      el.style.visibility = visible ? "visible" : "hidden";
+    });
+    row.querySelectorAll<HTMLElement>(".msg-turn-actions").forEach((el) => {
+      el.style.visibility = visible ? "visible" : "hidden";
+    });
+  };
+
   if (isSystemInjected) {
     const noticeText = (typeof message.content === "string" && message.content)
       ? message.content
@@ -321,6 +333,8 @@ function MessageRowView({
     <div
       data-message-id={message.id}
       className="animate-slide-up msg-row"
+      onMouseEnter={() => setHoverActionsVisible(true)}
+      onMouseLeave={() => setHoverActionsVisible(false)}
       style={{
         animationDelay: `${Math.min(index * 20, 200)}ms`,
         display: "flex",
@@ -381,7 +395,7 @@ function MessageRowView({
             )}
             {userContent}
           </div>
-          <div className="msg-row-timestamp" style={{ display: "flex", alignItems: "center", gap: 2, justifyContent: "flex-end", marginTop: 4, paddingRight: 4 }}>
+          <div className="msg-row-timestamp" style={{ display: "flex", visibility: "hidden", alignItems: "center", gap: 2, justifyContent: "flex-end", marginTop: 4, paddingRight: 4 }}>
             {onEditResend && (
               <button
                 type="button"
@@ -409,7 +423,7 @@ function MessageRowView({
             <div className="msg-turn-header">
               {getHarnessIcon(assistantEngineId, 11)}
               <span className="msg-turn-header-label">{assistantLabel}</span>
-              <span className="msg-turn-actions">
+              <span className="msg-turn-actions" style={{ visibility: "hidden" }}>
                 {messageTimestamp && <span style={{ padding: "0 2px" }}>{messageTimestamp}</span>}
                 <MessageCopyButton message={message} />
               </span>

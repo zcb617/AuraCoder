@@ -191,6 +191,9 @@ function applyRuntimeStateFromEvent(
     // if (completionStatus === "failed") {
     //   return { status: "error", streaming: false };
     // }
+    if (completionStatus === "failed") {
+      return { status: "error", streaming: false };
+    }
     if (completionStatus === "interrupted") {
       return { status: "idle", streaming: false };
     }
@@ -1174,6 +1177,21 @@ function normalizeBlocks(blocks?: ContentBlock[]): ContentBlock[] | undefined {
       });
       continue;
     }
+    if (
+      block.type === "action" &&
+      (block.status === "running" || block.status === "pending")
+    ) {
+      normalized.push({
+        ...block,
+        status: "error" as const,
+        result: {
+          success: false,
+          error: "Action did not report completion.",
+          durationMs: 0,
+        },
+      });
+      continue;
+    }
     normalized.push(block);
   }
 
@@ -1612,7 +1630,7 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
     // 旧逻辑会把缺失 status 也转换为 completed，现保留迁移留痕但不再执行：
     // const completionStatus = String(event.status ?? "completed");
     const completionStatus = event.status;
-    if (completionStatus !== "completed" && completionStatus !== "interrupted") {
+    if (completionStatus !== "completed" && completionStatus !== "interrupted" && completionStatus !== "failed") {
       return messages;
     }
   }
