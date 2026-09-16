@@ -42,6 +42,7 @@
     "macos-universal/libcua_driver_sdk.dylib",
     "macos-universal/cua_driver_node_runtime.node",
     "macos-universal/cua_driver_abi.h",
-    "macos-universal/node-runtime-NOTICE.md"
+    "macos-universal/node-runtime-NOTICE.md",
+    "macos-universal/cua-cursor-theme"
   ]
 }
