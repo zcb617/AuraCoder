@@ -712,6 +712,59 @@ async function pushClaudePromptInput(messageInput, input, sessionId) {
   }
 }
 
+/**
+ * 为 Claude SDK 对象模式输入流补充错误、push 和 destroy 诊断日志。
+ * 根因背景：2026-09-15/16 aborted_streaming 事故中，SDK 的 streamInput reject
+ * 会自动触发 query abort；该诊断用于同时确认 sidecar 输入流自身是否先发生异常。
+ * 回退方式：移除本函数调用即可恢复未监听输入流错误的旧行为，不改变输入流业务语义。
+ */
+function attachClaudeMessageInputDiagnostics(messageInput, requestId) {
+  /** 记录输入流操作异常，保留原始异常对象、message 和 stack，不改写原文。 */
+  const traceInputFailure = (error, operation) => {
+    traceClaudeSdk("stream_input_error", {
+      // 关联产生该输入流的 AuraCoder 查询请求。
+      requestId,
+      // 标识异常来自输入流事件、push 还是 destroy 操作。
+      operation,
+      // 保留 Node/SDK 提供的原始异常对象，便于还原完整错误上下文。
+      error,
+      // 原始异常 message，禁止拼接、替换或格式化。
+      message: error?.message,
+      // 原始异常 stack，禁止截断、拼接或格式化。
+      stack: error?.stack,
+    });
+  };
+
+  messageInput.on("error", (error) => {
+    traceInputFailure(error, "error");
+  });
+
+  const originalPush = messageInput.push.bind(messageInput);
+  messageInput.push = (chunk, encoding) => {
+    try {
+      return originalPush(chunk, encoding);
+    } catch (error) {
+      traceInputFailure(error, "push");
+      throw error;
+    }
+  };
+
+  const originalDestroy = messageInput.destroy.bind(messageInput);
+  messageInput.destroy = (error) => {
+    if (error !== undefined) {
+      traceInputFailure(error, "destroy");
+    }
+    try {
+      return originalDestroy(error);
+    } catch (destroyError) {
+      traceInputFailure(destroyError, "destroy");
+      throw destroyError;
+    }
+  };
+
+  return messageInput;
+}
+
 /** 创建一个查询上下文，并保存该查询当前可变的权限策略状态。 */
 function createQueryContext(id, approvalPolicy = null, planMode = false) {
   const normalizedApprovalPolicy = typeof approvalPolicy === "string" ? approvalPolicy : null;
@@ -2589,6 +2642,8 @@ async function handleQuery(req, persistentSession = null) {
   const permissionOptions = context.permissionOptions;
 
   const sessionCwd = cwd || process.cwd();
+  // SDK 查询专用中止控制器，用于捕获 streamInput reject 自动触发的原始 abort 原因。
+  const queryAbortController = new AbortController();
   let actualSessionId = null;
   try {
     const normalizedSandboxMode = normalizeSandboxMode(sandboxMode);
@@ -2650,6 +2705,8 @@ async function handleQuery(req, persistentSession = null) {
 
     const options = applyClaudeRuntime({
       cwd: sessionCwd,
+      // 让 SDK 将 streamInput reject 原样作为 abort reason 传回 sidecar 监听器。
+      abortController: queryAbortController,
       additionalDirectories: additionalDirectoriesForSandbox(
         sessionCwd,
         normalizedSandboxMode,
@@ -2852,6 +2909,34 @@ async function handleQuery(req, persistentSession = null) {
     if (maxTurns) options.maxTurns = maxTurns;
     if (reasoningEffort) options.effort = reasoningEffort;
 
+    /**
+     * 记录 SDK query 的 abort 原因，重点捕获 streamInput reject 自动传播的原始错误。
+     * 根因背景：2026-09-15/16 aborted_streaming 事故中，SDK 自动 abort 的真实原因未落盘。
+     * 回退方式：移除此监听器即可恢复旧行为，不改变 SDK 的中止流程。
+     */
+    const traceQueryAbort = (signal) => {
+      const reason = signal?.reason;
+      traceClaudeSdk("query_aborted", {
+        // 关联发生中止的 AuraCoder 查询请求。
+        requestId: id,
+        // 保留 AbortSignal.reason 原始值，禁止改写或降级为自定义文本。
+        signalReason: reason,
+        // 同时保留原始 reason，便于日志消费者直接读取异常对象。
+        reason,
+        // 当 reason 为异常对象时保留完整原始异常对象。
+        error: reason,
+        // 原始 abort reason message，禁止拼接、替换或格式化。
+        message: reason?.message,
+        // 原始 abort reason stack，禁止截断、拼接或格式化。
+        stack: reason?.stack,
+      });
+    };
+    queryAbortController.signal.addEventListener(
+      "abort",
+      () => traceQueryAbort(queryAbortController.signal),
+      { once: true },
+    );
+
     emit({ id, type: "turn_started" });
 
     let sawTextDelta = false;
@@ -2862,10 +2947,13 @@ async function handleQuery(req, persistentSession = null) {
       context.messageInput = persistentSession.messageInput;
       promptInput = persistentSession.messageInput;
     } else {
-      const messageInput = new Readable({
-        objectMode: true,
-        read() {},
-      });
+      const messageInput = attachClaudeMessageInputDiagnostics(
+        new Readable({
+          objectMode: true,
+          read() {},
+        }),
+        id,
+      );
       context.messageInput = messageInput;
       const initialInput = buildPromptInput(
         prompt,
@@ -2883,6 +2971,16 @@ async function handleQuery(req, persistentSession = null) {
     traceClaudeSdk("query_create", { requestId: id, promptInput, options });
     const query = queryFn({ prompt: promptInput, options });
     context.query = query;
+    // SDK 当前版本未在 sdk.d.ts 声明 Query 的 abortController/signal；若运行时暴露，
+    // 额外监听该信号，避免遗漏非 options.abortController 的中止来源。
+    const querySignal = query?.abortController?.signal || query?.signal;
+    if (querySignal && querySignal !== queryAbortController.signal) {
+      querySignal.addEventListener?.(
+        "abort",
+        () => traceQueryAbort(querySignal),
+        { once: true },
+      );
+    }
     if (persistentSession) {
       persistentSession.query = query;
       persistentSession.context = context;
@@ -3599,10 +3697,13 @@ async function createPersistentSessionHandle(req) {
     }
   }
 
-  const messageInput = new Readable({
-    objectMode: true,
-    read() {},
-  });
+  const messageInput = attachClaudeMessageInputDiagnostics(
+    new Readable({
+      objectMode: true,
+      read() {},
+    }),
+    id,
+  );
   const entry = {
     threadId,
     handleId,
