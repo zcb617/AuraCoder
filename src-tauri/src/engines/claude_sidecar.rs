@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::{
     auracoder_thread_mcp_service::AuraCoderThreadMcpService,
+    common::MANUAL_STOP,
     computer_control_service::ComputerControlService, process_utils, runtime_env,
 };
 
@@ -33,8 +34,6 @@ use super::{
     ModelInfo, OutputStream, ReasoningEffortOption, SandboxPolicy, ThreadScope,
     TurnCompletionStatus, TurnInput, TurnInputItem,
 };
-
-pub(crate) static MANUAL_STOP: AtomicU8 = AtomicU8::new(0);
 
 const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const NODE_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(5);

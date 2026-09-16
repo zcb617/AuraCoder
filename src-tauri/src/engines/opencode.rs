@@ -26,6 +26,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::common::MANUAL_STOP;
 use crate::models::{
     OpenCodeAgentDto, OpenCodeCommandDto, OpenCodeMcpServerDto, OpenCodeRuntimeCatalogDto,
 };
@@ -975,6 +976,7 @@ impl Engine for OpenCodeEngine {
         event_tx: mpsc::Sender<EngineEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
+        let manual_stop = MANUAL_STOP.load(Ordering::SeqCst);
         let session = {
             let state = self.state.lock().await;
             state
@@ -1016,6 +1018,9 @@ impl Engine for OpenCodeEngine {
             tokio::select! {
                 _ = cancellation.cancelled() => {
                     self.interrupt(engine_thread_id).await?;
+                    if manual_stop == 1 {
+                        MANUAL_STOP.store(0, Ordering::SeqCst);
+                    }
                     return Ok(());
                 }
                 result = &mut prompt_request => {
@@ -1037,6 +1042,9 @@ impl Engine for OpenCodeEngine {
                                 .await;
                                 self.complete_after_idle(&mut mapper, &event_tx).await;
                             }
+                            if manual_stop == 1 {
+                                MANUAL_STOP.store(0, Ordering::SeqCst);
+                            }
                             return Ok(());
                         }
                         Err(error) => {
@@ -1044,6 +1052,9 @@ impl Engine for OpenCodeEngine {
                                 log::warn!(
                                     "OpenCode /message request finished with an error after turn completion: {error:#}"
                                 );
+                                if manual_stop == 1 {
+                                    MANUAL_STOP.store(0, Ordering::SeqCst);
+                                }
                                 return Ok(());
                             }
                             log::error!(
@@ -1187,6 +1198,9 @@ impl Engine for OpenCodeEngine {
                                     "timed out draining OpenCode /message response after turn completion"
                                 );
                             }
+                        }
+                        if manual_stop == 1 {
+                            MANUAL_STOP.store(0, Ordering::SeqCst);
                         }
                         return Ok(());
                     }

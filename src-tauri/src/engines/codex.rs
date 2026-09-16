@@ -27,6 +27,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::common::MANUAL_STOP;
 use crate::models::{
     CodexAccountLoginCompletedDto, CodexAccountStateDto, CodexAppDto, CodexConfigLayerDto,
     CodexConfigStateDto, CodexConfigWarningDto, CodexExperimentalFeatureDto,
@@ -824,6 +825,7 @@ impl Engine for CodexEngine {
         event_tx: mpsc::Sender<EngineEvent>,
         cancellation: CancellationToken,
     ) -> Result<(), anyhow::Error> {
+        let manual_stop = MANUAL_STOP.load(Ordering::SeqCst);
         let transport = self.ensure_ready_transport().await?;
         if let Some(message) =
             Self::unsupported_external_auth_tokens_message(transport.as_ref()).await
@@ -919,6 +921,9 @@ impl Engine for CodexEngine {
                   service
                     .revoke_turn(&thread_id, expected_turn_id.as_deref())
                     .await;
+                }
+                if manual_stop == 1 {
+                  MANUAL_STOP.store(0, Ordering::SeqCst);
                 }
                 return Ok(());
               }
@@ -1599,6 +1604,9 @@ impl Engine for CodexEngine {
                 .await;
         }
         self.clear_active_turn(&thread_id).await;
+        if manual_stop == 1 {
+            MANUAL_STOP.store(0, Ordering::SeqCst);
+        }
         Ok(())
     }
 

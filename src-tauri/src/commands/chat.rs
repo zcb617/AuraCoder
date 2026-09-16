@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::engines::claude_sidecar::MANUAL_STOP;
+use crate::common::MANUAL_STOP;
 use crate::{
     cli_tools::{
         factory::CliToolFactory, CliExecutionContext, CliLocationKind, CliRuntimePermissions,
@@ -3676,57 +3676,65 @@ async fn run_turn(
     // 将执行异常转换为固定安全提示，避免原始异常进入前端消息和错误状态。
     macro_rules! emit_safe_turn_notice {
         () => {{
-            let notice = EngineEvent::Notice {
-                kind: "turn_exception_observed".to_string(),
-                level: "info".to_string(),
-                title: "执行提示".to_string(),
-                message: "执行出现异常，正在继续本轮".to_string(),
-                // 异常安全提示不附带原始异常或结构化后台任务元数据。
-                metadata: None,
-            };
-            let progress = process_stream_event(
-                &app,
-                &state,
-                &thread,
-                &assistant_message_id,
-                &stream_event_topic,
-                &approval_event_topic,
-                &notice,
-                &mut blocks,
-                &mut action_index,
-                &mut approval_index,
-                max_output_chars,
-            )
-            .await;
-            let force_persist = apply_stream_progress(
-                progress,
-                &mut message_status,
-                &mut thread_status,
-                &mut turn_model_id,
-                &mut token_usage,
-                &mut blocks_dirty,
-                &mut message_state_dirty,
-                &mut thread_status_dirty,
-                &mut turn_model_dirty,
-            );
-            flush_stream_state(
-                &state,
-                &thread,
-                &assistant_message_id,
-                &blocks,
-                &message_status,
-                &thread_status,
-                &turn_model_id,
-                &mut blocks_dirty,
-                &mut message_state_dirty,
-                &mut thread_status_dirty,
-                &mut turn_model_dirty,
-                &mut last_persisted_thread_status,
-                &mut last_persist_at,
-                &mut last_blocks_persist_at,
-                force_persist,
-            )
-            .await;
+            if MANUAL_STOP.load(Ordering::SeqCst) == 1 {
+                log::info!(
+                    "用户手动终止，抑制执行异常提示: thread_id={}, engine_id={}",
+                    thread.id,
+                    thread.engine_id
+                );
+            } else {
+                let notice = EngineEvent::Notice {
+                    kind: "turn_exception_observed".to_string(),
+                    level: "info".to_string(),
+                    title: "执行提示".to_string(),
+                    message: "执行出现异常，正在继续本轮".to_string(),
+                    // 异常安全提示不附带原始异常或结构化后台任务元数据。
+                    metadata: None,
+                };
+                let progress = process_stream_event(
+                    &app,
+                    &state,
+                    &thread,
+                    &assistant_message_id,
+                    &stream_event_topic,
+                    &approval_event_topic,
+                    &notice,
+                    &mut blocks,
+                    &mut action_index,
+                    &mut approval_index,
+                    max_output_chars,
+                )
+                .await;
+                let force_persist = apply_stream_progress(
+                    progress,
+                    &mut message_status,
+                    &mut thread_status,
+                    &mut turn_model_id,
+                    &mut token_usage,
+                    &mut blocks_dirty,
+                    &mut message_state_dirty,
+                    &mut thread_status_dirty,
+                    &mut turn_model_dirty,
+                );
+                flush_stream_state(
+                    &state,
+                    &thread,
+                    &assistant_message_id,
+                    &blocks,
+                    &message_status,
+                    &thread_status,
+                    &turn_model_id,
+                    &mut blocks_dirty,
+                    &mut message_state_dirty,
+                    &mut thread_status_dirty,
+                    &mut turn_model_dirty,
+                    &mut last_persisted_thread_status,
+                    &mut last_persist_at,
+                    &mut last_blocks_persist_at,
+                    force_persist,
+                )
+                .await;
+            }
         }};
     }
 

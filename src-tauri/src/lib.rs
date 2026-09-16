@@ -2,6 +2,7 @@ mod auracoder_thread_mcp_service;
 mod cli_service_health;
 pub(crate) mod cli_tools;
 mod commands;
+pub(crate) mod common;
 mod computer_control_sdk;
 mod computer_control_service;
 mod config;
