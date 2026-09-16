@@ -6589,7 +6589,7 @@ opencode/gpt-5-nano
 
     #[cfg(target_os = "windows")]
     #[test]
-    #[ignore = "requires CUA v0.19.3 runtime"]
+    #[ignore = "requires CUA v0.28.2 runtime"]
     fn cua_catalog_converts_all_opencode_tools() {
         let sdk = Arc::new(crate::computer_control_sdk::CuaDriverSdk::new());
         let manifest_key = concat!("CAR", "G", "O_MANIFEST_DIR");

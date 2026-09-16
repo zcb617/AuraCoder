@@ -1159,7 +1159,7 @@ mod macos_tests {
             .initialize()
             .expect("macOS CUA runtime should initialize");
         assert_eq!(info.abi_version, "1.1.0");
-        assert_eq!(info.driver_version.as_deref(), Some("0.19.3"));
+        assert_eq!(info.driver_version.as_deref(), Some("0.28.2"));
         assert!(info.embedded);
         let tools = sdk.list_tools().expect("tool inventory should load");
         assert!(tools
@@ -1200,7 +1200,7 @@ mod tests {
         sdk.set_resource_dir(Some(resource_dir));
         let info = sdk.initialize().expect("CUA runtime should initialize");
         assert_eq!(info.abi_version, "1.1.0");
-        assert_eq!(info.driver_version.as_deref(), Some("0.19.3"));
+        assert_eq!(info.driver_version.as_deref(), Some("0.28.2"));
         assert!(info.embedded);
         assert!(sdk
             .list_tools()
@@ -1312,7 +1312,7 @@ mod linux_tests {
             .initialize()
             .expect("Linux CUA runtime should initialize");
         assert_eq!(info.abi_version, "1.1.0");
-        assert_eq!(info.driver_version.as_deref(), Some("0.19.3"));
+        assert_eq!(info.driver_version.as_deref(), Some("0.28.2"));
         assert!(info.embedded);
         let tools = sdk.list_tools().expect("tool inventory should load");
         assert!(tools
