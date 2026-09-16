@@ -1983,12 +1983,15 @@ button.linux-window-update-control:hover {
 }
 
 /* ── Timestamp hover-reveal ── */
+/* hover 透明度过渡在鼠标划过滚动条时触发 viewport 整层重绘，与 overlay 滚动条重绘叠加成闪烁，停用 */
 .msg-row-timestamp {
   font-size: 10px; color: var(--text-3);
-  opacity: 0; transition: opacity var(--duration-fast) var(--ease-out);
+  /* opacity: 0; transition: opacity var(--duration-fast) var(--ease-out); */
 }
+/*
 .msg-row:hover .msg-row-timestamp,
 .msg-row:focus-within .msg-row-timestamp { opacity: 1; pointer-events: auto; }
+*/
 
 /* ── User bubble ── */
 .msg-user-bubble {
@@ -2107,10 +2110,12 @@ button.linux-window-update-control:hover {
 .msg-turn-actions {
   margin-left: auto;
   display: inline-flex; align-items: center; gap: 2px;
-  opacity: 0; transition: opacity var(--duration-fast) var(--ease-out);
+  /* opacity: 0; transition: opacity var(--duration-fast) var(--ease-out); */
 }
+/*
 .msg-row:hover .msg-turn-actions,
 .msg-row:focus-within .msg-turn-actions { opacity: 1; }
+*/
 .msg-turn-actions button,
 .msg-row-action-btn {
   display: inline-flex; align-items: center; gap: 4px;
