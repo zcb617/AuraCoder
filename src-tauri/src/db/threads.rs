@@ -34,6 +34,41 @@ pub fn create_thread(
     get_thread(db, &id)?.context("thread not found after insert")
 }
 
+/// 读取指定线程的 Claude 完整历史同步标记，供点击 Claude 会话时决定是否读取消息。
+pub fn get_claude_sync_required(db: &Database, thread_id: &str) -> anyhow::Result<bool> {
+    let conn = db.connect()?;
+    let sync_required: Option<i64> = conn
+        .query_row(
+            "SELECT claude_sync_required FROM threads WHERE id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to query Claude thread sync flag")?;
+    sync_required
+        .map(|value| value != 0)
+        .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))
+}
+
+/// 更新指定线程的 Claude 完整历史同步标记；线程不存在时返回明确错误。
+pub fn set_claude_sync_required(
+    db: &Database,
+    thread_id: &str,
+    sync_required: bool,
+) -> anyhow::Result<()> {
+    let conn = db.connect()?;
+    let affected = conn
+        .execute(
+            "UPDATE threads SET claude_sync_required = ?1 WHERE id = ?2",
+            params![if sync_required { 1_i64 } else { 0_i64 }, thread_id],
+        )
+        .context("failed to update Claude thread sync flag")?;
+    if affected == 0 {
+        anyhow::bail!("thread not found: {thread_id}");
+    }
+    Ok(())
+}
+
 pub fn get_thread(db: &Database, thread_id: &str) -> anyhow::Result<Option<ThreadDto>> {
     let conn = db.connect()?;
     conn.query_row(
@@ -1040,6 +1075,19 @@ mod tests {
         fs::create_dir_all(&root).expect("failed to create temp workspace root");
         let workspace = workspaces::upsert_workspace(db, root.to_string_lossy().as_ref()).unwrap();
         create_thread(db, &workspace.id, "codex", "gpt-5.3-codex", title).unwrap()
+    }
+
+    /// 验证 Claude 线程同步标记默认关闭，并可独立切换后读取。
+    #[test]
+    fn claude_sync_required_defaults_to_false_and_round_trips() {
+        let db = test_db();
+        let thread = test_thread(&db, "Claude sync flag");
+
+        assert!(!get_claude_sync_required(&db, &thread.id).unwrap());
+        set_claude_sync_required(&db, &thread.id, true).unwrap();
+        assert!(get_claude_sync_required(&db, &thread.id).unwrap());
+        set_claude_sync_required(&db, &thread.id, false).unwrap();
+        assert!(!get_claude_sync_required(&db, &thread.id).unwrap());
     }
 
     #[test]

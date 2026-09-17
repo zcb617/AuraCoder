@@ -468,7 +468,8 @@ async fn persist_sessions(
 
                     let existing = tx
                         .query_row(
-                            "SELECT id, last_activity_at, engine_metadata_json, title
+                            "SELECT id, last_activity_at, engine_metadata_json, title,
+                                    claude_sync_required
                              FROM threads
                              WHERE workspace_id = ?1
                                AND engine_id = 'claude'
@@ -480,14 +481,20 @@ async fn persist_sessions(
                                     row.get::<_, Option<String>>(1)?,
                                     row.get::<_, Option<String>>(2)?,
                                     row.get::<_, Option<String>>(3)?,
+                                    row.get::<_, i64>(4)?,
                                 ))
                             },
                         )
                         .optional()
                         .context("failed query existing Claude remote thread")?;
 
-                    let Some((thread_id, db_last_activity_at, existing_metadata, existing_title)) =
-                        existing
+                    let Some((
+                        thread_id,
+                        db_last_activity_at,
+                        existing_metadata,
+                        existing_title,
+                        claude_sync_required,
+                    )) = existing
                     else {
                         let created_at = runtime_env::system_time_rfc3339();
                         let last_activity_at = session
@@ -507,8 +514,8 @@ async fn persist_sessions(
                             "INSERT INTO threads (
                                  id, workspace_id, engine_id, model_id, engine_thread_id,
                                  engine_metadata_json, title, status, reasoning_effort,
-                                 last_activity_at, created_at
-                             ) VALUES (?1, ?2, 'claude', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                 last_activity_at, created_at, claude_sync_required
+                             ) VALUES (?1, ?2, 'claude', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)",
                             params![
                                 Uuid::new_v4().to_string(),
                                 workspace_id,
@@ -559,6 +566,9 @@ async fn persist_sessions(
                     if db_time.is_some_and(|value| remote_time <= value) {
                         continue;
                     }
+                    // 只有远端时间严格晚于可解析的本地时间，才要求点击时读取完整历史。
+                    let remote_time_is_newer =
+                        db_time.map(|value| remote_time > value).unwrap_or(true);
 
                     let mut manual_title = false;
                     let metadata_raw = existing_metadata.clone().unwrap_or_default();
@@ -619,12 +629,18 @@ async fn persist_sessions(
                         "UPDATE threads
                          SET title = ?1,
                              engine_metadata_json = ?2,
-                             last_activity_at = ?3
-                         WHERE id = ?4",
+                             last_activity_at = ?3,
+                             claude_sync_required = CASE
+                                 WHEN ?4 THEN 1
+                                 ELSE ?5
+                             END
+                         WHERE id = ?6",
                         params![
                             title_to_write,
                             metadata_to_write,
                             session.updated_at,
+                            remote_time_is_newer,
+                            claude_sync_required,
                             thread_id,
                         ],
                     )
@@ -1056,6 +1072,18 @@ mod tests {
             )
             .expect("failed to count imported Claude sessions");
         assert_eq!(count, 2);
+        let sync_flags: Vec<i64> = conn
+            .prepare(
+                "SELECT claude_sync_required FROM threads
+                 WHERE workspace_id = ?1 AND engine_id = 'claude'
+                 ORDER BY engine_thread_id",
+            )
+            .expect("failed to prepare imported Claude sync flag query")
+            .query_map(params![workspace.id], |row| row.get(0))
+            .expect("failed to read imported Claude sync flags")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("failed to decode imported Claude sync flags");
+        assert_eq!(sync_flags, vec![1, 1]);
     }
 
     #[tokio::test]
@@ -1168,11 +1196,13 @@ mod tests {
             Option<String>,
             Option<String>,
             Option<String>,
+            i64,
         ) = conn
             .query_row(
                 "SELECT title, model_id, status, archived_at, created_at, last_activity_at,
                         COALESCE(engine_metadata_json, ''), message_count, total_tokens,
-                        plan_mode, send_method, reasoning_effort, permission_mode
+                        plan_mode, send_method, reasoning_effort, permission_mode,
+                        claude_sync_required
                  FROM threads
                  WHERE workspace_id = ?1 AND engine_thread_id = 'claude-existing'",
                 params![workspace.id],
@@ -1191,6 +1221,7 @@ mod tests {
                         row.get(10)?,
                         row.get(11)?,
                         row.get(12)?,
+                        row.get(13)?,
                     ))
                 },
             )
@@ -1207,6 +1238,7 @@ mod tests {
         assert_eq!(existing_row.10.as_deref(), Some("manual"));
         assert_eq!(existing_row.11.as_deref(), Some("low"));
         assert_eq!(existing_row.12.as_deref(), Some("default"));
+        assert_eq!(existing_row.13, 1);
         let existing_metadata: Value = serde_json::from_str(&existing_row.6)
             .expect("existing Claude metadata should remain valid JSON");
         assert_eq!(existing_metadata.get("local"), Some(&json!(true)));
@@ -1218,18 +1250,19 @@ mod tests {
             Some(&json!("2026-08-17T09:00:00Z"))
         );
 
-        let active_existing_row: (String, String, String, Option<String>, String, String, String, i64, i64, Option<i64>, Option<String>, Option<String>, Option<String>) = conn
+        let active_existing_row: (String, String, String, Option<String>, String, String, String, i64, i64, Option<i64>, Option<String>, Option<String>, Option<String>, i64) = conn
             .query_row(
                 "SELECT title, model_id, status, archived_at, created_at, last_activity_at,
                         COALESCE(engine_metadata_json, ''), message_count, total_tokens,
-                        plan_mode, send_method, reasoning_effort, permission_mode
+                        plan_mode, send_method, reasoning_effort, permission_mode,
+                        claude_sync_required
                  FROM threads
                  WHERE workspace_id = ?1 AND engine_thread_id = 'claude-existing-active'",
                 params![workspace.id],
                 |row| Ok((
                     row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
                     row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
-                    row.get(10)?, row.get(11)?, row.get(12)?,
+                    row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?,
                 )),
             )
             .expect("failed to read active existing Claude session");
@@ -1245,6 +1278,7 @@ mod tests {
         assert_eq!(active_existing_row.10.as_deref(), Some("auto"));
         assert_eq!(active_existing_row.11.as_deref(), Some("medium"));
         assert_eq!(active_existing_row.12.as_deref(), Some("safe"));
+        assert_eq!(active_existing_row.13, 1);
         let active_metadata: Value = serde_json::from_str(&active_existing_row.6)
             .expect("active Claude metadata should remain valid JSON");
         assert_eq!(active_metadata.get("local"), Some(&json!(true)));
@@ -1333,6 +1367,15 @@ mod tests {
             )
             .expect("failed to read last activity timestamp")
         };
+        let read_sync_flag = |thread_id: &str| -> i64 {
+            conn.query_row(
+                "SELECT claude_sync_required FROM threads
+                 WHERE workspace_id = ?1 AND engine_thread_id = ?2",
+                params![workspace.id, thread_id],
+                |row| row.get(0),
+            )
+            .expect("failed to read Claude sync flag")
+        };
         assert_eq!(read_last_activity("claude-equal-zone"), "2026-08-18T10:00:00Z");
         assert_eq!(read_last_activity("claude-older"), "2026-08-18T10:00:00Z");
         assert_eq!(read_last_activity("claude-millisecond"), "2026-08-18T10:00:00.001Z");
@@ -1341,6 +1384,14 @@ mod tests {
         assert_eq!(read_last_activity("claude-invalid-remote"), "2026-08-18T10:00:00Z");
         assert_eq!(read_last_activity("claude-none-remote"), "2026-08-18T10:00:00Z");
         assert_eq!(read_last_activity("claude-empty-remote"), "2026-08-18T10:00:00Z");
+        assert_eq!(read_sync_flag("claude-equal-zone"), 0);
+        assert_eq!(read_sync_flag("claude-older"), 0);
+        assert_eq!(read_sync_flag("claude-millisecond"), 1);
+        assert_eq!(read_sync_flag("claude-invalid-db"), 1);
+        assert_eq!(read_sync_flag("claude-empty-db"), 1);
+        assert_eq!(read_sync_flag("claude-invalid-remote"), 0);
+        assert_eq!(read_sync_flag("claude-none-remote"), 0);
+        assert_eq!(read_sync_flag("claude-empty-remote"), 0);
     }
 
     /// 验证已有非法 metadata 在远端刷新时保持原始字符串而不阻断时间更新。

@@ -2209,13 +2209,13 @@ async fn sync_empty_cli_thread_from_engine(
     thread_id: &str,
     thread: &ThreadDto,
 ) -> Result<ThreadDto, String> {
-    let message_count = run_db(state.db.clone(), {
-        let thread_id = thread_id.to_string();
-        move |db| db::messages::count_thread_messages(db, &thread_id)
-    })
-    .await?;
     let mut summary_synced_thread = thread.clone();
     if thread.engine_id == "opencode" {
+        let message_count = run_db(state.db.clone(), {
+            let thread_id = thread_id.to_string();
+            move |db| db::messages::count_thread_messages(db, &thread_id)
+        })
+        .await?;
         if let Some(engine_thread_id) = thread
             .engine_thread_id
             .as_deref()
@@ -2278,9 +2278,27 @@ async fn sync_empty_cli_thread_from_engine(
                 return Ok(summary_synced_thread);
             }
         }
-    }
-    if message_count != 0 {
-        return Ok(thread.clone());
+        if message_count != 0 {
+            return Ok(thread.clone());
+        }
+    } else if thread.engine_id == "claude" {
+        let sync_required = run_db(state.db.clone(), {
+            let thread_id = thread_id.to_string();
+            move |db| db::threads::get_claude_sync_required(db, &thread_id)
+        })
+        .await?;
+        if !sync_required {
+            return Ok(thread.clone());
+        }
+    } else {
+        let message_count = run_db(state.db.clone(), {
+            let thread_id = thread_id.to_string();
+            move |db| db::messages::count_thread_messages(db, &thread_id)
+        })
+        .await?;
+        if message_count != 0 {
+            return Ok(thread.clone());
+        }
     }
 
     let Some(engine_thread_id) = thread
@@ -2356,7 +2374,7 @@ async fn sync_empty_cli_thread_from_engine(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    run_db(state.db.clone(), {
+    let updated_thread = run_db(state.db.clone(), {
         let thread_id = thread_id.to_string();
         let title = title.map(str::to_string);
         move |db| {
@@ -2369,7 +2387,18 @@ async fn sync_empty_cli_thread_from_engine(
             )
         }
     })
-    .await
+    .await?;
+
+    // 完整历史、统计和现有运行时更新全部成功后，清除当前 Claude 线程的同步标记。
+    if thread.engine_id == "claude" {
+        run_db(state.db.clone(), {
+            let thread_id = thread_id.to_string();
+            move |db| db::threads::set_claude_sync_required(db, &thread_id, false)
+        })
+        .await?;
+    }
+
+    Ok(updated_thread)
 }
 
 /// 通过 Tauri 命令同步指定引擎线程的最新会话内容。
