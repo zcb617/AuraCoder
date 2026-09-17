@@ -1,4 +1,9 @@
-import { useRef, type CSSProperties, type MouseEvent as ReactMouseEvent } from "react";
+import {
+  useLayoutEffect,
+  useRef,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import {
   classifyLinkTarget,
   getWorkspacePaneLeafIdFromEventTarget,
@@ -19,6 +24,8 @@ export interface TextBlockProps {
   content: string;
   /** 标记文本是否仍在流式接收，用于暂缓未闭合代码围栏。 */
   streaming?: boolean;
+  /** 当前流式文本已经提交到消息 DOM 后执行的业务回调。 */
+  onContentCommitted?: () => void;
   /** 文本块外层容器的 CSS 类名。 */
   className?: string;
   /** 文本块外层容器的行内样式。 */
@@ -101,6 +108,7 @@ function handleMarkdownLinkContextMenu(
 export function TextBlock({
   content,
   streaming = false,
+  onContentCommitted,
   className,
   style,
   enableFileContextMenu = false,
@@ -108,6 +116,8 @@ export function TextBlock({
   const { openLocalFileContextMenu, contextMenu } = useChatFileContextMenu();
   const appenderRef = useRef<ReturnType<typeof createStreamingMarkdownAppender> | null>(null);
   const previousContentRef = useRef<string | null>(null);
+  // 记录最近一次已提交的 HTML，确保回调只对应实际内容提交而非父组件重渲染。
+  const committedHtmlRef = useRef<string | null>(null);
 
   if (appenderRef.current === null) {
     appenderRef.current = createStreamingMarkdownAppender();
@@ -135,6 +145,15 @@ export function TextBlock({
     html = renderMarkdownToHtml(content);
     previousContentRef.current = null;
   }
+
+  useLayoutEffect(() => {
+    const htmlChanged = committedHtmlRef.current !== html;
+    committedHtmlRef.current = html;
+    if (!streaming || !onContentCommitted || !htmlChanged) {
+      return;
+    }
+    onContentCommitted();
+  }, [html, onContentCommitted, streaming]);
 
   return (
     <>

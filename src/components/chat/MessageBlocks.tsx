@@ -101,6 +101,8 @@ interface Props {
   engineId?: string;
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   onLoadActionOutput?: (actionId: string) => Promise<void>;
+  /** 当前流式消息文本提交到 DOM 后执行的滚动回调。 */
+  onContentCommitted?: () => void;
   onOpenDiffFile?: (filePath: string) => void;
   onOpenImageAttachment?: (attachment: AttachmentBlock) => void;
 }
@@ -2415,6 +2417,7 @@ function renderSingleBlock(
   engineId: string | undefined,
   onApproval: (approvalId: string, response: ApprovalResponse) => void,
   onLoadActionOutput: ((actionId: string) => Promise<void>) | undefined,
+  onContentCommitted: (() => void) | undefined,
   backgroundTaskActions: ActionBlock[],
   onOpenDiffFile: ((filePath: string) => void) | undefined,
   onOpenImageAttachment: ((attachment: AttachmentBlock) => void) | undefined,
@@ -2433,6 +2436,7 @@ function renderSingleBlock(
         key={blockKey}
         content={textContent}
         streaming={isStreamingText ? true : undefined}
+        onContentCommitted={isStreamingText ? onContentCommitted : undefined}
         enableFileContextMenu
         className="prose"
         style={{ fontSize: 13, padding: "6px 14px" }}
@@ -2557,6 +2561,7 @@ function MessageBlocksView({
   engineId,
   onApproval,
   onLoadActionOutput,
+  onContentCommitted,
   onOpenDiffFile,
   onOpenImageAttachment,
 }: Props) {
@@ -2730,6 +2735,7 @@ function MessageBlocksView({
           engineId,
           onApproval,
           onLoadActionOutput,
+          onContentCommitted,
           backgroundTaskActions,
           onOpenDiffFile,
           onOpenImageAttachment,
@@ -2749,6 +2755,7 @@ export const MessageBlocks = memo(
     prev.engineId === next.engineId &&
     prev.onApproval === next.onApproval &&
     prev.onLoadActionOutput === next.onLoadActionOutput &&
+    prev.onContentCommitted === next.onContentCommitted &&
     prev.onOpenDiffFile === next.onOpenDiffFile &&
     prev.onOpenImageAttachment === next.onOpenImageAttachment,
 );

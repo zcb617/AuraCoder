@@ -92,6 +92,8 @@ export interface MessageRowProps {
   onApproval: (approvalId: string, response: ApprovalResponse) => void;
   /** 用户请求加载动作输出时执行的业务回调。 */
   onLoadActionOutput: (messageId: string, actionId: string) => Promise<void>;
+  /** 当前流式消息文本提交到 DOM 后执行的滚动回调。 */
+  onContentCommitted?: () => void;
   /** 用户编辑并重新发送消息时执行的业务回调。 */
   onEditResend?: (text: string) => void;
   /** 用户打开差异文件时执行的业务回调。 */
@@ -206,6 +208,7 @@ function MessageRowView({
   preparingLabel,
   onApproval,
   onLoadActionOutput,
+  onContentCommitted,
   onEditResend,
   onOpenDiffFile,
   onOpenImageAttachment,
@@ -438,6 +441,7 @@ function MessageRowView({
                 engineId={assistantEngineId}
                 onApproval={onApproval}
                 onLoadActionOutput={(actionId) => onLoadActionOutput(message.id, actionId)}
+                onContentCommitted={onContentCommitted}
                 onOpenDiffFile={onOpenDiffFile}
                 onOpenImageAttachment={onOpenImageAttachment}
               />
@@ -525,6 +529,7 @@ export const MessageRow = memo(
     prev.preparingLabel === next.preparingLabel &&
     prev.onApproval === next.onApproval &&
     prev.onLoadActionOutput === next.onLoadActionOutput &&
+    prev.onContentCommitted === next.onContentCommitted &&
     prev.onEditResend === next.onEditResend &&
     prev.onOpenDiffFile === next.onOpenDiffFile &&
     prev.onOpenImageAttachment === next.onOpenImageAttachment,

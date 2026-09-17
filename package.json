@@ -1,7 +1,7 @@
 {
   "name": "auracoder",
   "private": true,
-  "version": "1.0.19",
+  "version": "1.0.20",
   "type": "module",
   "engines": {
     "node": ">=24 <25"
@@ -34,7 +34,7 @@
     "prune:artifacts:stale": "node scripts/prune-local-artifacts.mjs --apply --stale",
     "preview": "vite preview",
     "lint": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run tests",
     "test:public-publish": "bash scripts/test-github-public-publish.sh",
     "typecheck": "tsc --noEmit",
     "check:codex-schema": "node scripts/check-codex-app-server-parity.mjs",

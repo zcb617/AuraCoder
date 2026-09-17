@@ -2989,6 +2989,14 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     viewport.scrollTo({ top: viewport.scrollHeight, behavior });
   }, []);
 
+  /** 当前流式文本完成 DOM 提交后，在未锁定时跟随消息视口到底部。 */
+  const handleStreamingTextContentCommitted = useCallback(() => {
+    if (autoScrollLocked) {
+      return;
+    }
+    scrollViewportToBottom("auto");
+  }, [autoScrollLocked, scrollViewportToBottom]);
+
   useEffect(() => {
     threadActivatedAtRef.current = performance.now();
     prependLoadInFlightRef.current = false;
@@ -3031,13 +3039,16 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     };
   }, [threadId, messages.length, messageFocusTarget?.threadId, scrollViewportToBottom]);
 
-  useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-    if (!autoScrollLocked) {
-      scrollViewportToBottom("smooth");
-    }
-  }, [messages, autoScrollLocked, scrollViewportToBottom]);
+  /*
+   * 已停用：messages 变化只代表远端 TextDelta 到达，不能作为消息 DOM 已提交的滚动触发信号。
+   * useEffect(() => {
+   *   const viewport = viewportRef.current;
+   *   if (!viewport) return;
+   *   if (!autoScrollLocked) {
+   *     scrollViewportToBottom("smooth");
+   *   }
+   * }, [messages, autoScrollLocked, scrollViewportToBottom]);
+   */
 
   useEffect(() => {
     if (!pendingSubmission || autoScrollLocked) {
@@ -5420,6 +5431,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
               flexibleMessageConfirmDisabled={flexibleMessageConfirmDisabled}
               flexibleMessageConfirmTitle={flexibleMessageConfirmTitle}
               autoScrollLocked={autoScrollLocked}
+              onStreamingTextContentCommitted={handleStreamingTextContentCommitted}
               textAnnotationPopover={textAnnotationPopover}
               textAnnotationComment={textAnnotationComment}
               textAnnotationPopoverRef={textAnnotationPopoverRef}

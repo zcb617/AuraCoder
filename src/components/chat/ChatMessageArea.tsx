@@ -77,6 +77,8 @@ interface ChatMessageAreaProps {
   flexibleMessageConfirmTitle: string;
   /** 当前是否锁定自动滚动到最新消息。 */
   autoScrollLocked: boolean;
+  /** 当前流式消息文本提交到 DOM 后执行的滚动回调。 */
+  onStreamingTextContentCommitted?: () => void;
   /** 当前文本标注浮层状态。 */
   textAnnotationPopover: TextAnnotationPopover | null;
   /** 当前文本标注评论内容。 */
@@ -139,6 +141,7 @@ export function ChatMessageArea({
   flexibleMessageConfirmDisabled,
   flexibleMessageConfirmTitle,
   autoScrollLocked,
+  onStreamingTextContentCommitted,
   textAnnotationPopover,
   textAnnotationComment,
   textAnnotationPopoverRef,
@@ -283,6 +286,10 @@ export function ChatMessageArea({
           <div style={{ display: "flex", flexDirection: "column", gap: MESSAGE_ROW_GAP }}>
             {visibleMessages.map((message, index) => {
               const assistantIdentity = assistantIdentityByMessageId.get(message.id);
+              const isCurrentStreamingMessage =
+                streaming &&
+                message.status === "streaming" &&
+                message.id === messages[messages.length - 1]?.id;
               return (
                 <MessageRow
                   key={message.id}
@@ -313,6 +320,11 @@ export function ChatMessageArea({
                   }
                   onApproval={handleApproval}
                   onLoadActionOutput={handleLoadActionOutput}
+                  onContentCommitted={
+                    isCurrentStreamingMessage
+                      ? onStreamingTextContentCommitted
+                      : undefined
+                  }
                   onEditResend={handleEditResend}
                   onOpenDiffFile={handleOpenDiffFile}
                   onOpenImageAttachment={handleOpenImageAttachment}
