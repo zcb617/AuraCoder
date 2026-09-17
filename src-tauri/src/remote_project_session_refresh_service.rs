@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 // 旧 OpenCode Tunnel HTTP 会话读取函数仅保留在下方注释中：
 // use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures::{SinkExt, StreamExt};
-use rusqlite::{params_from_iter, types::Value as SqlValue};
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -410,6 +410,7 @@ pub(crate) struct RemoteSessionSnapshot {
     pub(crate) metadata: Value,
 }
 
+/// 按远端会话更新时间导入或增量刷新指定工作区的会话持久化状态。
 async fn persist_sessions(
     db: Arc<Database>,
     workspace: &WorkspaceDto,
@@ -421,74 +422,219 @@ async fn persist_sessions(
     }
 
     if engine_id == "claude" {
-        // Claude Code 启动同步只负责导入本地尚不存在的会话。把整批远端数据
-        // 一次交给 SQLite，通过 NOT EXISTS 在 INSERT 前排除已有记录；这里不
-        // 做前置 SELECT、不逐条查库，也不在 Rust 中维护已有 ID 集合。
-        let value_groups = vec!["(?, ?, ?, ?, ?, ?, ?, ?, ?)"; sessions.len()].join(", ");
-        let sql = format!(
-            r#"
-            WITH remote_sessions (
-                id, engine_thread_id, model_id, title, status,
-                engine_metadata_json, reasoning_effort, last_activity_at, created_at
-            ) AS (VALUES {value_groups})
-            INSERT INTO threads (
-                id, workspace_id, engine_id, model_id, engine_thread_id,
-                engine_metadata_json, title, status, reasoning_effort, last_activity_at, created_at
-            )
-            SELECT
-                remote.id, ?, 'claude', remote.model_id, remote.engine_thread_id,
-                remote.engine_metadata_json, remote.title, remote.status, remote.reasoning_effort,
-                CASE
-                    WHEN remote.last_activity_at <> '' THEN remote.last_activity_at
-                    ELSE remote.created_at
-                END,
-                remote.created_at
-            FROM remote_sessions AS remote
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM threads AS local
-                WHERE local.workspace_id = ?
-                  AND local.engine_id = 'claude'
-                  AND local.engine_thread_id = remote.engine_thread_id
-            )
-            "#
-        );
-        let mut bind_values = Vec::with_capacity(sessions.len() * 9 + 2);
-        for session in sessions {
-            let model_id = if session.model_id.trim().is_empty() {
-                "unknown".to_string()
-            } else {
-                session.model_id.trim().to_string()
-            };
-            let created_at = runtime_env::system_time_rfc3339();
-            bind_values.extend([
-                SqlValue::Text(Uuid::new_v4().to_string()),
-                SqlValue::Text(session.engine_thread_id),
-                SqlValue::Text(model_id),
-                SqlValue::Text(session.title),
-                SqlValue::Text(session.status.as_str().to_string()),
-                SqlValue::Text(session.metadata.to_string()),
-                session
-                    .reasoning_effort
-                    .map(SqlValue::Text)
-                    .unwrap_or(SqlValue::Null),
-                SqlValue::Text(session.updated_at.unwrap_or_default()),
-                SqlValue::Text(created_at),
-            ]);
-        }
-        bind_values.push(SqlValue::Text(workspace.id.clone()));
-        bind_values.push(SqlValue::Text(workspace.id.clone()));
+        // 在单个事务内按工作区和 Claude 会话身份导入或增量刷新远端快照。
+        tokio::task::spawn_blocking({
+            let workspace_id = workspace.id.clone();
+            move || -> Result<()> {
+                let mut conn = db.connect()?;
+                let tx = conn
+                    .transaction()
+                    .context("failed begin Claude remote thread import transaction")?;
 
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = db.connect()?;
-            let tx = conn
-                .transaction()
-                .context("failed begin Claude remote thread import transaction")?;
-            tx.execute(&sql, params_from_iter(bind_values))
-                .context("failed insert Claude remote thread snapshots")?;
-            tx.commit()
-                .context("failed commit Claude remote thread import transaction")?;
-            Ok(())
+                for session in sessions {
+                    let remote_time = match session.updated_at.as_deref() {
+                        Some(raw) if !raw.trim().is_empty() => {
+                            match chrono::DateTime::parse_from_rfc3339(raw.trim()) {
+                                Ok(value) => Some(value.with_timezone(&chrono::Utc)),
+                                Err(error) => {
+                                    log::warn!(
+                                        "Claude 会话远端时间解析失败: workspace_id={} session_id={} raw={} error={error}",
+                                        workspace_id,
+                                        session.engine_thread_id,
+                                        raw
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Some(raw) => {
+                            log::warn!(
+                                "Claude 会话远端时间缺失: workspace_id={} session_id={} raw={}",
+                                workspace_id,
+                                session.engine_thread_id,
+                                raw
+                            );
+                            None
+                        }
+                        None => {
+                            log::warn!(
+                                "Claude 会话远端时间缺失: workspace_id={} session_id={}",
+                                workspace_id,
+                                session.engine_thread_id
+                            );
+                            None
+                        }
+                    };
+
+                    let existing = tx
+                        .query_row(
+                            "SELECT id, last_activity_at, engine_metadata_json, title
+                             FROM threads
+                             WHERE workspace_id = ?1
+                               AND engine_id = 'claude'
+                               AND engine_thread_id = ?2",
+                            params![workspace_id, session.engine_thread_id],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, Option<String>>(1)?,
+                                    row.get::<_, Option<String>>(2)?,
+                                    row.get::<_, Option<String>>(3)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                        .context("failed query existing Claude remote thread")?;
+
+                    let Some((thread_id, db_last_activity_at, existing_metadata, existing_title)) =
+                        existing
+                    else {
+                        let created_at = runtime_env::system_time_rfc3339();
+                        let last_activity_at = session
+                            .updated_at
+                            .as_deref()
+                            .filter(|raw| {
+                                !raw.trim().is_empty()
+                                    && chrono::DateTime::parse_from_rfc3339(raw.trim()).is_ok()
+                            })
+                            .unwrap_or(&created_at);
+                        let model_id = if session.model_id.trim().is_empty() {
+                            "unknown"
+                        } else {
+                            session.model_id.trim()
+                        };
+                        tx.execute(
+                            "INSERT INTO threads (
+                                 id, workspace_id, engine_id, model_id, engine_thread_id,
+                                 engine_metadata_json, title, status, reasoning_effort,
+                                 last_activity_at, created_at
+                             ) VALUES (?1, ?2, 'claude', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                            params![
+                                Uuid::new_v4().to_string(),
+                                workspace_id,
+                                model_id,
+                                session.engine_thread_id,
+                                session.metadata.to_string(),
+                                session.title,
+                                session.status.as_str().to_string(),
+                                session.reasoning_effort,
+                                last_activity_at,
+                                created_at,
+                            ],
+                        )
+                        .context("failed insert Claude remote thread snapshot")?;
+                        continue;
+                    };
+
+                    let Some(remote_time) = remote_time else {
+                        continue;
+                    };
+
+                    let db_time = match db_last_activity_at.as_deref() {
+                        Some(raw) if !raw.trim().is_empty() => {
+                            match chrono::DateTime::parse_from_rfc3339(raw.trim()) {
+                                Ok(value) => Some(value.with_timezone(&chrono::Utc)),
+                                Err(error) => {
+                                    log::warn!(
+                                        "Claude 会话数据库时间解析失败: workspace_id={} session_id={} raw={} error={error}",
+                                        workspace_id,
+                                        session.engine_thread_id,
+                                        raw
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Some(raw) => {
+                            log::warn!(
+                                "Claude 会话数据库时间缺失: workspace_id={} session_id={} raw={}",
+                                workspace_id,
+                                session.engine_thread_id,
+                                raw
+                            );
+                            None
+                        }
+                        None => None,
+                    };
+                    if db_time.is_some_and(|value| remote_time <= value) {
+                        continue;
+                    }
+
+                    let mut manual_title = false;
+                    let metadata_raw = existing_metadata.clone().unwrap_or_default();
+                    let metadata_to_write = if metadata_raw.trim().is_empty() {
+                        let mut metadata = serde_json::Map::new();
+                        if let Value::Object(remote_metadata) = &session.metadata {
+                            metadata.extend(remote_metadata.clone());
+                        }
+                        Value::Object(metadata).to_string()
+                    } else {
+                        match serde_json::from_str::<Value>(&metadata_raw) {
+                            Ok(Value::Object(mut metadata)) => {
+                                let existing_manual_title = metadata.get("manualTitle").cloned();
+                                let existing_manual_title_updated_at =
+                                    metadata.get("manualTitleUpdatedAt").cloned();
+                                manual_title = existing_manual_title
+                                    .as_ref()
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                if let Value::Object(remote_metadata) = &session.metadata {
+                                    metadata.extend(remote_metadata.clone());
+                                }
+                                if let Some(value) = existing_manual_title {
+                                    metadata.insert("manualTitle".to_string(), value);
+                                }
+                                if let Some(value) = existing_manual_title_updated_at {
+                                    metadata.insert("manualTitleUpdatedAt".to_string(), value);
+                                }
+                                Value::Object(metadata).to_string()
+                            }
+                            Ok(value) => {
+                                log::warn!(
+                                    "Claude 会话数据库 metadata 不是 JSON object: workspace_id={} session_id={} raw={} value={}",
+                                    workspace_id,
+                                    session.engine_thread_id,
+                                    metadata_raw,
+                                    value
+                                );
+                                metadata_raw.clone()
+                            }
+                            Err(error) => {
+                                log::warn!(
+                                    "Claude 会话数据库 metadata 解析失败: workspace_id={} session_id={} raw={} error={error}",
+                                    workspace_id,
+                                    session.engine_thread_id,
+                                    metadata_raw
+                                );
+                                metadata_raw.clone()
+                            }
+                        }
+                    };
+                    let title_to_write = if manual_title {
+                        existing_title
+                    } else {
+                        Some(session.title)
+                    };
+                    tx.execute(
+                        "UPDATE threads
+                         SET title = ?1,
+                             engine_metadata_json = ?2,
+                             last_activity_at = ?3
+                         WHERE id = ?4",
+                        params![
+                            title_to_write,
+                            metadata_to_write,
+                            session.updated_at,
+                            thread_id,
+                        ],
+                    )
+                    .context("failed update Claude remote thread snapshot")?;
+                }
+
+                tx.commit()
+                    .context("failed commit Claude remote thread import transaction")?;
+                Ok(())
+            }
         })
         .await
         .context("Claude remote thread import task failed")??;
@@ -940,21 +1086,24 @@ mod tests {
         assert_eq!(count, 500);
     }
 
+        /// 验证 Claude 远端较新时只刷新允许的来源字段，并保护本地状态和配置。
     #[tokio::test]
-    async fn claude_batch_import_skips_existing_archived_and_unarchived_sessions() {
+    async fn claude_batch_import_updates_existing_sessions_without_overwriting_local_state() {
         let (db, workspace) = test_database_and_workspace();
         let conn = db.connect().expect("failed to connect test database");
         conn.execute(
             "INSERT INTO threads (
                  id, workspace_id, engine_id, model_id, engine_thread_id,
                  engine_metadata_json, title, status, archived_at,
-                 created_at, last_activity_at
+                 message_count, total_tokens, plan_mode, send_method,
+                 reasoning_effort, permission_mode, created_at, last_activity_at
              ) VALUES (?1, ?2, 'claude', 'local-model', 'claude-existing',
-                       ?3, 'local-title', 'completed', ?4, ?5, ?6)",
+                       ?3, 'local-title', 'completed', ?4, 5, 42, 1, 'manual',
+                       'low', 'default', ?5, ?6)",
             params![
                 "local-thread-id",
                 workspace.id,
-                r#"{"local":true}"#,
+                r#"{"local":true,"manualTitle":true,"manualTitleUpdatedAt":"2026-08-17T09:00:00Z"}"#,
                 "2026-08-17T10:00:00Z",
                 "2026-08-16T10:00:00Z",
                 "2026-08-16T11:00:00Z",
@@ -965,9 +1114,11 @@ mod tests {
             "INSERT INTO threads (
                  id, workspace_id, engine_id, model_id, engine_thread_id,
                  engine_metadata_json, title, status, archived_at,
-                 created_at, last_activity_at
+                 message_count, total_tokens, plan_mode, send_method,
+                 reasoning_effort, permission_mode, created_at, last_activity_at
              ) VALUES (?1, ?2, 'claude', 'local-active-model', 'claude-existing-active',
-                       ?3, 'local-active-title', 'idle', NULL, ?4, ?5)",
+                       ?3, 'local-active-title', 'idle', NULL, 7, 84, 0, 'auto',
+                       'medium', 'safe', ?4, ?5)",
             params![
                 "local-active-thread-id",
                 workspace.id,
@@ -982,9 +1133,17 @@ mod tests {
         let mut existing = test_snapshot("claude-existing", "remote-title");
         existing.model_id = "remote-model".to_string();
         existing.status = ThreadStatusDto::Streaming;
+        existing.reasoning_effort = Some("remote-effort".to_string());
+        existing.metadata = json!({
+            "remote": true,
+            "manualTitle": false,
+            "manualTitleUpdatedAt": "remote-value",
+            "remoteOnly": "new"
+        });
         let mut active_existing = test_snapshot("claude-existing-active", "remote-active-title");
         active_existing.model_id = "remote-active-model".to_string();
         active_existing.status = ThreadStatusDto::Completed;
+        active_existing.metadata = json!({"remoteActive": true});
         let snapshots = vec![
             existing,
             active_existing,
@@ -994,7 +1153,7 @@ mod tests {
             .await
             .expect("Claude mixed batch import should succeed");
 
-        let conn = db.connect().expect("failed to connect test database");
+        let conn = db.connect().expect("failed to read Claude sessions");
         let existing_row: (
             String,
             String,
@@ -1003,10 +1162,17 @@ mod tests {
             String,
             String,
             String,
+            i64,
+            i64,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
         ) = conn
             .query_row(
                 "SELECT title, model_id, status, archived_at, created_at, last_activity_at,
-                        COALESCE(engine_metadata_json, '')
+                        COALESCE(engine_metadata_json, ''), message_count, total_tokens,
+                        plan_mode, send_method, reasoning_effort, permission_mode
                  FROM threads
                  WHERE workspace_id = ?1 AND engine_thread_id = 'claude-existing'",
                 params![workspace.id],
@@ -1019,6 +1185,12 @@ mod tests {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
                     ))
                 },
             )
@@ -1028,44 +1200,56 @@ mod tests {
         assert_eq!(existing_row.2, "completed");
         assert_eq!(existing_row.3.as_deref(), Some("2026-08-17T10:00:00Z"));
         assert_eq!(existing_row.4, "2026-08-16T10:00:00Z");
-        assert_eq!(existing_row.5, "2026-08-16T11:00:00Z");
-        assert_eq!(existing_row.6, r#"{"local":true}"#);
+        assert_eq!(existing_row.5, "2026-08-18T10:00:00Z");
+        assert_eq!(existing_row.7, 5);
+        assert_eq!(existing_row.8, 42);
+        assert_eq!(existing_row.9, Some(1));
+        assert_eq!(existing_row.10.as_deref(), Some("manual"));
+        assert_eq!(existing_row.11.as_deref(), Some("low"));
+        assert_eq!(existing_row.12.as_deref(), Some("default"));
+        let existing_metadata: Value = serde_json::from_str(&existing_row.6)
+            .expect("existing Claude metadata should remain valid JSON");
+        assert_eq!(existing_metadata.get("local"), Some(&json!(true)));
+        assert_eq!(existing_metadata.get("remote"), Some(&json!(true)));
+        assert_eq!(existing_metadata.get("remoteOnly"), Some(&json!("new")));
+        assert_eq!(existing_metadata.get("manualTitle"), Some(&json!(true)));
+        assert_eq!(
+            existing_metadata.get("manualTitleUpdatedAt"),
+            Some(&json!("2026-08-17T09:00:00Z"))
+        );
 
-        let active_existing_row: (
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-            String,
-        ) = conn
+        let active_existing_row: (String, String, String, Option<String>, String, String, String, i64, i64, Option<i64>, Option<String>, Option<String>, Option<String>) = conn
             .query_row(
                 "SELECT title, model_id, status, archived_at, created_at, last_activity_at,
-                        COALESCE(engine_metadata_json, '')
+                        COALESCE(engine_metadata_json, ''), message_count, total_tokens,
+                        plan_mode, send_method, reasoning_effort, permission_mode
                  FROM threads
                  WHERE workspace_id = ?1 AND engine_thread_id = 'claude-existing-active'",
                 params![workspace.id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
+                |row| Ok((
+                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                    row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                    row.get(10)?, row.get(11)?, row.get(12)?,
+                )),
             )
             .expect("failed to read active existing Claude session");
-        assert_eq!(active_existing_row.0, "local-active-title");
+        assert_eq!(active_existing_row.0, "remote-active-title");
         assert_eq!(active_existing_row.1, "local-active-model");
         assert_eq!(active_existing_row.2, "idle");
         assert_eq!(active_existing_row.3, None);
         assert_eq!(active_existing_row.4, "2026-08-15T10:00:00Z");
-        assert_eq!(active_existing_row.5, "2026-08-15T11:00:00Z");
-        assert_eq!(active_existing_row.6, r#"{"local":true,"active":true}"#);
+        assert_eq!(active_existing_row.5, "2026-08-18T10:00:00Z");
+        assert_eq!(active_existing_row.7, 7);
+        assert_eq!(active_existing_row.8, 84);
+        assert_eq!(active_existing_row.9, Some(0));
+        assert_eq!(active_existing_row.10.as_deref(), Some("auto"));
+        assert_eq!(active_existing_row.11.as_deref(), Some("medium"));
+        assert_eq!(active_existing_row.12.as_deref(), Some("safe"));
+        let active_metadata: Value = serde_json::from_str(&active_existing_row.6)
+            .expect("active Claude metadata should remain valid JSON");
+        assert_eq!(active_metadata.get("local"), Some(&json!(true)));
+        assert_eq!(active_metadata.get("active"), Some(&json!(true)));
+        assert_eq!(active_metadata.get("remoteActive"), Some(&json!(true)));
 
         let count: i64 = conn
             .query_row(
@@ -1076,6 +1260,129 @@ mod tests {
             )
             .expect("failed to count mixed Claude sessions");
         assert_eq!(count, 3);
+    }
+
+    /// 验证 RFC3339 绝对时间、毫秒边界和无效时间的跳过或修复规则。
+    #[tokio::test]
+    async fn claude_refresh_compares_rfc3339_times_and_repairs_database_time() {
+        let (db, workspace) = test_database_and_workspace();
+        let conn = db.connect().expect("failed to connect test database");
+        for (thread_id, last_activity_at, metadata) in [
+            ("claude-equal-zone", Some("2026-08-18T10:00:00Z"), "{\"keep\":true}"),
+            ("claude-older", Some("2026-08-18T10:00:00Z"), "{\"keep\":true}"),
+            ("claude-millisecond", Some("2026-08-18T10:00:00.000Z"), "{\"keep\":true}"),
+            ("claude-invalid-db", Some("not-a-time"), "{\"keep\":true}"),
+            ("claude-empty-db", Some(""), "{\"keep\":true}"),
+            ("claude-invalid-remote", Some("2026-08-18T10:00:00Z"), "{\"keep\":true}"),
+            ("claude-none-remote", Some("2026-08-18T10:00:00Z"), "{\"keep\":true}"),
+            ("claude-empty-remote", Some("2026-08-18T10:00:00Z"), "{\"keep\":true}"),
+        ] {
+            conn.execute(
+                "INSERT INTO threads (
+                     id, workspace_id, engine_id, model_id, engine_thread_id,
+                     engine_metadata_json, title, status, created_at, last_activity_at
+                 ) VALUES (?1, ?2, 'claude', 'local-model', ?3, ?4, 'local-title',
+                           'completed', '2026-08-16T10:00:00Z', ?5)",
+                params![Uuid::new_v4().to_string(), workspace.id, thread_id, metadata, last_activity_at],
+            )
+            .expect("failed to insert time comparison fixture");
+        }
+        drop(conn);
+
+        let mut equal_zone = test_snapshot("claude-equal-zone", "remote-equal");
+        equal_zone.updated_at = Some("2026-08-18T12:00:00+02:00".to_string());
+        let mut older = test_snapshot("claude-older", "remote-older");
+        older.updated_at = Some("2026-08-18T09:59:59Z".to_string());
+        let mut millisecond = test_snapshot("claude-millisecond", "remote-millisecond");
+        millisecond.updated_at = Some("2026-08-18T10:00:00.001Z".to_string());
+        let mut invalid_db = test_snapshot("claude-invalid-db", "remote-invalid-db");
+        invalid_db.updated_at = Some("2026-08-18T11:00:00Z".to_string());
+        let mut empty_db = test_snapshot("claude-empty-db", "remote-empty-db");
+        empty_db.updated_at = Some("2026-08-18T11:00:00Z".to_string());
+        let mut invalid_remote = test_snapshot("claude-invalid-remote", "remote-invalid");
+        invalid_remote.updated_at = Some("not-a-time".to_string());
+        let mut none_remote = test_snapshot("claude-none-remote", "remote-none");
+        none_remote.updated_at = None;
+        let mut empty_remote = test_snapshot("claude-empty-remote", "remote-empty");
+        empty_remote.updated_at = Some("   ".to_string());
+        persist_sessions(
+            Arc::new(db.clone()),
+            &workspace,
+            "claude",
+            vec![
+                equal_zone,
+                older,
+                millisecond,
+                invalid_db,
+                empty_db,
+                invalid_remote,
+                none_remote,
+                empty_remote,
+            ],
+        )
+        .await
+        .expect("Claude time comparison should succeed");
+
+        let conn = db.connect().expect("failed to read time comparison fixtures");
+        let read_last_activity = |thread_id: &str| -> String {
+            conn.query_row(
+                "SELECT last_activity_at FROM threads
+                 WHERE workspace_id = ?1 AND engine_thread_id = ?2",
+                params![workspace.id, thread_id],
+                |row| row.get(0),
+            )
+            .expect("failed to read last activity timestamp")
+        };
+        assert_eq!(read_last_activity("claude-equal-zone"), "2026-08-18T10:00:00Z");
+        assert_eq!(read_last_activity("claude-older"), "2026-08-18T10:00:00Z");
+        assert_eq!(read_last_activity("claude-millisecond"), "2026-08-18T10:00:00.001Z");
+        assert_eq!(read_last_activity("claude-invalid-db"), "2026-08-18T11:00:00Z");
+        assert_eq!(read_last_activity("claude-empty-db"), "2026-08-18T11:00:00Z");
+        assert_eq!(read_last_activity("claude-invalid-remote"), "2026-08-18T10:00:00Z");
+        assert_eq!(read_last_activity("claude-none-remote"), "2026-08-18T10:00:00Z");
+        assert_eq!(read_last_activity("claude-empty-remote"), "2026-08-18T10:00:00Z");
+    }
+
+    /// 验证已有非法 metadata 在远端刷新时保持原始字符串而不阻断时间更新。
+    #[tokio::test]
+    async fn claude_refresh_preserves_invalid_existing_metadata() {
+        let (db, workspace) = test_database_and_workspace();
+        let conn = db.connect().expect("failed to connect test database");
+        conn.execute(
+            "INSERT INTO threads (
+                 id, workspace_id, engine_id, model_id, engine_thread_id,
+                 engine_metadata_json, title, status, created_at, last_activity_at
+             ) VALUES (?1, ?2, 'claude', 'local-model', 'claude-invalid-metadata',
+                       ?3, 'local-title', 'completed', ?4, ?5)",
+            params![
+                "invalid-metadata-thread",
+                workspace.id,
+                "not-json",
+                "2026-08-16T10:00:00Z",
+                "2026-08-16T11:00:00Z",
+            ],
+        )
+        .expect("failed to insert invalid metadata fixture");
+        drop(conn);
+
+        let mut snapshot = test_snapshot("claude-invalid-metadata", "remote-title");
+        snapshot.updated_at = Some("2026-08-18T11:00:00Z".to_string());
+        persist_sessions(Arc::new(db.clone()), &workspace, "claude", vec![snapshot])
+            .await
+            .expect("Claude invalid metadata refresh should succeed");
+
+        let conn = db.connect().expect("failed to read invalid metadata fixture");
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT engine_metadata_json, title, last_activity_at FROM threads
+                 WHERE workspace_id = ?1 AND engine_thread_id = 'claude-invalid-metadata'",
+                params![workspace.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("failed to read invalid metadata row");
+        assert_eq!(row.0, "not-json");
+        assert_eq!(row.1, "remote-title");
+        assert_eq!(row.2, "2026-08-18T11:00:00Z");
     }
 
     #[tokio::test]
