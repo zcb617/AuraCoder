@@ -5037,6 +5037,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
   const batchApprovalInFlightRef = useRef(false);
 
+  /** 先同步完整权限，再批量结算当前已有的审批请求。 */
   async function allowAllPendingApprovals(stopAsking: boolean) {
     if (batchApprovalInFlightRef.current) {
       return;
@@ -5052,22 +5053,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
     batchApprovalInFlightRef.current = true;
     try {
-      for (const approval of batchApprovableRows) {
-        const details = approval.details ?? {};
-        const decision = stopAsking ? "accept_for_session" : "accept";
-        const accepted = await respondApproval(
-          approval.approvalId,
-          isPermissionsRequestApproval(details)
-            ? buildPermissionApprovalResponseForEngine(engineId, details, decision)
-            : { decision },
-          targetThreadId,
-        );
-        if (!accepted) {
-          toast.error(t("panel.toasts.approvalBatchFailed"));
-          return;
-        }
-      }
-
       if (stopAsking) {
         /*
          * 旧实现通过 autonomyPresetExecutionPolicyRequest 按 CLI 生成
@@ -5102,7 +5087,26 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
           ...permissionComponent,
           autonomyPreset: ["full"],
         } satisfies PermissionComponentJson;
-        await onPermissionComponentChange(next);
+        const permissionsSaved = await onPermissionComponentChange(next);
+        if (!permissionsSaved) {
+          return;
+        }
+      }
+
+      for (const approval of batchApprovableRows) {
+        const details = approval.details ?? {};
+        const decision = stopAsking ? "accept_for_session" : "accept";
+        const accepted = await respondApproval(
+          approval.approvalId,
+          isPermissionsRequestApproval(details)
+            ? buildPermissionApprovalResponseForEngine(engineId, details, decision)
+            : { decision },
+          targetThreadId,
+        );
+        if (!accepted) {
+          toast.error(t("panel.toasts.approvalBatchFailed"));
+          return;
+        }
       }
     } finally {
       batchApprovalInFlightRef.current = false;
