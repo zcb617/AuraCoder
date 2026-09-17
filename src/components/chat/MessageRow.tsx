@@ -164,7 +164,7 @@ function MessageCopyButton({ message }: { message: Message }) {
         padding: "2px 4px",
         display: "inline-flex",
         alignItems: "center",
-        color: copied ? "var(--success)" : "var(--text-3)",
+        color: copied ? "var(--success)" : "var(--message-meta)",
       }}
       aria-label="Copy message"
     >
