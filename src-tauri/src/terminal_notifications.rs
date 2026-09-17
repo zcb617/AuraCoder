@@ -40,11 +40,11 @@ const TERMINAL_NOTIFY_SUBCOMMAND: &str = "notify";
 const CODEX_NOTIFICATION_TITLE: &str = "Codex";
 const CODEX_NOTIFICATION_KIND_TURN_COMPLETE: &str = "agent-turn-complete";
 
-// Linux 下记录本应用已发出且仍由驻留线程持有的桌面通知 ID，供窗口聚焦时批量关闭。
+// Linux 下记录本应用已发出且仍可由原始句柄关闭的桌面通知，供窗口聚焦时批量关闭。
 #[cfg(target_os = "linux")]
-static ACTIVE_DESKTOP_NOTIFICATION_IDS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<u32>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static ACTIVE_DESKTOP_NOTIFICATION_HANDLES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, notify_rust::NotificationHandle>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 const CLAUDE_NOTIFICATION_TITLE: &str = "Claude";
 const CLAUDE_NOTIFICATION_ERROR_TITLE: &str = "Claude Error";
@@ -326,6 +326,33 @@ impl TerminalNotificationManager {
 
     pub async fn clear_for_workspace(&self, app: &AppHandle, workspace_id: &str) -> bool {
         self.clear(app, workspace_id, None).await
+    }
+
+    /// 清理所有工作区的终端通知记录，并向前端同步每个实际存在通知的工作区。
+    pub async fn clear_all(&self, app: &AppHandle) {
+        let workspace_ids = {
+            let mut notifications = self.notifications.write().await;
+            let workspace_ids = notifications
+                .iter()
+                .filter(|(_, by_session)| !by_session.is_empty())
+                .map(|(workspace_id, _)| workspace_id.clone())
+                .collect::<Vec<_>>();
+            notifications.clear();
+            workspace_ids
+        };
+
+        for workspace_id in workspace_ids {
+            let event_name = format!("{NOTIFICATION_CLEARED_EVENT_PREFIX}{workspace_id}");
+            let _ = app.emit(
+                &event_name,
+                TerminalNotificationClearedEvent { session_id: None },
+            );
+        }
+    }
+
+    /// 读取窗口级焦点状态，为聊天通知提供后端兜底判断。
+    pub async fn is_window_focused(&self) -> bool {
+        self.focus.read().await.window_focused
     }
 
     pub async fn set_focus(
@@ -1717,46 +1744,27 @@ fn resolved_notification_sound() -> Option<String> {
     config.notification_sound().map(|s| s.to_string())
 }
 
-// 按通知 ID 关闭本应用当前仍处于活动状态的全部 Linux 桌面通知，清除窗口聚焦后的系统未读徽标。
+// 按创建时保留的原始句柄关闭本应用当前全部 Linux 桌面通知，清除窗口聚焦后的系统未读徽标。
 pub fn close_all_desktop_notifications() {
     #[cfg(target_os = "linux")]
     {
-        let notification_ids = match ACTIVE_DESKTOP_NOTIFICATION_IDS.lock() {
+        let notification_handles = match ACTIVE_DESKTOP_NOTIFICATION_HANDLES.lock() {
             Ok(mut guard) => std::mem::take(&mut *guard),
             Err(error) => {
-                log::warn!("获取活动桌面通知 ID 失败，无法批量关闭: {error}");
+                log::warn!("获取活动桌面通知句柄失败，无法批量关闭: {error}");
                 return;
             }
         };
-        if notification_ids.is_empty() {
+        if notification_handles.is_empty() {
             return;
         }
 
-        let count = notification_ids.len();
+        let count = notification_handles.len();
         std::thread::spawn(move || {
-            zbus::block_on(async move {
-                let connection = match zbus::Connection::session().await {
-                    Ok(connection) => connection,
-                    Err(error) => {
-                        log::warn!("创建关闭桌面通知的 D-Bus 连接失败: {error}");
-                        return;
-                    }
-                };
-                for id in notification_ids {
-                    if let Err(error) = connection
-                        .call_method(
-                            Some("org.freedesktop.Notifications"),
-                            "/org/freedesktop/Notifications",
-                            Some("org.freedesktop.Notifications"),
-                            "CloseNotification",
-                            &(id),
-                        )
-                        .await
-                    {
-                        log::warn!("关闭桌面通知失败，通知 ID {id}: {error}");
-                    }
-                }
-            });
+            for (notification_id, handle) in notification_handles {
+                handle.close();
+                log::debug!("已关闭桌面通知，通知 ID {notification_id}");
+            }
             log::info!("窗口聚焦，已请求关闭 {count} 条桌面通知");
         });
     }
@@ -1803,6 +1811,8 @@ fn show_desktop_notification_content(
             .appname(&appname)
             .summary(title)
             .body(body)
+            // 避免桌面通知服务持久化历史通知，防止应用徽标持续累积
+            .hint(notify_rust::Hint::Transient(true))
             // 与插件行为对齐：未显式指定 icon 时按可执行文件名自动匹配图标
             .auto_icon();
         if let Some(sound) = resolved_notification_sound() {
@@ -1811,31 +1821,16 @@ fn show_desktop_notification_content(
         }
         match notification.show() {
             Ok(handle) => {
-                // 关键修复：handle 持有 D-Bus 连接，把它挂到独立线程里一直持有到
-                // 通知被关闭（wait_for_action 阻塞至用户操作或系统关闭该通知），
-                // 连接不断，GNOME 就不会销毁通知。
-                // 代价是每条通知驻留一个线程直到通知关闭，线程开销极小，可接受；
-                // 若系统通知服务异常永不关闭，最多遗留一个空闲阻塞线程，不影响主流程。
+                // 保留创建通知时的原始句柄及其 D-Bus 连接，供窗口聚焦时关闭通知。
                 let notification_id = handle.id();
-                match ACTIVE_DESKTOP_NOTIFICATION_IDS.lock() {
+                match ACTIVE_DESKTOP_NOTIFICATION_HANDLES.lock() {
                     Ok(mut guard) => {
-                        guard.insert(notification_id);
+                        guard.insert(notification_id, handle);
                     }
                     Err(error) => {
-                        log::warn!("记录活动桌面通知 ID {notification_id} 失败: {error}");
+                        log::warn!("记录活动桌面通知句柄 {notification_id} 失败: {error}");
                     }
                 }
-                std::thread::spawn(move || {
-                    handle.wait_for_action(|_| {});
-                    match ACTIVE_DESKTOP_NOTIFICATION_IDS.lock() {
-                        Ok(mut guard) => {
-                            guard.remove(&notification_id);
-                        }
-                        Err(error) => {
-                            log::warn!("移除已关闭桌面通知 ID {notification_id} 失败: {error}");
-                        }
-                    }
-                });
                 Ok(())
             }
             Err(error) => {
@@ -1973,9 +1968,8 @@ fn focus_matches_target(
     workspace_id: &str,
     session_id: &str,
 ) -> bool {
+    let _ = (workspace_id, session_id);
     focus.window_focused
-        && focus.workspace_id.as_deref() == Some(workspace_id)
-        && focus.session_id.as_deref() == Some(session_id)
 }
 
 fn print_notify_help() {
@@ -2385,21 +2379,20 @@ mod tests {
     }
 
     #[test]
-    fn focus_matches_target_requires_window_workspace_and_session_match() {
-        let focus = NotificationFocusState {
+    fn focus_matches_target_uses_window_focus_over_workspace_and_session() {
+        let focused = NotificationFocusState {
             window_focused: true,
             workspace_id: Some("ws-1".to_string()),
             session_id: Some("term-1".to_string()),
         };
+        let unfocused = NotificationFocusState {
+            window_focused: false,
+            workspace_id: Some("ws-1".to_string()),
+            session_id: Some("term-1".to_string()),
+        };
 
-        assert!(focus_matches_target(&focus, "ws-1", "term-1"));
-        assert!(!focus_matches_target(&focus, "ws-1", "term-2"));
-        assert!(!focus_matches_target(&focus, "ws-2", "term-1"));
-        assert!(!focus_matches_target(
-            &NotificationFocusState::default(),
-            "ws-1",
-            "term-1"
-        ));
+        assert!(focus_matches_target(&focused, "ws-2", "term-2"));
+        assert!(!focus_matches_target(&unfocused, "ws-1", "term-1"));
     }
 
     #[test]

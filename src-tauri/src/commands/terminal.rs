@@ -320,6 +320,7 @@ pub async fn terminal_clear_notification(
     Ok(())
 }
 
+/// 同步主窗口焦点状态，并在重新聚焦时清理全部终端通知。
 #[tauri::command]
 pub async fn terminal_set_notification_focus(
     app: tauri::AppHandle,
@@ -334,14 +335,7 @@ pub async fn terminal_set_notification_focus(
         .await;
 
     if window_focused {
-        if let (Some(workspace_id), Some(session_id)) =
-            (workspace_id.as_deref(), session_id.as_deref())
-        {
-            state
-                .notifications
-                .clear_for_session(&app, workspace_id, session_id)
-                .await;
-        }
+        state.notifications.clear_all(&app).await;
     }
 
     Ok(())

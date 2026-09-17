@@ -716,6 +716,7 @@ fn show_database_version_error(
         .blocking_show();
 }
 
+/// 创建主窗口并同步窗口焦点状态，用于统一控制桌面通知生命周期。
 fn create_main_window(app: &tauri::AppHandle) -> anyhow::Result<WebviewWindow> {
     let main_window_config = app
         .config()
@@ -739,6 +740,8 @@ fn create_main_window(app: &tauri::AppHandle) -> anyhow::Result<WebviewWindow> {
         .build()?;
 
     let close_window = main_window.clone();
+    let notifications = app.state::<AppState>().notifications.clone();
+    let app_handle = app.clone();
     main_window.on_window_event(move |event| {
         if let WindowEvent::CloseRequested { api, .. } = event {
             api.prevent_close();
@@ -746,8 +749,21 @@ fn create_main_window(app: &tauri::AppHandle) -> anyhow::Result<WebviewWindow> {
                 log::warn!("failed to hide main window on close: {error}");
             }
         }
-        if let WindowEvent::Focused(true) = event {
-            crate::terminal_notifications::close_all_desktop_notifications();
+        if let WindowEvent::Focused(window_focused) = event {
+            let window_focused = *window_focused;
+            let notifications = notifications.clone();
+            let app_handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                notifications
+                    .set_focus(window_focused, None, None)
+                    .await;
+                if window_focused {
+                    notifications.clear_all(&app_handle).await;
+                }
+            });
+            if window_focused {
+                crate::terminal_notifications::close_all_desktop_notifications();
+            }
         }
     });
 

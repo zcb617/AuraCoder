@@ -32,20 +32,20 @@ import { useTerminalStore } from "./terminalStore";
 import { useHarnessStore } from "./harnessStore";
 import { useWorkspaceStore } from "./workspaceStore";
 
-function makeSession(id: string): TerminalSession {
+function makeSession(id: string, workspaceId = "ws-1"): TerminalSession {
   return {
     id,
-    workspaceId: "ws-1",
+    workspaceId,
     shell: "zsh",
     cwd: "/tmp",
     createdAt: new Date(0).toISOString(),
   };
 }
 
-function makeNotification(sessionId: string): TerminalNotification {
+function makeNotification(sessionId: string, workspaceId = "ws-1"): TerminalNotification {
   return {
     id: `notif-${sessionId}`,
-    workspaceId: "ws-1",
+    workspaceId,
     sessionId,
     source: "codex",
     title: "Ready",
@@ -1258,7 +1258,53 @@ describe("terminalStore.createMultiSessionGroup", () => {
     });
   });
 
-  it("clears the focused session notification when syncing focus", async () => {
+  it("clears every workspace notification when syncing window focus", async () => {
+    const workspaceState = {
+      isOpen: true,
+      layoutMode: "split" as const,
+      preEditorLayoutMode: "chat" as const,
+      panelSize: 32,
+      activeSessionId: "s1",
+      activeGroupId: "g1",
+      focusedSessionId: "s1",
+      broadcastGroupId: null,
+      startupPreset: null,
+      pendingStartupPreset: null,
+      loading: false,
+      error: undefined,
+      groups: [
+        {
+          id: "g1",
+          name: "Terminal 1",
+          root: { type: "leaf" as const, sessionId: "s1" },
+          sessionMeta: { s1: {} },
+          worktreeConfig: null,
+        },
+      ],
+    };
+    useTerminalStore.setState({
+      workspaces: {
+        "ws-1": {
+          ...workspaceState,
+          sessions: [makeSession("s1")],
+          notificationsBySessionId: { s1: makeNotification("s1") },
+        },
+        "ws-2": {
+          ...workspaceState,
+          sessions: [makeSession("s2", "ws-2")],
+          notificationsBySessionId: { s2: makeNotification("s2", "ws-2") },
+        },
+      },
+    });
+
+    await useTerminalStore.getState().syncNotificationFocus("ws-1", "s1", true);
+
+    expect(useTerminalStore.getState().workspaces["ws-1"]?.notificationsBySessionId).toEqual({});
+    expect(useTerminalStore.getState().workspaces["ws-2"]?.notificationsBySessionId).toEqual({});
+    expect(mockIpc.terminalSetNotificationFocus).toHaveBeenCalledWith("ws-1", "s1", true);
+  });
+
+  it("keeps local notifications when syncing window blur", async () => {
     useTerminalStore.setState({
       workspaces: {
         "ws-1": {
@@ -1267,18 +1313,14 @@ describe("terminalStore.createMultiSessionGroup", () => {
           preEditorLayoutMode: "chat",
           panelSize: 32,
           sessions: [makeSession("s1")],
-          notificationsBySessionId: {
-            s1: makeNotification("s1"),
-          },
+          notificationsBySessionId: { s1: makeNotification("s1") },
           activeSessionId: "s1",
           groups: [
             {
               id: "g1",
               name: "Terminal 1",
               root: { type: "leaf", sessionId: "s1" },
-              sessionMeta: {
-                s1: {},
-              },
+              sessionMeta: { s1: {} },
               worktreeConfig: null,
             },
           ],
@@ -1293,9 +1335,11 @@ describe("terminalStore.createMultiSessionGroup", () => {
       },
     });
 
-    await useTerminalStore.getState().syncNotificationFocus("ws-1", "s1", true);
+    await useTerminalStore.getState().syncNotificationFocus("ws-1", "s1", false);
 
-    expect(useTerminalStore.getState().workspaces["ws-1"]?.notificationsBySessionId).toEqual({});
-    expect(mockIpc.terminalSetNotificationFocus).toHaveBeenCalledWith("ws-1", "s1", true);
+    expect(useTerminalStore.getState().workspaces["ws-1"]?.notificationsBySessionId).toEqual({
+      s1: makeNotification("s1"),
+    });
+    expect(mockIpc.terminalSetNotificationFocus).toHaveBeenCalledWith("ws-1", "s1", false);
   });
 });

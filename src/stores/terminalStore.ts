@@ -1628,9 +1628,12 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     }
   },
 
+  // 同步窗口级焦点状态，聚焦时清除所有工作区的本地终端通知。
   syncNotificationFocus: async (workspaceId, sessionId, windowFocused) => {
-    if (windowFocused && workspaceId && sessionId) {
-      get().clearNotificationLocal(workspaceId, sessionId);
+    if (windowFocused) {
+      for (const currentWorkspaceId of Object.keys(get().workspaces)) {
+        get().clearNotificationLocal(currentWorkspaceId, null);
+      }
     }
     try {
       await ipc.terminalSetNotificationFocus(workspaceId, sessionId, windowFocused);

@@ -544,13 +544,7 @@ export function App() {
         return;
       }
 
-      const activeWorkspaceId = useWorkspaceStore.getState().activeWorkspaceId;
-      const activeThreadId = useThreadStore.getState().activeThreadId;
-      if (
-        document.hasFocus()
-        && activeWorkspaceId === event.workspaceId
-        && activeThreadId === event.threadId
-      ) {
+      if (document.hasFocus()) {
         return;
       }
 

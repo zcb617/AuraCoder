@@ -463,11 +463,16 @@ pub async fn preview_notification_sound(
     }
 }
 
+/// 按主窗口焦点状态决定是否发送聊天完成桌面通知。
 #[tauri::command]
 pub async fn show_agent_notification(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     title: String,
     body: String,
 ) -> Result<(), String> {
+    if state.notifications.is_window_focused().await {
+        return Ok(());
+    }
     show_agent_desktop_notification(&app, &title, &body).map_err(err_to_string)
 }
