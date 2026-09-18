@@ -11,7 +11,7 @@ src-tauri/sidecar-dist/claude-sdk-node_modules.tar.gz
 *.log
 .agent-workspace/
 *.tsbuildinfo
-
+nul
 
 # Local recovery copy for the Tauri updater signing key.
 #.tauri-signing/
