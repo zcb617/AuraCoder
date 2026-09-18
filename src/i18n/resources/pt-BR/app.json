@@ -749,6 +749,11 @@
       "displayScale": "Escala da interface",
       "displayScaleDescription": "Ajuste toda a interface do AuraCoder. As mudanças são aplicadas imediatamente.",
       "displayScaleFailed": "Não foi possível salvar a escala da interface.",
+      "transcriptWidth": "Largura do conteúdo do chat",
+      "transcriptWidthDescription": "Largura máxima da área de texto das mensagens do chat",
+      "transcriptWidth_narrow": "Estreito",
+      "transcriptWidth_medium": "Médio",
+      "transcriptWidth_wide": "Largo",
       "languageDescription": "Usado na navegação, diálogos e mensagens de status.",
       "gpuAcceleration": "Aceleração de GPU",
       "gpuAccelerationDescription": "Ativar aceleração de hardware para melhorar o desempenho de renderização. As alterações requerem reinicialização para entrar em vigor."

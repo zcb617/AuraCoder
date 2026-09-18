@@ -417,6 +417,8 @@ pub fn run() {
             commands::app::set_app_theme,
             commands::app::get_display_scale,
             commands::app::set_display_scale,
+            commands::app::get_transcript_width,
+            commands::app::set_transcript_width,
             commands::computer_control_settings::respond_computer_control_approval,
             commands::computer_control_settings::get_computer_control_settings_status,
             commands::computer_control_settings::set_computer_control_enabled,

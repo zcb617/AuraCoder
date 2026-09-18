@@ -8,6 +8,7 @@ import { ipc } from "./lib/ipc";
 import { getBrowserLocaleFallback } from "./lib/locale";
 import { useDisplayScaleStore } from "./stores/displayScaleStore";
 import { useThemeStore } from "./stores/themeStore";
+import { useTranscriptWidthStore } from "./stores/transcriptWidthStore";
 import "./globals.css";
 
 async function bootstrap() {
@@ -24,6 +25,7 @@ async function bootstrap() {
   await Promise.all([
     useThemeStore.getState().load(),
     useDisplayScaleStore.getState().load(),
+    useTranscriptWidthStore.getState().load(),
   ]);
 
  await initializeI18n(locale);

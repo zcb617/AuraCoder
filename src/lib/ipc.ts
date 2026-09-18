@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { normalizeDependencyReport } from "./dependencies";
 import type { AppLocale } from "./locale";
 import type { DisplayScale } from "./displayScale";
+import type { TranscriptWidth } from "./transcriptWidth";
 import type { ThemePreference } from "./theme";
 import type {
   ApprovalResponse,
@@ -165,6 +166,9 @@ export const ipc = {
   getDisplayScale: () => invoke<DisplayScale>("get_display_scale"),
   setDisplayScale: (displayScale: DisplayScale) =>
     invoke<DisplayScale>("set_display_scale", { displayScale }),
+  getTranscriptWidth: () => invoke<TranscriptWidth>("get_transcript_width"),
+  setTranscriptWidth: (transcriptWidth: TranscriptWidth) =>
+    invoke<TranscriptWidth>("set_transcript_width", { transcriptWidth }),
   getComputerControlStatus: () =>
     invoke<ComputerControlStatus>("get_computer_control_settings_status"),
   setComputerControl: (enabled: boolean) =>

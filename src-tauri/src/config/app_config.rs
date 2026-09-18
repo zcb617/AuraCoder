@@ -16,7 +16,7 @@ use crate::runtime_env;
 
 /// 配置字典中允许由 AppConfig 读写的固定键集合，未知键由数据库保留。
 #[cfg(test)]
-const CONFIG_KEYS: [&str; 35] = [
+const CONFIG_KEYS: [&str; 36] = [
     "general.theme",
     "general.default_engine",
     "general.default_model",
@@ -32,6 +32,7 @@ const CONFIG_KEYS: [&str; 35] = [
     "ui.git_panel_width",
     "ui.font_size",
     "ui.display_scale",
+    "ui.transcript_width",
     "debug.persist_engine_event_logs",
     "debug.max_action_output_chars",
     "power.keep_awake_enabled",
@@ -69,6 +70,8 @@ pub const MIN_TERMINAL_FONT_SIZE: u32 = 8;
 pub const MAX_TERMINAL_FONT_SIZE: u32 = 32;
 pub const DEFAULT_DISPLAY_SCALE: u32 = 100;
 pub const VALID_DISPLAY_SCALES: [u32; 6] = [100, 110, 120, 130, 140, 150];
+pub const DEFAULT_TRANSCRIPT_WIDTH: &str = "medium";
+pub const VALID_TRANSCRIPT_WIDTHS: [&str; 3] = ["narrow", "medium", "wide"];
 pub const VALID_AUTONOMY_PRESETS: [&str; 4] = ["read-only", "ask", "auto", "full"];
 
 /// Clamp a requested terminal font size into the supported range.
@@ -83,6 +86,14 @@ pub fn normalize_display_scale(display_scale: u32) -> u32 {
     } else {
         DEFAULT_DISPLAY_SCALE
     }
+}
+
+/// 将持久化的聊天内容宽度归一化为受支持的配置值，缺失或非法值使用中等宽度。
+pub fn normalize_transcript_width(transcript_width: Option<&str>) -> String {
+    transcript_width
+        .filter(|value| VALID_TRANSCRIPT_WIDTHS.contains(value))
+        .map(ToString::to_string)
+        .unwrap_or_else(|| DEFAULT_TRANSCRIPT_WIDTH.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +149,9 @@ pub struct UiConfig {
     pub git_panel_width: u32,
     pub font_size: u32,
     pub display_scale: u32,
+    /// 聊天消息文字显示区域的宽度偏好；缺失时使用中等宽度。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_width: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,6 +460,7 @@ impl Default for UiConfig {
             git_panel_width: 380,
             font_size: 13,
             display_scale: DEFAULT_DISPLAY_SCALE,
+            transcript_width: None,
         }
     }
 }
@@ -502,6 +517,11 @@ impl AppConfig {
 
     pub fn display_scale(&self) -> u32 {
         normalize_display_scale(self.ui.display_scale)
+    }
+
+    /// 返回聊天消息文字显示区域的归一化宽度偏好，默认使用中等宽度。
+    pub fn transcript_width(&self) -> String {
+        normalize_transcript_width(self.ui.transcript_width.as_deref())
     }
 
     pub fn chat_notifications_enabled(&self) -> bool {
@@ -715,6 +735,7 @@ fn load_config_dictionary(connection: &Connection) -> anyhow::Result<AppConfig> 
             "ui.git_panel_width" => apply_config_json!(&key, raw, config.ui.git_panel_width),
             "ui.font_size" => apply_config_json!(&key, raw, config.ui.font_size),
             "ui.display_scale" => apply_config_json!(&key, raw, config.ui.display_scale),
+            "ui.transcript_width" => apply_config_json!(&key, raw, config.ui.transcript_width),
             "debug.persist_engine_event_logs" => {
                 apply_config_json!(&key, raw, config.debug.persist_engine_event_logs)
             }
@@ -782,7 +803,7 @@ fn save_config_dictionary(connection: &mut Connection, config: &AppConfig) -> an
         "INSERT INTO config(config_key, config_value) VALUES (?1, ?2)\
          ON CONFLICT(config_key) DO UPDATE SET config_value = excluded.config_value",
     )?;
-    // 35 个固定字段统一使用 JSON 文本写入字典表，未知键不会被触碰。
+    // 36 个固定字段统一使用 JSON 文本写入字典表，未知键不会被触碰。
     macro_rules! upsert {
         ($key:expr, $value:expr $(,)?) => {{
             let serialized = serde_json::to_string($value)?;
@@ -831,6 +852,7 @@ fn save_config_dictionary(connection: &mut Connection, config: &AppConfig) -> an
     upsert!("ui.git_panel_width", &config.ui.git_panel_width)?;
     upsert!("ui.font_size", &config.ui.font_size)?;
     upsert!("ui.display_scale", &config.ui.display_scale)?;
+    upsert!("ui.transcript_width", &config.ui.transcript_width)?;
     upsert!(
         "debug.persist_engine_event_logs",
         &config.debug.persist_engine_event_logs,
@@ -1183,6 +1205,27 @@ max_action_output_chars = 20000
     }
 
     #[test]
+    fn transcript_width_defaults_and_normalizes_unknown_values() {
+        let config = AppConfig::default();
+        assert_eq!(config.transcript_width(), super::DEFAULT_TRANSCRIPT_WIDTH);
+
+        let mut invalid = AppConfig::default();
+        invalid.ui.transcript_width = Some("extra-wide".to_string());
+        assert_eq!(invalid.transcript_width(), super::DEFAULT_TRANSCRIPT_WIDTH);
+    }
+
+    #[test]
+    fn transcript_width_serialize_roundtrip() {
+        let mut config = AppConfig::default();
+        config.ui.transcript_width = Some("wide".to_string());
+
+        let raw = toml::to_string_pretty(&config).expect("config should serialize");
+        let loaded = toml::from_str::<AppConfig>(&raw).expect("config should deserialize");
+
+        assert_eq!(loaded.transcript_width(), "wide");
+    }
+
+    #[test]
     fn terminal_accelerated_rendering_defaults_to_enabled() {
         let config = AppConfig::default();
 
@@ -1400,6 +1443,7 @@ notification_sound = "Glass"
         config.general.locale = Some("zh-CN".to_string());
         config.general.terminal_font_size = Some(18);
         config.ui.sidebar_width = 333;
+        config.ui.transcript_width = Some("narrow".to_string());
         config.debug.max_action_output_chars = 3210;
         config.power.ac_only_mode = true;
         config.power.battery_threshold = Some(22);
@@ -1436,10 +1480,11 @@ notification_sound = "Glass"
         save_config_dictionary(&mut connection, &config).expect("config should save");
         let restored = load_config_dictionary(&connection).expect("config should load");
 
-        assert_eq!(CONFIG_KEYS.len(), 35);
+        assert_eq!(CONFIG_KEYS.len(), 36);
         assert_eq!(config.general.theme, restored.general.theme);
         assert_eq!(config.general.locale, restored.general.locale);
         assert_eq!(config.ui.sidebar_width, restored.ui.sidebar_width);
+        assert_eq!(config.ui.transcript_width, restored.ui.transcript_width);
         assert_eq!(
             config.debug.max_action_output_chars,
             restored.debug.max_action_output_chars
@@ -1461,7 +1506,7 @@ notification_sound = "Glass"
         let row_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM config", [], |row| row.get(0))
             .expect("config row count should be readable");
-        assert_eq!(row_count, 34);
+        assert_eq!(row_count, 36);
     }
 
     #[test]
@@ -1549,7 +1594,7 @@ notification_sound = "Glass"
         let row_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM config", [], |row| row.get(0))
             .expect("config row count should be readable");
-        assert_eq!(row_count, 34);
+        assert_eq!(row_count, 36);
         fs::remove_dir_all(&test_dir).expect("test directory should be removed");
     }
     */

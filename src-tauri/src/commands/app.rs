@@ -242,6 +242,55 @@ pub async fn set_display_scale(
     Ok(display_scale)
 }
 
+/// 读取聊天内容宽度配置，供前端启动时恢复聊天消息区域宽度。
+#[tauri::command]
+pub async fn get_transcript_width(webview: Webview) -> Result<String, String> {
+    let _ = webview;
+    tokio::task::spawn_blocking(move || {
+        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        Ok(config.transcript_width())
+    })
+    .await
+    .map_err(err_to_string)?
+}
+
+/// 保存聊天内容宽度配置，并回读确认持久化值后返回给前端。
+#[tauri::command]
+pub async fn set_transcript_width(
+    state: State<'_, AppState>,
+    webview: Webview,
+    transcript_width: String,
+) -> Result<String, String> {
+    let _ = webview;
+    let normalized = crate::config::app_config::normalize_transcript_width(Some(&transcript_width));
+    if normalized != transcript_width.as_str() {
+        return Err(format!("unsupported transcript width: {transcript_width}"));
+    }
+
+    let config_write_lock = state.config_write_lock.clone();
+    let _guard = config_write_lock.lock_owned().await;
+
+    tokio::task::spawn_blocking(move || {
+        AppConfig::mutate(|config| {
+            config.ui.transcript_width = Some(normalized.clone());
+            Ok(())
+        })
+        .map_err(err_to_string)?;
+
+        let persisted = AppConfig::load_or_create()
+            .map_err(err_to_string)?
+            .transcript_width();
+        if persisted != normalized {
+            return Err(format!(
+                "transcript width did not persist: expected {normalized}, got {persisted}"
+            ));
+        }
+        Ok(persisted)
+    })
+    .await
+    .map_err(err_to_string)?
+}
+
 #[tauri::command]
 pub async fn get_terminal_accelerated_rendering() -> Result<bool, String> {
     tokio::task::spawn_blocking(move || {

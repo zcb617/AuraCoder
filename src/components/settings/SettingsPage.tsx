@@ -28,6 +28,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  RectangleHorizontal,
   Search,
   Sun,
   TerminalSquare,
@@ -42,6 +43,7 @@ import {
   DISPLAY_SCALE_PREFERENCES,
   isDisplayScale,
 } from "../../lib/displayScale";
+import { TRANSCRIPT_WIDTH_PREFERENCES } from "../../lib/transcriptWidth";
 import { ipc } from "../../lib/ipc";
 import {
   emitTerminalAcceleratedRenderingChanged,
@@ -67,6 +69,7 @@ import { useChatComposerStore } from "../../stores/chatComposerStore";
 import { useTerminalNotificationSettingsStore } from "../../stores/terminalNotificationSettingsStore";
 import { useDisplayScaleStore } from "../../stores/displayScaleStore";
 import { useThemeStore } from "../../stores/themeStore";
+import { useTranscriptWidthStore } from "../../stores/transcriptWidthStore";
 import { toast } from "../../stores/toastStore";
 import { useUiStore, type SettingsSection } from "../../stores/uiStore";
 import { useUpdateStore } from "../../stores/updateStore";
@@ -205,6 +208,8 @@ export function SettingsPage() {
   const setThemePreference = useThemeStore((state) => state.setPreference);
   const displayScale = useDisplayScaleStore((state) => state.displayScale);
   const setDisplayScale = useDisplayScaleStore((state) => state.setDisplayScale);
+  const transcriptWidth = useTranscriptWidthStore((state) => state.transcriptWidth);
+  const setTranscriptWidth = useTranscriptWidthStore((state) => state.setTranscriptWidth);
   const chatSendShortcut = useChatComposerStore((state) => state.sendShortcut);
   const setChatSendShortcut = useChatComposerStore((state) => state.setSendShortcut);
   const chatInputMode = useChatComposerStore((state) => state.chatInputMode);
@@ -1026,6 +1031,24 @@ export function SettingsPage() {
                     }}
                     triggerStyle={{ minWidth: 112, height: 32 }}
                   />
+                </SettingsRow>
+                <SettingsRow
+                  icon={<RectangleHorizontal size={17} />}
+                  title={t("app:settingsPage.appearance.transcriptWidth")}
+                  description={t("app:settingsPage.appearance.transcriptWidthDescription")}
+                >
+                  <div className="usp-segmented">
+                    {TRANSCRIPT_WIDTH_PREFERENCES.map((width) => (
+                      <button
+                        key={width}
+                        type="button"
+                        className={transcriptWidth === width ? "usp-segment-active" : ""}
+                        onClick={() => void setTranscriptWidth(width)}
+                      >
+                        {t(`app:settingsPage.appearance.transcriptWidth_${width}`)}
+                      </button>
+                    ))}
+                  </div>
                 </SettingsRow>
                 <SettingsRow icon={<Globe2 size={17} />} title={t("common:language.label")} description={t("app:settingsPage.appearance.languageDescription")}>
                   <Dropdown

@@ -940,6 +940,13 @@ button, input, textarea, select {
 
 /* ── Ambient Background (disabled for pitch black) ── */
 
+/* ── Chat message content width ── */
+.chat-message-viewport > * {
+  max-width: var(--chat-content-max-width, 100%);
+  margin-left: auto;
+  margin-right: auto;
+}
+
 /* ── Scrollbar ── */
 /* 自定义滚动条样式已停用：恢复 WebKitGTK 原生滚动条行为，排查聊天区滚动条显示异常 */
 /*
