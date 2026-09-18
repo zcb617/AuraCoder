@@ -4,22 +4,42 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::models::{ScheduledTaskDto, ScheduledTaskRunDto, ThreadDto, ThreadStatusDto};
+use crate::runtime_env;
 
 use super::Database;
 
 #[derive(Debug, Clone)]
 pub struct ScheduledTaskWrite {
+    /// 定时任务描述。
     pub description: String,
+    /// 任务是否启用。
     pub enabled: bool,
+    /// 执行设备标识。
     pub execution_device_id: String,
+    /// 任务目标类型。
     pub target_type: String,
+    /// 所属工作区标识。
     pub workspace_id: String,
+    /// 可选的复用线程标识。
     pub thread_id: Option<String>,
+    /// CLI 运行时配置快照。
     pub runtime_config: Option<Value>,
+    /// 调度规则类型。
     pub schedule_type: String,
+    /// 调度规则 JSON。
     pub schedule: Value,
+    /// 任务业务时区。
     pub timezone: String,
+    /// 下一次执行时间，入库时转换为本机本地时间。
     pub next_run_at: Option<String>,
+}
+
+/// 将定时任务中的外部时间转换为本机本地 RFC3339；空值保持 NULL 语义。
+fn normalize_task_time(value: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    runtime_env::normalize_time_to_local(value).map(Some)
 }
 
 pub fn list_tasks(db: &Database) -> anyhow::Result<Vec<ScheduledTaskDto>> {
@@ -29,7 +49,7 @@ pub fn list_tasks(db: &Database) -> anyhow::Result<Vec<ScheduledTaskDto>> {
                 workspace_id, thread_id, runtime_config_json, schedule_type,
                 schedule_json, timezone, next_run_at, last_run_at, created_at, updated_at
          FROM scheduled_tasks
-         ORDER BY updated_at DESC, created_at DESC",
+         ORDER BY julianday(updated_at) DESC, julianday(created_at) DESC, rowid DESC",
     )?;
     let rows = stmt.query_map([], map_task_row)?;
     let mut tasks = rows.collect::<Result<Vec<_>, _>>()?;
@@ -68,6 +88,8 @@ pub fn get_task(db: &Database, task_id: &str) -> anyhow::Result<Option<Scheduled
 
 pub fn create_task(db: &Database, write: &ScheduledTaskWrite) -> anyhow::Result<ScheduledTaskDto> {
     let id = Uuid::new_v4().to_string();
+    let next_run_at = normalize_task_time(write.next_run_at.as_deref())?;
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     conn.execute(
         "INSERT INTO scheduled_tasks (
@@ -76,7 +98,7 @@ pub fn create_task(db: &Database, write: &ScheduledTaskWrite) -> anyhow::Result<
             schedule_json, timezone, next_run_at, created_at, updated_at
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-            datetime('now'), datetime('now')
+            ?13, ?13
          )",
         params![
             id,
@@ -90,7 +112,8 @@ pub fn create_task(db: &Database, write: &ScheduledTaskWrite) -> anyhow::Result<
             write.schedule_type,
             write.schedule.to_string(),
             write.timezone,
-            write.next_run_at,
+            next_run_at,
+            now,
         ],
     )
     .context("failed to insert scheduled task")?;
@@ -103,6 +126,8 @@ pub fn update_task(
     task_id: &str,
     write: &ScheduledTaskWrite,
 ) -> anyhow::Result<ScheduledTaskDto> {
+    let next_run_at = normalize_task_time(write.next_run_at.as_deref())?;
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     let changed = conn.execute(
         "UPDATE scheduled_tasks
@@ -117,8 +142,8 @@ pub fn update_task(
              schedule_json = ?9,
              timezone = ?10,
              next_run_at = ?11,
-             updated_at = datetime('now')
-         WHERE id = ?12",
+             updated_at = ?12
+         WHERE id = ?13",
         params![
             write.description,
             write.enabled,
@@ -130,7 +155,8 @@ pub fn update_task(
             write.schedule_type,
             write.schedule.to_string(),
             write.timezone,
-            write.next_run_at,
+            next_run_at,
+            now,
             task_id,
         ],
     )?;
@@ -147,14 +173,16 @@ pub fn set_task_enabled(
     enabled: bool,
     next_run_at: Option<&str>,
 ) -> anyhow::Result<ScheduledTaskDto> {
+    let next_run_at = normalize_task_time(next_run_at)?;
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     let changed = conn.execute(
         "UPDATE scheduled_tasks
          SET enabled = ?1,
              next_run_at = ?2,
-             updated_at = datetime('now')
-         WHERE id = ?3",
-        params![enabled, next_run_at, task_id],
+             updated_at = ?3
+         WHERE id = ?4",
+        params![enabled, next_run_at, now, task_id],
     )?;
     if changed == 0 {
         anyhow::bail!("scheduled task not found: {task_id}");
@@ -172,17 +200,18 @@ pub fn delete_task(db: &Database, task_id: &str) -> anyhow::Result<bool> {
 }
 
 pub fn acknowledge_latest_run(db: &Database, task_id: &str) -> anyhow::Result<()> {
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     conn.execute(
         "UPDATE scheduled_task_runs
-         SET acknowledged_at = datetime('now')
+         SET acknowledged_at = ?2
          WHERE id = (
            SELECT id FROM scheduled_task_runs
            WHERE task_id = ?1
-           ORDER BY created_at DESC, rowid DESC
+           ORDER BY julianday(created_at) DESC, rowid DESC
            LIMIT 1
          )",
-        params![task_id],
+        params![task_id, now],
     )?;
     Ok(())
 }
@@ -190,34 +219,10 @@ pub fn acknowledge_latest_run(db: &Database, task_id: &str) -> anyhow::Result<()
 pub fn next_due_at(db: &Database) -> anyhow::Result<Option<String>> {
     let conn = db.connect()?;
     conn.query_row(
-        "SELECT MIN(task.next_run_at)
+        "SELECT task.next_run_at
          FROM scheduled_tasks task
          WHERE task.enabled = 1
            AND task.next_run_at IS NOT NULL
-           AND NOT EXISTS (
-             SELECT 1 FROM scheduled_task_runs run
-             WHERE run.task_id = task.id
-               AND (
-                 run.status IN ('queued', 'running', 'needs_confirmation')
-                 OR (run.status IN ('error', 'interrupted') AND run.acknowledged_at IS NULL)
-               )
-           )",
-        [],
-        |row| row.get(0),
-    )
-    .context("failed to query next scheduled task")
-}
-
-pub fn list_due_tasks(db: &Database, now: &str) -> anyhow::Result<Vec<ScheduledTaskDto>> {
-    let conn = db.connect()?;
-    let mut stmt = conn.prepare(
-        "SELECT id, description, enabled, execution_device_id, target_type,
-                workspace_id, thread_id, runtime_config_json, schedule_type,
-                schedule_json, timezone, next_run_at, last_run_at, created_at, updated_at
-         FROM scheduled_tasks task
-         WHERE task.enabled = 1
-           AND task.next_run_at IS NOT NULL
-           AND task.next_run_at <= ?1
            AND NOT EXISTS (
              SELECT 1 FROM scheduled_task_runs run
              WHERE run.task_id = task.id
@@ -226,7 +231,35 @@ pub fn list_due_tasks(db: &Database, now: &str) -> anyhow::Result<Vec<ScheduledT
                  OR (run.status IN ('error', 'interrupted') AND run.acknowledged_at IS NULL)
                )
            )
-         ORDER BY task.next_run_at ASC",
+         ORDER BY julianday(task.next_run_at) ASC, task.rowid ASC
+         LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .context("failed to query next scheduled task")
+}
+
+pub fn list_due_tasks(db: &Database, now: &str) -> anyhow::Result<Vec<ScheduledTaskDto>> {
+    let now = runtime_env::normalize_time_to_local(now)?;
+    let conn = db.connect()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, description, enabled, execution_device_id, target_type,
+                workspace_id, thread_id, runtime_config_json, schedule_type,
+                schedule_json, timezone, next_run_at, last_run_at, created_at, updated_at
+         FROM scheduled_tasks task
+         WHERE task.enabled = 1
+           AND task.next_run_at IS NOT NULL
+           AND julianday(task.next_run_at) <= julianday(?1)
+           AND NOT EXISTS (
+             SELECT 1 FROM scheduled_task_runs run
+             WHERE run.task_id = task.id
+               AND (
+                 run.status IN ('queued', 'running', 'needs_confirmation')
+                 OR (run.status IN ('error', 'interrupted') AND run.acknowledged_at IS NULL)
+               )
+           )
+         ORDER BY julianday(task.next_run_at) ASC, task.rowid ASC",
     )?;
     let tasks = stmt
         .query_map(params![now], map_task_row)?
@@ -240,6 +273,9 @@ pub fn claim_due_task(
     scheduled_for: &str,
     next_run_at: &str,
 ) -> anyhow::Result<Option<ScheduledTaskRunDto>> {
+    let scheduled_for = runtime_env::normalize_time_to_local(scheduled_for)?;
+    let next_run_at = runtime_env::normalize_time_to_local(next_run_at)?;
+    let now = runtime_env::system_time_rfc3339();
     let mut conn = db.connect()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let eligible = tx.query_row(
@@ -247,7 +283,7 @@ pub fn claim_due_task(
            SELECT 1 FROM scheduled_tasks task
            WHERE task.id = ?1
              AND task.enabled = 1
-             AND task.next_run_at = ?2
+             AND julianday(task.next_run_at) = julianday(?2)
              AND NOT EXISTS (
                SELECT 1 FROM scheduled_task_runs run
                WHERE run.task_id = task.id
@@ -266,17 +302,17 @@ pub fn claim_due_task(
 
     let run_id = Uuid::new_v4().to_string();
     tx.execute(
-        "INSERT INTO scheduled_task_runs (id, task_id, scheduled_for, status)
-         VALUES (?1, ?2, ?3, 'queued')",
-        params![run_id, task_id, scheduled_for],
+        "INSERT INTO scheduled_task_runs (id, task_id, scheduled_for, status, created_at)
+         VALUES (?1, ?2, ?3, 'queued', ?4)",
+        params![run_id, task_id, scheduled_for, now],
     )?;
     tx.execute(
         "UPDATE scheduled_tasks
-         SET last_run_at = datetime('now'),
-             next_run_at = ?1,
-             updated_at = datetime('now')
-         WHERE id = ?2",
-        params![next_run_at, task_id],
+         SET last_run_at = ?1,
+             next_run_at = ?2,
+             updated_at = ?3
+         WHERE id = ?4",
+        params![now, next_run_at, now, task_id],
     )?;
     tx.commit()?;
     get_run(db, &run_id)
@@ -288,45 +324,48 @@ pub fn mark_run_started(
     thread_id: &str,
     assistant_message_id: &str,
 ) -> anyhow::Result<()> {
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     conn.execute(
         "UPDATE scheduled_task_runs
          SET status = 'running',
-             started_at = COALESCE(started_at, datetime('now')),
+             started_at = COALESCE(started_at, ?4),
              thread_id = ?1,
              assistant_message_id = ?2,
              error_message = NULL
          WHERE id = ?3",
-        params![thread_id, assistant_message_id, run_id],
+        params![thread_id, assistant_message_id, run_id, now],
     )?;
     Ok(())
 }
 
 pub fn mark_run_error(db: &Database, run_id: &str, message: &str) -> anyhow::Result<()> {
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     conn.execute(
         "UPDATE scheduled_task_runs
          SET status = 'error',
-             started_at = COALESCE(started_at, datetime('now')),
-             finished_at = datetime('now'),
+             started_at = COALESCE(started_at, ?3),
+             finished_at = ?3,
              error_message = ?1,
              acknowledged_at = NULL
          WHERE id = ?2",
-        params![message, run_id],
+        params![message, run_id, now],
     )?;
     Ok(())
 }
 
 pub fn mark_run_skipped(db: &Database, run_id: &str, message: &str) -> anyhow::Result<()> {
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     conn.execute(
         "UPDATE scheduled_task_runs
          SET status = 'skipped',
-             started_at = COALESCE(started_at, datetime('now')),
-             finished_at = datetime('now'),
+             started_at = COALESCE(started_at, ?3),
+             finished_at = ?3,
              error_message = ?1
          WHERE id = ?2",
-        params![message, run_id],
+        params![message, run_id, now],
     )?;
     Ok(())
 }
@@ -340,7 +379,7 @@ pub fn mark_run_needs_confirmation_by_message(
         .query_row(
             "SELECT task_id FROM scheduled_task_runs
              WHERE assistant_message_id = ?1
-             ORDER BY created_at DESC
+             ORDER BY julianday(created_at) DESC, rowid DESC
              LIMIT 1",
             params![assistant_message_id],
             |row| row.get::<_, String>(0),
@@ -364,12 +403,13 @@ pub fn finish_run_by_message(
     result_preview: Option<&str>,
     error_message: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     let task_id = conn
         .query_row(
             "SELECT task_id FROM scheduled_task_runs
              WHERE assistant_message_id = ?1
-             ORDER BY created_at DESC
+             ORDER BY julianday(created_at) DESC, rowid DESC
              LIMIT 1",
             params![assistant_message_id],
             |row| row.get::<_, String>(0),
@@ -379,28 +419,29 @@ pub fn finish_run_by_message(
         conn.execute(
             "UPDATE scheduled_task_runs
              SET status = ?1,
-                 finished_at = datetime('now'),
+                 finished_at = ?5,
                  result_preview = ?2,
                  error_message = ?3,
                  acknowledged_at = CASE WHEN ?1 IN ('completed', 'skipped')
-                                        THEN datetime('now') ELSE NULL END
+                                        THEN ?5 ELSE NULL END
              WHERE assistant_message_id = ?4",
-            params![status, result_preview, error_message, assistant_message_id],
+            params![status, result_preview, error_message, assistant_message_id, now],
         )?;
     }
     Ok(task_id)
 }
 
 pub fn recover_interrupted_runs(db: &Database) -> anyhow::Result<usize> {
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     Ok(conn.execute(
         "UPDATE scheduled_task_runs
          SET status = 'interrupted',
-             finished_at = datetime('now'),
+             finished_at = ?1,
              error_message = COALESCE(error_message, 'AuraCoder exited before this scheduled run finished.'),
              acknowledged_at = NULL
          WHERE status IN ('queued', 'running')",
-        [],
+        params![now],
     )?)
 }
 
@@ -472,7 +513,7 @@ fn hydrate_task(conn: &rusqlite::Connection, task: &mut ScheduledTaskDto) -> any
                     acknowledged_at, created_at
              FROM scheduled_task_runs
              WHERE task_id = ?1
-             ORDER BY created_at DESC, rowid DESC
+             ORDER BY julianday(created_at) DESC, rowid DESC
              LIMIT 1",
             params![task.id],
             map_run_row,

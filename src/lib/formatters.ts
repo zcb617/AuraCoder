@@ -42,15 +42,9 @@ function asLocale(locale?: string | null): AppLocale {
 
 function toDate(value: string | number | Date): Date | null {
   const normalizedValue = typeof value === "string" ? value.trim() : value;
-  // SQLite's datetime('now') is UTC but returns a timestamp without an offset.
-  // JavaScript otherwise treats that representation as local time, producing an
-  // offset-sized error in relative timestamps.
-  const sqliteUtcTimestamp =
-    typeof normalizedValue === "string" &&
-    /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(normalizedValue)
-      ? `${normalizedValue.replace(" ", "T")}Z`
-      : normalizedValue;
-  const date = value instanceof Date ? value : new Date(sqliteUtcTimestamp);
+  const localTimeValue =
+    typeof normalizedValue === "string" ? normalizedValue.replace(" ", "T") : normalizedValue;
+  const date = value instanceof Date ? value : new Date(localTimeValue);
   return Number.isNaN(date.getTime()) ? null : date;
 }
 

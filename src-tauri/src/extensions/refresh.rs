@@ -18,6 +18,7 @@ use crate::{
         latest_snapshot_timestamp,
     },
     models::{CachedExtensionCatalogDto, ExtensionCatalogRefreshErrorDto, ExtensionItemDto},
+    runtime_env,
     state::AppState,
 };
 
@@ -68,7 +69,7 @@ impl ExtensionCatalogRefreshManager {
     async fn finish(&self, key: &RefreshKey) {
         self.in_flight.write().await.remove(key);
         if let Some(activity) = self.activity.write().await.get_mut(key) {
-            activity.completed_at = Some(Utc::now().to_rfc3339());
+            activity.completed_at = Some(runtime_env::system_time_rfc3339());
         }
     }
 
@@ -239,7 +240,7 @@ pub async fn request_catalog_refresh(
         &state.db,
         provider_id,
         &context_key,
-        &Utc::now().to_rfc3339(),
+        &runtime_env::system_time_rfc3339(),
     )?;
     let key = RefreshKey {
         provider_id: provider_id.to_string(),
@@ -258,7 +259,7 @@ pub fn spawn_catalog_refresh_scheduler(app: AppHandle, state: AppState) {
     tauri::async_runtime::spawn(async move {
         schedule_startup_refreshes(&state).await;
         loop {
-            let now = Utc::now().to_rfc3339();
+            let now = runtime_env::system_time_rfc3339();
             match snapshot_db::list_due_refreshes(&state.db, &now) {
                 Ok(targets) => {
                     for ((provider_id, context_key), kinds) in group_due_refreshes(targets) {
@@ -364,7 +365,7 @@ async fn schedule_context_once_per_run(
         return Ok(false);
     }
 
-    let observed_at = Utc::now().to_rfc3339();
+    let observed_at = runtime_env::system_time_rfc3339();
     let schedule_result = (|| {
         snapshot_db::ensure_context(&state.db, provider_id, context_key, &observed_at)?;
         for kind in snapshot_db::EXTENSION_KINDS {
@@ -399,7 +400,7 @@ async fn run_catalog_refresh(
     requested_kinds: Vec<String>,
 ) {
     for kind in requested_kinds {
-        let attempted_at = Utc::now().to_rfc3339();
+        let attempted_at = runtime_env::system_time_rfc3339();
         let refresh_result = if requires_codex_catalog_refresh_lock(&key.provider_id) {
             let _guard = state
                 .extension_catalog_refreshes
@@ -796,10 +797,15 @@ mod tests {
             let snapshots = snapshot_db::load_snapshots(&state.db, provider_id, &context_key)
                 .expect("failed to load scheduled snapshots");
             assert_eq!(snapshots.len(), snapshot_db::EXTENSION_KINDS.len());
-            assert!(snapshots.iter().all(|snapshot| snapshot
-                .next_refresh_at
-                .as_deref()
-                .is_some_and(|value| value <= Utc::now().to_rfc3339().as_str())));
+            for snapshot in snapshots {
+                let next_refresh_at = snapshot
+                    .next_refresh_at
+                    .as_deref()
+                    .expect("scheduled snapshot should have next_refresh_at");
+                let next_refresh_at_utc = runtime_env::parse_persisted_time_to_utc(next_refresh_at)
+                    .expect("persisted next_refresh_at should be parseable");
+                assert!(next_refresh_at_utc <= Utc::now());
+            }
         }
     }
 

@@ -435,7 +435,18 @@ async fn persist_sessions(
                     let remote_time = match session.updated_at.as_deref() {
                         Some(raw) if !raw.trim().is_empty() => {
                             match chrono::DateTime::parse_from_rfc3339(raw.trim()) {
-                                Ok(value) => Some(value.with_timezone(&chrono::Utc)),
+                                Ok(value) => match runtime_env::normalize_time_to_local(raw) {
+                                    Ok(local) => Some((value.with_timezone(&chrono::Utc), local)),
+                                    Err(error) => {
+                                        log::warn!(
+                                            "Claude 会话远端时间本地化失败: workspace_id={} session_id={} raw={} error={error:#}",
+                                            workspace_id,
+                                            session.engine_thread_id,
+                                            raw
+                                        );
+                                        None
+                                    }
+                                },
                                 Err(error) => {
                                     log::warn!(
                                         "Claude 会话远端时间解析失败: workspace_id={} session_id={} raw={} error={error}",
@@ -497,13 +508,9 @@ async fn persist_sessions(
                     )) = existing
                     else {
                         let created_at = runtime_env::system_time_rfc3339();
-                        let last_activity_at = session
-                            .updated_at
-                            .as_deref()
-                            .filter(|raw| {
-                                !raw.trim().is_empty()
-                                    && chrono::DateTime::parse_from_rfc3339(raw.trim()).is_ok()
-                            })
+                        let last_activity_at = remote_time
+                            .as_ref()
+                            .map(|(_, local)| local.as_str())
                             .unwrap_or(&created_at);
                         let model_id = if session.model_id.trim().is_empty() {
                             "unknown"
@@ -533,17 +540,17 @@ async fn persist_sessions(
                         continue;
                     };
 
-                    let Some(remote_time) = remote_time else {
+                    let Some((remote_time, remote_time_local)) = remote_time else {
                         continue;
                     };
 
                     let db_time = match db_last_activity_at.as_deref() {
                         Some(raw) if !raw.trim().is_empty() => {
-                            match chrono::DateTime::parse_from_rfc3339(raw.trim()) {
-                                Ok(value) => Some(value.with_timezone(&chrono::Utc)),
+                            match runtime_env::parse_persisted_time_to_utc(raw) {
+                                Ok(value) => Some(value),
                                 Err(error) => {
                                     log::warn!(
-                                        "Claude 会话数据库时间解析失败: workspace_id={} session_id={} raw={} error={error}",
+                                        "Claude 会话数据库时间解析失败: workspace_id={} session_id={} raw={} error={error:#}",
                                         workspace_id,
                                         session.engine_thread_id,
                                         raw
@@ -638,7 +645,7 @@ async fn persist_sessions(
                         params![
                             title_to_write,
                             metadata_to_write,
-                            session.updated_at,
+                            remote_time_local,
                             remote_time_is_newer,
                             claude_sync_required,
                             thread_id,
@@ -1231,7 +1238,10 @@ mod tests {
         assert_eq!(existing_row.2, "completed");
         assert_eq!(existing_row.3.as_deref(), Some("2026-08-17T10:00:00Z"));
         assert_eq!(existing_row.4, "2026-08-16T10:00:00Z");
-        assert_eq!(existing_row.5, "2026-08-18T10:00:00Z");
+        assert_eq!(
+            existing_row.5,
+            runtime_env::normalize_time_to_local("2026-08-18T10:00:00Z").unwrap()
+        );
         assert_eq!(existing_row.7, 5);
         assert_eq!(existing_row.8, 42);
         assert_eq!(existing_row.9, Some(1));
@@ -1271,7 +1281,10 @@ mod tests {
         assert_eq!(active_existing_row.2, "idle");
         assert_eq!(active_existing_row.3, None);
         assert_eq!(active_existing_row.4, "2026-08-15T10:00:00Z");
-        assert_eq!(active_existing_row.5, "2026-08-18T10:00:00Z");
+        assert_eq!(
+            active_existing_row.5,
+            runtime_env::normalize_time_to_local("2026-08-18T10:00:00Z").unwrap()
+        );
         assert_eq!(active_existing_row.7, 7);
         assert_eq!(active_existing_row.8, 84);
         assert_eq!(active_existing_row.9, Some(0));
@@ -1376,14 +1389,43 @@ mod tests {
             )
             .expect("failed to read Claude sync flag")
         };
-        assert_eq!(read_last_activity("claude-equal-zone"), "2026-08-18T10:00:00Z");
-        assert_eq!(read_last_activity("claude-older"), "2026-08-18T10:00:00Z");
-        assert_eq!(read_last_activity("claude-millisecond"), "2026-08-18T10:00:00.001Z");
-        assert_eq!(read_last_activity("claude-invalid-db"), "2026-08-18T11:00:00Z");
-        assert_eq!(read_last_activity("claude-empty-db"), "2026-08-18T11:00:00Z");
-        assert_eq!(read_last_activity("claude-invalid-remote"), "2026-08-18T10:00:00Z");
-        assert_eq!(read_last_activity("claude-none-remote"), "2026-08-18T10:00:00Z");
-        assert_eq!(read_last_activity("claude-empty-remote"), "2026-08-18T10:00:00Z");
+        assert_eq!(
+            runtime_env::parse_persisted_time_to_utc(&read_last_activity("claude-equal-zone"))
+                .unwrap(),
+            runtime_env::parse_persisted_time_to_utc("2026-08-18T10:00:00Z").unwrap()
+        );
+        assert_eq!(
+            runtime_env::parse_persisted_time_to_utc(&read_last_activity("claude-older"))
+                .unwrap(),
+            runtime_env::parse_persisted_time_to_utc("2026-08-18T10:00:00Z").unwrap()
+        );
+        assert_eq!(
+            read_last_activity("claude-millisecond"),
+            runtime_env::normalize_time_to_local("2026-08-18T10:00:00.001Z").unwrap()
+        );
+        assert_eq!(
+            read_last_activity("claude-invalid-db"),
+            runtime_env::normalize_time_to_local("2026-08-18T11:00:00Z").unwrap()
+        );
+        assert_eq!(
+            read_last_activity("claude-empty-db"),
+            runtime_env::normalize_time_to_local("2026-08-18T11:00:00Z").unwrap()
+        );
+        assert_eq!(
+            runtime_env::parse_persisted_time_to_utc(&read_last_activity("claude-invalid-remote"))
+                .unwrap(),
+            runtime_env::parse_persisted_time_to_utc("2026-08-18T10:00:00Z").unwrap()
+        );
+        assert_eq!(
+            runtime_env::parse_persisted_time_to_utc(&read_last_activity("claude-none-remote"))
+                .unwrap(),
+            runtime_env::parse_persisted_time_to_utc("2026-08-18T10:00:00Z").unwrap()
+        );
+        assert_eq!(
+            runtime_env::parse_persisted_time_to_utc(&read_last_activity("claude-empty-remote"))
+                .unwrap(),
+            runtime_env::parse_persisted_time_to_utc("2026-08-18T10:00:00Z").unwrap()
+        );
         assert_eq!(read_sync_flag("claude-equal-zone"), 0);
         assert_eq!(read_sync_flag("claude-older"), 0);
         assert_eq!(read_sync_flag("claude-millisecond"), 1);
@@ -1433,7 +1475,10 @@ mod tests {
             .expect("failed to read invalid metadata row");
         assert_eq!(row.0, "not-json");
         assert_eq!(row.1, "remote-title");
-        assert_eq!(row.2, "2026-08-18T11:00:00Z");
+        assert_eq!(
+            row.2,
+            runtime_env::normalize_time_to_local("2026-08-18T11:00:00Z").unwrap()
+        );
     }
 
     #[tokio::test]

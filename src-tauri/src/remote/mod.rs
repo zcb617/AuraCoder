@@ -1304,7 +1304,7 @@ impl RemoteTunnelManager {
                                                 uuid::Uuid::new_v4().simple(),
                                                 uuid::Uuid::new_v4().simple()
                                             );
-                                            let now = Utc::now().to_rfc3339();
+                                            let now = crate::runtime_env::system_time_rfc3339();
                                             let device = RemoteDeviceConfig {
                                                 id: format!("mobile_{}", uuid::Uuid::new_v4().simple()),
                                                 name: device_name_from_payload(&request.payload),
@@ -1345,7 +1345,7 @@ impl RemoteTunnelManager {
                                         "device.identify" => {
                                             let credential = request.auth.clone();
                                             let device_name = device_name_from_payload(&request.payload);
-                                            let connected_at = Utc::now().to_rfc3339();
+                                            let connected_at = crate::runtime_env::system_time_rfc3339();
                                             let credential_to_save = credential.clone();
                                             let name_to_save = device_name.clone();
                                             let connected_at_to_save = connected_at.clone();

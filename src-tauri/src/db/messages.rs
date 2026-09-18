@@ -169,11 +169,26 @@ pub fn append_thread_messages(
         if message.role == "user" {
             bind_legacy_local_turn_to_remote_turn(&tx, thread_id, message, remote_turn_id)?;
         }
-        let created_at = message.created_at.clone().unwrap_or_else(|| {
+        let fallback_created_at = || {
             runtime_env::format_system_time(
                 fallback_created_at_base + ChronoDuration::milliseconds(index as i64),
             )
-        });
+        };
+        let created_at = match message.created_at.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => match runtime_env::normalize_time_to_local(raw) {
+                Ok(value) => value,
+                Err(error) => {
+                    log::warn!(
+                        "导入消息时间归一化失败，使用本地回退时间: raw={} thread_id={} remote_turn_id={} error={error:#}",
+                        raw,
+                        thread_id,
+                        remote_turn_id
+                    );
+                    fallback_created_at()
+                }
+            },
+            _ => fallback_created_at(),
+        };
         let existing = tx
             .query_row(
                 "SELECT id, turn_engine_id
@@ -261,7 +276,7 @@ fn is_latest_thread_message(
             "SELECT id
              FROM messages
              WHERE thread_id = ?1
-             ORDER BY created_at DESC, rowid DESC
+             ORDER BY julianday(created_at) DESC, rowid DESC
              LIMIT 1",
             params![thread_id],
             |row| row.get::<_, String>(0),
@@ -294,7 +309,7 @@ fn bind_legacy_local_turn_to_remote_turn(
                AND role = 'user'
                AND remote_turn_id IS NULL
                AND content = ?2
-             ORDER BY created_at ASC, rowid ASC
+             ORDER BY julianday(created_at) ASC, rowid ASC
              LIMIT 1",
             params![thread_id, content],
             |row| row.get::<_, String>(0),
@@ -335,10 +350,10 @@ fn bind_legacy_local_turn_to_remote_turn(
                AND candidate.role = 'assistant'
                AND candidate.remote_turn_id IS NULL
                AND (
-                   candidate.created_at > user.created_at
-                   OR (candidate.created_at = user.created_at AND candidate.rowid > user.rowid)
+                   julianday(candidate.created_at) > julianday(user.created_at)
+                   OR (julianday(candidate.created_at) = julianday(user.created_at) AND candidate.rowid > user.rowid)
                )
-             ORDER BY candidate.created_at ASC, candidate.rowid ASC
+             ORDER BY julianday(candidate.created_at) ASC, candidate.rowid ASC
              LIMIT 1
          )
            AND NOT EXISTS (
@@ -376,10 +391,10 @@ pub fn bind_local_turn_to_remote_turn(
                 WHERE candidate.thread_id = assistant.thread_id
                   AND candidate.role = 'user'
                   AND (
-                    candidate.created_at < assistant.created_at
-                    OR (candidate.created_at = assistant.created_at AND candidate.rowid < assistant.rowid)
+                    julianday(candidate.created_at) < julianday(assistant.created_at)
+                    OR (julianday(candidate.created_at) = julianday(assistant.created_at) AND candidate.rowid < assistant.rowid)
                   )
-                ORDER BY candidate.created_at DESC, candidate.rowid DESC
+                ORDER BY julianday(candidate.created_at) DESC, candidate.rowid DESC
                 LIMIT 1
             )",
         params![remote_turn_id, assistant_message_id],
@@ -623,7 +638,7 @@ pub fn get_thread_messages(db: &Database, thread_id: &str) -> anyhow::Result<Vec
             token_input, token_output, turn_engine_id, turn_model_id, turn_reasoning_effort, created_at
      FROM messages
      WHERE thread_id = ?1
-     ORDER BY created_at ASC, rowid ASC",
+     ORDER BY julianday(created_at) ASC, rowid ASC",
     )?;
 
     let rows = stmt.query_map(params![thread_id], map_message_row)?;
@@ -669,7 +684,7 @@ pub fn get_thread_messages_page_desc(
         "SELECT id, role, content, created_at
          FROM messages
          WHERE thread_id = ?1
-         ORDER BY created_at DESC, rowid DESC
+         ORDER BY julianday(created_at) DESC, rowid DESC
          LIMIT ?2 OFFSET ?3",
     )?;
     let rows = stmt.query_map(params![thread_id, limit, offset], |row| {
@@ -714,16 +729,16 @@ pub fn get_thread_messages_window(
      WHERE thread_id = ?1
        AND (
          ?2 IS NULL
-         OR created_at < ?2
+         OR julianday(created_at) < julianday(?2)
          OR (
-           created_at = ?2
+           julianday(created_at) = julianday(?2)
            AND (
              (?3 IS NOT NULL AND rowid < ?3)
              OR (?3 IS NULL AND ?4 IS NOT NULL AND id < ?4)
            )
          )
        )
-     ORDER BY created_at DESC, rowid DESC
+     ORDER BY julianday(created_at) DESC, rowid DESC
      LIMIT ?5",
     )?;
 
@@ -798,16 +813,16 @@ pub fn get_thread_messages_window_with_row_ids(
      WHERE thread_id = ?1
        AND (
          ?2 IS NULL
-         OR created_at < ?2
+         OR julianday(created_at) < julianday(?2)
          OR (
-           created_at = ?2
+           julianday(created_at) = julianday(?2)
            AND (
              (?3 IS NOT NULL AND rowid < ?3)
              OR (?3 IS NULL AND ?4 IS NOT NULL AND id < ?4)
            )
          )
        )
-     ORDER BY created_at DESC, rowid DESC
+     ORDER BY julianday(created_at) DESC, rowid DESC
      LIMIT ?5",
     )?;
 
@@ -2492,14 +2507,17 @@ mod tests {
         assert_eq!(unique_ids.len(), 5);
         assert_eq!(all_ids.len(), 5);
 
-        // 分页拼接顺序必须与一次取全部（limit=10）的顺序完全一致。
+        // 分页按“最新页优先”返回，完整窗口按整体升序返回；只比较两者的稳定 ID 集合。
         let full = get_thread_messages_window(&db, &thread_id, None, 10).unwrap();
-        let full_ids = full
+        let mut full_ids = full
             .messages
             .iter()
             .map(|message| message.id.clone())
             .collect::<Vec<_>>();
-        assert_eq!(all_ids, full_ids);
+        let mut paginated_ids = all_ids;
+        paginated_ids.sort();
+        full_ids.sort();
+        assert_eq!(paginated_ids, full_ids);
     }
 
     #[test]

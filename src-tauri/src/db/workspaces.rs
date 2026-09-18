@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::models::WorkspaceDto;
 use crate::path_utils;
+use crate::runtime_env;
 
 use super::Database;
 
@@ -25,14 +26,15 @@ pub fn upsert_workspace(db: &Database, root_path: &str) -> anyhow::Result<Worksp
         None
     };
 
+    let now = runtime_env::system_time_rfc3339();
     if let Some(id) = existing {
         conn.execute(
             "UPDATE workspaces
        SET root_path = ?2,
-           last_opened_at = datetime('now'),
+           last_opened_at = ?3,
            archived_at = NULL
        WHERE id = ?1",
-            params![id, canonical],
+            params![id, canonical, now],
         )
         .context("failed to update workspace last_opened_at")?;
     } else {
@@ -40,9 +42,9 @@ pub fn upsert_workspace(db: &Database, root_path: &str) -> anyhow::Result<Worksp
         let name = workspace_name_from_path(&canonical);
         conn.execute(
             "INSERT INTO workspaces (
-                id, name, root_path, location_kind, ssh_connection_id
-             ) VALUES (?1, ?2, ?3, 'local', NULL)",
-            params![id, name, canonical],
+                id, name, root_path, location_kind, ssh_connection_id, created_at, last_opened_at
+             ) VALUES (?1, ?2, ?3, 'local', NULL, ?4, ?4)",
+            params![id, name, canonical, now],
         )
         .context("failed to insert workspace")?;
     }
@@ -104,6 +106,7 @@ pub fn create_ssh_workspace(
         .optional()
         .context("failed to query remote workspace")?;
 
+    let now = runtime_env::system_time_rfc3339();
     let workspace_id = if let Some((workspace_id, archived_at)) = existing {
         if archived_at.is_none() {
             return get_workspace_by_id(&conn, &workspace_id);
@@ -112,9 +115,9 @@ pub fn create_ssh_workspace(
             "UPDATE workspaces
              SET name = ?1,
                  archived_at = NULL,
-                 last_opened_at = datetime('now')
+                 last_opened_at = ?3
              WHERE id = ?2",
-            params![name, workspace_id],
+            params![name, workspace_id, now],
         )
         .context("failed to restore remote workspace")?;
         workspace_id
@@ -122,9 +125,9 @@ pub fn create_ssh_workspace(
         let workspace_id = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO workspaces (
-               id, name, root_path, location_kind, ssh_connection_id
-             ) VALUES (?1, ?2, ?3, 'ssh', ?4)",
-            params![workspace_id, name, root_path, connection_id],
+               id, name, root_path, location_kind, ssh_connection_id, created_at, last_opened_at
+             ) VALUES (?1, ?2, ?3, 'ssh', ?4, ?5, ?5)",
+            params![workspace_id, name, root_path, connection_id, now],
         )
         .context("failed to insert remote workspace")?;
         workspace_id
@@ -143,7 +146,7 @@ pub fn list_workspaces(db: &Database) -> anyhow::Result<Vec<WorkspaceDto>> {
          LEFT JOIN ssh_connections s ON s.id = w.ssh_connection_id
          WHERE w.archived_at IS NULL
            AND (w.location_kind = 'local' OR (s.id IS NOT NULL AND s.deleted_at IS NULL))
-         ORDER BY w.last_opened_at DESC",
+         ORDER BY julianday(w.last_opened_at) DESC, w.rowid DESC",
     )?;
 
     let rows = stmt.query_map([], map_workspace_row)?;
@@ -166,7 +169,7 @@ pub fn list_archived_workspaces(db: &Database) -> anyhow::Result<Vec<WorkspaceDt
          LEFT JOIN ssh_connections s ON s.id = w.ssh_connection_id
          WHERE w.archived_at IS NOT NULL
            AND (w.location_kind = 'local' OR (s.id IS NOT NULL AND s.deleted_at IS NULL))
-         ORDER BY w.archived_at DESC",
+         ORDER BY julianday(w.archived_at) DESC, w.rowid DESC",
     )?;
 
     let rows = stmt.query_map([], map_workspace_row)?;
@@ -197,13 +200,14 @@ pub fn delete_workspace(db: &Database, workspace_id: &str) -> anyhow::Result<()>
 
 pub fn archive_workspace(db: &Database, workspace_id: &str) -> anyhow::Result<()> {
     let conn = db.connect()?;
+    let archived_at = runtime_env::system_time_rfc3339();
     let affected = conn
         .execute(
             "UPDATE workspaces
-       SET archived_at = datetime('now')
+       SET archived_at = ?2
        WHERE id = ?1
          AND archived_at IS NULL",
-            params![workspace_id],
+            params![workspace_id, archived_at],
         )
         .context("failed to archive workspace")?;
 
@@ -216,11 +220,12 @@ pub fn archive_workspace(db: &Database, workspace_id: &str) -> anyhow::Result<()
 
 pub fn restore_workspace(db: &Database, workspace_id: &str) -> anyhow::Result<WorkspaceDto> {
     let conn = db.connect()?;
+    let last_opened_at = runtime_env::system_time_rfc3339();
     let affected = conn
         .execute(
             "UPDATE workspaces
        SET archived_at = NULL,
-           last_opened_at = datetime('now')
+           last_opened_at = ?2
        WHERE id = ?1
          AND archived_at IS NOT NULL
          AND (
@@ -231,7 +236,7 @@ pub fn restore_workspace(db: &Database, workspace_id: &str) -> anyhow::Result<Wo
                AND s.deleted_at IS NULL
            )
          )",
-            params![workspace_id],
+            params![workspace_id, last_opened_at],
         )
         .context("failed to restore workspace")?;
 
@@ -287,16 +292,17 @@ pub fn set_workspace_startup_preset_json(
     startup_preset_json: Option<&str>,
 ) -> anyhow::Result<()> {
     let conn = db.connect()?;
+    let updated_at = runtime_env::system_time_rfc3339();
     let affected = conn
         .execute(
             "UPDATE workspaces
              SET startup_preset_json = ?1,
                  startup_preset_updated_at = CASE
                      WHEN ?1 IS NULL THEN NULL
-                     ELSE datetime('now')
+                     ELSE ?3
                  END
              WHERE id = ?2",
-            params![startup_preset_json, workspace_id],
+            params![startup_preset_json, workspace_id, updated_at],
         )
         .context("failed to persist workspace startup preset")?;
 

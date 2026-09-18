@@ -1,15 +1,21 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use chrono::{Duration, Utc};
-use rusqlite::params;
+use chrono::{Duration, Local};
+use rusqlite::{params, OptionalExtension};
 
 use crate::models::ExtensionItemDto;
+use crate::runtime_env;
 
 use super::Database;
 
 pub const EXTENSION_KINDS: [&str; 3] = ["skill", "plugin", "mcp"];
 pub const NORMAL_REFRESH_INTERVAL: Duration = Duration::hours(6);
+
+/// 将扩展缓存操作时间转换为本机本地 RFC3339，拒绝非法输入。
+fn normalize_extension_time(raw: &str) -> Result<String> {
+    runtime_env::normalize_time_to_local(raw)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionRefreshTarget {
@@ -34,6 +40,7 @@ pub fn ensure_context(
     context_key: &str,
     observed_at: &str,
 ) -> Result<()> {
+    let observed_at = normalize_extension_time(observed_at)?;
     let mut conn = db.connect()?;
     let transaction = conn
         .transaction()
@@ -65,6 +72,7 @@ pub fn schedule_startup_refresh(
     kind: &str,
     observed_at: &str,
 ) -> Result<()> {
+    let observed_at = normalize_extension_time(observed_at)?;
     let conn = db.connect()?;
     conn.execute(
         "UPDATE extension_catalog_snapshots
@@ -140,13 +148,14 @@ pub fn load_snapshots(
 }
 
 pub fn list_due_refreshes(db: &Database, now: &str) -> Result<Vec<ExtensionRefreshTarget>> {
+    let now = normalize_extension_time(now)?;
     let conn = db.connect()?;
     let mut statement = conn
         .prepare(
             "SELECT provider_id, context_key, kind
              FROM extension_catalog_snapshots
-             WHERE next_refresh_at IS NULL OR next_refresh_at <= ?1
-             ORDER BY provider_id, context_key, kind",
+             WHERE next_refresh_at IS NULL OR julianday(next_refresh_at) <= julianday(?1)
+             ORDER BY julianday(next_refresh_at) ASC, provider_id, context_key, kind",
         )
         .context("failed to prepare due extension catalog refresh query")?;
     let rows = statement
@@ -165,10 +174,15 @@ pub fn list_due_refreshes(db: &Database, now: &str) -> Result<Vec<ExtensionRefre
 pub fn next_refresh_at(db: &Database) -> Result<Option<String>> {
     let conn = db.connect()?;
     conn.query_row(
-        "SELECT MIN(next_refresh_at) FROM extension_catalog_snapshots",
+        "SELECT next_refresh_at
+         FROM extension_catalog_snapshots
+         WHERE next_refresh_at IS NOT NULL
+         ORDER BY julianday(next_refresh_at) ASC, rowid ASC
+         LIMIT 1",
         [],
         |row| row.get(0),
     )
+    .optional()
     .context("failed to read next extension catalog refresh time")
 }
 
@@ -180,7 +194,8 @@ pub fn record_success(
     items: &[ExtensionItemDto],
     attempted_at: &str,
 ) -> Result<()> {
-    let next_refresh_at = (Utc::now() + NORMAL_REFRESH_INTERVAL).to_rfc3339();
+    let attempted_at = normalize_extension_time(attempted_at)?;
+    let next_refresh_at = runtime_env::format_system_time(Local::now() + NORMAL_REFRESH_INTERVAL);
     let items_json = serde_json::to_string(items)
         .context("failed to serialize sanitized extension catalog snapshot")?;
     let conn = db.connect()?;
@@ -217,6 +232,7 @@ pub fn record_failure(
     attempted_at: &str,
     error_summary: &str,
 ) -> Result<u32> {
+    let attempted_at = normalize_extension_time(attempted_at)?;
     let mut conn = db.connect()?;
     let transaction = conn
         .transaction()
@@ -239,7 +255,7 @@ pub fn record_failure(
         )
         .context("failed to read extension catalog failure count")?;
     let failure_count = previous_failure_count.max(0) as u32 + 1;
-    let next_refresh_at = (Utc::now() + retry_delay(failure_count)).to_rfc3339();
+    let next_refresh_at = runtime_env::format_system_time(Local::now() + retry_delay(failure_count));
     transaction
         .execute(
             "UPDATE extension_catalog_snapshots
@@ -291,7 +307,7 @@ pub fn latest_snapshot_timestamp(snapshots: &[ExtensionCatalogSnapshot]) -> Opti
     snapshots
         .iter()
         .filter_map(|snapshot| snapshot.fetched_at.as_deref())
-        .max()
+        .max_by_key(|value| runtime_env::parse_persisted_time_to_utc(value).ok())
         .map(str::to_string)
 }
 
@@ -299,29 +315,22 @@ pub fn latest_attempt_timestamp(snapshots: &[ExtensionCatalogSnapshot]) -> Optio
     snapshots
         .iter()
         .filter_map(|snapshot| snapshot.last_attempt_at.as_deref())
-        .max()
+        .max_by_key(|value| runtime_env::parse_persisted_time_to_utc(value).ok())
         .map(str::to_string)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
-
     use chrono::Utc;
+    use uuid::Uuid;
 
     use super::*;
-    use crate::db::{ConnectionPool, Database, SQLITE_POOL_MAX_IDLE};
+    use crate::db::Database;
 
+    /// 创建使用唯一文件路径的扩展测试数据库，避免迁移备份目标发生冲突。
     fn test_database() -> Database {
-        let db = Database {
-            path: PathBuf::from(":memory:"),
-            pool: Arc::new(ConnectionPool {
-                idle: std::sync::Mutex::new(Vec::new()),
-                max_idle: SQLITE_POOL_MAX_IDLE,
-            }),
-        };
-        db.run_migrations().expect("failed to run test migrations");
-        db
+        let path = std::env::temp_dir().join(format!("auracoder-extensions-{}.db", Uuid::new_v4()));
+        Database::open(path).expect("failed to open test database")
     }
 
     #[test]
@@ -390,13 +399,17 @@ mod tests {
         .unwrap();
 
         let startup_at = "2030-01-02T03:04:05+00:00";
+        let expected_startup_at = runtime_env::normalize_time_to_local(startup_at).unwrap();
         schedule_startup_refresh(&db, "codex", "workspace:/demo", "skill", startup_at).unwrap();
         let scheduled = load_snapshots(&db, "codex", "workspace:/demo")
             .unwrap()
             .into_iter()
             .find(|snapshot| snapshot.kind == "skill")
             .unwrap();
-        assert_eq!(scheduled.next_refresh_at.as_deref(), Some(startup_at));
+        assert_eq!(
+            scheduled.next_refresh_at.as_deref(),
+            Some(expected_startup_at.as_str())
+        );
 
         record_failure(
             &db,
@@ -408,6 +421,7 @@ mod tests {
         )
         .unwrap();
         let restarted_at = "2030-01-02T04:05:06+00:00";
+        let expected_restarted_at = runtime_env::normalize_time_to_local(restarted_at).unwrap();
         schedule_startup_refresh(&db, "codex", "workspace:/demo", "skill", restarted_at).unwrap();
         let after_restart = load_snapshots(&db, "codex", "workspace:/demo")
             .unwrap()
@@ -415,6 +429,6 @@ mod tests {
             .find(|snapshot| snapshot.kind == "skill")
             .and_then(|snapshot| snapshot.next_refresh_at)
             .unwrap();
-        assert_eq!(after_restart, restarted_at);
+        assert_eq!(after_restart, expected_restarted_at);
     }
 }

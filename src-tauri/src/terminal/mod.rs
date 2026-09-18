@@ -1079,7 +1079,7 @@ impl TerminalSessionHandle {
             .saturating_add(1);
         let chunk = TerminalReplayChunkDto {
             seq,
-            ts: Utc::now().to_rfc3339(),
+            ts: runtime_env::system_time_rfc3339(),
             data,
         };
         let chunk_bytes = chunk.data.len();
@@ -1266,7 +1266,7 @@ impl TerminalSessionHandle {
                     rows: rows.max(1),
                     pixel_width,
                     pixel_height,
-                    recorded_at: Utc::now().to_rfc3339(),
+                    recorded_at: runtime_env::system_time_rfc3339(),
                 });
                 if pixel_width == 0 || pixel_height == 0 {
                     let now_ms = Utc::now().timestamp_millis();

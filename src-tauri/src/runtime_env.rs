@@ -127,6 +127,31 @@ pub fn system_time_rfc3339() -> String {
     format_system_time(chrono::Local::now())
 }
 
+/// 将数据库中可能存在的 RFC3339 或历史 SQLite UTC 时间解析为绝对 UTC 时间。
+pub fn parse_persisted_time_to_utc(raw: &str) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    let trimmed = raw.trim();
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(value.with_timezone(&chrono::Utc));
+    }
+
+    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(value) = chrono::NaiveDateTime::parse_from_str(trimmed, format) {
+            return Ok(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                value,
+                chrono::Utc,
+            ));
+        }
+    }
+
+    anyhow::bail!("无法解析持久化时间 {:?}", raw)
+}
+
+/// 将外部或历史数据库时间统一转换为当前运行电脑本地时区的 RFC3339 毫秒字符串。
+pub fn normalize_time_to_local(raw: &str) -> anyhow::Result<String> {
+    let utc = parse_persisted_time_to_utc(raw)?;
+    Ok(format_system_time(utc.with_timezone(&chrono::Local)))
+}
+
 pub fn legacy_app_data_dir() -> Option<PathBuf> {
     home_dir().map(|home| legacy_app_data_dir_for(&home))
 }
@@ -1275,6 +1300,29 @@ mod tests {
         assert!(!value.ends_with('Z'));
     }
 
+    #[test]
+    fn persisted_time_formats_share_one_absolute_local_time() {
+        let z = normalize_time_to_local("2026-08-18T10:00:00.123Z").unwrap();
+        let offset = normalize_time_to_local("2026-08-18T18:00:00.123+08:00").unwrap();
+        let sqlite = normalize_time_to_local("2026-08-18 10:00:00.123").unwrap();
+        assert_eq!(z, offset);
+        assert_eq!(z, sqlite);
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&z)
+                .unwrap()
+                .offset()
+                .local_minus_utc(),
+            chrono::Local::now().offset().local_minus_utc()
+        );
+    }
+
+    #[test]
+    fn persisted_time_parse_error_contains_original_input() {
+        let raw = "not-a-time";
+        let error = normalize_time_to_local(raw).expect_err("invalid time should fail");
+        assert!(error.to_string().contains(raw));
+    }
+
     fn normalize_path(path: &Path) -> String {
         path.to_string_lossy().replace('\\', "/")
     }
@@ -2123,3 +2171,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/system_local_time_tests.rs"]
+mod system_local_time_tests;

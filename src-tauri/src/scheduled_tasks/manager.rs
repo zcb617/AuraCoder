@@ -7,11 +7,12 @@ use tokio::{sync::Notify, time::sleep};
 
 use crate::{
     commands::{
-        chat::{self, ChatMessageService, SendMessageRequest},
+        chat::{ChatMessageService, SendMessageRequest},
         threads,
     },
     db,
     models::{ScheduledTaskDto, ScheduledTaskRunDto, ThreadDto},
+    runtime_env,
     state::AppState,
 };
 
@@ -91,11 +92,10 @@ async fn next_scheduler_delay(state: &AppState) -> Duration {
     let Ok(Ok(Some(next))) = next else {
         return SCHEDULER_IDLE_DELAY;
     };
-    let Ok(next) = DateTime::parse_from_rfc3339(&next) else {
+    let Ok(next) = runtime_env::parse_persisted_time_to_utc(&next) else {
         return SCHEDULER_RECHECK_DELAY;
     };
-    next.with_timezone(&Utc)
-        .signed_duration_since(Utc::now())
+    next.signed_duration_since(Utc::now())
         .to_std()
         .unwrap_or(SCHEDULER_RECHECK_DELAY)
         .max(Duration::from_secs(1))
@@ -103,7 +103,7 @@ async fn next_scheduler_delay(state: &AppState) -> Duration {
 
 async fn process_due_tasks(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let now = Utc::now();
-    let now_rfc3339 = now.to_rfc3339();
+    let now_rfc3339 = runtime_env::system_time_rfc3339();
     let db = state.db.clone();
     let due =
         tokio::task::spawn_blocking(move || db::scheduled_tasks::list_due_tasks(&db, &now_rfc3339))
@@ -115,9 +115,13 @@ async fn process_due_tasks(app: &AppHandle, state: &AppState) -> Result<(), Stri
         let Some(scheduled_for_raw) = task.next_run_at.as_deref() else {
             continue;
         };
-        let scheduled_for = DateTime::parse_from_rfc3339(scheduled_for_raw)
-            .map_err(|error| format!("invalid scheduled task next_run_at: {error}"))?
-            .with_timezone(&Utc);
+        let scheduled_for = runtime_env::parse_persisted_time_to_utc(scheduled_for_raw)
+            .map_err(|error| {
+                format!(
+                    "invalid scheduled task next_run_at {:?}: {error}",
+                    scheduled_for_raw
+                )
+            })?;
         let next_run = next_run_after_due(
             &task.schedule_type,
             &task.schedule,
@@ -127,8 +131,21 @@ async fn process_due_tasks(app: &AppHandle, state: &AppState) -> Result<(), Stri
         )?;
         let db = state.db.clone();
         let task_id = task.id.clone();
-        let scheduled_for_string = scheduled_for.to_rfc3339();
-        let next_run_string = next_run.to_rfc3339();
+        let scheduled_for_raw = scheduled_for_raw.to_string();
+        let scheduled_for_string = runtime_env::normalize_time_to_local(&scheduled_for.to_rfc3339())
+            .map_err(|error| {
+                format!(
+                    "failed to normalize scheduled task next_run_at {:?}: {error}",
+                    scheduled_for_raw
+                )
+            })?;
+        let next_run_raw = next_run.to_rfc3339();
+        let next_run_string = runtime_env::normalize_time_to_local(&next_run_raw).map_err(|error| {
+            format!(
+                "failed to normalize scheduled task computed next_run_at {:?}: {error}",
+                next_run_raw
+            )
+        })?;
         let run = tokio::task::spawn_blocking(move || {
             db::scheduled_tasks::claim_due_task(
                 &db,

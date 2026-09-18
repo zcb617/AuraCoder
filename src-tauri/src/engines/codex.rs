@@ -7440,7 +7440,7 @@ async fn refresh_protocol_diagnostics_via_transport(
     };
     update_method_availability(&mut diagnostics, "config/read", config_availability);
 
-    diagnostics.fetched_at = Some(Utc::now().to_rfc3339());
+    diagnostics.fetched_at = Some(crate::runtime_env::system_time_rfc3339());
     diagnostics.stale = false;
     diagnostics
         .method_availability

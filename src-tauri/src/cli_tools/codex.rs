@@ -23,6 +23,7 @@ use crate::{
     },
     extensions,
     local_cli_service_lifecycle::{LocalCliHandle, LocalCliServiceLifecycle},
+    runtime_env,
     models::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
@@ -1856,7 +1857,7 @@ impl CliTool for CodexCli {
 
             ..Default::default()
         }));
-        let fetched_at = chrono::Utc::now().to_rfc3339();
+        let fetched_at = runtime_env::system_time_rfc3339();
         let kind_fetched_at = ["skill", "plugin", "mcp"]
             .into_iter()
             .map(|kind| (kind.to_string(), Some(fetched_at.clone())))

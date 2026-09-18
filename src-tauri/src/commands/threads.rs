@@ -1743,7 +1743,7 @@ pub async fn rename_thread(
         object.insert("manualTitle".to_string(), json!(true));
         object.insert(
             "manualTitleUpdatedAt".to_string(),
-            json!(Utc::now().to_rfc3339()),
+            json!(runtime_env::system_time_rfc3339()),
         );
     }
 
@@ -3444,7 +3444,7 @@ fn merge_codex_runtime_metadata(
         if sync_required {
             object.insert(
                 "codexSyncUpdatedAt".to_string(),
-                json!(Utc::now().to_rfc3339()),
+                json!(runtime_env::system_time_rfc3339()),
             );
             if let Some(reason) = sync_reason.map(str::trim).filter(|value| !value.is_empty()) {
                 object.insert("codexSyncReason".to_string(), json!(reason));
@@ -3452,7 +3452,7 @@ fn merge_codex_runtime_metadata(
         } else {
             object.insert(
                 "codexSyncUpdatedAt".to_string(),
-                json!(Utc::now().to_rfc3339()),
+                json!(runtime_env::system_time_rfc3339()),
             );
             object.insert("codexSyncReason".to_string(), serde_json::Value::Null);
         }

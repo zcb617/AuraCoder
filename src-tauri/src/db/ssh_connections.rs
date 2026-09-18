@@ -2,6 +2,7 @@ use anyhow::Context;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{SshConnectionDto, SshConnectionInput};
+use crate::runtime_env;
 
 use super::Database;
 
@@ -25,7 +26,7 @@ pub fn list(db: &Database, deleted: bool) -> anyhow::Result<Vec<SshConnectionDto
     let query = format!(
         "SELECT {SELECT_COLUMNS}
          FROM ssh_connections WHERE (deleted_at IS NOT NULL) = ?1
-         ORDER BY updated_at DESC, display_name COLLATE NOCASE"
+         ORDER BY julianday(updated_at) DESC, rowid DESC, display_name COLLATE NOCASE"
     );
     let mut stmt = conn.prepare(&query)?;
     let rows = stmt.query_map(params![deleted], map_row)?;
@@ -38,7 +39,7 @@ pub fn list_records(db: &Database, deleted: bool) -> anyhow::Result<Vec<SshConne
     let query = format!(
         "SELECT {SELECT_COLUMNS}
          FROM ssh_connections WHERE (deleted_at IS NOT NULL) = ?1
-         ORDER BY updated_at DESC, display_name COLLATE NOCASE"
+         ORDER BY julianday(updated_at) DESC, rowid DESC, display_name COLLATE NOCASE"
     );
     let mut stmt = conn.prepare(&query)?;
     let rows = stmt.query_map(params![deleted], map_record)?;
@@ -89,12 +90,13 @@ pub fn insert(
     key_type: &str,
     key_base64: &str,
 ) -> anyhow::Result<SshConnectionDto> {
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     conn.execute(
         "INSERT INTO ssh_connections (
            id, display_name, source_kind, config_alias, host_name, user_name, port,
-           identity_file, host_key_type, host_key_base64, connection_status
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+           identity_file, host_key_type, host_key_base64, connection_status, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
         params![
             id,
             input.display_name.trim(),
@@ -107,6 +109,7 @@ pub fn insert(
             key_type,
             key_base64,
             STATUS_UNKNOWN,
+            now,
         ],
     )
     .context("failed to insert ssh connection")?;
@@ -122,6 +125,7 @@ pub fn update(
     key_type: &str,
     key_base64: &str,
 ) -> anyhow::Result<SshConnectionDto> {
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     let changed = conn
         .execute(
@@ -129,7 +133,7 @@ pub fn update(
                display_name=?2, config_alias=?3, host_name=?4, user_name=?5, port=?6,
                identity_file=?7, host_key_type=?8, host_key_base64=?9,
                connection_status=?10, last_connected_at=NULL, last_error=NULL,
-               updated_at=strftime('%Y-%m-%d %H:%M:%f', 'now')
+               updated_at=?11
              WHERE id=?1 AND deleted_at IS NULL",
             params![
                 id,
@@ -142,6 +146,7 @@ pub fn update(
                 key_type,
                 key_base64,
                 STATUS_UNKNOWN,
+                now,
             ],
         )
         .context("failed to update ssh connection")?;
@@ -160,14 +165,15 @@ pub fn set_enabled(db: &Database, id: &str, enabled: bool) -> anyhow::Result<Ssh
     } else {
         STATUS_DISABLED
     };
+    let now = runtime_env::system_time_rfc3339();
     let changed = conn
         .execute(
             "UPDATE ssh_connections SET
                enabled=?2, connection_status=?3,
                last_error=NULL,
-               updated_at=strftime('%Y-%m-%d %H:%M:%f', 'now')
+               updated_at=?4
              WHERE id=?1 AND deleted_at IS NULL",
-            params![id, enabled, status],
+            params![id, enabled, status, now],
         )
         .context("failed to update ssh connection state")?;
     if changed == 0 {
@@ -185,14 +191,15 @@ pub fn record_test(
     ok: bool,
     error: Option<&str>,
 ) -> anyhow::Result<()> {
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     if ok {
         conn.execute(
             "UPDATE ssh_connections SET
-               connection_status=?2, last_connected_at=strftime('%Y-%m-%d %H:%M:%f', 'now'),
+               connection_status=?2, last_connected_at=?4,
                last_error=NULL
              WHERE id=?1 AND updated_at=?3",
-            params![id, STATUS_OK, expected_updated_at],
+            params![id, STATUS_OK, expected_updated_at, now],
         )?;
     } else {
         conn.execute(
@@ -211,14 +218,15 @@ pub fn set_status_if_current(
     status: &str,
     error: Option<&str>,
 ) -> anyhow::Result<bool> {
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     let changed = match status {
         STATUS_OK => conn.execute(
             "UPDATE ssh_connections SET
-               connection_status=?3, last_connected_at=strftime('%Y-%m-%d %H:%M:%f', 'now'),
+               connection_status=?3, last_connected_at=?4,
                last_error=NULL
              WHERE id=?1 AND updated_at=?2 AND enabled=1 AND deleted_at IS NULL",
-            params![id, expected_updated_at, status],
+            params![id, expected_updated_at, status, now],
         )?,
         STATUS_CONNECTING => conn.execute(
             "UPDATE ssh_connections SET connection_status=?3
@@ -236,13 +244,14 @@ pub fn set_status_if_current(
 }
 
 pub fn soft_delete(db: &Database, id: &str) -> anyhow::Result<()> {
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     let changed = conn.execute(
         "UPDATE ssh_connections SET
-           deleted_at=strftime('%Y-%m-%d %H:%M:%f', 'now'), connection_status=?2,
-           updated_at=strftime('%Y-%m-%d %H:%M:%f', 'now')
+           deleted_at=?3, connection_status=?2,
+           updated_at=?3
          WHERE id=?1 AND deleted_at IS NULL",
-        params![id, STATUS_DELETED],
+        params![id, STATUS_DELETED, now],
     )?;
     if changed == 0 {
         anyhow::bail!("ssh connection not found: {id}");
@@ -251,15 +260,16 @@ pub fn soft_delete(db: &Database, id: &str) -> anyhow::Result<()> {
 }
 
 pub fn restore(db: &Database, id: &str) -> anyhow::Result<SshConnectionDto> {
+    let now = runtime_env::system_time_rfc3339();
     let conn = db.connect()?;
     let changed = conn.execute(
         "UPDATE ssh_connections SET
            deleted_at=NULL,
            connection_status=CASE WHEN enabled=1 THEN ?2 ELSE ?3 END,
            last_error=NULL,
-           updated_at=strftime('%Y-%m-%d %H:%M:%f', 'now')
+           updated_at=?4
          WHERE id=?1 AND deleted_at IS NOT NULL",
-        params![id, STATUS_UNKNOWN, STATUS_DISABLED],
+        params![id, STATUS_UNKNOWN, STATUS_DISABLED, now],
     )?;
     if changed == 0 {
         anyhow::bail!("deleted ssh connection not found: {id}");

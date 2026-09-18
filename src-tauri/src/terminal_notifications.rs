@@ -9,7 +9,6 @@ use std::{
 };
 
 use anyhow::Context;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
@@ -508,7 +507,7 @@ impl TerminalNotificationManager {
             source,
             title,
             body,
-            created_at: Utc::now().to_rfc3339(),
+            created_at: runtime_env::system_time_rfc3339(),
         };
 
         {

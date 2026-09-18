@@ -170,7 +170,22 @@ pub fn upsert_ssh_remote_thread_snapshot(
     } else {
         model_id.trim()
     };
-    let last_activity = last_activity_at.unwrap_or("");
+    let fallback_last_activity = runtime_env::system_time_rfc3339();
+    let last_activity = match last_activity_at {
+        Some(raw) if !raw.trim().is_empty() => match runtime_env::normalize_time_to_local(raw) {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!(
+                    "SSH 远端线程时间归一化失败，使用当前本地时间: raw={} workspace_id={} engine_thread_id={} error={error:#}",
+                    raw,
+                    workspace_id,
+                    engine_thread_id
+                );
+                fallback_last_activity.clone()
+            }
+        },
+        _ => fallback_last_activity.clone(),
+    };
     if let Some((thread_id, current_model, current_metadata_raw, current_reasoning_effort)) =
         existing
     {
@@ -279,7 +294,7 @@ pub fn list_threads_for_workspace(
            WHERE messages.thread_id = threads.id
          )
        )
-     ORDER BY last_activity_at DESC",
+     ORDER BY julianday(last_activity_at) DESC, rowid DESC",
     )?;
 
     let rows = stmt.query_map(params![workspace_id], map_thread_row)?;
@@ -310,7 +325,7 @@ pub fn list_archived_threads_for_workspace(
            WHERE messages.thread_id = threads.id
          )
        )
-     ORDER BY archived_at DESC",
+     ORDER BY julianday(archived_at) DESC, rowid DESC",
     )?;
 
     let rows = stmt.query_map(params![workspace_id], map_thread_row)?;
@@ -596,6 +611,26 @@ pub fn update_thread_permissions(
 
 /// 按局部更新 DTO 更新 threads 表；NULL 保留原值，空字符串照常持久化。
 pub fn update_thread(db: &Database, update: &ThreadUpdateDto) -> anyhow::Result<ThreadDto> {
+    let normalized_archived_at = update
+        .archived_at
+        .as_deref()
+        .map(runtime_env::normalize_time_to_local)
+        .transpose()?;
+    let normalized_created_at = update
+        .created_at
+        .as_deref()
+        .map(runtime_env::normalize_time_to_local)
+        .transpose()?;
+    let normalized_last_activity_at = update
+        .last_activity_at
+        .as_deref()
+        .map(runtime_env::normalize_time_to_local)
+        .transpose()?;
+    let normalized_context_usage_updated_at = update
+        .context_usage_updated_at
+        .as_deref()
+        .map(runtime_env::normalize_time_to_local)
+        .transpose()?;
     let conn = db.connect()?;
     let affected = conn
         .execute(
@@ -630,18 +665,18 @@ pub fn update_thread(db: &Database, update: &ThreadUpdateDto) -> anyhow::Result<
                 update.engine_capabilities_json,
                 update.title,
                 update.status,
-                update.archived_at,
+                normalized_archived_at,
                 update.message_count,
                 update.total_tokens,
-                update.created_at,
-                update.last_activity_at,
+                normalized_created_at,
+                normalized_last_activity_at,
                 update.plan_mode,
                 update.send_method,
                 update.reasoning_effort,
                 update.permission_mode,
                 update.context_current_tokens,
                 update.context_max_tokens,
-                update.context_usage_updated_at,
+                normalized_context_usage_updated_at,
                 update.id,
             ],
         )
@@ -805,7 +840,12 @@ pub fn refresh_thread_message_stats(
             "SELECT
                 COUNT(*),
                 COALESCE(SUM(COALESCE(token_input, 0) + COALESCE(token_output, 0)), 0),
-                MAX(created_at)
+                (
+                    SELECT created_at FROM messages
+                    WHERE thread_id = ?1
+                    ORDER BY julianday(created_at) DESC, rowid DESC
+                    LIMIT 1
+                )
              FROM messages
              WHERE thread_id = ?1",
             params![thread_id],
@@ -999,7 +1039,7 @@ fn derive_thread_status_for_recovery(
        FROM messages
        WHERE thread_id = ?1
          AND role = 'assistant'
-       ORDER BY created_at DESC, rowid DESC
+       ORDER BY julianday(created_at) DESC, rowid DESC
        LIMIT 1",
             params![thread_id],
             |row| row.get::<_, String>(0),
@@ -1137,10 +1177,11 @@ mod tests {
     fn update_thread_last_activity_persists_exact_timestamp() {
         let db = test_db();
         let thread = test_thread(&db, "Timestamp");
-        let expected_last_activity_at = "2026-08-19T12:33:53+00:00";
+        let raw_last_activity_at = "2026-08-19T12:33:53+00:00";
+        let expected_last_activity_at = runtime_env::normalize_time_to_local(raw_last_activity_at)
+            .unwrap();
 
-        let updated =
-            update_thread_last_activity(&db, &thread.id, expected_last_activity_at).unwrap();
+        let updated = update_thread_last_activity(&db, &thread.id, raw_last_activity_at).unwrap();
 
         assert_eq!(updated.last_activity_at, expected_last_activity_at);
         assert_eq!(updated.created_at, thread.created_at);
@@ -1397,8 +1438,9 @@ mod tests {
     fn refresh_thread_message_stats_preserves_existing_activity_without_messages() {
         let db = test_db();
         let thread = test_thread(&db, "Empty stats");
-        let old_last_activity_at = "2026-01-02T00:00:00+00:00";
-        update_thread_last_activity(&db, &thread.id, old_last_activity_at).unwrap();
+        let raw_last_activity_at = "2026-01-02T00:00:00+00:00";
+        let old_last_activity_at = runtime_env::normalize_time_to_local(raw_last_activity_at).unwrap();
+        update_thread_last_activity(&db, &thread.id, raw_last_activity_at).unwrap();
 
         refresh_thread_message_stats(
             &db,
@@ -1418,8 +1460,9 @@ mod tests {
     fn refresh_thread_message_stats_preserves_existing_activity_while_recomputing_counters() {
         let db = test_db();
         let thread = test_thread(&db, "Preserved stats");
-        let old_last_activity_at = "2026-01-03T00:00:00+00:00";
-        update_thread_last_activity(&db, &thread.id, old_last_activity_at).unwrap();
+        let raw_last_activity_at = "2026-01-03T00:00:00+00:00";
+        let old_last_activity_at = runtime_env::normalize_time_to_local(raw_last_activity_at).unwrap();
+        update_thread_last_activity(&db, &thread.id, raw_last_activity_at).unwrap();
         messages::insert_user_message(
             &db,
             &thread.id,
@@ -1465,8 +1508,9 @@ mod tests {
     fn update_thread_preserves_last_activity_when_only_status_changes() {
         let db = test_db();
         let thread = test_thread(&db, "Status only");
-        let old_last_activity_at = "2026-01-04T00:00:00+00:00";
-        update_thread_last_activity(&db, &thread.id, old_last_activity_at).unwrap();
+        let raw_last_activity_at = "2026-01-04T00:00:00+00:00";
+        let old_last_activity_at = runtime_env::normalize_time_to_local(raw_last_activity_at).unwrap();
+        update_thread_last_activity(&db, &thread.id, raw_last_activity_at).unwrap();
 
         let updated = update_thread(
             &db,

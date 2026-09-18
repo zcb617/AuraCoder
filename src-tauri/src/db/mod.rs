@@ -663,6 +663,8 @@ mod migration_tests {
                 host_key_base64 TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 connection_status TEXT NOT NULL DEFAULT 'ok',
+                last_connected_at TEXT,
+                last_error TEXT,
                 deleted_at TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -737,12 +739,93 @@ mod migration_tests {
                 token_output INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            CREATE TABLE actions (
+                id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+                engine_action_id TEXT,
+                action_type TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                truncated INTEGER NOT NULL DEFAULT 0,
+                result_json TEXT,
+                duration_ms INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE approvals (
+                id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+                action_type TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                decision TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                answered_at TEXT
+            );
+            CREATE TABLE engine_event_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                event_json TEXT NOT NULL
+            );
+            CREATE TABLE extension_catalog_snapshots (
+                provider_id TEXT NOT NULL,
+                context_key TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('skill', 'plugin', 'mcp')),
+                items_json TEXT NOT NULL,
+                fetched_at TEXT,
+                last_attempt_at TEXT,
+                next_refresh_at TEXT,
+                last_error TEXT,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (provider_id, context_key, kind)
+            );
             CREATE TABLE scheduled_tasks (
                 id TEXT PRIMARY KEY,
+                description TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                execution_device_id TEXT NOT NULL DEFAULT 'local',
+                target_type TEXT NOT NULL,
                 workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
                 thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL,
                 runtime_config_json TEXT,
-                schedule_json TEXT NOT NULL
+                schedule_type TEXT NOT NULL,
+                schedule_json TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                next_run_at TEXT,
+                last_run_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                CHECK (target_type IN ('existing_thread', 'new_thread')),
+                CHECK (schedule_type IN ('interval', 'daily', 'weekly'))
+            );
+            CREATE TABLE scheduled_task_runs (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+                scheduled_for TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL,
+                assistant_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                error_message TEXT,
+                result_preview TEXT,
+                acknowledged_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                CHECK (status IN (
+                    'queued',
+                    'running',
+                    'needs_confirmation',
+                    'completed',
+                    'error',
+                    'interrupted',
+                    'skipped'
+                )),
+                UNIQUE(task_id, scheduled_for)
             );
             INSERT INTO workspaces (
                 id, name, root_path, location_kind, ssh_connection_id, startup_preset_json
@@ -787,11 +870,14 @@ mod migration_tests {
                 ('message-home', 'thread-home', 'user', 'home message'),
                 ('message-remote', 'thread-remote', 'user', 'remote message');
             INSERT INTO scheduled_tasks (
-                id, workspace_id, thread_id, runtime_config_json, schedule_json
+                id, description, enabled, execution_device_id, target_type,
+                workspace_id, thread_id, runtime_config_json, schedule_type,
+                schedule_json, timezone, next_run_at, last_run_at, created_at, updated_at
             ) VALUES (
-                'task-108', 'workspace-home', 'thread-repo-new',
+                'task-108', 'Migration test task', 1, 'local', 'existing_thread',
+                'workspace-home', 'thread-repo-new',
                 '{"repoId":"repo-new","workspaceWritableRoots":["/home/user"],"workspaceWriteOptIn":true,"keep":"yes"}',
-                '{}'
+                'interval', '{}', 'UTC', NULL, NULL, datetime('now'), datetime('now')
             );
             "#,
         )
