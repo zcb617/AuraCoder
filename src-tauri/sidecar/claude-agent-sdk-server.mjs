@@ -781,6 +781,8 @@ function createQueryContext(id, approvalPolicy = null, planMode = false) {
     actionCounter: 0,
     // SDK 工具标识与 AuraCoder 操作标识的稳定关联，供后台任务归属后续补齐。
     actionIdsByToolUseId: new Map(),
+    // 已发出操作完成事件的 SDK 工具标识，避免 tool_result 兜底重复完成。
+    completedActionIds: new Set(),
     // SDK 工具进度消息提供的工具与后台任务关联。
     backgroundTaskIdsByToolUseId: new Map(),
     // 已通知宿主的操作与后台任务关联，避免快照重放造成重复事件。
@@ -2909,6 +2911,9 @@ async function handleQuery(req, persistentSession = null) {
                 hookInput?.tool_result ??
                 hookInput?.result;
               emitToolOutputChunks(id, actionId, output);
+              if (typeof toolUseId === "string" && toolUseId.length > 0) {
+                context.completedActionIds.add(toolUseId);
+              }
 
               emit({
                 id,
@@ -2944,6 +2949,9 @@ async function handleQuery(req, persistentSession = null) {
                 return {};
               }
               const actionId = getActionIdForToolUse(context, toolUseId);
+              if (typeof toolUseId === "string" && toolUseId.length > 0) {
+                context.completedActionIds.add(toolUseId);
+              }
 
               emit({
                 id,
@@ -3176,6 +3184,61 @@ async function handleQuery(req, persistentSession = null) {
           error: permissionMessage,
           durationMs: 0,
         });
+      } else if (message.type === "user") {
+        try {
+          // SDK 的 tool_result 通常位于 user 消息内容中；仅为已开始且尚未完成的错误动作补发失败终态。
+          const content = message?.message?.content;
+          if (Array.isArray(content)) {
+            for (const block of content) {
+              if (block?.type !== "tool_result" || block.is_error !== true) {
+                continue;
+              }
+              const toolUseId = block.tool_use_id;
+              if (
+                typeof toolUseId !== "string" ||
+                toolUseId.length === 0 ||
+                !context.actionIdsByToolUseId.has(toolUseId) ||
+                context.completedActionIds.has(toolUseId)
+              ) {
+                continue;
+              }
+
+              const actionId = context.actionIdsByToolUseId.get(toolUseId);
+              let errorText = "Tool execution failed";
+              if (typeof block.content === "string") {
+                errorText = block.content;
+              } else if (Array.isArray(block.content)) {
+                const text = block.content
+                  .filter(
+                    (textBlock) =>
+                      textBlock?.type === "text" && typeof textBlock.text === "string",
+                  )
+                  .map((textBlock) => textBlock.text)
+                  .join("");
+                if (text) {
+                  errorText = text;
+                }
+              }
+
+              traceClaudeSdk("tool_result_error_fallback", { requestId: id, toolUseId });
+              context.completedActionIds.add(toolUseId);
+              emit({
+                id,
+                type: "action_completed",
+                actionId,
+                success: false,
+                error: errorText,
+                durationMs: 0,
+              });
+            }
+          }
+        } catch (error) {
+          traceClaudeSdk("tool_result_error_fallback_failed", {
+            requestId: id,
+            error,
+            stack: error?.stack,
+          });
+        }
       } else if (message.type === "assistant" && typeof message.error === "string") {
         const assistantError = formatAssistantMessageError(message);
         terminalStatus = "failed";
