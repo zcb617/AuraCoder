@@ -6,6 +6,8 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use gtk::{glib::Cast, prelude::*};
 use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Webview, WebviewBuilder, WebviewUrl,
 };
@@ -98,13 +100,34 @@ pub async fn browser_show(
     validate_browser_bounds(&bounds)?;
     let scope = normalize_browser_scope(&scope)?;
     let initial_url = normalize_browser_url(initial_url.as_deref().unwrap_or(DEFAULT_BROWSER_URL))?;
-    let create_handle = app.clone();
-    let create_scope = scope.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        ensure_browser_webview(&create_handle, &create_scope, initial_url)
-    })
-    .await
-    .map_err(|error| format!("Browser WebView initialization task failed: {error}"))??;
+    #[cfg(target_os = "linux")]
+    {
+        // Linux 业务：把浏览器 WebView 创建和 GTK 容器操作一次性派发到 GTK 主线程，避免后台线程等待 with_webview 导致事件循环死锁。
+        let create_handle = app.clone();
+        let create_scope = scope.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.run_on_main_thread(move || {
+            let result = ensure_browser_webview(&create_handle, &create_scope, initial_url);
+            if sender.send(result).is_err() {
+                log::error!("failed to return browser WebView initialization result");
+            }
+        })
+        .map_err(browser_error)?;
+        receiver
+            .recv()
+            .map_err(|error| format!("Browser WebView initialization result unavailable: {error}"))??;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let create_handle = app.clone();
+        let create_scope = scope.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            ensure_browser_webview(&create_handle, &create_scope, initial_url)
+        })
+        .await
+        .map_err(|error| format!("Browser WebView initialization task failed: {error}"))??;
+    }
 
     hide_other_browser_webviews(&app, &scope)?;
     let webview = browser_webview(&app, &scope)?;
@@ -299,6 +322,64 @@ fn ensure_browser_webview(
         .get_webview("main")
         .ok_or_else(|| "Main window is unavailable for the browser panel.".to_string())?;
     let main_window = main_webview.window();
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux 业务：将主 WebView 放入 GTK Overlay，并建立 Fixed 绝对定位层，给浏览器 WebView 提供 Wayland 可用的父容器。
+        let overlay_setup_error = Arc::new(Mutex::new(None::<String>));
+        let overlay_setup_error_for_callback = Arc::clone(&overlay_setup_error);
+        main_webview
+            .with_webview(move |platform| {
+                let result = (|| -> Result<(), String> {
+                    let main_inner = platform.inner();
+                    let parent = main_inner
+                        .parent()
+                        .ok_or_else(|| "Main WebView GTK parent is unavailable.".to_string())?;
+                    if parent.is::<gtk::Overlay>() {
+                        return Ok(());
+                    }
+                    let parent = parent
+                        .dynamic_cast::<gtk::Box>()
+                        .map_err(|_| "Main WebView GTK parent is not a GtkBox.".to_string())?;
+                    if parent
+                        .children()
+                        .iter()
+                        .any(|child| child.is::<gtk::Overlay>())
+                    {
+                        return Ok(());
+                    }
+
+                    let overlay = gtk::Overlay::new();
+                    let fixed = gtk::Fixed::new();
+                    parent.remove(&main_inner);
+                    overlay.add(&main_inner);
+                    overlay.add_overlay(&fixed);
+                    // Linux 业务：让透明 Fixed 覆盖层穿透主 WebView 的点击事件，同时保留其子浏览器 WebView 的事件接收能力。
+                    overlay.set_overlay_pass_through(&fixed, true);
+                    parent.pack_start(&overlay, true, true, 0);
+                    overlay.show_all();
+                    log::info!("browser Linux GTK overlay and Fixed container created");
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    log::error!("failed to create browser Linux GTK Fixed container: {error}");
+                    if let Ok(mut state) = overlay_setup_error_for_callback.lock() {
+                        *state = Some(error);
+                    } else {
+                        log::error!("failed to record browser Linux GTK container error");
+                    }
+                }
+            })
+            .map_err(browser_error)?;
+        let overlay_setup_failure = overlay_setup_error
+            .lock()
+            .map_err(|_| "Browser Linux GTK container error state is unavailable.".to_string())?
+            .take();
+        if let Some(error) = overlay_setup_failure {
+            return Err(error);
+        }
+    }
+
     let annotation_app = app.clone();
     let navigation_app = app.clone();
     let annotation_label = label.clone();
@@ -352,6 +433,62 @@ fn ensure_browser_webview(
             LogicalSize::new(1.0, 1.0),
         )
         .map_err(browser_error)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux 业务：把 Tauri 已注册的浏览器 WebView 从默认 GtkBox 移入 Fixed，避免 GtkBox 忽略绝对坐标。
+        let relocation_error = Arc::new(Mutex::new(None::<String>));
+        let relocation_error_for_callback = Arc::clone(&relocation_error);
+        let relocation_label = label.clone();
+        webview
+            .with_webview(move |platform| {
+                let result = (|| -> Result<(), String> {
+                    let browser_inner = platform.inner();
+                    let parent = browser_inner
+                        .parent()
+                        .ok_or_else(|| "Browser WebView GTK parent is unavailable.".to_string())?;
+                    let parent = parent
+                        .dynamic_cast::<gtk::Box>()
+                        .map_err(|_| "Browser WebView GTK parent is not a GtkBox.".to_string())?;
+                    let fixed = parent
+                        .children()
+                        .into_iter()
+                        .find_map(|child| child.dynamic_cast::<gtk::Overlay>().ok())
+                        .and_then(|overlay| {
+                            overlay
+                                .children()
+                                .into_iter()
+                                .find_map(|child| child.dynamic_cast::<gtk::Fixed>().ok())
+                        })
+                        .ok_or_else(|| "Browser GTK Fixed container is unavailable.".to_string())?;
+                    parent.remove(&browser_inner);
+                    fixed.put(&browser_inner, 0, 0);
+                    browser_inner.set_size_request(1, 1);
+                    fixed.show_all();
+                    log::info!(
+                        "browser WebView {relocation_label} moved into GTK Fixed container"
+                    );
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    log::error!("failed to move browser WebView into GTK Fixed: {error}");
+                    if let Ok(mut state) = relocation_error_for_callback.lock() {
+                        *state = Some(error);
+                    } else {
+                        log::error!("failed to record browser WebView GTK relocation error");
+                    }
+                }
+            })
+            .map_err(browser_error)?;
+        let relocation_failure = relocation_error
+            .lock()
+            .map_err(|_| "Browser Linux GTK relocation error state is unavailable.".to_string())?
+            .take();
+        if let Some(error) = relocation_failure {
+            return Err(error);
+        }
+    }
+
     webview.hide().map_err(browser_error)
 }
 
@@ -462,12 +599,102 @@ fn validate_browser_bounds(bounds: &BrowserBounds) -> Result<(), String> {
 }
 
 fn set_browser_bounds(webview: &Webview, bounds: &BrowserBounds) -> Result<(), String> {
-    webview
-        .set_position(LogicalPosition::new(bounds.x, bounds.y))
-        .map_err(browser_error)?;
-    webview
-        .set_size(LogicalSize::new(bounds.width, bounds.height))
-        .map_err(browser_error)
+    #[cfg(target_os = "linux")]
+    {
+        // Linux 业务：把逻辑边界同步、GtkFixed::move_ 和尺寸设置一次性放到 GTK 主线程，避免 with_webview 跨线程阻塞等待。
+        let webview_for_main_thread = webview.clone();
+        let bounds_for_main_thread = bounds.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        webview
+            .run_on_main_thread(move || {
+                let result = (|| -> Result<(), String> {
+                    webview_for_main_thread
+                        .set_position(LogicalPosition::new(
+                            bounds_for_main_thread.x,
+                            bounds_for_main_thread.y,
+                        ))
+                        .map_err(|error| {
+                            log::error!("failed to set browser WebView position: {error}");
+                            browser_error(error)
+                        })?;
+                    webview_for_main_thread
+                        .set_size(LogicalSize::new(
+                            bounds_for_main_thread.width,
+                            bounds_for_main_thread.height,
+                        ))
+                        .map_err(|error| {
+                            log::error!("failed to set browser WebView size: {error}");
+                            browser_error(error)
+                        })?;
+
+                    let bounds_x = bounds_for_main_thread.x as i32;
+                    let bounds_y = bounds_for_main_thread.y as i32;
+                    let bounds_width = bounds_for_main_thread.width as i32;
+                    let bounds_height = bounds_for_main_thread.height as i32;
+                    let bounds_error = Arc::new(Mutex::new(None::<String>));
+                    let bounds_error_for_callback = Arc::clone(&bounds_error);
+                    webview_for_main_thread
+                        .with_webview(move |platform| {
+                            let result = (|| -> Result<(), String> {
+                                let browser_inner = platform.inner();
+                                let parent = browser_inner.parent().ok_or_else(|| {
+                                    "Browser WebView GTK parent is unavailable.".to_string()
+                                })?;
+                                let fixed = parent.dynamic_cast::<gtk::Fixed>().map_err(|_| {
+                                    "Browser WebView GTK parent is not a GtkFixed.".to_string()
+                                })?;
+                                fixed.move_(&browser_inner, bounds_x, bounds_y);
+                                browser_inner.set_size_request(bounds_width, bounds_height);
+                                log::info!(
+                                    "browser WebView bounds set with GTK Fixed: x={bounds_x}, y={bounds_y}, width={bounds_width}, height={bounds_height}"
+                                );
+                                Ok(())
+                            })();
+                            if let Err(error) = result {
+                                log::error!(
+                                    "failed to set browser WebView GTK Fixed bounds: {error}"
+                                );
+                                if let Ok(mut state) = bounds_error_for_callback.lock() {
+                                    *state = Some(error);
+                                } else {
+                                    log::error!(
+                                        "failed to record browser WebView GTK bounds error"
+                                    );
+                                }
+                            }
+                        })
+                        .map_err(browser_error)?;
+                    let bounds_failure = bounds_error
+                        .lock()
+                        .map_err(|_| {
+                            "Browser Linux GTK bounds error state is unavailable.".to_string()
+                        })?
+                        .take();
+                    if let Some(error) = bounds_failure {
+                        return Err(error);
+                    }
+                    Ok(())
+                })();
+                if sender.send(result).is_err() {
+                    log::error!("failed to return browser WebView bounds result");
+                }
+            })
+            .map_err(browser_error)?;
+        receiver
+            .recv()
+            .map_err(|error| format!("Browser WebView bounds result unavailable: {error}"))??;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        webview
+            .set_position(LogicalPosition::new(bounds.x, bounds.y))
+            .map_err(browser_error)?;
+        webview
+            .set_size(LogicalSize::new(bounds.width, bounds.height))
+            .map_err(browser_error)
+    }
 }
 
 fn validate_browser_selection(selection: &BrowserAnnotationSelection) -> Result<(), String> {
