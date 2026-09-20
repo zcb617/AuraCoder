@@ -2209,6 +2209,13 @@ async fn sync_empty_cli_thread_from_engine(
     thread_id: &str,
     thread: &ThreadDto,
 ) -> Result<ThreadDto, String> {
+    log::info!(
+        "CLI 历史消息同步入口: thread_id={} workspace_id={} engine_id={} engine_thread_id={:?} message_sync_path=sync_empty_cli_thread_from_engine",
+        thread_id,
+        thread.workspace_id,
+        thread.engine_id,
+        thread.engine_thread_id
+    );
     let mut summary_synced_thread = thread.clone();
     if thread.engine_id == "opencode" {
         let message_count = run_db(state.db.clone(), {
@@ -2282,12 +2289,38 @@ async fn sync_empty_cli_thread_from_engine(
             return Ok(thread.clone());
         }
     } else if thread.engine_id == "claude" {
-        let sync_required = run_db(state.db.clone(), {
+        let sync_required = match run_db(state.db.clone(), {
             let thread_id = thread_id.to_string();
             move |db| db::threads::get_claude_sync_required(db, &thread_id)
         })
-        .await?;
+        .await
+        {
+            Ok(sync_required) => sync_required,
+            Err(error) => {
+                log::error!(
+                    "Claude 历史同步标记读取失败: thread_id={} workspace_id={} engine_id=claude engine_thread_id={:?} error={}",
+                    thread_id,
+                    thread.workspace_id,
+                    thread.engine_thread_id,
+                    error
+                );
+                return Err(error);
+            }
+        };
+        log::info!(
+            "Claude 历史同步标记读取完成: thread_id={} workspace_id={} engine_id=claude engine_thread_id={:?} claude_sync_required={}",
+            thread_id,
+            thread.workspace_id,
+            thread.engine_thread_id,
+            sync_required
+        );
         if !sync_required {
+            log::info!(
+                "Claude 历史同步跳过: thread_id={} workspace_id={} engine_id=claude engine_thread_id={:?} skip_reason=sync_not_required",
+                thread_id,
+                thread.workspace_id,
+                thread.engine_thread_id
+            );
             return Ok(thread.clone());
         }
     } else {
@@ -2307,6 +2340,13 @@ async fn sync_empty_cli_thread_from_engine(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
+        if thread.engine_id == "claude" {
+            log::info!(
+                "Claude 历史同步跳过: thread_id={} workspace_id={} engine_id=claude engine_thread_id=None skip_reason=missing_engine_thread_id",
+                thread_id,
+                thread.workspace_id
+            );
+        }
         return Ok(thread.clone());
     };
 
@@ -2323,15 +2363,57 @@ async fn sync_empty_cli_thread_from_engine(
         .create(&thread.engine_id)
         .map_err(|error| format!("unsupported CLI engine {}: {error}", thread.engine_id))?;
     let cli: &dyn CliTool = cli_tool.as_ref();
+    if thread.engine_id == "claude" {
+        log::info!(
+            "读取 Claude 历史快照请求: thread_id={} engine_thread_id={} workspace_id={} cwd={}",
+            thread_id,
+            engine_thread_id,
+            thread.workspace_id,
+            context.root_path
+        );
+    }
     let snapshot = match cli
         .read_thread_sync_snapshot(&context, thread, engine_thread_id)
         .await
     {
-        Ok(Some(snapshot)) => snapshot,
-        Ok(None) => return Ok(summary_synced_thread),
+        Ok(Some(snapshot)) => {
+            if thread.engine_id == "claude" {
+                log::info!(
+                    "读取 Claude 历史快照成功: thread_id={} engine_thread_id={} workspace_id={} snapshot_cwd={} title_present={} imported_messages={}",
+                    thread_id,
+                    engine_thread_id,
+                    thread.workspace_id,
+                    context.root_path,
+                    snapshot.title.is_some(),
+                    snapshot.imported_messages.len()
+                );
+            }
+            snapshot
+        }
+        Ok(None) => {
+            if thread.engine_id == "claude" {
+                log::info!(
+                    "读取 Claude 历史快照完成但无快照: thread_id={} engine_thread_id={} workspace_id={} no_snapshot=true",
+                    thread_id,
+                    engine_thread_id,
+                    thread.workspace_id
+                );
+            }
+            return Ok(summary_synced_thread);
+        }
         Err(error) => {
             // 旧完整历史入口会把原始读取错误返回给点击层和 MCP；两者再回退到本地结果。
-            return Err(err_to_string(error));
+            let error_text = err_to_string(error);
+            if thread.engine_id == "claude" {
+                log::error!(
+                    "读取 Claude 历史快照失败: thread_id={} engine_thread_id={} workspace_id={} error={}",
+                    thread_id,
+                    engine_thread_id,
+                    thread.workspace_id,
+                    error_text
+                );
+            }
+            return Err(error_text);
             // 旧实现曾在此处记录 debug 后返回本地线程，保留迁移留痕但不再吞掉原生错误：
             // log::debug!("failed to sync {} thread {}: {error}", thread.engine_id, thread_id);
             // return Ok(thread.clone());
@@ -2355,6 +2437,7 @@ async fn sync_empty_cli_thread_from_engine(
             created_at: message.created_at.clone(),
         })
         .collect::<Vec<_>>();
+    let imported_message_count = imported_messages.len();
     run_db(state.db.clone(), {
         let thread_id = thread_id.to_string();
         move |db| {
@@ -2368,6 +2451,15 @@ async fn sync_empty_cli_thread_from_engine(
         }
     })
     .await?;
+    if thread.engine_id == "claude" {
+        log::info!(
+            "Claude 历史消息写入与统计刷新成功: thread_id={} engine_thread_id={} workspace_id={} imported_messages={}",
+            thread_id,
+            engine_thread_id,
+            thread.workspace_id,
+            imported_message_count
+        );
+    }
 
     let title = snapshot
         .title
@@ -2396,6 +2488,12 @@ async fn sync_empty_cli_thread_from_engine(
             move |db| db::threads::set_claude_sync_required(db, &thread_id, false)
         })
         .await?;
+        log::info!(
+            "Claude 历史同步标记清除成功: thread_id={} engine_thread_id={} workspace_id={} flag_cleared=true",
+            thread_id,
+            engine_thread_id,
+            thread.workspace_id
+        );
     }
 
     Ok(updated_thread)

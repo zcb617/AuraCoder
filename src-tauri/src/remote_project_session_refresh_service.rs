@@ -248,6 +248,11 @@ pub async fn refresh_local_project_sessions(
     let _guard = WorkspaceRefreshGuard::acquire(workspace_id)
         .ok_or_else(|| anyhow::anyhow!("workspace refresh already in progress: {workspace_id}"))?;
     let workspace = load_local_workspace(db.clone(), workspace_id).await?;
+    log::info!(
+        "本地项目会话同步开始: workspace_id={} workspace_root_path={} cli_order=codex,opencode,claude succeeded_cli_ids=[] failed_cli_ids=[]",
+        workspace_id,
+        workspace.root_path
+    );
     let mut report = LocalProjectSessionRefreshReport {
         workspace_id: workspace_id.to_string(),
         succeeded_cli_ids: Vec::new(),
@@ -266,6 +271,13 @@ pub async fn refresh_local_project_sessions(
             }
         }
     }
+    log::info!(
+        "本地项目会话同步结束: workspace_id={} workspace_root_path={} cli_order=codex,opencode,claude succeeded_cli_ids={:?} failed_cli_ids={:?}",
+        workspace_id,
+        workspace.root_path,
+        report.succeeded_cli_ids,
+        report.failed_cli_ids
+    );
     Ok(report)
 }
 
@@ -301,7 +313,20 @@ async fn sync_cli(
             .create("codex")
             .expect("Codex CLI factory mapping must exist");
         let cli: &dyn CliTool = codex.as_ref();
+        log::info!(
+            "调用 CLI list_sessions 前: workspace_id={} workspace_root_path={} cli_id={}",
+            workspace.id,
+            workspace.root_path,
+            cli_id
+        );
         let sessions = cli.list_sessions(&context, None, Some(false)).await?;
+        log::info!(
+            "调用 CLI list_sessions 后: workspace_id={} workspace_root_path={} cli_id={} returned_session_count={}",
+            workspace.id,
+            workspace.root_path,
+            cli_id,
+            sessions.len()
+        );
         let sessions = sessions
             .into_iter()
             .filter(|session| path_utils::paths_equal(&session.cwd, &workspace.root_path))
@@ -326,7 +351,20 @@ async fn sync_cli(
             .create("opencode")
             .expect("OpenCode CLI factory mapping must exist");
         let cli: &dyn CliTool = opencode.as_ref();
+        log::info!(
+            "调用 CLI list_sessions 前: workspace_id={} workspace_root_path={} cli_id={}",
+            workspace.id,
+            workspace.root_path,
+            cli_id
+        );
         let sessions = cli.list_sessions(&context, None, Some(false)).await?;
+        log::info!(
+            "调用 CLI list_sessions 后: workspace_id={} workspace_root_path={} cli_id={} returned_session_count={}",
+            workspace.id,
+            workspace.root_path,
+            cli_id,
+            sessions.len()
+        );
         let sessions = sessions
             .into_iter()
             .filter(|session| path_utils::paths_equal(&session.cwd, &workspace.root_path))
@@ -364,7 +402,21 @@ async fn sync_cli(
             .create("claude")
             .expect("Claude CLI factory mapping must exist");
         let cli: &dyn CliTool = claude.as_ref();
+        log::info!(
+            "调用 CLI list_sessions 前: workspace_id={} workspace_root_path={} cli_id={}",
+            workspace.id,
+            workspace.root_path,
+            cli_id
+        );
         let sessions = cli.list_sessions(&context, None, Some(false)).await?;
+        let returned_session_count = sessions.len();
+        log::info!(
+            "调用 CLI list_sessions 后: workspace_id={} workspace_root_path={} cli_id={} returned_session_count={}",
+            workspace.id,
+            workspace.root_path,
+            cli_id,
+            returned_session_count
+        );
         let sessions = sessions
             .into_iter()
             .filter(|session| path_utils::paths_equal(&session.cwd, &workspace.root_path))
@@ -378,7 +430,15 @@ async fn sync_cli(
                 status: session.status,
                 metadata: session.metadata,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        log::info!(
+            "Claude list_sessions cwd 过滤完成: workspace_id={} workspace_root_path={} cli_id={} returned_session_count={} filtered_session_count={}",
+            workspace.id,
+            workspace.root_path,
+            cli_id,
+            returned_session_count,
+            sessions.len()
+        );
         return persist_sessions(db, workspace, "claude", sessions).await;
     }
 
@@ -431,13 +491,21 @@ async fn persist_sessions(
     engine_id: &str,
     sessions: Vec<RemoteSessionSnapshot>,
 ) -> Result<()> {
+    if engine_id == "claude" {
+        log::info!(
+            "Claude 会话持久化开始: workspace_id={} session_count={}",
+            workspace.id,
+            sessions.len()
+        );
+    }
     if sessions.is_empty() {
         return Ok(());
     }
 
     if engine_id == "claude" {
         // 在单个事务内按工作区和 Claude 会话身份导入或增量刷新远端快照。
-        tokio::task::spawn_blocking({
+        let session_count = sessions.len();
+        let import_result = tokio::task::spawn_blocking({
             let workspace_id = workspace.id.clone();
             move || -> Result<()> {
                 let mut conn = db.connect()?;
@@ -513,6 +581,14 @@ async fn persist_sessions(
                         .optional()
                         .context("failed query existing Claude remote thread")?;
 
+                    log::debug!(
+                        "Claude 会话扫描结果: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} existing_claude_sync_required={:?}",
+                        workspace_id,
+                        session.engine_thread_id,
+                        session.updated_at,
+                        existing.as_ref().and_then(|row| row.1.as_deref()),
+                        existing.as_ref().map(|row| row.4)
+                    );
                     let Some((
                         thread_id,
                         db_last_activity_at,
@@ -521,6 +597,12 @@ async fn persist_sessions(
                         claude_sync_required,
                     )) = existing
                     else {
+                        log::info!(
+                            "Claude 会话持久化分支: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw=None existing_claude_sync_required=None final_branch=insert_new(flag=1)",
+                            workspace_id,
+                            session.engine_thread_id,
+                            session.updated_at
+                        );
                         let created_at = runtime_env::system_time_rfc3339();
                         let last_activity_at = remote_time
                             .as_ref()
@@ -555,6 +637,14 @@ async fn persist_sessions(
                     };
 
                     let Some((remote_time, remote_time_local)) = remote_time else {
+                        log::info!(
+                            "Claude 会话持久化分支: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} existing_claude_sync_required={} final_branch=skip_missing_remote_timestamp",
+                            workspace_id,
+                            session.engine_thread_id,
+                            session.updated_at,
+                            db_last_activity_at,
+                            claude_sync_required
+                        );
                         continue;
                     };
 
@@ -584,7 +674,24 @@ async fn persist_sessions(
                         }
                         None => None,
                     };
+                    log::debug!(
+                        "Claude 会话时间比较: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} remote_time_utc={} database_time_utc={:?}",
+                        workspace_id,
+                        session.engine_thread_id,
+                        session.updated_at,
+                        db_last_activity_at,
+                        remote_time,
+                        db_time
+                    );
                     if db_time.is_some_and(|value| remote_time <= value) {
+                        log::info!(
+                            "Claude 会话持久化分支: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} existing_claude_sync_required={} final_branch=skip_not_newer",
+                            workspace_id,
+                            session.engine_thread_id,
+                            session.updated_at,
+                            db_last_activity_at,
+                            claude_sync_required
+                        );
                         continue;
                     }
                     // 只有远端时间严格晚于可解析的本地时间，才要求点击时读取完整历史。
@@ -646,6 +753,20 @@ async fn persist_sessions(
                     } else {
                         Some(session.title)
                     };
+                    let final_branch = if remote_time_is_newer {
+                        "mark_sync_required=1"
+                    } else {
+                        "preserve_existing_flag"
+                    };
+                    log::info!(
+                        "Claude 会话持久化分支: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} existing_claude_sync_required={} final_branch={}",
+                        workspace_id,
+                        session.engine_thread_id,
+                        session.updated_at,
+                        db_last_activity_at,
+                        claude_sync_required,
+                        final_branch
+                    );
                     tx.execute(
                         "UPDATE threads
                          SET title = ?1,
@@ -670,11 +791,25 @@ async fn persist_sessions(
 
                 tx.commit()
                     .context("failed commit Claude remote thread import transaction")?;
+                log::info!(
+                    "Claude 会话事务提交成功: workspace_id={} engine_id=claude processed_session_count={}",
+                    workspace_id,
+                    session_count
+                );
                 Ok(())
             }
         })
         .await
-        .context("Claude remote thread import task failed")??;
+        .context("Claude remote thread import task failed")
+        .and_then(|result| result);
+        if let Err(error) = import_result {
+            log::error!(
+                "Claude 会话持久化失败: workspace_id={} engine_id=claude processed_session_count={} error={error:#}",
+                workspace.id,
+                session_count
+            );
+            return Err(error);
+        }
         return Ok(());
     }
 
