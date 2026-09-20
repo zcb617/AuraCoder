@@ -36,6 +36,27 @@ describe("createStreamingMarkdownAppender 纯 append 流式解析", () => {
     expect(second.html.startsWith(first.html)).toBe(true);
   });
 
+  it("段落中间增量不产生多个 <p>（竖排回归）", () => {
+    const appender = createStreamingMarkdownAppender();
+    const p1 = appender.push("BUILD SUCCESS，");
+    const p2 = appender.push("BUILD SUCCESS，退出码 0，");
+    const p3 = appender.push("BUILD SUCCESS，退出码 0，942 个源文件编译通过。");
+    for (const result of [p1, p2, p3]) {
+      expect((result.html.match(/<p[ >]/g) ?? []).length).toBeLessThanOrEqual(1);
+    }
+    expect(p3.html).toContain("942 个源文件编译通过。");
+  });
+
+  it("空行后新段落即时整体重渲且已锁死前缀不变", () => {
+    const appender = createStreamingMarkdownAppender();
+    const first = appender.push("第一段\n\n第二");
+    expect(first.html).toContain("第一段");
+    expect(first.html).toContain("第二");
+    const second = appender.push("第一段\n\n第二段补充");
+    expect(second.html).toContain("第二段补充");
+    expect(second.html.startsWith("<p>第一段</p>")).toBe(true);
+  });
+
   it("未闭合代码围栏时尾巴憋住，闭合后增量 append", () => {
     const appender = createStreamingMarkdownAppender();
 

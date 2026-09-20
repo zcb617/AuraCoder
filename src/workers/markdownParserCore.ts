@@ -530,6 +530,14 @@ function findUnclosedInlineDelimiterStart(
 }
 
 /**
+ * 查找 Markdown 中最后一个空行块边界，用于锁定已经完成的块级内容。
+ */
+function findLastBlockBoundary(markdown: string): number {
+  const boundaryIndex = markdown.lastIndexOf("\n\n");
+  return boundaryIndex >= 0 ? boundaryIndex + 2 : 0;
+}
+
+/**
  * 按流式状态解析 Markdown，并返回已稳定 HTML 与暂缓尾部原文。
  */
 export function renderStableMarkdownToHtml(
@@ -605,30 +613,30 @@ export function createStreamingMarkdownAppender(): StreamingMarkdownAppender {
       reset();
     }
 
-    const unclosedFenceStart = findUnclosedFenceStart(fullMarkdownSoFar);
-    const unclosedInlineStart = findUnclosedInlineDelimiterStart(
+    const boundary = findLastBlockBoundary(fullMarkdownSoFar);
+    if (boundary > lockedMarkdownLength) {
+      const stableDelta = fullMarkdownSoFar.slice(
+        lockedMarkdownLength,
+        boundary,
+      );
+      lockedHtml += renderMarkdownToHtml(stableDelta);
+      lockedMarkdownLength = boundary;
+    }
+
+    const tail = fullMarkdownSoFar.slice(lockedMarkdownLength);
+    const inlineStart = findUnclosedInlineDelimiterStart(
       fullMarkdownSoFar,
       lockedMarkdownLength,
     );
-    const candidates = [unclosedFenceStart, unclosedInlineStart].filter(
-      (v): v is number => v !== null,
-    );
-    const stableMarkdownEnd =
-      candidates.length > 0 ? Math.min(...candidates) : fullMarkdownSoFar.length;
-
-    if (stableMarkdownEnd > lockedMarkdownLength) {
-      const stableDelta = fullMarkdownSoFar.slice(
-        lockedMarkdownLength,
-        stableMarkdownEnd,
-      );
-      if (stableDelta) {
-        lockedHtml += renderMarkdownToHtml(stableDelta);
-      }
-      lockedMarkdownLength = stableMarkdownEnd;
-    }
+    const renderTail =
+      inlineStart !== null
+        ? fullMarkdownSoFar.slice(lockedMarkdownLength, inlineStart)
+        : tail;
+    const html =
+      lockedHtml + (renderTail ? renderMarkdownToHtml(renderTail) : "");
 
     previousMarkdown = fullMarkdownSoFar;
-    return { html: lockedHtml };
+    return { html };
   };
 
   return { push, reset };
