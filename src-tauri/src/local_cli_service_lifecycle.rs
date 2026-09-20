@@ -339,6 +339,12 @@ async fn start_local_opencode_service(
     let mut child = command.spawn().with_context(|| {
         format!("启动本机 OpenCode 服务进程失败: executable={}", executable.display())
     })?;
+    // Windows 内核级兜底：把子进程登记进 KILL_ON_JOB_CLOSE Job，
+    // 保证本进程被强杀/崩溃时由内核自动结束该服务进程，不再产生孤儿。
+    // 登记失败不影响进程已启动，仅记录告警，仍由 kill_on_drop 尽力兜底。
+    if let Err(error) = process_utils::register_child_kill_on_close(&child) {
+        log::warn!("登记本机 OpenCode 服务进程到收尸 Job 失败，回退 kill_on_drop 兜底: {error}");
+    }
     let stdout = child.stdout.take().context("OpenCode stdout 不可用")?;
     let stderr = child.stderr.take().context("OpenCode stderr 不可用")?;
     tokio::spawn(async move {
