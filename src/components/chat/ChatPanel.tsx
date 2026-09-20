@@ -1994,6 +1994,15 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     chatInputHeightDragValueRef.current = null;
   }, []);
 
+  const scrollViewportToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    viewport.scrollTo({ top: viewport.scrollHeight, behavior });
+  }, []);
+
   /** 启动普通聊天 textarea 顶部拖动，移动过程仅更新界面，结束时才保存数据库。 */
   const handleChatInputHeightStart = useCallback(
     (event: React.MouseEvent<HTMLDivElement>) => {
@@ -2020,6 +2029,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         );
         chatInputHeightDragValueRef.current = nextHeight;
         setChatInputHeightValue(nextHeight);
+        // 输入框变高会压缩消息区可见窗口，未手动上翻时跟随到底部避免内容被遮挡
+        if (!autoScrollLocked) {
+          scrollViewportToBottom("auto");
+        }
       };
       const onUp = () => {
         const finalHeight = chatInputHeightDragValueRef.current;
@@ -2051,6 +2064,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       getChatInputHeightBounds,
       persistChatInputHeight,
       showSpecialInputComposer,
+      autoScrollLocked,
+      scrollViewportToBottom,
     ],
   );
 
@@ -3143,15 +3158,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     bindChatThread,
     setActiveThreadInStore,
   ]);
-
-  const scrollViewportToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
-    const viewport = viewportRef.current;
-    if (!viewport) {
-      return;
-    }
-
-    viewport.scrollTo({ top: viewport.scrollHeight, behavior });
-  }, []);
 
   /** 当前流式文本完成 DOM 提交后，在未锁定时跟随消息视口到底部。 */
   const handleStreamingTextContentCommitted = useCallback(() => {
