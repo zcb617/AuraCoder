@@ -3032,6 +3032,23 @@ impl Engine for ClaudeSidecarEngine {
                                             })
                                             .await
                                             .ok();
+                                    } else if recoverable == Some(true) {
+                                        // 主代理仍存活时保留原始错误，交给现有 chat.rs 过程提示逻辑继续处理。
+                                        log::warn!(
+                                            "claude 可恢复查询异常(code={:?}): status={:?} details={:?} recoverable={:?} msg={}",
+                                            code,
+                                            api_error_status,
+                                            error_details,
+                                            recoverable,
+                                            message
+                                        );
+                                        event_tx
+                                            .send(EngineEvent::Error {
+                                                message,
+                                                recoverable: true,
+                                            })
+                                            .await
+                                            .ok();
                                     } else {
                                         // default：其它一切未命中具体码的异常统一归系统通用异常 -1，
                                         // 记完整原始错误日志，并转换为业务化 Notice 上报前端（与 -99 同形态）。

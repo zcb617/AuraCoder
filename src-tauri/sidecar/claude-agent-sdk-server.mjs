@@ -3601,11 +3601,77 @@ async function handleQuery(req, persistentSession = null) {
           }
         } else {
           terminalStatus = "failed";
+          // 仅当 SDK result 来自 task-notification 且当前查询生命周期未终止时，才交给主代理继续处理。
+          const persistentSessionIsAlive =
+            !persistentSession ||
+            sessionHandles.get(persistentSession.threadId) === persistentSession;
+          const isTaskNotificationResult = message.origin?.kind === "task-notification";
+          const hasPendingBackgroundContinuation =
+            !context.authoritativeBackgroundTasksEmpty ||
+            context.backgroundTasks.size > 0 ||
+            context.awaitingTaskNotification ||
+            context.pendingTaskNotificationIds.size > 0 ||
+            context.deferredTaskNotifications.length > 0 ||
+            context.backgroundContinuationResultCount < context.backgroundContinuationInjectedCount ||
+            context.stopReason === "tool_use";
+          const mainAgentIsAlive =
+            isTaskNotificationResult &&
+            activeQueries.get(id) === context &&
+            !context.turnCompleted &&
+            !context.cancelled &&
+            !shuttingDown &&
+            !persistentSession?.interruptRequested &&
+            persistentSessionIsAlive;
+          const resultErrorMessage = formatSdkResultError(message);
+          traceClaudeSdk("sdk_result_error_lifecycle", {
+            // 关联产生 SDK result 的 AuraCoder 查询请求。
+            requestId: id,
+            // 记录 SDK result 的原始 subtype，区分中间结果和终止结果。
+            subtype: message.subtype,
+            // 记录 SDK origin.kind，仅用于排查，不将 task-notification 直接视为子代理失败。
+            originKind: message.origin?.kind,
+            // 记录当前 result 是否属于主代理可继续处理的 task-notification 来源。
+            isTaskNotificationResult,
+            // 记录主代理是否仍具备继续处理当前逻辑轮次的能力。
+            mainAgentIsAlive,
+            // 记录 persistent session 句柄是否仍由当前查询持有。
+            persistentSessionIsAlive,
+            // 记录当前查询是否使用 persistent session。
+            isPersistentSession: context.isPersistentSession,
+            // 记录当前 activeQueries 是否仍指向该查询上下文。
+            activeQueryMatches: activeQueries.get(id) === context,
+            // 记录是否存在后台续跑或待处理状态作为继续处理依据。
+            hasPendingBackgroundContinuation,
+            // 记录当前权威后台任务快照是否为空。
+            authoritativeBackgroundTasksEmpty: context.authoritativeBackgroundTasksEmpty,
+            // 记录当前是否存在可继续处理的工具等待状态。
+            stopReason: context.stopReason,
+            // 记录当前逻辑轮次是否已经发出完成事件。
+            turnCompleted: context.turnCompleted,
+            // 记录当前查询是否已被取消。
+            cancelled: context.cancelled,
+            // 记录 sidecar 是否正在关闭。
+            shuttingDown,
+            // 记录当前权威后台任务数量。
+            backgroundTaskCount: context.backgroundTasks.size,
+            // 记录尚未收到 task_notification 的任务数量。
+            pendingTaskNotificationCount: context.pendingTaskNotificationIds.size,
+            // 记录当前是否仍等待后台任务通知。
+            awaitingTaskNotification: context.awaitingTaskNotification,
+            // 记录等待压缩或审批收尾后注入的通知数量。
+            deferredTaskNotificationCount: context.deferredTaskNotifications.length,
+            // 记录已经注入的后台续跑数量。
+            backgroundContinuationInjectedCount: context.backgroundContinuationInjectedCount,
+            // 记录已经收到后台续跑 result 的数量。
+            backgroundContinuationResultCount: context.backgroundContinuationResultCount,
+            // 保留格式化后的原始 SDK result 错误消息。
+            message: resultErrorMessage,
+          });
           emit({
             id,
             type: "error",
-            message: formatSdkResultError(message),
-            recoverable: false,
+            message: resultErrorMessage,
+            recoverable: mainAgentIsAlive,
           });
         }
         const hadSdkResult = context.sdkResultReceived;
