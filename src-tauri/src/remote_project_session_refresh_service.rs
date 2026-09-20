@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::{
     cli_tools::{factory::CliToolFactory, CliExecutionContext, CliTool},
     db::{threads, workspaces, Database},
+    local_cli_service_lifecycle::{LocalCliHandle, LocalCliServiceLifecycle},
     message_notify_helper::{
         notify_app_startup_progress, notify_ssh_remote_project_sessions_refreshed,
         SshRemoteProjectSessionsRefreshedEvent,
@@ -340,7 +341,20 @@ async fn sync_cli(
                 metadata: session.metadata,
             })
             .collect();
-        return persist_sessions(db, workspace, "opencode", sessions).await;
+        let result = persist_sessions(db, workspace, "opencode", sessions).await;
+        // 同步完成后关闭该项目的 OpenCode serve 进程，不常驻
+        if let Ok(service) = LocalCliServiceLifecycle::get("opencode").await {
+            if let LocalCliHandle::OpenCode(handle) = service.handle() {
+                if let Err(error) = handle.terminate_cwd(&workspace.root_path).await {
+                    log::warn!(
+                        "关闭本机 OpenCode 同步进程失败: workspace_id={} cwd={} error={error:#}",
+                        workspace.id,
+                        workspace.root_path
+                    );
+                }
+            }
+        }
+        return result;
     }
 
     if cli_id == "claude" {
