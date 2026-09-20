@@ -366,6 +366,9 @@ pub trait CliTool: Send + Sync {
     /// 当前 CLI Service 重启自身对应的远端服务；本机 CLI 服务不支持该业务操作。
     async fn restart_service(&self, context: &CliExecutionContext) -> Result<()>;
 
+    /// 同步会话完成后，关闭当前 CLI 在该项目中启动的临时进程；不需要关闭的 CLI 实现为空操作。
+    async fn close_workspace_service(&self, context: &CliExecutionContext) -> Result<()>;
+
     /// 查询当前运行位置的 CLI 服务是否已经由对应生命周期登记并处于 Ready 状态，不创建或启动服务。
     async fn is_service_ready(&self, context: &CliExecutionContext) -> Result<bool>;
 

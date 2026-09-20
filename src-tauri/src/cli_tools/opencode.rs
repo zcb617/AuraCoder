@@ -532,6 +532,19 @@ impl CliTool for OpenCodeCli {
         Ok(())
     }
 
+    /// 同步会话完成后，关闭该项目对应的 OpenCode serve 进程，不常驻。
+    async fn close_workspace_service(&self, context: &CliExecutionContext) -> Result<()> {
+        if context.location_kind == CliLocationKind::Local {
+            let service = LocalCliServiceLifecycle::get(self.id()).await?;
+            if let crate::local_cli_service_lifecycle::LocalCliHandle::OpenCode(handle) =
+                service.handle()
+            {
+                handle.terminate_cwd(&context.root_path).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// 查询当前 OpenCode 服务是否已经由本机或 SSH CLI 生命周期登记并处于 Ready 状态。
     async fn is_service_ready(&self, context: &CliExecutionContext) -> Result<bool> {
         match context.location_kind {

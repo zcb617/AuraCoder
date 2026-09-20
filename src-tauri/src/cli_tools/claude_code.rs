@@ -1195,6 +1195,11 @@ impl CliTool for ClaudeCodeCli {
         Ok(())
     }
 
+    /// Claude Code 不 spawn 独立 serve 进程，空操作。
+    async fn close_workspace_service(&self, _context: &CliExecutionContext) -> Result<()> {
+        Ok(())
+    }
+
     /// 查询当前 Claude Code 服务是否已经由本机或 SSH CLI 生命周期登记并处于 Ready 状态。
     async fn is_service_ready(&self, context: &CliExecutionContext) -> Result<bool> {
         match context.location_kind {
