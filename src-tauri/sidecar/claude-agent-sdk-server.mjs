@@ -775,7 +775,7 @@ function createQueryContext(id, approvalPolicy = null, planMode = false) {
   return {
     id,
     threadId: id,
-    // 当前查询使用的可持续输入流，后台任务完成后继续向同一查询注入通知。
+    // 当前查询使用的可持续输入流，仅接收初始或真实用户输入。
     messageInput: null,
     query: null,
     actionCounter: 0,
@@ -795,17 +795,17 @@ function createQueryContext(id, approvalPolicy = null, planMode = false) {
     suppressedToolUseIds: new Set(),
     pendingApprovalIds: new Set(),
     // 当前是否正处于上下文压缩（system/status status=compacting 开始、status=requesting 结束）。
-    // 压缩期间注入后台任务通知会让 CLI 中止压缩中的主轮（2026-09-16 aborted_streaming 事故实证），
-    // 与挂起审批同理必须先排队，等压缩收尾后由 flushDeferredTaskNotifications 补注入。
+    // 该状态只用于保留 SDK 生命周期展示信息，不参与主代理终态判断。
     compacting: false,
-    // 挂起审批期间到达的后台任务通知在此排队；立即注入会让 CLI 中止轮次、杀死审批卡（2026-09-13 事故实证），
-    // 必须等审批全部答复后由 flushDeferredTaskNotifications 补注入。
+    // 旧版挂起审批期间曾在此排队后台通知；保留字段用于兼容状态记录，但不再回注入输入流。
     deferredTaskNotifications: [],
     cancelled: false,
     // 当前逻辑轮次是否已经向 AuraCoder 发出最终完成事件。
     turnCompleted: false,
     // 当前逻辑轮次是否已经收到 SDK result 消息。
     sdkResultReceived: false,
+    // 当前逻辑轮次是否已经向 AuraCoder 发出主代理错误，确保错误只发送一次。
+    errorEmitted: false,
     // 当前逻辑轮次最近一个 SDK result 的终态，用于最终完成状态回传。
     sdkTerminalStatus: "completed",
     // 当前查询是否使用持久会话句柄，决定输入流在轮次完成后是否继续保留。
@@ -814,17 +814,17 @@ function createQueryContext(id, approvalPolicy = null, planMode = false) {
     backgroundTasks: new Map(),
     // 当前 assistant 消息展示的后台任务，包括活动任务和已结束任务。
     backgroundTaskDisplay: new Map(),
-    // 权威后台任务集合当前是否为空，只能随 background_tasks_changed 快照更新。
+    // 旧版后台终态门控使用的权威任务集合空状态，保留用于生命周期兼容记录，不参与收尾。
     authoritativeBackgroundTasksEmpty: true,
-    // 当前权威任务集合中仍等待 task_notification 的任务标识。
+    // 旧版等待 task_notification 的任务标识，保留用于展示生命周期兼容记录。
     pendingTaskNotificationIds: new Set(),
-    // 已收到 task_notification 的任务标识，避免快照重放时重新等待同一通知。
+    // 旧版已收到 task_notification 的任务标识，保留用于快照兼容记录。
     notifiedTaskIds: new Set(),
-    // 当前逻辑轮次是否仍在等待一个或多个 task_notification。
+    // 旧版等待 task_notification 的状态，保留但不参与 turn_completed/failed。
     awaitingTaskNotification: false,
-    // 已向 SDK 输入流注入的 task notification synthetic continuation 数量。
+    // 旧版注入 task notification synthetic continuation 的数量，当前始终不参与收尾。
     backgroundContinuationInjectedCount: 0,
-    // 已收到对应 synthetic continuation result 的数量。
+    // 旧版 synthetic continuation result 的数量，当前始终不参与收尾。
     backgroundContinuationResultCount: 0,
     sessionId: null,
     // 当前线程最近一次由 Claude message_start 确认的上下文窗口快照。
@@ -1070,18 +1070,24 @@ function cleanupPendingApprovalsForQuery(queryId, denialMessage) {
 }
 
 /**
- * 挂起审批全部答复、且不在上下文压缩期时，把排队期间的后台任务通知补注入 SDK 输入流。
- * 根因1：2026-09-13 审批卡死亡事故——子代理死亡通知在审批挂起期间立即注入输入流，
- * CLI 会中止当前轮次，挂起的 AskUserQuestion/权限审批被杀（"Tool permission request aborted"），
- * 用户迟到的回答因此报 "approval ID is unknown or no longer pending"。
- * 根因2：2026-09-16 压缩期主流断流事故——子代理通知在上下文压缩（compacting）期间注入，
- * 把压缩中的主轮掐成 aborted_streaming。
- * 所以对注入加闸门：挂起审批 OR 压缩期先排队，审批答复/压缩收尾后由本函数补注入；
- * 通知内容和顺序不变，只是晚到。
- * 调用点：两个审批等待函数的答复返回点、压缩收尾（status=requesting）处；
- * 回退方式：删除注入点的排队分支并移除本函数调用即可恢复原行为。
+ * 清理旧版后台通知延迟队列，避免后台生命周期消息进入 SDK 用户输入流。
+ * 旧版曾在审批或压缩结束后把 synthetic notification 写回 messageInput；当前架构由
+ * Claude Agent SDK 自己负责 Agent Loop，AuraCoder 只展示后台 Notice，不再回注入通知。
+ * 保留该函数和旧实现注释，便于追溯历史事故与迁移边界，但函数不产生输入注入副作用。
  */
 function flushDeferredTaskNotifications(context) {
+  if (context.deferredTaskNotifications.length === 0) {
+    return;
+  }
+
+  const discarded = context.deferredTaskNotifications.splice(0);
+  traceClaudeSdk("deferred_task_notifications_discarded", {
+    requestId: context.id,
+    count: discarded.length,
+  });
+
+  /*
+  // 旧版在审批/压缩结束后把后台通知写回 SDK 输入流，现已停用：
   if (
     context.pendingApprovalIds.size > 0 ||
     context.compacting ||
@@ -1090,7 +1096,6 @@ function flushDeferredTaskNotifications(context) {
     return;
   }
   if (!context.messageInput || context.cancelled || shuttingDown) {
-    // 输入流已不可用时丢弃队列，避免向已结束的查询注入。
     context.deferredTaskNotifications.length = 0;
     return;
   }
@@ -1099,10 +1104,7 @@ function flushDeferredTaskNotifications(context) {
     context.backgroundContinuationInjectedCount += 1;
     context.messageInput.push(notification);
   }
-  traceClaudeSdk("deferred_task_notifications_flushed", {
-    requestId: context.id,
-    count: flushed.length,
-  });
+  */
 }
 
 function computerControlCallResultToClaudeContent(value) {
@@ -1392,8 +1394,10 @@ async function requestPermissionApproval(context, toolName, toolInput, suggestio
 
   context.pendingApprovalIds.delete(approvalId);
   pendingApprovals.delete(approvalId);
-  // 审批答复后补注入挂起期间排队的后台任务通知（详见 flushDeferredTaskNotifications 注释）。
+  /*
+  // 旧版审批答复后补注入后台任务通知，当前由 SDK 自己负责 Agent Loop，已停用。
   flushDeferredTaskNotifications(context);
+  */
   return permission;
 }
 
@@ -1436,8 +1440,10 @@ async function requestAskUserQuestionApproval(context, toolInput) {
 
   context.pendingApprovalIds.delete(approvalId);
   pendingApprovals.delete(approvalId);
-  // 审批答复后补注入挂起期间排队的后台任务通知（详见 flushDeferredTaskNotifications 注释）。
+  /*
+  // 旧版审批答复后补注入后台任务通知，当前由 SDK 自己负责 Agent Loop，已停用。
   flushDeferredTaskNotifications(context);
+  */
   return permission;
 }
 
@@ -3066,12 +3072,14 @@ async function handleQuery(req, persistentSession = null) {
     }
 
     /**
-     * 根据 Claude 后台任务状态机统一判断当前逻辑轮次是否可以完成。
-     * 只有权威任务集合为空、无需等待任务通知且所有续跑结果均到达时，才发送 turn_completed。
+     * 按 Claude Agent SDK 的正式 ResultMessage 判断当前逻辑轮次是否可以完成。
+     * 后台任务状态只用于 Notice 展示，不能阻止主代理按 SDK 结果收尾。
      */
     const maybeCompleteTurn = ({
-      allowMissingSdkResult = false,
+      // allowMissingSdkResult = false,
       forceStatus = null,
+      // iteratorEnded 表示 SDK iterator 已经正常结束或尾部异常，需要完成非持久轮次。
+      iteratorEnded = false,
     } = {}) => {
       if (context.turnCompleted) {
         return true;
@@ -3088,14 +3096,24 @@ async function handleQuery(req, persistentSession = null) {
         emitTurnCompleted(context, "interrupted");
         return true;
       }
-      if (!allowMissingSdkResult && !context.sdkResultReceived) {
+      if (!context.sdkResultReceived) {
         return false;
       }
-      // tool_use 只表示当前 Claude 消息等待工具结果，不能结束整个逻辑轮次。
-      if (context.stopReason === "tool_use") {
+      if (!persistentSession && !iteratorEnded) {
+        // 非持久查询必须先消费完 SDK iterator，确保尾部后台生命周期 Notice 先于完成事件发出。
         return false;
       }
 
+      // 轮次结束前先作废未回答审批，保证 approval_expired 先于 turn_completed 到达前端。
+      cleanupPendingApprovalsForQuery(context.id, "Claude turn completed before approval was answered.");
+      emitTurnCompleted(context, context.sdkTerminalStatus || terminalStatus);
+      if (!persistentSession) {
+        context.messageInput?.push(null);
+      }
+      return true;
+
+      /*
+      // 旧版依赖后台任务快照、task_notification 和 synthetic continuation 结果收尾，已停用。
       const authoritativeBackgroundTasksEmpty =
         context.authoritativeBackgroundTasksEmpty && context.backgroundTasks.size === 0;
       const allInjectedContinuationsCompleted =
@@ -3107,14 +3125,7 @@ async function handleQuery(req, persistentSession = null) {
       ) {
         return false;
       }
-
-      // 轮次结束前先作废未回答审批，保证 approval_expired 先于 turn_completed 到达前端。
-      cleanupPendingApprovalsForQuery(context.id, "Claude turn completed before approval was answered.");
-      emitTurnCompleted(context, context.sdkTerminalStatus || terminalStatus);
-      if (!persistentSession) {
-        context.messageInput?.push(null);
-      }
-      return true;
+      */
     };
 
     void fetchClaudeUsageSnapshot().then((usage) => {
@@ -3242,22 +3253,25 @@ async function handleQuery(req, persistentSession = null) {
       } else if (message.type === "assistant" && typeof message.error === "string") {
         const assistantError = formatAssistantMessageError(message);
         terminalStatus = "failed";
-        emit({
-          id,
-          type: "error",
-          message: assistantError.message,
-          recoverable: assistantError.recoverable,
-          errorType: assistantError.errorType,
-          isAuthError: assistantError.isAuthError,
-          // 透传统一异常码与 SDK 原始字段，供后端归类与完整记日志（仅当 CHG-01 返回了对应字段才透传）。
-          ...(assistantError.code !== undefined ? { code: assistantError.code } : {}),
-          ...(assistantError.apiErrorStatus !== undefined
-            ? { apiErrorStatus: assistantError.apiErrorStatus }
-            : {}),
-          ...(assistantError.errorDetails !== undefined
-            ? { errorDetails: assistantError.errorDetails }
-            : {}),
-        });
+        if (!context.errorEmitted && !context.turnCompleted) {
+          context.errorEmitted = true;
+          emit({
+            id,
+            type: "error",
+            message: assistantError.message,
+            recoverable: assistantError.recoverable,
+            errorType: assistantError.errorType,
+            isAuthError: assistantError.isAuthError,
+            // 透传统一异常码与 SDK 原始字段，供后端归类与完整记日志（仅当 CHG-01 返回了对应字段才透传）。
+            ...(assistantError.code !== undefined ? { code: assistantError.code } : {}),
+            ...(assistantError.apiErrorStatus !== undefined
+              ? { apiErrorStatus: assistantError.apiErrorStatus }
+              : {}),
+            ...(assistantError.errorDetails !== undefined
+              ? { errorDetails: assistantError.errorDetails }
+              : {}),
+          });
+        }
       } else if (message.type === "rate_limit_event") {
         const usage = buildRateLimitUsageSnapshot(message);
         if (usage) {
@@ -3273,12 +3287,15 @@ async function handleQuery(req, persistentSession = null) {
         associateActionWithBackgroundTask(context, id, toolUseId, taskId);
       } else if (message.type === "system" && message.subtype === "status") {
         // 维护压缩期标志：compacting 开始、requesting（或其它非压缩状态）结束。
-        // 压缩收尾时补注入压缩期间排队的后台任务通知（详见 flushDeferredTaskNotifications 注释）。
+        // 后台通知只展示，不在压缩收尾处回注入 SDK 输入流。
         if (message.status === "compacting") {
           context.compacting = true;
         } else if (context.compacting) {
           context.compacting = false;
+          /*
+          // 旧版压缩收尾会补注入后台任务通知，当前已停用。
           flushDeferredTaskNotifications(context);
+          */
         }
         const notice = buildStatusNotice(message);
         if (notice) {
@@ -3345,6 +3362,8 @@ async function handleQuery(req, persistentSession = null) {
         }
         // 已在 Hook 中收到子代理操作的场景，任务快照到达后立即把这些操作归入对应任务。
         associateKnownSubagentActions(context, id);
+        /*
+        // 旧版用权威快照维护 task_notification 等待状态，当前后台状态不参与主代理终态。
         for (const taskId of context.notifiedTaskIds) {
           if (!currentTaskIds.has(taskId)) {
             context.notifiedTaskIds.delete(taskId);
@@ -3357,9 +3376,12 @@ async function handleQuery(req, persistentSession = null) {
         }
         context.authoritativeBackgroundTasksEmpty = context.backgroundTasks.size === 0;
         context.awaitingTaskNotification = context.pendingTaskNotificationIds.size > 0;
+        */
         emitClaudeBackgroundNotice(id, message.subtype, null, tasks, context);
-        // 快照变为空时也必须检查此前已收到的 SDK result 是否可以完成。
+        /*
+        // 旧版由后台快照变空触发轮次收尾，当前必须等待正式 ResultMessage。
         maybeCompleteTurn();
+        */
       } else if (message.type === "system" && message.subtype === "task_started") {
         // task_started 只负责发送生命周期通知，权威任务集合仍由 background_tasks_changed 提供。
         const taskId = typeof message.task_id === "string" ? message.task_id : "";
@@ -3482,10 +3504,12 @@ async function handleQuery(req, persistentSession = null) {
           : "failed";
         const finishedAt = Date.now();
         if (taskId) {
-          // task_notification 只结算对应通知等待状态，不修改权威后台任务集合。
+          /*
+          // 旧版 task_notification 会结算后台通知等待状态，当前只更新展示状态。
           context.pendingTaskNotificationIds.delete(taskId);
           context.notifiedTaskIds.add(taskId);
           context.awaitingTaskNotification = context.pendingTaskNotificationIds.size > 0;
+          */
           const displayTask = context.backgroundTaskDisplay.get(taskId);
           if (displayTask) {
             // 终态状态只由 SDK task_notification 写入展示 map。
@@ -3522,9 +3546,12 @@ async function handleQuery(req, persistentSession = null) {
             });
           }
         }
-        // task_notification 只发送最终通知和续跑输入，不修改权威任务集合。
+        // task_notification 只发送最终展示通知，不修改权威任务集合，也不回注入用户输入。
         emitClaudeBackgroundNotice(id, message.subtype, message, null, context);
 
+        /*
+        // 旧版在 task_notification 到达后构造 synthetic 用户消息，回注入同一 SDK 输入流。
+        // 当前架构由 Claude Agent SDK 负责 Agent Loop，后台通知只能展示和记录，严禁回注入。
         const persistentSessionIsAlive =
           !persistentSession || sessionHandles.get(persistentSession.threadId) === persistentSession;
         const canInjectContinuation =
@@ -3557,11 +3584,6 @@ async function handleQuery(req, persistentSession = null) {
             session_id: context.sessionId || message.session_id || "",
           };
           if (context.pendingApprovalIds.size > 0 || context.compacting) {
-            // 有挂起未答的审批/提问、或正处于上下文压缩期：此时注入会让 CLI 中止轮次
-            // （2026-09-13 审批卡死亡、2026-09-16 压缩期主流 aborted_streaming 两起事故实证），
-            // 先排队，等审批答复/压缩收尾后由 flushDeferredTaskNotifications 补注入；
-            // 通知不丢、顺序不变，只是晚到。
-            // 回退方式：删掉本分支即恢复立即注入的旧行为。
             context.deferredTaskNotifications.push(syntheticTaskNotification);
             traceClaudeSdk("task_notification_deferred", {
               requestId: id,
@@ -3570,12 +3592,13 @@ async function handleQuery(req, persistentSession = null) {
               compacting: context.compacting,
             });
           } else {
-            // 记录已注入的 synthetic continuation，等待对应 SDK result 到达。
             context.backgroundContinuationInjectedCount += 1;
             context.messageInput.push(syntheticTaskNotification);
           }
         }
+        // 旧版 task_notification 会触发 continuation 收尾，当前不因后台通知改变终态。
         maybeCompleteTurn();
+        */
       } else if (message.type === "result") {
         traceClaudeSdk("sdk_result_before_processing", {
           requestId: id,
@@ -3601,30 +3624,35 @@ async function handleQuery(req, persistentSession = null) {
           }
         } else {
           terminalStatus = "failed";
-          emit({
-            id,
-            type: "error",
-            message: formatSdkResultError(message),
-            recoverable: false,
-          });
+          if (!context.errorEmitted && !context.turnCompleted) {
+            context.errorEmitted = true;
+            emit({
+              id,
+              type: "error",
+              message: formatSdkResultError(message),
+              recoverable: false,
+            });
+          }
         }
-        const hadSdkResult = context.sdkResultReceived;
         context.sdkResultReceived = true;
         context.sdkTerminalStatus = terminalStatus;
+        /*
+        // 旧版把 result 解释为 synthetic continuation result 并参与后台任务计数，当前已停用。
+        const hadSdkResult = context.sdkResultReceived;
         if (
           hadSdkResult &&
           context.backgroundContinuationResultCount < context.backgroundContinuationInjectedCount
         ) {
-          // 按输入流顺序消费一个已注入的 task notification continuation result。
           context.backgroundContinuationResultCount += 1;
         }
         if (context.backgroundTasks.size > 0) {
           context.awaitingTaskNotification = context.pendingTaskNotificationIds.size > 0;
         }
-        // 初始 result 和续跑 result 都通过同一个状态机门控完成。
+        */
+        // 每个正式 SDK ResultMessage 都由同一状态机最多完成当前逻辑轮次一次。
         maybeCompleteTurn();
 
-        // 中间 result 只结束当前 SDK 子轮次，后台任务仍可通过同一输入流续跑。
+        // 持久会话继续保留输入流，下一轮只接受真实用户输入。
         if (!context.turnCompleted || context.isPersistentSession) {
           sawTextDelta = false;
           terminalStatus = "completed";
@@ -3701,24 +3729,27 @@ async function handleQuery(req, persistentSession = null) {
     }
 
     setContextSessionId(context, actualSessionId);
-    const completedAfterIterator = maybeCompleteTurn({ allowMissingSdkResult: true });
-    const hasPendingBackgroundContinuation =
-      !context.authoritativeBackgroundTasksEmpty ||
-      context.awaitingTaskNotification ||
-      context.backgroundContinuationResultCount < context.backgroundContinuationInjectedCount ||
-      context.stopReason === "tool_use";
-    if (!completedAfterIterator && !context.cancelled && hasPendingBackgroundContinuation) {
-      // SDK 查询异常结束时明确失败，避免后台任务待处理却让 UI 永久保持 streaming。
-      emit({
-        // 关联发生异常的 AuraCoder 查询。
-        id,
-        // 使用统一错误事件告知调用方当前轮次无法继续。
-        type: "error",
-        // 说明 SDK query 在后台任务待处理时意外结束，后台结果尚未返回。
-        message: "Claude SDK query 在后台任务待处理时意外结束，后台任务结果尚未返回。",
-        // 该错误无法由当前 query 自动恢复，必须由调用方重新发起处理。
-        recoverable: false,
+    const completedAfterIterator = maybeCompleteTurn({ iteratorEnded: true });
+    if (!completedAfterIterator && !context.cancelled && !context.turnCompleted) {
+      // SDK iterator 正常结束但没有正式 ResultMessage 时，记录查询异常并只失败一次。
+      const iteratorEndedError = new Error(
+        "Claude SDK query ended before returning a ResultMessage.",
+      );
+      traceClaudeSdk("query_iterator_ended_without_result", {
+        requestId: id,
+        error: iteratorEndedError,
+        stack: iteratorEndedError.stack,
+        context,
       });
+      if (!context.errorEmitted) {
+        context.errorEmitted = true;
+        emit({
+          id,
+          type: "error",
+          message: iteratorEndedError.message,
+          recoverable: false,
+        });
+      }
       // 通过唯一完成门控发出失败终态，避免异常路径再次重复完成。
       maybeCompleteTurn({ forceStatus: "failed" });
     }
@@ -3729,16 +3760,25 @@ async function handleQuery(req, persistentSession = null) {
       stack: err?.stack,
       context,
     });
-    emit({
-      id,
-      type: "error",
-      message: err.message || String(err),
-      recoverable: false,
-    });
-    setContextSessionId(context, actualSessionId);
-    // 先于 turn_completed 作废挂起审批，保证 approval_expired 事件能被仍在监听的事件泵转发。
-    cleanupPendingApprovalsForQuery(id, "Claude query failed before approval was answered.");
-    emitTurnCompleted(context, "failed");
+    if (!context.sdkResultReceived && !context.turnCompleted) {
+      if (!context.errorEmitted) {
+        context.errorEmitted = true;
+        emit({
+          id,
+          type: "error",
+          message: err?.message || String(err),
+          recoverable: false,
+        });
+      }
+      setContextSessionId(context, actualSessionId);
+      // 先于 turn_completed 作废挂起审批，保证 approval_expired 事件能被仍在监听的事件泵转发。
+      cleanupPendingApprovalsForQuery(id, "Claude query failed before approval was answered.");
+      emitTurnCompleted(context, "failed");
+    } else if (context.sdkResultReceived && !context.turnCompleted) {
+      // ResultMessage 已经确认主代理结果；尾部 iterator 异常只结束非持久轮次，不重复发送 Error/failed。
+      setContextSessionId(context, actualSessionId);
+      maybeCompleteTurn({ iteratorEnded: true });
+    }
   } finally {
     traceClaudeSdk("handle_query_finally", { requestId: id, context });
     cleanupPendingApprovalsForQuery(id, "Claude query was canceled.");
@@ -3935,8 +3975,10 @@ async function sendPersistentSessionMessage(req) {
     entry.context.turnCompleted = false;
     // 新逻辑轮次重新等待 SDK result，并恢复默认终态。
     entry.context.sdkResultReceived = false;
+    entry.context.errorEmitted = false;
     entry.context.sdkTerminalStatus = "completed";
-    // 新轮次不重写权威任务 Map，只根据现有快照重建通知等待状态。
+    /*
+    // 旧版为后台 continuation 重建通知等待状态，当前后台状态不参与主代理终态。
     entry.context.pendingTaskNotificationIds.clear();
     entry.context.notifiedTaskIds.clear();
     for (const taskId of entry.context.backgroundTasks.keys()) {
@@ -3944,9 +3986,10 @@ async function sendPersistentSessionMessage(req) {
     }
     entry.context.authoritativeBackgroundTasksEmpty = entry.context.backgroundTasks.size === 0;
     entry.context.awaitingTaskNotification = entry.context.pendingTaskNotificationIds.size > 0;
-    // 新轮次重新统计已注入和已收到的续跑结果。
+    // 旧版重新统计 synthetic continuation 结果，当前已停用。
     entry.context.backgroundContinuationInjectedCount = 0;
     entry.context.backgroundContinuationResultCount = 0;
+    */
     entry.context.tokenUsage = null;
     entry.context.stopReason = null;
     entry.interruptRequested = false;

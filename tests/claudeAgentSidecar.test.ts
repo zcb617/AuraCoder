@@ -232,7 +232,7 @@ async function runStartupProbe(scriptPath: string, env: Record<string, string>) 
   }
 }
 
-/** 创建一个只记录合成用户消息的 SDK 测试模块，用于验证同一输入流续跑。 */
+/** 创建一个发送后台生命周期和正式 ResultMessage 的 SDK 测试模块。 */
 async function createBackgroundTaskMockModule() {
   const root = await mkdtemp(path.join(tmpdir(), "auracoder-claude-background-mock-"));
   const supportModule = pathToFileURL(
@@ -261,24 +261,57 @@ function makeResult(partial = {}) {
   };
 }
 
-export function query({ prompt }) {
+export function query({ prompt, options }) {
   const scenario = JSON.parse(process.env.CLAUDE_AGENT_SDK_MOCK_SCENARIO || "{}");
-  const continuationBeforeBackgroundTasksChanged =
+  const resultBeforeBackgroundTasksChanged =
     scenario.continuationBeforeBackgroundTasksChanged === true;
+  const approvalDuringBackground = scenario.approvalDuringBackground === true;
   let closed = false;
+  let syntheticInput = null;
+  let approvalPromise = null;
+  // 并行消费 SDK 输入，只记录 sidecar 是否错误地回注入 synthetic 消息。
+  const inputMonitor = typeof prompt === "string"
+    ? Promise.resolve()
+    : (async () => {
+        for await (const userMessage of prompt) {
+          if (userMessage?.isSynthetic === true) {
+            syntheticInput = userMessage;
+            return;
+          }
+        }
+      })();
+
   const iterator = (async function* () {
     yield {
       type: "system",
       subtype: "init",
       session_id: "background-session",
     };
+    if (approvalDuringBackground) {
+      // 模拟后台通知到达时 SDK 正在等待一个真实审批答复。
+      approvalPromise = options.canUseTool(
+        "Bash",
+        { command: "printf background" },
+        {
+          signal: new AbortController().signal,
+          toolUseID: "background-approval-tool",
+        },
+      );
+    }
     yield {
       type: "system",
       subtype: "background_tasks_changed",
       tasks: [{ task_id: "background-task-1", task_type: "bash", description: "执行后台命令" }],
       session_id: "background-session",
     };
-    yield makeResult({ result: "intermediate result" });
+    if (scenario.compactingDuringBackground === true) {
+      yield {
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        session_id: "background-session",
+      };
+    }
     yield {
       type: "system",
       subtype: "task_notification",
@@ -288,35 +321,41 @@ export function query({ prompt }) {
       summary: "后台命令已结束",
       session_id: "background-session",
     };
-    if (!continuationBeforeBackgroundTasksChanged) {
+    if (scenario.compactingDuringBackground === true) {
       yield {
         type: "system",
-        subtype: "background_tasks_changed",
-        tasks: [],
+        subtype: "status",
+        status: "requesting",
         session_id: "background-session",
       };
     }
-    if (typeof prompt !== "string") {
-      for await (const userMessage of prompt) {
-        if (closed) {
-          return;
-        }
-        if (userMessage?.isSynthetic === true) {
-          yield makeResult({
-            result: JSON.stringify(userMessage),
-            session_id: "background-session",
-          });
-          if (continuationBeforeBackgroundTasksChanged) {
-            yield {
-              type: "system",
-              subtype: "background_tasks_changed",
-              tasks: [],
-              session_id: "background-session",
-            };
-          }
-          return;
-        }
-      }
+    if (approvalPromise) {
+      await approvalPromise;
+    }
+    if (resultBeforeBackgroundTasksChanged) {
+      yield makeResult({ result: "formal background result" });
+    }
+    yield {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [],
+      session_id: "background-session",
+    };
+    if (!resultBeforeBackgroundTasksChanged) {
+      yield makeResult({ result: "formal background result" });
+    }
+
+    // 不等待输入流关闭，避免非持久查询在 iterator 收尾前因等待 messageInput 关闭而死锁。
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (closed) {
+      return;
+    }
+    if (syntheticInput) {
+      // 让测试明确发现 sidecar 仍在发送 synthetic 输入，而不是静默吞掉它。
+      yield makeResult({
+        result: JSON.stringify({ unexpectedSyntheticInput: syntheticInput }),
+        session_id: "background-session",
+      });
     }
   })();
   iterator.close = () => {
@@ -505,7 +544,7 @@ describe("claude-agent-sdk-server sidecar", () => {
   });
 
   it.each(["completed", "failed", "stopped"] as const)(
-    "keeps the turn open and resumes the same SDK input stream after a %s background task",
+    "keeps background notices separate from the formal ResultMessage for a %s task",
     async (status) => {
       const mock = await createBackgroundTaskMockModule();
       try {
@@ -528,6 +567,12 @@ describe("claude-agent-sdk-server sidecar", () => {
             event.type === "notice" &&
             event.sdkSubtype === "task_notification",
         );
+        expect(taskNotification).toMatchObject({
+          kind: "claude_background_tasks",
+          taskId: "background-task-1",
+          status,
+          summary: "后台命令已结束",
+        });
         const taskNotificationIndex = harness.events.indexOf(taskNotification);
         expect(
           harness.events
@@ -555,50 +600,28 @@ describe("claude-agent-sdk-server sidecar", () => {
             event.type === "turn_completed",
         );
         expect(completedEvents).toHaveLength(1);
-
-        const finalText = harness.events
+        const textContents = harness.events
           .filter(
             (event) =>
               event.id === `query-background-${status}` &&
               event.type === "text_delta",
           )
-          .at(-1);
-        const syntheticMessage = JSON.parse(String(finalText?.content)) as {
-          type?: string;
-          isSynthetic?: boolean;
-          priority?: string;
-          shouldQuery?: boolean;
-          message?: { content?: string };
-        };
-        expect(syntheticMessage).toMatchObject({
-          type: "user",
-          isSynthetic: true,
-          priority: "now",
-          shouldQuery: true,
-        });
-        expect(syntheticMessage.message?.content).toContain("background-task-1");
-        expect(syntheticMessage.message?.content).toContain(status);
-        expect(syntheticMessage.message?.content).toContain("/tmp/background-task-1.output");
-        expect(syntheticMessage.message?.content).toContain("后台命令已结束");
-        expect(syntheticMessage.message?.content).toContain(
-          "在完成此前未交付的原任务并给出最终结论/交付结果前，不得结束当前逻辑轮次",
-        );
-        expect(syntheticMessage.message?.content).toContain("TaskOutput");
-        expect(syntheticMessage.message?.content).toContain(
-          JSON.stringify({ task_id: "background-task-1", block: false, timeout: 1000 }),
-        );
+          .map((event) => String(event.content));
+        expect(textContents).toContain("formal background result");
+        expect(textContents.join("\n")).not.toContain("unexpectedSyntheticInput");
+        expect(textContents.join("\n")).not.toContain("isSynthetic");
       } finally {
         await rm(mock.root, { recursive: true, force: true });
       }
     },
   );
 
-  it("completes when the continuation result arrives before the empty task snapshot", async () => {
+  it("completes from ResultMessage before a later empty task snapshot", async () => {
     const mock = await createBackgroundTaskMockModule();
     try {
       const harness = await spawnHarness(
         {
-          // 让 mock 按 task_notification、续跑 result、空集合快照的顺序发送消息。
+          // 让 mock 按 task_notification、正式 ResultMessage、空集合快照的顺序发送消息。
           continuationBeforeBackgroundTasksChanged: true,
         },
         { CLAUDE_AGENT_SDK_MODULE: mock.modulePath },
@@ -607,20 +630,31 @@ describe("claude-agent-sdk-server sidecar", () => {
         id: "query-background-continuation-first",
         method: "query",
         params: {
-          prompt: "verify continuation result before empty snapshot",
+          prompt: "verify ResultMessage before empty snapshot",
           cwd: repoRoot,
         },
       });
 
+      const taskNotification = await harness.waitFor(
+        (event) =>
+          event.id === "query-background-continuation-first" &&
+          event.type === "notice" &&
+          event.sdkSubtype === "task_notification",
+      );
+      expect(taskNotification).toMatchObject({
+        kind: "claude_background_tasks",
+        taskId: "background-task-1",
+        summary: "后台命令已结束",
+      });
       const completed = await harness.waitFor(
         (event) =>
           event.id === "query-background-continuation-first" &&
           event.type === "turn_completed",
       );
       expect(completed).toMatchObject({
-        // 两种 SDK 事件顺序最终都应以成功状态完成。
+        // 正式 SDK ResultMessage 到达后即可成功收尾。
         status: "completed",
-        // 保留 mock SDK 返回的会话标识，确认续跑 result 已被消费。
+        // 保留 mock SDK 返回的会话标识，确认正式 result 已被消费。
         sessionId: "background-session",
       });
       expect(
@@ -636,6 +670,154 @@ describe("claude-agent-sdk-server sidecar", () => {
             event.id === "query-background-continuation-first" && event.type === "error",
         ),
       ).toBe(false);
+      const textContents = harness.events
+        .filter(
+          (event) =>
+            event.id === "query-background-continuation-first" &&
+            event.type === "text_delta",
+        )
+        .map((event) => String(event.content));
+      expect(textContents).toContain("formal background result");
+      expect(textContents.join("\n")).not.toContain("unexpectedSyntheticInput");
+    } finally {
+      await rm(mock.root, { recursive: true, force: true });
+    }
+  });
+
+  it("shows background notifications during compacting without injecting or interrupting", async () => {
+    const mock = await createBackgroundTaskMockModule();
+    try {
+      const harness = await spawnHarness(
+        { compactingDuringBackground: true },
+        { CLAUDE_AGENT_SDK_MODULE: mock.modulePath },
+      );
+      harness.send({
+        id: "query-background-compacting",
+        method: "query",
+        params: {
+          prompt: "verify background notification during compacting",
+          cwd: repoRoot,
+        },
+      });
+
+      const taskNotification = await harness.waitFor(
+        (event) =>
+          event.id === "query-background-compacting" &&
+          event.type === "notice" &&
+          event.sdkSubtype === "task_notification",
+      );
+      expect(taskNotification).toMatchObject({
+        kind: "claude_background_tasks",
+        taskId: "background-task-1",
+        status: "completed",
+      });
+      const compactingNotice = await harness.waitFor(
+        (event) =>
+          event.id === "query-background-compacting" &&
+          event.type === "notice" &&
+          event.kind === "claude_status" &&
+          String(event.message).includes("compacting"),
+      );
+      expect(compactingNotice).toMatchObject({ kind: "claude_status" });
+      await harness.waitFor(
+        (event) =>
+          event.id === "query-background-compacting" &&
+          event.type === "turn_completed",
+      );
+      expect(
+        harness.events.filter(
+          (event) => event.id === "query-background-compacting" && event.type === "error",
+        ),
+      ).toHaveLength(0);
+      const textContents = harness.events
+        .filter(
+          (event) =>
+            event.id === "query-background-compacting" &&
+            event.type === "text_delta",
+        )
+        .map((event) => String(event.content));
+      expect(textContents).toContain("formal background result");
+      expect(textContents.join("\n")).not.toContain("unexpectedSyntheticInput");
+    } finally {
+      await rm(mock.root, { recursive: true, force: true });
+    }
+  });
+
+  it("shows background notifications while approval is pending without injection", async () => {
+    const mock = await createBackgroundTaskMockModule();
+    try {
+      const harness = await spawnHarness(
+        { approvalDuringBackground: true },
+        { CLAUDE_AGENT_SDK_MODULE: mock.modulePath },
+      );
+      harness.send({
+        id: "query-background-approval",
+        method: "query",
+        params: {
+          prompt: "verify background notification during approval",
+          cwd: repoRoot,
+        },
+      });
+
+      const approvalEvent = await harness.waitFor(
+        (event) =>
+          event.id === "query-background-approval" &&
+          event.type === "approval_requested",
+      );
+      const taskNotification = await harness.waitFor(
+        (event) =>
+          event.id === "query-background-approval" &&
+          event.type === "notice" &&
+          event.sdkSubtype === "task_notification",
+      );
+      expect(taskNotification).toMatchObject({
+        kind: "claude_background_tasks",
+        taskId: "background-task-1",
+        status: "completed",
+      });
+      expect(
+        harness.events.some(
+          (event) => event.id === "query-background-approval" && event.type === "turn_completed",
+        ),
+      ).toBe(false);
+
+      harness.send({
+        id: "approval-background-response",
+        method: "approval_response",
+        params: {
+          approvalId: approvalEvent.approvalId,
+          response: { decision: "accept" },
+        },
+      });
+      await expect(
+        harness.waitFor(
+          (event) =>
+            event.id === "approval-background-response" &&
+            event.type === "approval_response_result",
+        ),
+      ).resolves.toMatchObject({
+        approvalId: approvalEvent.approvalId,
+        success: true,
+      });
+      await harness.waitFor(
+        (event) =>
+          event.id === "query-background-approval" &&
+          event.type === "turn_completed",
+      );
+      expect(
+        harness.events.filter(
+          (event) => event.id === "query-background-approval" && event.type === "error",
+        ),
+      ).toHaveLength(0);
+      const textContents = harness.events
+        .filter(
+          (event) =>
+            event.id === "query-background-approval" &&
+            event.type === "text_delta",
+        )
+        .map((event) => String(event.content));
+      expect(textContents).toContain("formal background result");
+      expect(textContents.join("\n")).not.toContain("unexpectedSyntheticInput");
     } finally {
       await rm(mock.root, { recursive: true, force: true });
     }
@@ -732,7 +914,15 @@ describe("claude-agent-sdk-server sidecar", () => {
         event.id === "query-background-lifecycle" &&
         event.type === "turn_completed",
     );
-    const lifecycleSubtypes = harness.events
+    const turnCompletedIndex = harness.events.findIndex(
+      (event) =>
+        event.id === "query-background-lifecycle" &&
+        event.type === "turn_completed",
+    );
+    expect(turnCompletedIndex).toBeGreaterThanOrEqual(0);
+    // 所有后台生命周期 Notice 必须在唯一 TurnCompleted 前发出，且事件中不能出现 synthetic 输入标记。
+    const eventsBeforeTurnCompleted = harness.events.slice(0, turnCompletedIndex);
+    const lifecycleSubtypes = eventsBeforeTurnCompleted
       .filter(
         (event) =>
           event.id === "query-background-lifecycle" &&
@@ -740,6 +930,8 @@ describe("claude-agent-sdk-server sidecar", () => {
           event.kind === "claude_background_tasks",
       )
       .map((event) => event.sdkSubtype);
+    expect(JSON.stringify(eventsBeforeTurnCompleted)).not.toContain("isSynthetic");
+    expect(JSON.stringify(eventsBeforeTurnCompleted)).not.toContain("unexpectedSyntheticInput");
     expect(lifecycleSubtypes).toEqual(
       expect.arrayContaining([
         "background_tasks_changed",
@@ -852,6 +1044,54 @@ describe("claude-agent-sdk-server sidecar", () => {
     });
   });
 
+  it("does not duplicate Error or TurnCompleted after a ResultMessage tail exception", async () => {
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "yield",
+          message: makeSuccessResult({ session_id: "tail-exception-session" }),
+        },
+        {
+          // 模拟正式 ResultMessage 后 SDK iterator 尾部继续抛出异常。
+          type: "throw",
+          error: "tail iterator failure",
+        },
+      ],
+    });
+
+    harness.send({
+      id: "query-result-tail-exception",
+      method: "query",
+      params: {
+        prompt: "verify tail exception is ignored after result",
+        cwd: repoRoot,
+      },
+    });
+
+    await expect(
+      harness.waitFor(
+        (event) =>
+          event.id === "query-result-tail-exception" &&
+          event.type === "turn_completed",
+      ),
+    ).resolves.toMatchObject({
+      status: "completed",
+      sessionId: "tail-exception-session",
+    });
+    expect(
+      harness.events.filter(
+        (event) => event.id === "query-result-tail-exception" && event.type === "error",
+      ),
+    ).toHaveLength(0);
+    expect(
+      harness.events.filter(
+        (event) =>
+          event.id === "query-result-tail-exception" &&
+          event.type === "turn_completed",
+      ),
+    ).toHaveLength(1);
+  });
+
   // 验证边沿生命周期消息不会越过 SDK 的完整后台任务集合真相。
   it.each(["task_started", "task_updated", "task_progress"] as const)(
     "does not let %s change the authoritative background task collection",
@@ -940,7 +1180,7 @@ describe("claude-agent-sdk-server sidecar", () => {
     },
   );
 
-  it("does not let task_notification remove an authoritative background task", async () => {
+  it("keeps task_notification display data without blocking a successful ResultMessage", async () => {
     const harness = await spawnHarness({
       steps: [
         {
@@ -950,7 +1190,7 @@ describe("claude-agent-sdk-server sidecar", () => {
             type: "system",
             // 该消息建立唯一权威活动任务。
             subtype: "background_tasks_changed",
-            // 后续 task_notification 不得删除此集合成员。
+            // task_notification 后仍保留该任务的展示归属。
             tasks: [
               {
                 // 提供权威任务的稳定标识。
@@ -968,9 +1208,9 @@ describe("claude-agent-sdk-server sidecar", () => {
           message: {
             // 标识这是 SDK 后台任务最终通知消息。
             type: "system",
-            // 该边沿消息只能发送通知和续跑输入。
+            // 该通知只更新展示状态，不回注入用户输入。
             subtype: "task_notification",
-            // 使用权威任务标识，验证边沿消息不得从集合中删除它。
+            // 使用权威任务标识，验证展示关联不丢失。
             task_id: "authoritative-task",
             // 传递任务最终状态展示数据。
             status: "completed",
@@ -996,32 +1236,48 @@ describe("claude-agent-sdk-server sidecar", () => {
       },
     });
 
-    const errorEvent = await harness.waitFor(
+    const taskNotification = await harness.waitFor(
       (event) =>
         event.id === "query-background-authority-notification" &&
-        event.type === "error" &&
-        event.recoverable === false &&
-        String(event.message).includes("后台任务待处理时意外结束"),
+        event.type === "notice" &&
+        event.sdkSubtype === "task_notification",
     );
+    expect(taskNotification).toMatchObject({
+      kind: "claude_background_tasks",
+      taskId: "authoritative-task",
+      status: "completed",
+      summary: "权威后台任务已结束",
+      metadata: {
+        activeTaskCount: 1,
+        backgroundTasks: [
+          {
+            taskId: "authoritative-task",
+            status: "completed",
+            summary: "权威后台任务已结束",
+          },
+        ],
+      },
+    });
     const completed = await harness.waitFor(
       (event) =>
         event.id === "query-background-authority-notification" &&
         event.type === "turn_completed",
     );
 
-    expect(errorEvent).toMatchObject({
-      // iterator 异常结束必须向调用方明确报告不可恢复错误。
-      recoverable: false,
-    });
+    expect(
+      harness.events.some(
+        (event) => event.id === "query-background-authority-notification" && event.type === "error",
+      ),
+    ).toBe(false);
     expect(completed).toMatchObject({
-      // 权威任务仍在集合中时，query 必须以失败状态收口。
-      status: "failed",
-      // 保留 SDK 返回的会话标识，便于调用方关联失败轮次。
+      // 正式 ResultMessage 到达后不受后台任务集合状态阻止。
+      status: "completed",
+      // 保留 SDK 返回的会话标识，便于调用方关联完成轮次。
       sessionId: "authoritative-session",
     });
   });
 
-  it("fails explicitly when the SDK iterator ends with an authoritative background task", async () => {
+  it("fails once when the SDK iterator ends without a ResultMessage", async () => {
     const harness = await spawnHarness({
       steps: [
         {
@@ -1029,9 +1285,9 @@ describe("claude-agent-sdk-server sidecar", () => {
           message: {
             // 标识这是 SDK 后台任务集合快照消息。
             type: "system",
-            // 该消息建立仍待处理的权威后台任务。
+            // 后台任务展示状态不能替代正式 ResultMessage。
             subtype: "background_tasks_changed",
-            // iterator 结束前任务集合保持非空。
+            // iterator 结束前保留后台任务，验证其不会生成错误原因文本。
             tasks: [
               {
                 // 提供权威任务的稳定标识。
@@ -1044,10 +1300,6 @@ describe("claude-agent-sdk-server sidecar", () => {
             ],
           },
         },
-        {
-          type: "yield",
-          message: makeSuccessResult({ session_id: "pending-session" }),
-        },
       ],
     });
 
@@ -1055,7 +1307,7 @@ describe("claude-agent-sdk-server sidecar", () => {
       id: "query-background-iterator-ended",
       method: "query",
       params: {
-        prompt: "verify unexpected iterator end",
+        prompt: "verify iterator end without result",
         cwd: repoRoot,
       },
     });
@@ -1064,8 +1316,7 @@ describe("claude-agent-sdk-server sidecar", () => {
       (event) =>
         event.id === "query-background-iterator-ended" &&
         event.type === "error" &&
-        event.recoverable === false &&
-        String(event.message).includes("后台任务待处理时意外结束"),
+        event.recoverable === false,
     );
     const completed = await harness.waitFor(
       (event) =>
@@ -1074,15 +1325,22 @@ describe("claude-agent-sdk-server sidecar", () => {
     );
 
     expect(errorEvent).toMatchObject({
-      // SDK iterator 异常结束必须产生明确不可恢复错误，而不是静默 hanging。
+      // 没有正式 ResultMessage 时必须产生明确不可恢复错误。
       recoverable: false,
+      message: "Claude SDK query ended before returning a ResultMessage.",
     });
+    expect(String(errorEvent.message)).not.toContain("后台任务待处理时意外结束");
     expect(completed).toMatchObject({
-      // 后台任务仍待处理时，轮次必须以失败状态收口。
+      // iterator 没有 ResultMessage 时，轮次必须以失败状态收口。
       status: "failed",
-      // 保留 SDK 返回的会话标识，便于调用方关联失败轮次。
-      sessionId: "pending-session",
     });
+    expect(
+      harness.events.filter(
+        (event) =>
+          event.id === "query-background-iterator-ended" &&
+          event.type === "error",
+      ),
+    ).toHaveLength(1);
     expect(
       harness.events.filter(
         (event) =>

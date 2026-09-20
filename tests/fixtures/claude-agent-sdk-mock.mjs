@@ -151,6 +151,11 @@ export function query({ prompt, options }) {
         continue;
       }
 
+      if (step.type === "throw") {
+        // 模拟 ResultMessage 后 iterator 尾部异常，验证 sidecar 不重复发错误终态。
+        throw new Error(String(step.error ?? "Mock SDK iterator tail error."));
+      }
+
       if (step.type === "hook") {
         await runHooks(options, step.hook, step.input);
         continue;
