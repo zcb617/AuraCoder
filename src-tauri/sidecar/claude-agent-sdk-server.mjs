@@ -3242,8 +3242,6 @@ async function handleQuery(req, persistentSession = null) {
       } else if (message.type === "assistant" && typeof message.error === "string") {
         const assistantError = formatAssistantMessageError(message);
         terminalStatus = "failed";
-        // 记录主代理 assistant error 的失败来源，后续成功 result 不能覆盖该失败终态。
-        context.sdkTerminalStatus = "failed";
         emit({
           id,
           type: "error",
@@ -3594,12 +3592,6 @@ async function handleQuery(req, persistentSession = null) {
           output: message.usage?.output_tokens,
         });
         if (message.subtype === "success") {
-          // 成功 result 必须先写入父轮次 completed，再由统一门控判断是否可以结束当前轮次。
-          // 已记录的主代理失败不能被后续成功 result 覆盖，保持主代理失败的原有终态语义。
-          if (context.sdkTerminalStatus !== "failed") {
-            terminalStatus = "completed";
-            context.sdkTerminalStatus = "completed";
-          }
           if (
             typeof message.result === "string" &&
             message.result.length > 0 &&
@@ -3608,89 +3600,17 @@ async function handleQuery(req, persistentSession = null) {
             emit({ id, type: "text_delta", content: message.result });
           }
         } else {
-          // 仅当 SDK result 来自 task-notification 且当前查询生命周期未终止时，才交给主代理继续处理。
-          const persistentSessionIsAlive =
-            !persistentSession ||
-            sessionHandles.get(persistentSession.threadId) === persistentSession;
-          const isTaskNotificationResult = message.origin?.kind === "task-notification";
-          const hasPendingBackgroundContinuation =
-            !context.authoritativeBackgroundTasksEmpty ||
-            context.backgroundTasks.size > 0 ||
-            context.awaitingTaskNotification ||
-            context.pendingTaskNotificationIds.size > 0 ||
-            context.deferredTaskNotifications.length > 0 ||
-            context.backgroundContinuationResultCount < context.backgroundContinuationInjectedCount ||
-            context.stopReason === "tool_use";
-          const mainAgentIsAlive =
-            isTaskNotificationResult &&
-            activeQueries.get(id) === context &&
-            !context.turnCompleted &&
-            !context.cancelled &&
-            !shuttingDown &&
-            !persistentSession?.interruptRequested &&
-            persistentSessionIsAlive;
-          if (mainAgentIsAlive) {
-            // 可恢复的 task-notification result 不得改变父轮次已有终态来源。
-            terminalStatus = "completed";
-          } else {
-            // 主代理已终止时，非成功 SDK result 仍按原有语义结束为 failed。
-            terminalStatus = "failed";
-            context.sdkTerminalStatus = "failed";
-          }
-          const resultErrorMessage = formatSdkResultError(message);
-          traceClaudeSdk("sdk_result_error_lifecycle", {
-            // 关联产生 SDK result 的 AuraCoder 查询请求。
-            requestId: id,
-            // 记录 SDK result 的原始 subtype，区分中间结果和终止结果。
-            subtype: message.subtype,
-            // 记录 SDK origin.kind，仅用于排查，不将 task-notification 直接视为子代理失败。
-            originKind: message.origin?.kind,
-            // 记录当前 result 是否属于主代理可继续处理的 task-notification 来源。
-            isTaskNotificationResult,
-            // 记录主代理是否仍具备继续处理当前逻辑轮次的能力。
-            mainAgentIsAlive,
-            // 记录 persistent session 句柄是否仍由当前查询持有。
-            persistentSessionIsAlive,
-            // 记录当前查询是否使用 persistent session。
-            isPersistentSession: context.isPersistentSession,
-            // 记录当前 activeQueries 是否仍指向该查询上下文。
-            activeQueryMatches: activeQueries.get(id) === context,
-            // 记录是否存在后台续跑或待处理状态作为继续处理依据。
-            hasPendingBackgroundContinuation,
-            // 记录当前权威后台任务快照是否为空。
-            authoritativeBackgroundTasksEmpty: context.authoritativeBackgroundTasksEmpty,
-            // 记录当前是否存在可继续处理的工具等待状态。
-            stopReason: context.stopReason,
-            // 记录当前逻辑轮次是否已经发出完成事件。
-            turnCompleted: context.turnCompleted,
-            // 记录当前查询是否已被取消。
-            cancelled: context.cancelled,
-            // 记录 sidecar 是否正在关闭。
-            shuttingDown,
-            // 记录当前权威后台任务数量。
-            backgroundTaskCount: context.backgroundTasks.size,
-            // 记录尚未收到 task_notification 的任务数量。
-            pendingTaskNotificationCount: context.pendingTaskNotificationIds.size,
-            // 记录当前是否仍等待后台任务通知。
-            awaitingTaskNotification: context.awaitingTaskNotification,
-            // 记录等待压缩或审批收尾后注入的通知数量。
-            deferredTaskNotificationCount: context.deferredTaskNotifications.length,
-            // 记录已经注入的后台续跑数量。
-            backgroundContinuationInjectedCount: context.backgroundContinuationInjectedCount,
-            // 记录已经收到后台续跑 result 的数量。
-            backgroundContinuationResultCount: context.backgroundContinuationResultCount,
-            // 保留格式化后的原始 SDK result 错误消息。
-            message: resultErrorMessage,
-          });
+          terminalStatus = "failed";
           emit({
             id,
             type: "error",
-            message: resultErrorMessage,
-            recoverable: mainAgentIsAlive,
+            message: formatSdkResultError(message),
+            recoverable: false,
           });
         }
         const hadSdkResult = context.sdkResultReceived;
         context.sdkResultReceived = true;
+        context.sdkTerminalStatus = terminalStatus;
         if (
           hadSdkResult &&
           context.backgroundContinuationResultCount < context.backgroundContinuationInjectedCount
