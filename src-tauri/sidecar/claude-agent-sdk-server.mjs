@@ -3775,9 +3775,15 @@ async function handleQuery(req, persistentSession = null) {
       cleanupPendingApprovalsForQuery(id, "Claude query failed before approval was answered.");
       emitTurnCompleted(context, "failed");
     } else if (context.sdkResultReceived && !context.turnCompleted) {
-      // ResultMessage 已经确认主代理结果；尾部 iterator 异常只结束非持久轮次，不重复发送 Error/failed。
+      // ResultMessage 已经确认主代理结果；尾部 iterator 异常只结束当前轮次，不重复发送 Error/failed。
       setContextSessionId(context, actualSessionId);
-      maybeCompleteTurn({ iteratorEnded: true });
+      // 先于 turn_completed 作废挂起审批，保持与正式结果收尾相同的事件顺序。
+      cleanupPendingApprovalsForQuery(id, "Claude query ended after ResultMessage before approval was answered.");
+      // 持久会话只发送当前轮次完成事件，finally 会根据会话类型保留输入流。
+      emitTurnCompleted(
+        context,
+        context.cancelled ? "interrupted" : context.sdkTerminalStatus || "completed",
+      );
     }
   } finally {
     traceClaudeSdk("handle_query_finally", { requestId: id, context });
