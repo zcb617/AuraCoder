@@ -2098,6 +2098,112 @@ describe("claude-agent-sdk-server sidecar", () => {
     expect(completed.sessionId).toBe("session-error");
   });
 
+  it("does not let recoverable task-notification failures poison parent completion", async () => {
+    const taskNotificationError = makeErrorResult({
+      // 标识该 result 来自后台 task-notification 子任务，而不是主代理。
+      origin: { kind: "task-notification" },
+      // 模拟上游 503 auth_unavailable 原始错误字段，验证错误仍可恢复并继续交给主代理。
+      apiErrorStatus: 503,
+      errorDetails: "auth_unavailable",
+      errors: ["503 auth_unavailable"],
+      session_id: "session-task-notification-recovery",
+    });
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "yield",
+          message: {
+            // 建立两个仍由 SDK 权威快照维护的后台任务。
+            type: "system",
+            subtype: "background_tasks_changed",
+            tasks: [
+              { task_id: "task-notification-1", task_type: "local_agent", description: "子任务一" },
+              { task_id: "task-notification-2", task_type: "local_agent", description: "子任务二" },
+            ],
+          },
+        },
+        {
+          type: "yield",
+          message: {
+            // 触发第一个后台任务的续跑通知。
+            type: "system",
+            subtype: "task_notification",
+            task_id: "task-notification-1",
+            status: "failed",
+            summary: "子任务一鉴权失败",
+          },
+        },
+        { type: "yield", message: taskNotificationError },
+        {
+          type: "yield",
+          message: {
+            // 触发第二个后台任务的续跑通知。
+            type: "system",
+            subtype: "task_notification",
+            task_id: "task-notification-2",
+            status: "failed",
+            summary: "子任务二鉴权失败",
+          },
+        },
+        { type: "yield", message: taskNotificationError },
+        {
+          type: "yield",
+          message: {
+            // 两个子任务均结算后清空权威后台任务集合。
+            type: "system",
+            subtype: "background_tasks_changed",
+            tasks: [],
+          },
+        },
+        {
+          type: "yield",
+          // 主代理最终成功 result 必须成为父轮次唯一完成来源。
+          message: makeSuccessResult({
+            session_id: "session-task-notification-recovery",
+            result: "主代理已完成",
+          }),
+        },
+      ],
+    });
+
+    harness.send({
+      id: "query-task-notification-recovery",
+      method: "query",
+      params: {
+        prompt: "recover from task notification errors",
+        cwd: repoRoot,
+      },
+    });
+
+    const completed = await harness.waitFor(
+      (event) =>
+        event.id === "query-task-notification-recovery" &&
+        event.type === "turn_completed",
+    );
+    const errors = harness.events.filter(
+      (event) =>
+        event.id === "query-task-notification-recovery" && event.type === "error",
+    );
+
+    expect(errors).toHaveLength(2);
+    expect(errors.every((event) => event.recoverable === true)).toBe(true);
+    expect(errors.map((event) => event.message)).toEqual([
+      "503 auth_unavailable",
+      "503 auth_unavailable",
+    ]);
+    expect(
+      harness.events.filter(
+        (event) =>
+          event.id === "query-task-notification-recovery" &&
+          event.type === "turn_completed",
+      ),
+    ).toHaveLength(1);
+    expect(completed).toMatchObject({
+      status: "completed",
+      sessionId: "session-task-notification-recovery",
+    });
+  });
+
   it("surfaces assistant errors, status notices, rate limits, and token usage", async () => {
     const harness = await spawnHarness({
       contextUsage: {

@@ -3242,6 +3242,8 @@ async function handleQuery(req, persistentSession = null) {
       } else if (message.type === "assistant" && typeof message.error === "string") {
         const assistantError = formatAssistantMessageError(message);
         terminalStatus = "failed";
+        // 记录主代理 assistant error 的失败来源，后续成功 result 不能覆盖该失败终态。
+        context.sdkTerminalStatus = "failed";
         emit({
           id,
           type: "error",
@@ -3592,6 +3594,12 @@ async function handleQuery(req, persistentSession = null) {
           output: message.usage?.output_tokens,
         });
         if (message.subtype === "success") {
+          // 成功 result 必须先写入父轮次 completed，再由统一门控判断是否可以结束当前轮次。
+          // 已记录的主代理失败不能被后续成功 result 覆盖，保持主代理失败的原有终态语义。
+          if (context.sdkTerminalStatus !== "failed") {
+            terminalStatus = "completed";
+            context.sdkTerminalStatus = "completed";
+          }
           if (
             typeof message.result === "string" &&
             message.result.length > 0 &&
@@ -3600,7 +3608,6 @@ async function handleQuery(req, persistentSession = null) {
             emit({ id, type: "text_delta", content: message.result });
           }
         } else {
-          terminalStatus = "failed";
           // 仅当 SDK result 来自 task-notification 且当前查询生命周期未终止时，才交给主代理继续处理。
           const persistentSessionIsAlive =
             !persistentSession ||
@@ -3622,6 +3629,14 @@ async function handleQuery(req, persistentSession = null) {
             !shuttingDown &&
             !persistentSession?.interruptRequested &&
             persistentSessionIsAlive;
+          if (mainAgentIsAlive) {
+            // 可恢复的 task-notification result 不得改变父轮次已有终态来源。
+            terminalStatus = "completed";
+          } else {
+            // 主代理已终止时，非成功 SDK result 仍按原有语义结束为 failed。
+            terminalStatus = "failed";
+            context.sdkTerminalStatus = "failed";
+          }
           const resultErrorMessage = formatSdkResultError(message);
           traceClaudeSdk("sdk_result_error_lifecycle", {
             // 关联产生 SDK result 的 AuraCoder 查询请求。
@@ -3676,7 +3691,6 @@ async function handleQuery(req, persistentSession = null) {
         }
         const hadSdkResult = context.sdkResultReceived;
         context.sdkResultReceived = true;
-        context.sdkTerminalStatus = terminalStatus;
         if (
           hadSdkResult &&
           context.backgroundContinuationResultCount < context.backgroundContinuationInjectedCount
