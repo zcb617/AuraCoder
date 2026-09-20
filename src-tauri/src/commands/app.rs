@@ -291,6 +291,54 @@ pub async fn set_transcript_width(
     .map_err(err_to_string)?
 }
 
+/// 读取普通聊天输入区 textarea 的持久化高度，缺失时返回 None。
+#[tauri::command]
+pub async fn get_chat_input_height(webview: Webview) -> Result<Option<u32>, String> {
+    let _ = webview;
+    tokio::task::spawn_blocking(move || {
+        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        Ok(config.chat_input_height())
+    })
+    .await
+    .map_err(err_to_string)?
+}
+
+/// 保存普通聊天输入区 textarea 高度，并回读确认数据库中的最终值。
+#[tauri::command]
+pub async fn set_chat_input_height(
+    state: State<'_, AppState>,
+    webview: Webview,
+    height: u32,
+) -> Result<u32, String> {
+    let _ = webview;
+    let normalized = crate::config::app_config::normalize_chat_input_height(Some(height))
+        .ok_or_else(|| format!("unsupported chat input height: {height}"))?;
+
+    let config_write_lock = state.config_write_lock.clone();
+    let _guard = config_write_lock.lock_owned().await;
+
+    tokio::task::spawn_blocking(move || {
+        AppConfig::mutate(|config| {
+            config.ui.chat_input_height = Some(normalized);
+            Ok(())
+        })
+        .map_err(err_to_string)?;
+
+        let persisted = AppConfig::load_or_create()
+            .map_err(err_to_string)?
+            .chat_input_height()
+            .ok_or_else(|| "chat input height is missing after persistence".to_string())?;
+        if persisted != normalized {
+            return Err(format!(
+                "chat input height did not persist: expected {normalized}, got {persisted}"
+            ));
+        }
+        Ok(persisted)
+    })
+    .await
+    .map_err(err_to_string)?
+}
+
 #[tauri::command]
 pub async fn get_terminal_accelerated_rendering() -> Result<bool, String> {
     tokio::task::spawn_blocking(move || {

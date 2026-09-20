@@ -16,7 +16,7 @@ use crate::runtime_env;
 
 /// 配置字典中允许由 AppConfig 读写的固定键集合，未知键由数据库保留。
 #[cfg(test)]
-const CONFIG_KEYS: [&str; 36] = [
+const CONFIG_KEYS: [&str; 37] = [
     "general.theme",
     "general.default_engine",
     "general.default_model",
@@ -33,6 +33,7 @@ const CONFIG_KEYS: [&str; 36] = [
     "ui.font_size",
     "ui.display_scale",
     "ui.transcript_width",
+    "ui.chat_input_height",
     "debug.persist_engine_event_logs",
     "debug.max_action_output_chars",
     "power.keep_awake_enabled",
@@ -72,6 +73,12 @@ pub const DEFAULT_DISPLAY_SCALE: u32 = 100;
 pub const VALID_DISPLAY_SCALES: [u32; 6] = [100, 110, 120, 130, 140, 150];
 pub const DEFAULT_TRANSCRIPT_WIDTH: &str = "medium";
 pub const VALID_TRANSCRIPT_WIDTHS: [&str; 3] = ["narrow", "medium", "wide"];
+
+/// 将持久化的聊天输入区高度归一化为正整数像素值，缺失或零值表示未配置。
+pub fn normalize_chat_input_height(height: Option<u32>) -> Option<u32> {
+    height.filter(|value| *value > 0)
+}
+
 pub const VALID_AUTONOMY_PRESETS: [&str; 4] = ["read-only", "ask", "auto", "full"];
 
 /// Clamp a requested terminal font size into the supported range.
@@ -152,6 +159,9 @@ pub struct UiConfig {
     /// 聊天消息文字显示区域的宽度偏好；缺失时使用中等宽度。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_width: Option<String>,
+    /// 普通聊天输入区 textarea 的持久化高度，单位为像素；缺失时使用 rows=3 的自然布局。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_input_height: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -461,6 +471,7 @@ impl Default for UiConfig {
             font_size: 13,
             display_scale: DEFAULT_DISPLAY_SCALE,
             transcript_width: None,
+            chat_input_height: None,
         }
     }
 }
@@ -522,6 +533,11 @@ impl AppConfig {
     /// 返回聊天消息文字显示区域的归一化宽度偏好，默认使用中等宽度。
     pub fn transcript_width(&self) -> String {
         normalize_transcript_width(self.ui.transcript_width.as_deref())
+    }
+
+    /// 返回普通聊天输入区已保存的合法高度，缺失或非法值保持未配置。
+    pub fn chat_input_height(&self) -> Option<u32> {
+        normalize_chat_input_height(self.ui.chat_input_height)
     }
 
     pub fn chat_notifications_enabled(&self) -> bool {
@@ -736,6 +752,7 @@ fn load_config_dictionary(connection: &Connection) -> anyhow::Result<AppConfig> 
             "ui.font_size" => apply_config_json!(&key, raw, config.ui.font_size),
             "ui.display_scale" => apply_config_json!(&key, raw, config.ui.display_scale),
             "ui.transcript_width" => apply_config_json!(&key, raw, config.ui.transcript_width),
+            "ui.chat_input_height" => apply_config_json!(&key, raw, config.ui.chat_input_height),
             "debug.persist_engine_event_logs" => {
                 apply_config_json!(&key, raw, config.debug.persist_engine_event_logs)
             }
@@ -803,7 +820,7 @@ fn save_config_dictionary(connection: &mut Connection, config: &AppConfig) -> an
         "INSERT INTO config(config_key, config_value) VALUES (?1, ?2)\
          ON CONFLICT(config_key) DO UPDATE SET config_value = excluded.config_value",
     )?;
-    // 36 个固定字段统一使用 JSON 文本写入字典表，未知键不会被触碰。
+    // 37 个固定字段统一使用 JSON 文本写入字典表，未知键不会被触碰。
     macro_rules! upsert {
         ($key:expr, $value:expr $(,)?) => {{
             let serialized = serde_json::to_string($value)?;
@@ -853,6 +870,7 @@ fn save_config_dictionary(connection: &mut Connection, config: &AppConfig) -> an
     upsert!("ui.font_size", &config.ui.font_size)?;
     upsert!("ui.display_scale", &config.ui.display_scale)?;
     upsert!("ui.transcript_width", &config.ui.transcript_width)?;
+    upsert!("ui.chat_input_height", &config.ui.chat_input_height)?;
     upsert!(
         "debug.persist_engine_event_logs",
         &config.debug.persist_engine_event_logs,
@@ -956,6 +974,10 @@ fn replace_file(temp_path: &std::path::Path, path: &std::path::Path) -> std::io:
     fs::rename(temp_path, path)
 }
 */
+
+#[cfg(test)]
+#[path = "../../tests/unit/chat_input_height_config_tests.rs"]
+mod chat_input_height_config_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1226,6 +1248,25 @@ max_action_output_chars = 20000
     }
 
     #[test]
+    fn chat_input_height_defaults_and_rejects_zero() {
+        let config = AppConfig::default();
+        assert_eq!(config.chat_input_height(), None);
+        assert_eq!(super::normalize_chat_input_height(Some(0)), None);
+        assert_eq!(super::normalize_chat_input_height(Some(180)), Some(180));
+    }
+
+    #[test]
+    fn chat_input_height_serialize_roundtrip() {
+        let mut config = AppConfig::default();
+        config.ui.chat_input_height = Some(180);
+
+        let raw = toml::to_string_pretty(&config).expect("config should serialize");
+        let loaded = toml::from_str::<AppConfig>(&raw).expect("config should deserialize");
+
+        assert_eq!(loaded.chat_input_height(), Some(180));
+    }
+
+    #[test]
     fn terminal_accelerated_rendering_defaults_to_enabled() {
         let config = AppConfig::default();
 
@@ -1444,6 +1485,7 @@ notification_sound = "Glass"
         config.general.terminal_font_size = Some(18);
         config.ui.sidebar_width = 333;
         config.ui.transcript_width = Some("narrow".to_string());
+        config.ui.chat_input_height = Some(180);
         config.debug.max_action_output_chars = 3210;
         config.power.ac_only_mode = true;
         config.power.battery_threshold = Some(22);
@@ -1480,11 +1522,12 @@ notification_sound = "Glass"
         save_config_dictionary(&mut connection, &config).expect("config should save");
         let restored = load_config_dictionary(&connection).expect("config should load");
 
-        assert_eq!(CONFIG_KEYS.len(), 36);
+        assert_eq!(CONFIG_KEYS.len(), 37);
         assert_eq!(config.general.theme, restored.general.theme);
         assert_eq!(config.general.locale, restored.general.locale);
         assert_eq!(config.ui.sidebar_width, restored.ui.sidebar_width);
         assert_eq!(config.ui.transcript_width, restored.ui.transcript_width);
+        assert_eq!(config.ui.chat_input_height, restored.ui.chat_input_height);
         assert_eq!(
             config.debug.max_action_output_chars,
             restored.debug.max_action_output_chars
@@ -1506,7 +1549,7 @@ notification_sound = "Glass"
         let row_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM config", [], |row| row.get(0))
             .expect("config row count should be readable");
-        assert_eq!(row_count, 36);
+        assert_eq!(row_count, 37);
     }
 
     #[test]
@@ -1594,7 +1637,7 @@ notification_sound = "Glass"
         let row_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM config", [], |row| row.get(0))
             .expect("config row count should be readable");
-        assert_eq!(row_count, 36);
+        assert_eq!(row_count, 37);
         fs::remove_dir_all(&test_dir).expect("test directory should be removed");
     }
     */

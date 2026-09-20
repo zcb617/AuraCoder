@@ -54,6 +54,11 @@ import { useGitStore } from "../../stores/gitStore";
 import { useTerminalStore, type LayoutMode } from "../../stores/terminalStore";
 import { toast } from "../../stores/toastStore";
 import { ipc, listenExtensionCatalogUpdated } from "../../lib/ipc";
+import {
+  clampChatInputHeight,
+  normalizeChatInputHeight,
+} from "../../lib/chatInputHeight";
+import { useChatInputHeightStore } from "../../stores/chatInputHeightStore";
 // 斜杠菜单统一由 buildSlashCommandsFromExtensions 按 ExtensionItemDto 解析。
 import { buildSlashCommandsFromExtensions } from "../../cli-tools/build-slash-commands";
 import type { CliSlashCommand } from "../../cli-tools/contracts/slash-command";
@@ -265,6 +270,9 @@ function prewarmEngineTransport(
 
 
 
+/** 普通聊天输入区拖动时必须保留的消息区最小可见高度，单位为像素。 */
+const CHAT_INPUT_MIN_VISIBLE_MESSAGE_SPACE = 120;
+
 interface ChatPanelProps {
   embedded?: boolean;
 }
@@ -272,6 +280,8 @@ interface ChatPanelProps {
 
 export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const { t } = useTranslation("chat");
+  const persistedChatInputHeight = useChatInputHeightStore((state) => state.chatInputHeight);
+  const persistChatInputHeight = useChatInputHeightStore((state) => state.setChatInputHeight);
   const renderStartedAtRef = useRef(performance.now());
   renderStartedAtRef.current = performance.now();
 
@@ -861,6 +871,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const syncTerminalSessions = useTerminalStore((s) => s.syncSessions);
   const viewportRef = useRef<HTMLDivElement>(null);
   const chatSectionRef = useRef<HTMLDivElement>(null);
+  const chatInputBoxRef = useRef<HTMLDivElement>(null);
+  const chatInputHeightDragCleanupRef = useRef<(() => void) | null>(null);
+  const chatInputHeightDragValueRef = useRef<number | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const textAnnotationPopoverRef = useRef<HTMLDivElement>(null);
   const annotationCommentInputRef = useRef<HTMLInputElement>(null);
@@ -886,6 +899,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     useState<TextAnnotationPopover | null>(null);
   const [textAnnotationComment, setTextAnnotationComment] = useState("");
   const [autoScrollLocked, setAutoScrollLocked] = useState(false);
+  const [chatInputHeightValue, setChatInputHeightValue] = useState<number | null>(
+    persistedChatInputHeight,
+  );
   const [hasExplicitComposerRuntime, setHasExplicitComposerRuntime] = useState(false);
   const [workspaceRootPrompt, setWorkspaceRootPrompt] = useState<any>(null);
   const [planImplementationPrompt, setPlanImplementationPrompt] = useState<{
@@ -1935,6 +1951,154 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   );
   const showSpecialInputComposer =
     showPendingToolInputComposer || showPlanImplementationComposer;
+
+  /** 根据普通聊天 textarea 当前 computed 样式和布局空间计算可用高度边界。 */
+  const getChatInputHeightBounds = useCallback(() => {
+    const textarea = inputRef.current;
+    const inputBox = chatInputBoxRef.current;
+    const chatSection = chatSectionRef.current;
+    if (!textarea || !inputBox || !chatSection) {
+      return null;
+    }
+
+    const computedStyle = window.getComputedStyle(textarea);
+    const lineHeight = Number.parseFloat(computedStyle.lineHeight);
+    const paddingTop = Number.parseFloat(computedStyle.paddingTop) || 0;
+    const paddingBottom = Number.parseFloat(computedStyle.paddingBottom) || 0;
+    const borderTop = Number.parseFloat(computedStyle.borderTopWidth) || 0;
+    const borderBottom = Number.parseFloat(computedStyle.borderBottomWidth) || 0;
+    const minimumHeight = Math.ceil(
+      (Number.isFinite(lineHeight) ? lineHeight : (Number.parseFloat(computedStyle.fontSize) || 13) * 1.6) +
+        paddingTop +
+        paddingBottom +
+        borderTop +
+        borderBottom,
+    );
+    const sectionHeight = chatSection.getBoundingClientRect().height;
+    const inputBoxHeight = inputBox.getBoundingClientRect().height;
+    const textareaHeight = textarea.getBoundingClientRect().height;
+    const composerSurface = inputBox.closest(".chat-composer-surface");
+    const composerHeight = composerSurface?.getBoundingClientRect().height ?? inputBoxHeight;
+    const outsideTextareaHeight = Math.max(0, composerHeight - textareaHeight);
+    const maximumHeight = Math.floor(
+      sectionHeight - CHAT_INPUT_MIN_VISIBLE_MESSAGE_SPACE - outsideTextareaHeight,
+    );
+
+    return { min: minimumHeight, max: Math.max(minimumHeight, maximumHeight) };
+  }, []);
+
+  /** 清理普通聊天输入区拖动期间注册的全局鼠标和窗口事件。 */
+  const cleanupChatInputHeightDrag = useCallback(() => {
+    chatInputHeightDragCleanupRef.current?.();
+    chatInputHeightDragCleanupRef.current = null;
+    chatInputHeightDragValueRef.current = null;
+  }, []);
+
+  /** 启动普通聊天 textarea 顶部拖动，移动过程仅更新界面，结束时才保存数据库。 */
+  const handleChatInputHeightStart = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      if (showSpecialInputComposer || !inputRef.current) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      cleanupChatInputHeightDrag();
+      const startY = event.clientY;
+      const startHeight = inputRef.current.getBoundingClientRect().height;
+      const initialHeight = normalizeChatInputHeight(chatInputHeightValue) ?? Math.round(startHeight);
+      chatInputHeightDragValueRef.current = initialHeight;
+      document.body.style.userSelect = "none";
+
+      const onMove = (moveEvent: MouseEvent) => {
+        const bounds = getChatInputHeightBounds();
+        if (!bounds) {
+          return;
+        }
+        const nextHeight = clampChatInputHeight(
+          initialHeight - (moveEvent.clientY - startY),
+          bounds,
+        );
+        chatInputHeightDragValueRef.current = nextHeight;
+        setChatInputHeightValue(nextHeight);
+      };
+      const onUp = () => {
+        const finalHeight = chatInputHeightDragValueRef.current;
+        cleanupChatInputHeightDrag();
+        document.body.style.userSelect = "";
+        if (finalHeight !== null) {
+          void persistChatInputHeight(finalHeight).then((saved) => {
+            if (!saved) {
+              setChatInputHeightValue(useChatInputHeightStore.getState().chatInputHeight);
+            }
+          });
+        }
+      };
+      const onBlur = () => onUp();
+
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+      window.addEventListener("blur", onBlur);
+      chatInputHeightDragCleanupRef.current = () => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        window.removeEventListener("blur", onBlur);
+        document.body.style.userSelect = "";
+      };
+    },
+    [
+      chatInputHeightValue,
+      cleanupChatInputHeightDrag,
+      getChatInputHeightBounds,
+      persistChatInputHeight,
+      showSpecialInputComposer,
+    ],
+  );
+
+  useEffect(() => {
+    if (!chatInputHeightDragCleanupRef.current) {
+      setChatInputHeightValue(persistedChatInputHeight);
+    }
+  }, [persistedChatInputHeight]);
+
+  useEffect(() => {
+    const clampRestoredHeight = () => {
+      const bounds = getChatInputHeightBounds();
+      if (!bounds || chatInputHeightValue === null) {
+        return;
+      }
+      const clamped = clampChatInputHeight(chatInputHeightValue, bounds);
+      if (clamped !== chatInputHeightValue) {
+        setChatInputHeightValue(clamped);
+      }
+    };
+    const frame = requestAnimationFrame(clampRestoredHeight);
+    window.addEventListener("resize", clampRestoredHeight);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("resize", clampRestoredHeight);
+    };
+  }, [
+    chatInputHeightValue,
+    getChatInputHeightBounds,
+    showSpecialInputComposer,
+    terminalWorkspaceState?.layoutMode,
+  ]);
+
+  useEffect(() => {
+    return () => cleanupChatInputHeightDrag();
+  }, [cleanupChatInputHeightDrag]);
+
+  useEffect(() => {
+    const currentLayoutMode = terminalWorkspaceState?.layoutMode ?? "chat";
+    if (showSpecialInputComposer || (currentLayoutMode !== "chat" && currentLayoutMode !== "split")) {
+      cleanupChatInputHeightDrag();
+    }
+  }, [
+    cleanupChatInputHeightDrag,
+    showSpecialInputComposer,
+    terminalWorkspaceState?.layoutMode,
+  ]);
+
   const pendingToolInputCanUseDecisionActions = canUseApprovalDecisionActions(
     activeThread?.engineId,
     pendingToolInputApproval?.details,
@@ -5492,9 +5656,19 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
           {/* Input container */}
           <div
+            ref={chatInputBoxRef}
             className={`chat-input-box ${activePlanMode && !showSpecialInputComposer ? "chat-input-box-plan" : ""} ${showSpecialInputComposer ? "chat-input-box-tool-input" : ""}`.trim()}
             onPaste={handleInputPaste}
           >
+            {!showSpecialInputComposer && (
+              <div
+                className="chat-input-height-resize-handle"
+                role="separator"
+                aria-orientation="horizontal"
+                aria-label={t("panel.chatInputHeightResize")}
+                onMouseDown={handleChatInputHeightStart}
+              />
+            )}
             {showPendingToolInputComposer && pendingToolInputApproval ? (
               <ToolInputQuestionnaire
                 details={pendingToolInputApproval.details ?? {}}
@@ -5688,6 +5862,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
                 <ChatComposerInput
                   input={input}
                   inputRef={inputRef}
+                  inputHeight={chatInputHeightValue}
                   activeWorkspaceId={activeWorkspaceId}
                   activePlanMode={activePlanMode}
                   planMode={planMode}

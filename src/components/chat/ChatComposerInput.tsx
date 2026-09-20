@@ -20,6 +20,8 @@ export interface ChatComposerInputProps {
   input: string;
   /** 主输入框引用，用于菜单定位和光标交互。 */
   inputRef: RefObject<HTMLTextAreaElement | null>;
+  /** 普通聊天 textarea 的持久化高度；缺失时保留 rows=3 的自然布局。 */
+  inputHeight?: number | null;
   /** 当前活动工作区标识，用于判断输入框是否可用。 */
   activeWorkspaceId: string | null;
   /** 当前输入框是否处于计划模式。 */
@@ -97,6 +99,7 @@ export interface ChatComposerInputProps {
 export function ChatComposerInput({
   input,
   inputRef,
+  inputHeight,
   activeWorkspaceId,
   activePlanMode,
   planMode,
@@ -276,6 +279,7 @@ export function ChatComposerInput({
                     fontSize: 13,
                     lineHeight: 1.6,
                     resize: "none",
+                    height: inputHeight ? `${inputHeight}px` : undefined,
                     fontFamily: "inherit",
                     caretColor: activePlanMode ? "var(--accent-2)" : "var(--accent)",
                   }}

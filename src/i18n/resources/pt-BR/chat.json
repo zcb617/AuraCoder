@@ -509,6 +509,7 @@
       "plan": "Descreva o que você quer planejar...",
       "chat": "Peça alterações de continuação"
     },
+    "chatInputHeightResize": "Redimensionar altura da entrada do chat",
     "repoAccess": "Acesso ao repo",
     "workspaceAccess": "Acesso ao workspace",
     "unsupportedSuffix": "(não suportado)",

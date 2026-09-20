@@ -509,6 +509,7 @@
       "plan": "描述你希望规划的内容…",
       "chat": "提出后续更改请求"
     },
+    "chatInputHeightResize": "调整聊天输入区高度",
     "repoAccess": "仓库访问",
     "workspaceAccess": "工作区访问",
     "unsupportedSuffix": "（不支持）",

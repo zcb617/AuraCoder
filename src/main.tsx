@@ -9,6 +9,7 @@ import { getBrowserLocaleFallback } from "./lib/locale";
 import { useDisplayScaleStore } from "./stores/displayScaleStore";
 import { useThemeStore } from "./stores/themeStore";
 import { useTranscriptWidthStore } from "./stores/transcriptWidthStore";
+import { useChatInputHeightStore } from "./stores/chatInputHeightStore";
 import "./globals.css";
 
 async function bootstrap() {
@@ -26,6 +27,7 @@ async function bootstrap() {
     useThemeStore.getState().load(),
     useDisplayScaleStore.getState().load(),
     useTranscriptWidthStore.getState().load(),
+    useChatInputHeightStore.getState().load(),
   ]);
 
  await initializeI18n(locale);

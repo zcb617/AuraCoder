@@ -11,7 +11,7 @@ pub struct Migration {
 pub const BASELINE_VERSION: u64 = 100;
 
 // 当前程序版本明确支持的数据库版本，不通过迁移清单最后一项推断。
-pub const SUPPORTED_DATABASE_VERSION: u64 = 113;
+pub const SUPPORTED_DATABASE_VERSION: u64 = 114;
 
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -105,7 +105,18 @@ pub const MIGRATIONS: &[Migration] = &[
         reason: "chat-transcript-width-config",
         requires_foreign_keys_off: false,
     },
+    Migration {
+        version: 114,
+        file: "114.sql",
+        sql: include_str!("114.sql"),
+        reason: "chat-input-height-config",
+        requires_foreign_keys_off: false,
+    },
 ];
+
+#[cfg(test)]
+#[path = "../../../tests/unit/chat_input_height_migration_tests.rs"]
+mod chat_input_height_migration_tests;
 
 #[cfg(test)]
 mod tests {

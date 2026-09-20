@@ -169,6 +169,11 @@ export const ipc = {
   getTranscriptWidth: () => invoke<TranscriptWidth>("get_transcript_width"),
   setTranscriptWidth: (transcriptWidth: TranscriptWidth) =>
     invoke<TranscriptWidth>("set_transcript_width", { transcriptWidth }),
+  /** 读取后端持久化的普通聊天输入区 textarea 高度，缺失时返回 null。 */
+  getChatInputHeight: () => invoke<number | null>("get_chat_input_height"),
+  /** 保存普通聊天输入区 textarea 高度，并返回后端回读确认值。 */
+  setChatInputHeight: (height: number) =>
+    invoke<number>("set_chat_input_height", { height }),
   getComputerControlStatus: () =>
     invoke<ComputerControlStatus>("get_computer_control_settings_status"),
   setComputerControl: (enabled: boolean) =>

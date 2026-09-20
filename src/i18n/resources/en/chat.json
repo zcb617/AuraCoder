@@ -509,6 +509,7 @@
       "plan": "Describe what you want to plan...",
       "chat": "Ask for follow-up changes"
     },
+    "chatInputHeightResize": "Resize chat input height",
     "repoAccess": "Repo access",
     "workspaceAccess": "Workspace access",
     "unsupportedSuffix": "(unsupported)",
