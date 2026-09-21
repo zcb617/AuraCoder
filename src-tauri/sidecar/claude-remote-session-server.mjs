@@ -142,9 +142,9 @@ async function readSessionSummary(filePath, expectedCwd, strict = false) {
   if (!cwd && strict) {
     throw new Error(`Claude 会话文件缺少 cwd：${filePath}`);
   }
-  if (expectedCwd && cwd !== expectedCwd) {
-    return null;
-  }
+  // if (expectedCwd && cwd !== expectedCwd) {
+  //   return null;
+  // }
   const fileStat = await stat(filePath);
   return {
     id: sessionId,
@@ -242,11 +242,11 @@ async function readSessionHistory(filePath, expectedSessionId) {
     }
     if (typeof record.cwd === "string" && record.cwd.trim()) {
       const recordCwd = path.posix.resolve(record.cwd);
-      if (cwd && cwd !== recordCwd) {
-        throw new Error(
-          `Claude session history contains multiple cwd values at line ${lineNumber}`,
-        );
-      }
+      // if (cwd && cwd !== recordCwd) {
+      //   throw new Error(
+      //     `Claude session history contains multiple cwd values at line ${lineNumber}`,
+      //   );
+      // }
       cwd = recordCwd;
     }
     records.push(record);

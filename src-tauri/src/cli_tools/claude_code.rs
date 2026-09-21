@@ -2488,12 +2488,12 @@ impl CliTool for ClaudeCodeCli {
                 history.id,
                 history.session_id
             );
-            anyhow::ensure!(
-                path_utils::paths_equal(&history.cwd, &workspace.root_path),
-                "SSH 远端 Claude 完整历史不属于当前 workspace: session_id={engine_thread_id} cwd={} workspace_root={}",
-                history.cwd,
-                workspace.root_path
-            );
+            // anyhow::ensure!(
+            //     path_utils::paths_equal(&history.cwd, &workspace.root_path),
+            //     "SSH 远端 Claude 完整历史不属于当前 workspace: session_id={engine_thread_id} cwd={} workspace_root={}",
+            //     history.cwd,
+            //     workspace.root_path
+            // );
             return Ok(Some(build_claude_thread_sync_snapshot(
                 engine_thread_id,
                 &history.cwd,

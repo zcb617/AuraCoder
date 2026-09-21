@@ -2332,9 +2332,9 @@ async function readClaudeSessionSummary(filePath, expectedCwd) {
       // Claude 正在追加的末行可能尚未形成完整 JSON，只忽略该行。
     }
   }
-  if (sessionCwd !== expectedCwd) {
-    return null;
-  }
+  // if (sessionCwd !== expectedCwd) {
+  //   return null;
+  // }
   const fileStat = await stat(filePath);
   return {
     id: sessionId,
@@ -2438,17 +2438,17 @@ async function readClaudeSessionHistory(filePath, expectedCwd, expectedSessionId
     }
     if (typeof record.cwd === "string" && record.cwd.trim()) {
       const recordCwd = path.resolve(record.cwd);
-      if (sessionCwd && sessionCwd !== recordCwd) {
-        throw new Error(
-          `Claude session history contains multiple cwd values at line ${lineNumber}`,
-        );
-      }
+      // if (sessionCwd && sessionCwd !== recordCwd) {
+      //   throw new Error(
+      //     `Claude session history contains multiple cwd values at line ${lineNumber}`,
+      //   );
+      // }
       sessionCwd = recordCwd;
-      if (sessionCwd !== expectedCwd) {
-        throw new Error(
-          `Claude session history cwd does not match requested workspace: expected ${expectedCwd}, got ${sessionCwd}`,
-        );
-      }
+      // if (sessionCwd !== expectedCwd) {
+      //   throw new Error(
+      //     `Claude session history cwd does not match requested workspace: expected ${expectedCwd}, got ${sessionCwd}`,
+      //   );
+      // }
     }
     records.push(record);
   }
