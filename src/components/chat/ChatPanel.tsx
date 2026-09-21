@@ -1522,7 +1522,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
             (workspace) => workspace.id === thread.workspaceId,
           )?.trustLevel ?? workspaceTrustLevel;
         if (shouldUpdateWorkspaceTrustLevel(nextTrust, currentWorkspaceTrustLevel)) {
-          await onWorkspaceTrustLevelChange(nextTrust);
+          await onWorkspaceTrustLevelChange(nextTrust, false);
         }
         const nextDefaultValue = Array.isArray(next.defaultForNewThreads)
           && typeof next.defaultForNewThreads[0] === "string"
@@ -5049,10 +5049,22 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     });
   }
 
-  async function onWorkspaceTrustLevelChange(nextTrustLevel: TrustLevel) {
+  async function onWorkspaceTrustLevelChange(
+    nextTrustLevel: TrustLevel,
+    enableWorkspaceAuto = true,
+  ) {
     if (activeWorkspaceId) {
       await useWorkspaceStore.getState().setWorkspaceTrustLevel(activeWorkspaceId, nextTrustLevel);
     }
+    if (!enableWorkspaceAuto || !activeThread?.id) {
+      return;
+    }
+    const next = {
+      ...permissionComponent,
+      trust: [nextTrustLevel],
+      autonomyPreset: ["auto"],
+    } satisfies PermissionComponentJson;
+    await onPermissionComponentChange(next);
   }
 
   /* 旧 PermissionPicker 的 CLI 权限状态合并和保存回调已停用，保留完整迁移记录。
