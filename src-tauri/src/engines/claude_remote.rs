@@ -671,6 +671,7 @@ impl ClaudeRemoteEngine {
                             status,
                         })
                         .await;
+                    // TurnCompleted 只结束当前逻辑轮次等待，不再代表整个持久事件流结束；后续尾部 Notice 由后台转发任务处理。
                     break;
                 }
                 RemoteClaudeEvent::TransportClosed => {
@@ -686,6 +687,54 @@ impl ClaudeRemoteEngine {
                 | RemoteClaudeEvent::SessionHistory { .. } => {}
             }
         }
+        let mut tail_events = turn.events;
+        let tail_event_tx = event_tx.clone();
+        let tail_request_id = request_id.to_string();
+        // 持久会话 TurnCompleted 仅结束当前轮次，尾部 Notice 由本后台任务继续按同一 handleId 转发，直到 TransportClosed/事件流关闭/接收方关闭。
+        tokio::spawn(async move {
+            loop {
+                let event = match tail_events.recv().await {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        log::warn!("SSH 远端 Claude 尾部事件流丢失 {skipped} 条事件");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                if event
+                    .request_id()
+                    .is_some_and(|id| id != tail_request_id.as_str())
+                {
+                    continue;
+                }
+                match event {
+                    RemoteClaudeEvent::Notice {
+                        kind,
+                        level,
+                        title,
+                        message,
+                        metadata,
+                        ..
+                    } => {
+                        if tail_event_tx
+                            .send(EngineEvent::Notice {
+                                kind,
+                                level,
+                                title,
+                                message,
+                                metadata,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    RemoteClaudeEvent::TransportClosed => break,
+                    _ => {}
+                }
+            }
+        });
         if let Some(config) = self.state.lock().await.threads.get_mut(engine_thread_id) {
             config.active_request_id = None;
         }

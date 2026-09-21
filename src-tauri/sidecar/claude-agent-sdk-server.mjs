@@ -3134,18 +3134,33 @@ async function handleQuery(req, persistentSession = null) {
       if (!context.sdkResultReceived) {
         return false;
       }
-      if (!persistentSession && !iteratorEnded) {
-        // 非持久查询必须先消费完 SDK iterator，确保尾部后台生命周期 Notice 先于完成事件发出。
-        return false;
+
+      if (!persistentSession) {
+        /*
+        // 旧逻辑在 ResultMessage 后等待 iteratorEnded 才关闭输入流，导致 SDK iterator 等待输入流结束而互相等待。
+        if (!iteratorEnded) {
+          return false;
+        }
+        */
+        // 普通查询收到正式 ResultMessage 后立即关闭输入流，但继续消费 iterator 的尾部事件。
+        if (context.messageInput && !context.messageInput.readableEnded) {
+          context.messageInput.push(null);
+        }
+        // iteratorEnded 只表示尾部事件已经消费完成，不能阻止 ResultMessage 后的输入流关闭。
+        if (!iteratorEnded) {
+          return false;
+        }
       }
 
       // 轮次结束前先作废未回答审批，保证 approval_expired 先于 turn_completed 到达前端。
       cleanupPendingApprovalsForQuery(context.id, "Claude turn completed before approval was answered.");
       emitTurnCompleted(context, context.sdkTerminalStatus || terminalStatus);
+      /*
+      // 旧版在发送 turn_completed 后才关闭普通查询输入流，当前已在 ResultMessage 后提前关闭。
       if (!persistentSession) {
         context.messageInput?.push(null);
       }
-      return true;
+      */
 
       /*
       // 旧版依赖后台任务快照、task_notification 和 synthetic continuation 结果收尾，已停用。

@@ -271,17 +271,28 @@ export function query({ prompt, options }) {
   let closed = false;
   let syntheticInput = null;
   let approvalPromise = null;
-  // 并行消费 SDK 输入，只记录 sidecar 是否错误地回注入 synthetic 消息。
+  let resolvePromptInputClosed = () => {};
+  // ResultMessage 后的尾部通知场景必须等待 sidecar 真正关闭普通查询输入流。
+  const promptInputClosed = typeof prompt === "string"
+    ? Promise.resolve()
+    : new Promise((resolve) => {
+        resolvePromptInputClosed = resolve;
+      });
+  // 并行消费 SDK 输入，只记录 sidecar 是否错误地回注入 synthetic 消息，并确认输入流最终关闭。
   const inputMonitor = typeof prompt === "string"
     ? Promise.resolve()
     : (async () => {
-        for await (const userMessage of prompt) {
-          if (userMessage?.isSynthetic === true) {
-            syntheticInput = userMessage;
-            return;
+        try {
+          for await (const userMessage of prompt) {
+            if (userMessage?.isSynthetic === true) {
+              syntheticInput = userMessage;
+            }
           }
+        } finally {
+          resolvePromptInputClosed();
         }
       })();
+  void inputMonitor;
 
   const iterator = (async function* () {
     yield {
@@ -315,8 +326,10 @@ export function query({ prompt, options }) {
       };
     }
     if (resultBeforeTaskNotification) {
-      // 先发送正式 ResultMessage，再继续发送尾部 task_notification，验证 iterator 会继续消费。
+      // 先发送正式 ResultMessage，再等待普通查询输入流关闭，最后发送尾部 task_notification。
       yield makeResult({ result: "formal background result" });
+      // sidecar 未在 ResultMessage 后关闭输入时，此处会一直等待，回归测试将明确超时。
+      await promptInputClosed;
     }
     yield {
       type: "system",
