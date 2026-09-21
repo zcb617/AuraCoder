@@ -362,6 +362,8 @@ pub(crate) struct ClaudeSessionSummary {
     pub(crate) title: String,
     /// 会话文件最近更新时间。
     pub(crate) updated_at: String,
+    /// 会话 JSONL 结构分类，用于区分正常、纯命令和未知会话。
+    pub(crate) conversation_kind: Option<String>,
 }
 
 /// 本机 Claude 会话的完整 JSONL 历史，供统一线程同步业务转换消息使用。

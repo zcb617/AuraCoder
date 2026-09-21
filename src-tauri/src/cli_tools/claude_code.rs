@@ -1497,6 +1497,7 @@ impl CliTool for ClaudeCodeCli {
                             "cwd": session.cwd.clone(),
                             "title": session.title.clone(),
                             "updatedAt": session.updated_at.clone(),
+                            "conversationKind": session.conversation_kind.clone(),
                         },
                     });
                     CliSessionSnapshot {
@@ -3056,6 +3057,8 @@ mod tests {
             cwd: "/workspace/project".to_string(),
             title: "Deploy production".to_string(),
             updated_at: "2026-08-27T00:00:00Z".to_string(),
+            // 测试缺失结构化会话分类时仍保持摘要兼容。
+            conversation_kind: None,
         };
 
         assert!(matches_claude_session_search(&session, Some("production")));

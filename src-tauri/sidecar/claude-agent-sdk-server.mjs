@@ -2307,6 +2307,16 @@ async function readClaudeSessionSummary(filePath, expectedCwd) {
   }
   let sessionCwd = "";
   let firstPrompt = "";
+  let hasCliEntrypoint = false;
+  let hasCommandProtocol = false;
+  let hasHumanInput = false;
+  const commandProtocolMarkers = [
+    "<local-command-caveat>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-stdout>",
+  ];
   const lines = createInterface({
     input: createReadStream(filePath, { encoding: "utf8" }),
     crlfDelay: Infinity,
@@ -2322,11 +2332,29 @@ async function readClaudeSessionSummary(filePath, expectedCwd) {
       if (!sessionCwd && typeof record.cwd === "string") {
         sessionCwd = path.resolve(record.cwd);
       }
-      if (!firstPrompt && record.type === "user") {
-        firstPrompt = extractClaudeSessionText(record.message?.content);
+      if (record.entrypoint === "cli") {
+        hasCliEntrypoint = true;
       }
-      if (sessionCwd && firstPrompt) {
-        break;
+      if (
+        record.origin?.kind === "human" ||
+        (record.promptSource === "typed" && record.turnOrigin === "human")
+      ) {
+        hasHumanInput = true;
+      }
+      const content = record.message?.content;
+      const contentIsCommandProtocol =
+        typeof content === "string" &&
+        commandProtocolMarkers.some((marker) => content.includes(marker));
+      if (contentIsCommandProtocol) {
+        hasCommandProtocol = true;
+      }
+      if (
+        !firstPrompt &&
+        record.type === "user" &&
+        record.isMeta !== true &&
+        !contentIsCommandProtocol
+      ) {
+        firstPrompt = extractClaudeSessionText(content);
       }
     } catch {
       // Claude 正在追加的末行可能尚未形成完整 JSON，只忽略该行。
@@ -2336,11 +2364,18 @@ async function readClaudeSessionSummary(filePath, expectedCwd) {
   //   return null;
   // }
   const fileStat = await stat(filePath);
+  const conversationKind =
+    hasCliEntrypoint && hasCommandProtocol && !hasHumanInput
+      ? "command_only"
+      : hasCommandProtocol
+        ? "unknown"
+        : "normal";
   return {
     id: sessionId,
     cwd: sessionCwd,
     title: claudeSessionTitle(sessionId, firstPrompt),
     updatedAt: fileStat.mtime.toISOString(),
+    conversationKind,
   };
 }
 

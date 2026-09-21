@@ -415,6 +415,23 @@ async fn sync_cli(
         let sessions = sessions
             .into_iter()
             .filter(|session| path_utils::paths_equal(&session.cwd, &workspace.root_path))
+            .collect::<Vec<_>>();
+        let filtered_session_count = sessions.len();
+        let mut skipped_command_only_session_ids = Vec::new();
+        let sessions = sessions
+            .into_iter()
+            .filter(|session| {
+                let is_command_only = session
+                    .metadata
+                    .get("claudeRemote")
+                    .and_then(|claude_remote| claude_remote.get("conversationKind"))
+                    .and_then(Value::as_str)
+                    == Some("command_only");
+                if is_command_only {
+                    skipped_command_only_session_ids.push(session.engine_thread_id.clone());
+                }
+                !is_command_only
+            })
             .map(|session| RemoteSessionSnapshot {
                 engine_thread_id: session.engine_thread_id,
                 title: session.title,
@@ -427,12 +444,14 @@ async fn sync_cli(
             })
             .collect::<Vec<_>>();
         log::info!(
-            "Claude list_sessions cwd 过滤完成: workspace_id={} workspace_root_path={} cli_id={} returned_session_count={} filtered_session_count={}",
+            "Claude list_sessions cwd 过滤完成: workspace_id={} workspace_root_path={} cli_id={} returned_session_count={} filtered_session_count={} skipped_command_only_count={} skipped_command_only_session_ids={:?}",
             workspace.id,
             workspace.root_path,
             cli_id,
             returned_session_count,
-            sessions.len()
+            filtered_session_count,
+            skipped_command_only_session_ids.len(),
+            skipped_command_only_session_ids
         );
         return persist_sessions(db, workspace, "claude", sessions).await;
     }
