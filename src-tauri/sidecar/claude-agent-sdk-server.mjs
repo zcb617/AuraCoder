@@ -3142,11 +3142,15 @@ async function handleQuery(req, persistentSession = null) {
           return false;
         }
         */
-        // 普通查询收到正式 ResultMessage 后立即关闭输入流，但继续消费 iterator 的尾部事件。
+        /*
+        // 已停用：主代理 ResultMessage 不代表后台子代理结束，不能在此关闭输入流；
+        // SDK 还要把 coder 完成通知通过这条流注回主代理，提前关流会切断子代理通信。
+        // 输入流收尾由 handleQuery 的 finally 块在 query 真正结束时处理。
         if (context.messageInput && !context.messageInput.readableEnded) {
           context.messageInput.push(null);
         }
-        // iteratorEnded 只表示尾部事件已经消费完成，不能阻止 ResultMessage 后的输入流关闭。
+        */
+        // iteratorEnded 只表示尾部事件已经消费完成，继续等待 iterator 结束后再完成本轮。
         if (!iteratorEnded) {
           return false;
         }

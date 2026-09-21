@@ -326,10 +326,10 @@ export function query({ prompt, options }) {
       };
     }
     if (resultBeforeTaskNotification) {
-      // 先发送正式 ResultMessage，再等待普通查询输入流关闭，最后发送尾部 task_notification。
+      // 先发送正式 ResultMessage，再直接发送尾部 task_notification。
+      // 依据官方收尾机制结论：sidecar 收到 ResultMessage 后不再关闭输入流，
+      // 必须继续存活并消费 SDK 尾部事件，因此这里不再等待输入流关闭。
       yield makeResult({ result: "formal background result" });
-      // sidecar 未在 ResultMessage 后关闭输入时，此处会一直等待，回归测试将明确超时。
-      await promptInputClosed;
     }
     yield {
       type: "system",
