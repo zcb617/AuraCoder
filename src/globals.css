@@ -1867,6 +1867,21 @@ button.linux-window-update-control:hover {
   font-size: 10px;
   white-space: nowrap;
 }
+/* 子代理卡头部：操作数/错误数/运行时间统计 + 状态图标的整行容器 */
+.claude-background-task-header-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+/* 头部统计文本（N 个操作 · N 个错误 · 运行时间），弱化色避免压过状态 */
+.claude-background-task-header-stats {
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  white-space: nowrap;
+}
 
 /* ── Chat Block Shared Styles ── */
 

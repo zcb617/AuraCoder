@@ -1126,6 +1126,9 @@ function ClaudeSubagentTaskCard({
   const taskStatusClass = `claude-background-task-status--${task.status}`;
   const elapsedEnd = task.status === "running" ? now : task.finishedAt ?? now;
   const failedActionCount = actions.filter((action) => action.status === "error").length;
+  // 头部状态行：操作数、错误数、运行时间放在状态图标前面，让用户不展开也能看到进度。
+  const elapsedLabel = formatClaudeBackgroundElapsed(task.startedAt, elapsedEnd);
+  const headerStats = `${actions.length} 个操作${failedActionCount > 0 ? ` · ${failedActionCount} 个错误` : ""} · ${elapsedLabel}`;
 
   return (
     <div className="msg-action-card claude-background-tasks-card">
@@ -1136,9 +1139,12 @@ function ClaudeSubagentTaskCard({
         expanded={expanded}
         onToggle={() => setExpanded(!expanded)}
         meta={
-          <span className={`claude-background-task-status ${taskStatusClass}`}>
-            {taskStatusIcon}
-            {taskStatusLabel}
+          <span className="claude-background-task-header-meta">
+            <span className="claude-background-task-header-stats">{headerStats}</span>
+            <span className={`claude-background-task-status ${taskStatusClass}`}>
+              {taskStatusIcon}
+              {taskStatusLabel}
+            </span>
           </span>
         }
       />
