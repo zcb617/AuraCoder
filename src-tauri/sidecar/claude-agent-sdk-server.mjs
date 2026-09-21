@@ -1360,6 +1360,9 @@ function emitApprovalRequest(context, actionType, summary, details, metadata = {
     ...(typeof metadata.requestId === "string" && metadata.requestId.length > 0
       ? { _claudeRequestId: metadata.requestId }
       : {}),
+    ...(metadata.sessionPermissionAvailable === true
+      ? { _claudeSessionPermissionAvailable: true }
+      : {}),
   };
   emit({
     id: context.id,
@@ -1374,12 +1377,19 @@ function emitApprovalRequest(context, actionType, summary, details, metadata = {
 
 /** 请求受控 Claude 工具授权，并将子代理标识传递到审批事件详情。 */
 async function requestPermissionApproval(context, toolName, toolInput, suggestions = [], metadata = {}) {
+  const sessionPermissionAvailable = Array.isArray(suggestions) && suggestions.some(
+    (suggestion) =>
+      typeof suggestion === "object" &&
+      suggestion !== null &&
+      !Array.isArray(suggestion) &&
+      suggestion.destination === "session",
+  );
   const approvalId = emitApprovalRequest(
     context,
     mapToolNameToActionType(toolName),
     summarizeTool(toolName, toolInput),
     toolInput ?? {},
-    metadata,
+    { ...metadata, sessionPermissionAvailable },
   );
 
   const permission = await new Promise((resolve) => {

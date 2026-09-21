@@ -3683,6 +3683,7 @@ describe("claude-agent-sdk-server sidecar", () => {
       _claudeAgentId: "coder-1",
       _claudeToolUseId: "permission-tool-1",
       _claudeRequestId: "request-approval-1",
+      _claudeSessionPermissionAvailable: true,
     });
     harness.send({
       id: "approval-response-accept-for-session",

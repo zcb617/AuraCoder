@@ -150,7 +150,8 @@ export function ApprovalBanner({
                     canUseDecisionActions &&
                     activeThreadApprovalDecisionCapabilities.includes("cancel");
                   const supportsSession =
-                    activeThreadApprovalDecisionCapabilities.includes("accept_for_session");
+                    activeThreadApprovalDecisionCapabilities.includes("accept_for_session") &&
+                    (!isClaudeApproval || details._claudeSessionPermissionAvailable === true);
                   const supportsAccept =
                     activeThreadApprovalDecisionCapabilities.includes("accept");
                   const proposedExecpolicyAmendment =
