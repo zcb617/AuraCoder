@@ -3150,14 +3150,15 @@ async function handleQuery(req, persistentSession = null) {
           context.messageInput.push(null);
         }
         */
+        emitTurnCompleted(context, context.sdkTerminalStatus || terminalStatus);       
         // iteratorEnded 只表示尾部事件已经消费完成，继续等待 iterator 结束后再完成本轮。
         if (!iteratorEnded) {
           return false;
         }
       }
 
-      // 轮次结束前先作废未回答审批，保证 approval_expired 先于 turn_completed 到达前端。
-      cleanupPendingApprovalsForQuery(context.id, "Claude turn completed before approval was answered.");
+      // 这是不可能的，不可能发生，还在等审批，而对话结束了。这是不可能的
+      // cleanupPendingApprovalsForQuery(context.id, "Claude turn completed before approval was answered.");
       emitTurnCompleted(context, context.sdkTerminalStatus || terminalStatus);
       /*
       // 旧版在发送 turn_completed 后才关闭普通查询输入流，当前已在 ResultMessage 后提前关闭。
