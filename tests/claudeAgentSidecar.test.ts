@@ -265,6 +265,8 @@ export function query({ prompt, options }) {
   const scenario = JSON.parse(process.env.CLAUDE_AGENT_SDK_MOCK_SCENARIO || "{}");
   const resultBeforeBackgroundTasksChanged =
     scenario.continuationBeforeBackgroundTasksChanged === true;
+  // 控制 mock 在 task_notification 之前发送正式 ResultMessage，覆盖 ResultMessage 尾部通知场景。
+  const resultBeforeTaskNotification = scenario.resultBeforeTaskNotification === true;
   const approvalDuringBackground = scenario.approvalDuringBackground === true;
   let closed = false;
   let syntheticInput = null;
@@ -312,6 +314,10 @@ export function query({ prompt, options }) {
         session_id: "background-session",
       };
     }
+    if (resultBeforeTaskNotification) {
+      // 先发送正式 ResultMessage，再继续发送尾部 task_notification，验证 iterator 会继续消费。
+      yield makeResult({ result: "formal background result" });
+    }
     yield {
       type: "system",
       subtype: "task_notification",
@@ -332,7 +338,7 @@ export function query({ prompt, options }) {
     if (approvalPromise) {
       await approvalPromise;
     }
-    if (resultBeforeBackgroundTasksChanged) {
+    if (resultBeforeBackgroundTasksChanged && !resultBeforeTaskNotification) {
       yield makeResult({ result: "formal background result" });
     }
     yield {
@@ -341,7 +347,7 @@ export function query({ prompt, options }) {
       tasks: [],
       session_id: "background-session",
     };
-    if (!resultBeforeBackgroundTasksChanged) {
+    if (!resultBeforeBackgroundTasksChanged && !resultBeforeTaskNotification) {
       yield makeResult({ result: "formal background result" });
     }
 
@@ -679,6 +685,67 @@ describe("claude-agent-sdk-server sidecar", () => {
         .map((event) => String(event.content));
       expect(textContents).toContain("formal background result");
       expect(textContents.join("\n")).not.toContain("unexpectedSyntheticInput");
+    } finally {
+      await rm(mock.root, { recursive: true, force: true });
+    }
+  });
+
+  it("continues consuming a task_notification after ResultMessage without duplicate completion or synthetic input", async () => {
+    const mock = await createBackgroundTaskMockModule();
+    try {
+      const queryId = "query-result-tail-task-notification";
+      const harness = await spawnHarness(
+        {
+          // 让正式 ResultMessage 先于 task_notification 到达，验证非持久 iterator 不提前收尾。
+          resultBeforeTaskNotification: true,
+        },
+        { CLAUDE_AGENT_SDK_MODULE: mock.modulePath },
+      );
+      harness.send({
+        id: queryId,
+        method: "query",
+        params: {
+          prompt: "verify ResultMessage tail task notification",
+          cwd: repoRoot,
+        },
+      });
+
+      const taskNotification = await harness.waitFor(
+        (event) =>
+          event.id === queryId &&
+          event.type === "notice" &&
+          event.sdkSubtype === "task_notification",
+      );
+      const completed = await harness.waitFor(
+        (event) => event.id === queryId && event.type === "turn_completed",
+      );
+      const textEvent = harness.events.find(
+        (event) => event.id === queryId && event.type === "text_delta",
+      );
+      const textIndex = textEvent ? harness.events.indexOf(textEvent) : -1;
+      const taskNotificationIndex = harness.events.indexOf(taskNotification);
+      const completedIndex = harness.events.indexOf(completed);
+
+      expect(textEvent).toMatchObject({
+        content: "formal background result",
+      });
+      // ResultMessage 后的 Notice 必须继续输出，且 TurnCompleted 只能在尾部事件消费后发出。
+      expect(textIndex).toBeGreaterThanOrEqual(0);
+      expect(textIndex).toBeLessThan(taskNotificationIndex);
+      expect(taskNotificationIndex).toBeLessThan(completedIndex);
+      expect(
+        harness.events.filter((event) => event.id === queryId && event.type === "error"),
+      ).toHaveLength(0);
+      expect(
+        harness.events.filter(
+          (event) => event.id === queryId && event.type === "turn_completed",
+        ),
+      ).toHaveLength(1);
+      const textContents = harness.events
+        .filter((event) => event.id === queryId && event.type === "text_delta")
+        .map((event) => String(event.content));
+      expect(textContents.join("\n")).not.toContain("unexpectedSyntheticInput");
+      expect(textContents.join("\n")).not.toContain("isSynthetic");
     } finally {
       await rm(mock.root, { recursive: true, force: true });
     }
@@ -1041,6 +1108,158 @@ describe("claude-agent-sdk-server sidecar", () => {
     ).resolves.toMatchObject({
       status: "completed",
       sessionId: "ordinary-session",
+    });
+  });
+
+  it("treats success with is_error=true as a failed ResultMessage", async () => {
+    const queryId = "query-result-success-is-error";
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "yield",
+          message: makeSuccessResult({
+            // 保留 subtype=success，覆盖 SDK ResultMessage 的 is_error 漏洞。
+            subtype: "success",
+            // is_error=true 必须进入失败分支，禁止输出 result 成功文本。
+            is_error: true,
+            result: "must not be emitted as successful text",
+            // 原始 SDK 错误列表供用户侧业务化错误文案使用。
+            errors: ["ResultMessage was marked as an error."],
+            // 原始终止原因分类供开发者诊断。
+            terminal_reason: "error",
+            // 原始错误来源分类供开发者诊断。
+            origin: "claude-agent-sdk",
+            // 合法数值 API 状态应透传到结构化 Error 事件。
+            api_error_status: 422,
+            session_id: "success-is-error-session",
+          }),
+        },
+      ],
+    });
+
+    harness.send({
+      id: queryId,
+      method: "query",
+      params: {
+        prompt: "verify success result error flag",
+        cwd: repoRoot,
+      },
+    });
+
+    const completed = await harness.waitFor(
+      (event) => event.id === queryId && event.type === "turn_completed",
+    );
+    const errorEvent = harness.events.find(
+      (event) => event.id === queryId && event.type === "error",
+    );
+    expect(errorEvent).toMatchObject({
+      // subtype=success 但 is_error=true 时，开发者侧分类仍保留原始 subtype。
+      errorType: "success",
+      // 合法数值 API 状态必须作为结构化字段透传。
+      apiErrorStatus: 422,
+      recoverable: false,
+      // 用户侧文案来自 formatSdkResultError，不是原始 JSON。
+      message: "ResultMessage was marked as an error.",
+    });
+    const errorDetails = JSON.parse(String(errorEvent?.errorDetails)) as Record<string, unknown>;
+    expect(errorDetails).toEqual({
+      subtype: "success",
+      is_error: true,
+      errors: ["ResultMessage was marked as an error."],
+      terminal_reason: "error",
+      origin: "claude-agent-sdk",
+      api_error_status: 422,
+    });
+    expect(String(errorEvent?.message)).not.toContain("subtype");
+    expect(
+      harness.events.filter((event) => event.id === queryId && event.type === "text_delta"),
+    ).toHaveLength(0);
+    expect(
+      harness.events.filter((event) => event.id === queryId && event.type === "error"),
+    ).toHaveLength(1);
+    expect(
+      harness.events.filter(
+        (event) => event.id === queryId && event.type === "turn_completed",
+      ),
+    ).toHaveLength(1);
+    expect(completed).toMatchObject({
+      status: "failed",
+      sessionId: "success-is-error-session",
+    });
+  });
+
+  it("preserves error_max_turns classification while keeping the user message business-facing", async () => {
+    const queryId = "query-result-error-max-turns";
+    const harness = await spawnHarness({
+      steps: [
+        {
+          type: "yield",
+          message: makeErrorResult({
+            // 使用 SDK error_* subtype 验证开发者侧分类不会被业务文案覆盖。
+            subtype: "error_max_turns",
+            // 明确标记 ResultMessage 为错误终态。
+            is_error: true,
+            // 原始错误列表用于生成用户可读业务错误文本。
+            errors: ["Claude reached the maximum number of turns."],
+            // 保留 SDK 的终止原因分类。
+            terminal_reason: "max_turns",
+            // 保留 SDK 的错误来源分类。
+            origin: "claude-agent-sdk",
+            // 合法 API 状态保留在结构化 Error 事件中。
+            api_error_status: 429,
+            session_id: "error-max-turns-session",
+          }),
+        },
+      ],
+    });
+
+    harness.send({
+      id: queryId,
+      method: "query",
+      params: {
+        prompt: "verify max turns classification",
+        cwd: repoRoot,
+      },
+    });
+
+    const completed = await harness.waitFor(
+      (event) => event.id === queryId && event.type === "turn_completed",
+    );
+    const errorEvent = harness.events.find(
+      (event) => event.id === queryId && event.type === "error",
+    );
+    expect(errorEvent).toMatchObject({
+      // 开发者侧保留 SDK 原始 error_max_turns 分类。
+      errorType: "error_max_turns",
+      apiErrorStatus: 429,
+      recoverable: false,
+      // 用户侧仍使用 formatSdkResultError 生成业务错误文本。
+      message: "Claude reached the maximum number of turns.",
+    });
+    const errorDetails = JSON.parse(String(errorEvent?.errorDetails)) as Record<string, unknown>;
+    expect(errorDetails).toEqual({
+      subtype: "error_max_turns",
+      is_error: true,
+      errors: ["Claude reached the maximum number of turns."],
+      terminal_reason: "max_turns",
+      origin: "claude-agent-sdk",
+      api_error_status: 429,
+    });
+    expect(String(errorEvent?.message)).not.toContain("{\"subtype\"");
+    expect(
+      harness.events.filter((event) => event.id === queryId && event.type === "text_delta"),
+    ).toHaveLength(0);
+    expect(
+      harness.events.filter((event) => event.id === queryId && event.type === "error"),
+    ).toHaveLength(1);
+    expect(
+      harness.events.filter(
+        (event) => event.id === queryId && event.type === "turn_completed",
+      ),
+    ).toHaveLength(1);
+    expect(completed).toMatchObject({
+      status: "failed",
+      sessionId: "error-max-turns-session",
     });
   });
 

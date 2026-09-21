@@ -3614,16 +3614,28 @@ async function handleQuery(req, persistentSession = null) {
           input: message.usage?.input_tokens,
           output: message.usage?.output_tokens,
         });
-        if (message.subtype === "success") {
-          if (
-            typeof message.result === "string" &&
-            message.result.length > 0 &&
-            !sawTextDelta
-          ) {
-            emit({ id, type: "text_delta", content: message.result });
-          }
-        } else {
+        if (message.subtype !== "success" || message.is_error === true) {
           terminalStatus = "failed";
+          // ResultMessage 的原始分类字段供开发者侧诊断和后端归类，用户侧仍只接收业务化错误文本。
+          const resultErrorDetails = JSON.stringify({
+            // SDK ResultMessage 的失败子类型，保留 error_* 等原始分类。
+            subtype: message.subtype,
+            // SDK 是否将本条 ResultMessage 标记为错误。
+            is_error: message.is_error,
+            // SDK 返回的原始错误列表，保留业务错误内容。
+            errors: message.errors,
+            // SDK 返回的终止原因分类。
+            terminal_reason: message.terminal_reason,
+            // SDK 返回的错误来源分类。
+            origin: message.origin,
+            // SDK 返回的原始 API 状态字段。
+            api_error_status: message.api_error_status,
+          });
+          const apiErrorStatus =
+            typeof message.api_error_status === "number" &&
+            Number.isFinite(message.api_error_status)
+              ? message.api_error_status
+              : undefined;
           if (!context.errorEmitted && !context.turnCompleted) {
             context.errorEmitted = true;
             emit({
@@ -3631,7 +3643,21 @@ async function handleQuery(req, persistentSession = null) {
               type: "error",
               message: formatSdkResultError(message),
               recoverable: false,
+              // ResultMessage subtype 是开发者侧可检索的原始错误分类。
+              errorType: message.subtype,
+              // 仅向开发者侧透传合法数值 API 状态，避免字符串等非法值污染结构化事件。
+              ...(apiErrorStatus !== undefined ? { apiErrorStatus } : {}),
+              // 结构化保留 ResultMessage 原始分类，用户侧 message 不使用该 JSON。
+              errorDetails: resultErrorDetails,
             });
+          }
+        } else {
+          if (
+            typeof message.result === "string" &&
+            message.result.length > 0 &&
+            !sawTextDelta
+          ) {
+            emit({ id, type: "text_delta", content: message.result });
           }
         }
         context.sdkResultReceived = true;
