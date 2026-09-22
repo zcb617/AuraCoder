@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
+import { ensureLinuxBuildDependencies } from './ensure-linux-build-deps.mjs';
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const keyPath = resolve(projectRoot, '.tauri-signing', 'auracoder-updater.key');
 const passwordPath = resolve(projectRoot, '.tauri-signing', 'auracoder-updater.key.password');
@@ -23,11 +24,25 @@ if (process.env.TAURI_SIGNING_PRIVATE_KEY) {
   console.log('[tauri-build] 已从 .tauri-signing 读取 updater 签名 key 与密码（本地模式）');
 }
 
+let buildEnv;
+try {
+  const dependencyResult = await ensureLinuxBuildDependencies({ env: process.env });
+  buildEnv = dependencyResult.env;
+  if (dependencyResult.installed) {
+    console.log('[tauri-build] 已自动安装 Linux 构建依赖');
+  }
+} catch (error) {
+  console.error(
+    '[tauri-build] Linux 系统依赖准备失败: ' +
+      (error instanceof Error ? error.message : String(error)),
+  );
+  process.exit(1);
+}
 const result = spawnSync('node scripts/check-tauri-architecture-references.mjs && tauri build', {
   cwd: projectRoot,
   shell: true,
   stdio: 'inherit',
-  env: process.env,
+  env: buildEnv,
 });
 
 if (result.error) {
