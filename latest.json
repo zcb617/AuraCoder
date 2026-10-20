@@ -1,0 +1,27 @@
+{
+  "version": "1.0.25",
+  "notes": "",
+  "pub_date": "2026-10-20T00:43:11Z",
+  "platforms": {
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRL0xxd0huak5DQTN5Z2Iwam50amRRQTlLUG1TRG9rdHhoNEk4NGxFSk51cVRoUUVEVU8ySUdIaEN0RVlLYUJxMHdJSUJyUUxMeUJhalFsM0oyZ3F6WmhiSm1weFBKTGdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDU4Mzg0CWZpbGU6QXVyYUNvZGVyLmFwcC50YXIuZ3oKRjd6N3BESlZHQkROb1NVcEg5NjhxVU9UWURPcDV2YUZsZlBDOFJYREZKNmZ5S0tWVXVrSWRLNjNRVGRjbEF2V2hBQ1N1Wll4STRocERXRjBkQjV3RHc9PQo=",
+      "url": "https://github.com/zcb617/AuraCoder/releases/download/v1.0.25/AuraCoder.app.tar.gz"
+    },
+    "darwin-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRL0xxd0huak5DQTN5Z2Iwam50amRRQTlLUG1TRG9rdHhoNEk4NGxFSk51cVRoUUVEVU8ySUdIaEN0RVlLYUJxMHdJSUJyUUxMeUJhalFsM0oyZ3F6WmhiSm1weFBKTGdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDU4Mzg0CWZpbGU6QXVyYUNvZGVyLmFwcC50YXIuZ3oKRjd6N3BESlZHQkROb1NVcEg5NjhxVU9UWURPcDV2YUZsZlBDOFJYREZKNmZ5S0tWVXVrSWRLNjNRVGRjbEF2V2hBQ1N1Wll4STRocERXRjBkQjV3RHc9PQo=",
+      "url": "https://github.com/zcb617/AuraCoder/releases/download/v1.0.25/AuraCoder.app.tar.gz"
+    },
+    "linux-x86_64-deb": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRL0xxd0huak5DQTVPODhJZDgrOW9udEZ0ejFSaS9VS2xzbDAxMGYwTjF5V3Y3TU81MFdLL0ZhZ2c4RFJIZ2pXdWg0TEpnZmNlU0V3NzNaT3JaRGN4QnZNNEhwa21Rd0FZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDU2OTc3CWZpbGU6QXVyYUNvZGVyXzEuMC4yNV9hbWQ2NC5kZWIKVXRBKzcvSXY1aTIydk5yUHR4cXNhR3llZ0RuRkhUSlEzWlhLV2RQSm5xOFJMZXlQSzJtbEgyN0hMOUlRcm9Yb3lmeE1nRlU2UjFIUU9kZ3F4WTROQ1E9PQo=",
+      "url": "https://github.com/zcb617/AuraCoder/releases/download/v1.0.25/AuraCoder_1.0.25_amd64.deb"
+    },
+    "linux-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRL0xxd0huak5DQTVPODhJZDgrOW9udEZ0ejFSaS9VS2xzbDAxMGYwTjF5V3Y3TU81MFdLL0ZhZ2c4RFJIZ2pXdWg0TEpnZmNlU0V3NzNaT3JaRGN4QnZNNEhwa21Rd0FZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDU2OTc3CWZpbGU6QXVyYUNvZGVyXzEuMC4yNV9hbWQ2NC5kZWIKVXRBKzcvSXY1aTIydk5yUHR4cXNhR3llZ0RuRkhUSlEzWlhLV2RQSm5xOFJMZXlQSzJtbEgyN0hMOUlRcm9Yb3lmeE1nRlU2UjFIUU9kZ3F4WTROQ1E9PQo=",
+      "url": "https://github.com/zcb617/AuraCoder/releases/download/v1.0.25/AuraCoder_1.0.25_amd64.deb"
+    },
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRL0xxd0huak5DQThUMjl1TGpheXdjS3U0MGxjWFppaEJoTlVvYXFZNk5DbTlJNjZlb1RKZlRkUEFiYnNZN3BnejA3MldzSCtXUWllc1hNSXZKTXNySWZPRmlkdGlaWEF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkyNDU3MzY2CWZpbGU6QXVyYUNvZGVyXzEuMC4yNV94NjQtc2V0dXAuZXhlCkhzZmM0MHQ5K1dTTHJRZEZnVUJyYlFwRG1ReFdkN0xWSUQ2QjVPeG5XKytzcHgzbkhDR0s3KzJDUitIQmpGWkpGYSsrRHZjRkxLOU10RVdwZEV0OEFRPT0K",
+      "url": "https://github.com/zcb617/AuraCoder/releases/download/v1.0.25/AuraCoder_1.0.25_x64-setup.exe"
+    }
+  }
+}
