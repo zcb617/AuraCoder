@@ -563,6 +563,7 @@
       "codexThreadRolledBack_one": "Uma nova ramificação com rollback do último {{count}} turno foi criada.",
       "codexThreadRolledBack_other": "Uma nova ramificação com rollback dos últimos {{count}} turnos foi criada.",
       "codexThreadCompactionStarted": "A compactação da thread do Codex foi iniciada.",
+      "codexThreadCompacted": "O contexto da conversa do Codex foi compactado.",
       "codexThreadResumed": "A thread remota do Codex selecionada foi anexada.",
       "openCodeSessionResumed": "A sessão remota do OpenCode selecionada foi anexada.",
       "serviceTierUpdated": "Camada de serviço -> {{value}}",

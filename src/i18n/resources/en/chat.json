@@ -563,6 +563,7 @@
       "codexThreadRolledBack_one": "Created a new rollback branch with the last {{count}} turn removed.",
       "codexThreadRolledBack_other": "Created a new rollback branch with the last {{count}} turns removed.",
       "codexThreadCompactionStarted": "Started Codex thread compaction.",
+      "codexThreadCompacted": "Codex thread context compacted.",
       "codexThreadResumed": "Attached the selected remote Codex thread.",
       "openCodeSessionResumed": "Attached the selected remote OpenCode session.",
       "serviceTierUpdated": "Service tier -> {{value}}",

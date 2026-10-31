@@ -2896,7 +2896,8 @@ pub async fn compact_codex_thread(
     if thread.engine_id != "codex" {
         return Err("native compact is only available for Codex threads".to_string());
     }
-    reject_ssh_remote_codex_local_only_action(state.inner(), &thread, "压缩").await?;
+    // SSH 压缩由 CodexCli 按工作区位置分派到远端句柄，不再走仅本机限制。
+    // reject_ssh_remote_codex_local_only_action(state.inner(), &thread, "压缩").await?;
     let engine_thread_id = thread
         .engine_thread_id
         .clone()
@@ -2914,7 +2915,10 @@ pub async fn compact_codex_thread(
         .await
         .map_err(err_to_string)?;
 
-    Ok(thread)
+    // 返回压缩完成后持久化的上下文快照，前端不再复用压缩前的 token 数量。
+    run_db(db, move |db| db::threads::get_thread(db, &thread_id))
+        .await?
+        .ok_or_else(|| "压缩完成后会话不存在".to_string())
 }
 
 #[tauri::command]

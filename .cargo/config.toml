@@ -1,0 +1,6 @@
+# 当前项目的 Cargo 依赖统一使用阿里云稀疏索引镜像。
+[source.crates-io]
+replace-with = "aliyun"
+
+[source.aliyun]
+registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"

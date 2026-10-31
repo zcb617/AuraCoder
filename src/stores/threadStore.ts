@@ -731,7 +731,8 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       return compacted;
     } catch (error) {
       set({ loading: false, error: String(error) });
-      return null;
+      // return null;
+      throw error;
     }
   },
   attachCodexRemoteThread: async (workspaceId, engineThreadId) => {

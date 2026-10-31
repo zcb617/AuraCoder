@@ -18,6 +18,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::time::timeout;
 use tokio::{
     fs as tokio_fs,
@@ -2031,8 +2032,19 @@ impl CodexEngine {
         })
     }
 
-    pub async fn compact_thread(&self, engine_thread_id: &str) -> anyhow::Result<()> {
+    pub async fn compact_thread(&self, engine_thread_id: &str) -> anyhow::Result<Option<(u64, u64)>> {
         let transport = self.ensure_ready_transport().await?;
+        // app-server 重启后历史会话可能尚未加载；只恢复原会话，不创建替代会话。
+        request_with_fallback(
+            transport.as_ref(),
+            THREAD_RESUME_METHODS,
+            serde_json::json!({ "threadId": engine_thread_id }),
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .context("压缩前恢复 Codex 会话失败")?;
+        // 在发起请求前订阅，避免遗漏紧随 RPC 响应到达的完成事件。
+        let mut incoming = transport.subscribe();
         request_with_fallback(
             transport.as_ref(),
             THREAD_COMPACT_START_METHODS,
@@ -2044,7 +2056,58 @@ impl CodexEngine {
         .await
         .context("failed to start codex thread compaction")?;
 
-        Ok(())
+        // 旧逻辑在 RPC 返回 {} 时即返回成功；现在等待该压缩轮次的最终结果。
+        // Ok(())
+        let result = tokio::time::timeout(TURN_REQUEST_TIMEOUT, async {
+            let mut turn_id: Option<String> = None;
+            let mut compacted = false;
+            let mut usage = None;
+            loop {
+                let message = incoming.recv().await.context("等待 Codex 压缩结果时事件连接中断")?;
+                let IncomingMessage::Notification { method, params } = message.message else {
+                    continue;
+                };
+                let method = normalize_method(&method);
+                let params = raw_value_to_value(&params);
+                if matches!(method.as_str(), "transport/eof" | "transport/readerror" | "transport/read_error") {
+                    anyhow::bail!("等待 Codex 压缩结果时连接断开: {params}");
+                }
+                if extract_thread_id_from_params(&params).as_deref() != Some(engine_thread_id) {
+                    continue;
+                }
+                if method == "turn/started" && turn_id.is_none() {
+                    turn_id = extract_turn_id(&params);
+                    log::info!("Codex compaction started: engine_thread_id={engine_thread_id} turn_id={turn_id:?}");
+                }
+                if turn_id.is_some() && extract_turn_id(&params).is_some()
+                    && extract_turn_id(&params) != turn_id {
+                    continue;
+                }
+                if let Some(snapshot) = extract_context_usage_limits(&params) {
+                    if let (Some(current), Some(max)) = (snapshot.current_tokens, snapshot.max_context_tokens) {
+                        if max > 0 { usage = Some((current, max)); }
+                    }
+                }
+                if method == "error" && params.get("willRetry").and_then(Value::as_bool) != Some(true) {
+                    anyhow::bail!("Codex 会话压缩失败: {params}");
+                }
+                if method == "item/completed"
+                    && params.pointer("/item/type").and_then(Value::as_str) == Some("contextCompaction") {
+                    compacted = true;
+                }
+                if method == "turn/completed" && turn_id.is_some() {
+                    let status = params.pointer("/turn/status").and_then(Value::as_str);
+                    anyhow::ensure!(status == Some("completed") && compacted,
+                        "Codex 压缩未成功完成: {params}");
+                    log::info!("Codex compaction completed: engine_thread_id={engine_thread_id} turn_id={turn_id:?} usage={usage:?}");
+                    return Ok(usage);
+                }
+            }
+        }).await.context("等待 Codex 压缩结果超时，尚未确认完成，请勿重复提交")?;
+        if let Err(error) = &result {
+            log::error!("Codex compaction failed: engine_thread_id={engine_thread_id} error={error:#}");
+        }
+        result
     }
 
     pub async fn start_review(

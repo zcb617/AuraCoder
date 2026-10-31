@@ -563,6 +563,7 @@
       "codexThreadRolledBack_one": "已创建新的回滚分支，并移除了最后 {{count}} 轮。",
       "codexThreadRolledBack_other": "已创建新的回滚分支，并移除了最后 {{count}} 轮。",
       "codexThreadCompactionStarted": "已开始 Codex 会话压缩。",
+      "codexThreadCompacted": "Codex 会话上下文压缩完成。",
       "codexThreadResumed": "已附加所选远程 Codex 会话。",
       "openCodeSessionResumed": "已附加所选远程 OpenCode 会话。",
       "serviceTierUpdated": "服务层级 → {{value}}",

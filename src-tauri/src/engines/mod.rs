@@ -744,7 +744,8 @@ impl EngineManager {
     }
 
     pub async fn compact_codex_thread(&self, engine_thread_id: &str) -> anyhow::Result<()> {
-        self.codex.compact_thread(engine_thread_id).await
+        // 兼容仅关心操作结果的旧入口；用量快照由 CliTool 实现负责保存。
+        self.codex.compact_thread(engine_thread_id).await.map(|_| ())
     }
 
     pub async fn archive_codex_thread(&self, engine_thread_id: &str) -> anyhow::Result<()> {

@@ -2003,15 +2003,42 @@ impl CliTool for CodexCli {
         context: &CliExecutionContext,
         engine_thread_id: &str,
     ) -> Result<()> {
-        self.load_workspace(context).await?;
-        anyhow::ensure!(
-            context.location_kind == CliLocationKind::Local,
-            "SSH 远端 Codex 暂未接入压缩，当前不会调用本机 Codex 执行"
-        );
-        self.local_engine()
-            .await?
-            .compact_thread(engine_thread_id)
-            .await
+        let workspace = self.load_workspace(context).await?;
+        // 旧实现仅允许本机；现在按正式工作区位置获取已有生命周期管理的句柄。
+        // anyhow::ensure!(context.location_kind == CliLocationKind::Local,
+        //     "SSH 远端 Codex 暂未接入压缩，当前不会调用本机 Codex 执行");
+        let engine = match context.location_kind {
+            CliLocationKind::Local => self.local_engine().await?,
+            CliLocationKind::Ssh => remote_project_codex_runtime_service::runtime(&workspace).await?,
+        };
+        let usage = engine.compact_thread(engine_thread_id).await.map_err(|error| {
+            log::error!("Codex thread compaction failed: workspace_id={} engine_thread_id={engine_thread_id} error={error:#}", workspace.id);
+            error
+        })?;
+        if let Some((current, max)) = usage {
+            let db = self.state.db.clone();
+            let workspace_id = workspace.id.clone();
+            let snapshot_engine_thread_id = engine_thread_id.to_owned();
+            let saved = tokio::task::spawn_blocking(move || -> Result<()> {
+                let thread = db::threads::find_thread_by_workspace_engine_thread_id(
+                    &db, &workspace_id, "codex", &snapshot_engine_thread_id,
+                )?.context("压缩后保存上下文用量失败：会话不存在")?;
+                db::threads::update_thread(&db, &crate::models::ThreadUpdateDto {
+                    id: thread.id,
+                    context_current_tokens: Some(i64::try_from(current)?),
+                    context_max_tokens: Some(i64::try_from(max)?),
+                    context_usage_updated_at: Some(runtime_env::system_time_rfc3339()),
+                    ..Default::default()
+                })?;
+                Ok(())
+            }).await.context("压缩后保存上下文用量任务失败")
+                .and_then(|result| result);
+            if let Err(error) = saved {
+                // 原生压缩已完成，用量持久化异常不能导致用户误判并重复压缩。
+                log::error!("Codex compaction completed but context usage persistence failed: workspace_id={} engine_thread_id={engine_thread_id} error={error:#}", workspace.id);
+            }
+        }
+        Ok(())
     }
 
     async fn start_review(
