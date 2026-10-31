@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::{
     cli_tools::{
@@ -16,7 +16,7 @@ use crate::{
     engines::SandboxPolicy,
     engines::ThreadSyncSnapshot,
     models::{
-        CodexRemoteThreadDto, CodexRemoteThreadPageDto, MessageStatusDto, OpenCodeRemoteSessionDto,
+        CodexRemoteThreadDto, CodexRemoteThreadPageDto, MessageDto, MessageStatusDto, OpenCodeRemoteSessionDto,
         OpenCodeRemoteSessionPageDto, PermissionComponentJson, ThreadDto, ThreadStatusDto,
         ThreadUpdateDto, TrustLevelDto,
     },
@@ -2876,8 +2876,72 @@ pub async fn rollback_codex_thread(
     .await
 }
 
+/// 通过消息更新事件让手动压缩状态在当前会话中原位显示。
+async fn save_compaction_notice(
+    state: &AppState,
+    thread_id: &str,
+    message_id: Option<&str>,
+    status: &str,
+    error: Option<&str>,
+) -> Result<MessageDto, String> {
+    let thread_id = thread_id.to_string();
+    let message_id = message_id.map(str::to_string);
+    let status = status.to_string();
+    let error = error.map(str::to_string);
+    run_db(state.db.clone(), move |db| {
+        let message_id = match message_id {
+            Some(message_id) => message_id,
+            None => db::messages::insert_assistant_placeholder(
+                db,
+                &thread_id,
+                Some("codex"),
+                None,
+                None,
+            )?
+            .id,
+        };
+        let level = match status.as_str() {
+            "failed" => "error",
+            "unconfirmed" => "warning",
+            _ => "info",
+        };
+        let message = match status.as_str() {
+            "in_progress" => "Compacting context...",
+            "completed" => "Context compaction completed.",
+            "failed" => "Context compaction failed.",
+            _ => "Context compaction result is unconfirmed.",
+        };
+        let mut metadata = serde_json::json!({
+            "type": "context_compaction",
+            "status": status,
+        });
+        if let Some(error) = error {
+            metadata["error"] = Value::String(error);
+        }
+        let blocks = serde_json::json!([{
+            "type": "notice",
+            "kind": "context_compaction",
+            "level": level,
+            "title": "Context compaction",
+            "message": message,
+            "metadata": metadata,
+        }]);
+        db::messages::update_assistant_blocks_json(
+            db,
+            &message_id,
+            &serde_json::to_string(&blocks)?,
+            MessageStatusDto::Completed,
+            None,
+        )?;
+        db::messages::get_message(db, &message_id)?
+            .ok_or_else(|| anyhow::anyhow!("压缩状态消息保存后无法读取: {message_id}"))
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn compact_codex_thread(
+    app: AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<ThreadDto, String> {
@@ -2911,9 +2975,96 @@ pub async fn compact_codex_thread(
         .await
         .map_err(err_to_string)?;
     let cli: &dyn CliTool = codex.as_ref();
-    cli.compact_thread(&context, &engine_thread_id)
-        .await
-        .map_err(err_to_string)?;
+    // 旧业务直接调用路径保留迁移留痕，改由持久化消息承载手动压缩状态：
+    // cli.compact_thread(&context, &engine_thread_id).await.map_err(err_to_string)?;
+    // 手动压缩状态独立持久化为已完成消息，Notice 本身承载实际进行状态。
+    let in_progress_message = save_compaction_notice(
+        state.inner(),
+        &thread_id,
+        None,
+        "in_progress",
+        None,
+    )
+    .await
+    .map_err(|error| {
+        log::error!("Failed to persist Codex compaction start message for thread {thread_id}: {error}");
+        error
+    })?;
+    let event_name = format!("message-updated-{thread_id}");
+    if let Err(error) = app.emit(&event_name, &in_progress_message) {
+        log::error!("Failed to emit Codex compaction start message for thread {thread_id}: {error}");
+    }
+
+    let compaction_result = match cli.compact_thread(&context, &engine_thread_id).await {
+        Ok(result) => result,
+        Err(error) => {
+            let compaction_error = err_to_string(error);
+            let status = if compaction_error.contains("超时")
+                || compaction_error.contains("尚未确认")
+            {
+                "unconfirmed"
+            } else {
+                "failed"
+            };
+            match save_compaction_notice(
+                state.inner(),
+                &thread_id,
+                Some(&in_progress_message.id),
+                status,
+                Some(&compaction_error),
+            )
+            .await
+            {
+                Ok(message) => {
+                    if let Err(error) = app.emit(&event_name, &message) {
+                        log::error!("Failed to emit Codex compaction failure message for thread {thread_id}: {error}");
+                    }
+                }
+                Err(error) => {
+                    log::error!("Failed to persist Codex compaction failure for thread {thread_id}: {error}");
+                }
+            }
+            return Err(compaction_error);
+        }
+    };
+
+    // 只绑定压缩状态助手消息，避免历史导入为手动压缩重新创建重复通知。
+    let binding_thread_id = thread_id.clone();
+    let binding_message_id = in_progress_message.id.clone();
+    let remote_turn_id = compaction_result.remote_turn_id.clone();
+    let binding_error = run_db(state.db.clone(), move |db| {
+        db::messages::bind_message_to_remote_turn(
+            db,
+            &binding_thread_id,
+            &binding_message_id,
+            &remote_turn_id,
+        )
+    })
+    .await
+    .err();
+    if let Some(error) = binding_error.as_deref() {
+        log::error!("Codex compaction completed but status message binding failed for thread {thread_id}: {error}");
+    }
+
+    // 压缩成功后将原消息更新为完成状态，并同步给当前对话视图。
+    let completed_message = save_compaction_notice(
+        state.inner(),
+        &thread_id,
+        Some(&in_progress_message.id),
+        "completed",
+        None,
+    )
+    .await
+    .map_err(|error| {
+        log::error!("Codex compaction completed but state persistence failed for thread {thread_id}: {error}");
+        format!("压缩已完成，状态保存失败：{error}")
+    })?;
+    if let Err(error) = app.emit(&event_name, &completed_message) {
+        log::error!("Failed to emit Codex compaction completion message for thread {thread_id}: {error}");
+    }
+    if let Some(error) = binding_error {
+        return Err(format!("压缩已完成，状态关联失败：{error}"));
+    }
 
     // 返回压缩完成后持久化的上下文快照，前端不再复用压缩前的 token 数量。
     run_db(db, move |db| db::threads::get_thread(db, &thread_id))

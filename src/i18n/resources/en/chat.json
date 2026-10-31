@@ -617,6 +617,13 @@
     }
   },
   "messageBlocks": {
+    "contextCompaction": {
+      "title": "Context compaction",
+      "inProgress": "Compacting context…",
+      "completed": "Context compaction completed.",
+      "failed": "Context compaction failed.",
+      "unconfirmed": "Context compaction result is unconfirmed."
+    },
     "diffFallback": "diff ({{scope}})",
     "parsing": "Parsing...",
     "parsingDiff": "Parsing diff...",

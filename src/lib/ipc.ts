@@ -1044,7 +1044,25 @@ export async function listenThreadEvents(
   threadId: string,
   onEvent: (event: StreamEvent) => void
 ): Promise<UnlistenFn> {
-  return listen<StreamEvent>(`stream-event-${threadId}`, ({ payload }) => onEvent(payload));
+  // 同时接收轮次引擎事件和已持久化消息快照，统一交给当前会话事件队列。
+  const unlistenStream = await listen<StreamEvent>(
+    `stream-event-${threadId}`,
+    ({ payload }) => onEvent(payload),
+  );
+  try {
+    const unlistenMessage = await listen<Message>(
+      `message-updated-${threadId}`,
+      ({ payload }) => onEvent({ type: "MessageUpdated", message: payload }),
+    );
+    return () => {
+      unlistenMessage();
+      unlistenStream();
+    };
+  } catch (error) {
+    // 第二个监听安装失败时释放已安装的引擎事件监听并保留原始异常。
+    unlistenStream();
+    throw error;
+  }
 }
 
 export interface CliServiceRestartRequiredEvent {

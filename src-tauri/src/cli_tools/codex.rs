@@ -2002,7 +2002,7 @@ impl CliTool for CodexCli {
         &self,
         context: &CliExecutionContext,
         engine_thread_id: &str,
-    ) -> Result<()> {
+    ) -> Result<super::CliCompactionResult> {
         let workspace = self.load_workspace(context).await?;
         // 旧实现仅允许本机；现在按正式工作区位置获取已有生命周期管理的句柄。
         // anyhow::ensure!(context.location_kind == CliLocationKind::Local,
@@ -2011,10 +2011,19 @@ impl CliTool for CodexCli {
             CliLocationKind::Local => self.local_engine().await?,
             CliLocationKind::Ssh => remote_project_codex_runtime_service::runtime(&workspace).await?,
         };
-        let usage = engine.compact_thread(engine_thread_id).await.map_err(|error| {
+        let (remote_turn_id, mut usage) = engine.compact_thread(engine_thread_id).await.map_err(|error| {
             log::error!("Codex thread compaction failed: workspace_id={} engine_thread_id={engine_thread_id} error={error:#}", workspace.id);
             error
         })?;
+        // 原生压缩未携带上下文用量时，从同一生命周期读取一次实际线程快照。
+        if usage.is_none() {
+            match engine.context_usage_snapshot(engine_thread_id).await {
+                Ok(snapshot) => usage = snapshot,
+                Err(error) => {
+                    log::error!("Codex compaction completed but context usage snapshot refresh failed: workspace_id={} engine_thread_id={engine_thread_id} error={error:#}", workspace.id);
+                }
+            }
+        }
         if let Some((current, max)) = usage {
             let db = self.state.db.clone();
             let workspace_id = workspace.id.clone();
@@ -2037,8 +2046,10 @@ impl CliTool for CodexCli {
                 // 原生压缩已完成，用量持久化异常不能导致用户误判并重复压缩。
                 log::error!("Codex compaction completed but context usage persistence failed: workspace_id={} engine_thread_id={engine_thread_id} error={error:#}", workspace.id);
             }
+        } else {
+            log::warn!("Codex compaction completed without a reliable context usage snapshot: workspace_id={} engine_thread_id={engine_thread_id}", workspace.id);
         }
-        Ok(())
+        Ok(super::CliCompactionResult { remote_turn_id })
     }
 
     async fn start_review(

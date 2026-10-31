@@ -600,14 +600,24 @@ export interface ClaudeBackgroundTaskMetadata {
   activeTaskCount: number;
 }
 
+/** Codex 上下文压缩 Notice 的统一状态数据。 */
+export interface ContextCompactionMetadata {
+  /** 标识该结构化元数据属于上下文压缩业务。 */
+  type: "context_compaction";
+  /** 标记压缩正在执行、已完成、失败或未确认。 */
+  status: "in_progress" | "completed" | "failed" | "unconfirmed";
+  /** 压缩失败或未确认时保留的原始错误文本。 */
+  error?: string;
+}
+
 export interface NoticeBlock {
   type: "notice";
   kind: string;
   level: "info" | "warning" | "error";
   title: string;
   message: string;
-  /** Notice 业务可选的结构化元数据。 */
-  metadata?: ClaudeBackgroundTaskMetadata;
+  /** Claude 后台任务或 Codex 上下文压缩使用的结构化元数据。 */
+  metadata?: ClaudeBackgroundTaskMetadata | ContextCompactionMetadata;
 }
 
 export interface ActionBlock {
@@ -1719,8 +1729,16 @@ export interface NoticeEvent {
   level: "info" | "warning" | "error";
   title: string;
   message: string;
-  /** Notice 事件可选的结构化元数据。 */
-  metadata?: ClaudeBackgroundTaskMetadata;
+  /** Claude 后台任务或 Codex 上下文压缩使用的结构化元数据。 */
+  metadata?: ClaudeBackgroundTaskMetadata | ContextCompactionMetadata;
+}
+
+/** 后端发送的已持久化消息快照事件，不代表普通对话轮次变化。 */
+export interface MessageUpdatedEvent {
+  /** 标识该事件携带的是消息快照更新。 */
+  type: "MessageUpdated";
+  /** 已写入数据库并可直接用于当前会话显示的完整消息。 */
+  message: Message;
 }
 
 export interface SteerAppliedEvent {
@@ -1748,6 +1766,7 @@ export type StreamEvent =
   | ApprovalExpiredEvent
   | ModelReroutedEvent
   | NoticeEvent
+  | MessageUpdatedEvent
   | SteerAppliedEvent
   | ErrorEvent
   | UsageLimitsUpdatedEvent;

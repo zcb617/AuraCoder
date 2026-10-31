@@ -617,6 +617,13 @@
     }
   },
   "messageBlocks": {
+    "contextCompaction": {
+      "title": "Compactação do contexto",
+      "inProgress": "Compactando o contexto…",
+      "completed": "Compactação do contexto concluída.",
+      "failed": "Falha ao compactar o contexto.",
+      "unconfirmed": "Não foi possível confirmar o resultado da compactação do contexto."
+    },
     "diffFallback": "diff ({{scope}})",
     "parsing": "Analisando...",
     "parsingDiff": "Analisando diff...",

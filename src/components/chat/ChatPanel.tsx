@@ -3642,16 +3642,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       throw new Error(t("panel.toasts.codexThreadCompactFailed"));
     }
 
-    toast.success(t("panel.toasts.codexThreadCompacted"));
-    try {
-      const refreshedUsage = await ipc.getCliContextUsage(compactedThread.id);
-      if (useChatStore.getState().threadId === compactedThread.id) {
-        useChatStore.setState({ contextUsage: refreshedUsage, contextUsageLoading: false });
-      }
-    } catch (error) {
-      // 压缩已经完成，用量刷新失败只记录原始异常，避免误报为压缩失败。
-      console.error("Failed to refresh context usage after compaction", error);
-    }
+    // 旧成功提示由对话内持久化压缩状态替代：toast.success(t("panel.toasts.codexThreadCompacted"));
+    // 旧用量读取与直接写 store 由统一竞态保护 action 替代。
+    await useChatStore.getState().refreshContextUsage(compactedThread.id);
   }
 
   async function onAttachCodexRemoteThread(engineThreadId: string) {

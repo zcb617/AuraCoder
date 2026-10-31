@@ -14,6 +14,7 @@ import type {
   ChatProviderUsageLimits,
   CliContextUsage,
   ContentBlock,
+  ContextCompactionMetadata,
   MentionBlock,
   Message,
   MessageWindowCursor,
@@ -44,6 +45,8 @@ interface ChatState {
   contextUsage: CliContextUsage | null;
   /** 当前线程上下文快照恢复请求是否仍在执行。 */
   contextUsageLoading: boolean;
+  /** 完成上下文压缩后从当前 CLI 读取并同步真实上下文用量。 */
+  refreshContextUsage: (threadId: string) => Promise<void>;
   /** 当前 CLI 账号额度窗口快照，不承载线程上下文。 */
   usageLimits: ChatProviderUsageLimits | null;
   /** 当前 CLI 账号额度恢复请求是否仍在执行。 */
@@ -156,13 +159,52 @@ function isThreadTurnActive(status: ThreadStatus): boolean {
   return status === "streaming" || status === "awaiting_approval";
 }
 
+/** 仅识别带有压缩业务标记和合法状态的上下文元数据。 */
+function isContextCompactionMetadata(metadata: unknown): metadata is ContextCompactionMetadata {
+  if (typeof metadata !== "object" || metadata === null) {
+    return false;
+  }
+  const value = metadata as { type?: unknown; status?: unknown };
+  return (
+    value.type === "context_compaction" &&
+    (value.status === "in_progress" ||
+      value.status === "completed" ||
+      value.status === "failed" ||
+      value.status === "unconfirmed")
+  );
+}
+
+/** 判断 Notice 或持久化消息中是否包含已完成的上下文压缩状态。 */
+function isCompletedContextCompactionNotice(kind: string, metadata: unknown): boolean {
+  return (
+    kind === "context_compacted" ||
+    kind.startsWith("codex_context_compaction_") ||
+    (isContextCompactionMetadata(metadata) && metadata.status === "completed")
+  );
+}
+
+/** 检查当前事件是否需要触发完成压缩后的真实用量补读。 */
+function eventContainsCompletedContextCompaction(event: StreamEvent): boolean {
+  if (event.type === "Notice") {
+    return isCompletedContextCompactionNotice(event.kind, event.metadata);
+  }
+  if (event.type === "MessageUpdated") {
+    return (event.message.blocks ?? []).some(
+      (block) =>
+        block.type === "notice" &&
+        isCompletedContextCompactionNotice(block.kind, block.metadata),
+    );
+  }
+  return false;
+}
+
 /** 根据后端事件更新线程运行态；仅消费后端最终完成或用户主动终止结果。 */
 function applyRuntimeStateFromEvent(
   status: ThreadStatus,
   streaming: boolean,
   event: StreamEvent,
 ): Pick<ChatState, "status" | "streaming"> {
-  if (event.type === "UsageLimitsUpdated") {
+  if (event.type === "UsageLimitsUpdated" || event.type === "MessageUpdated") {
     return { status, streaming };
   }
 
@@ -1154,7 +1196,9 @@ function normalizeBlocks(blocks?: ContentBlock[]): ContentBlock[] | undefined {
     if (
       block.type === "notice" &&
       block.kind === "claude_background_tasks" &&
-      block.metadata?.backgroundTasks
+      block.metadata !== undefined &&
+      "backgroundTasks" in block.metadata &&
+      Array.isArray(block.metadata.backgroundTasks)
     ) {
       const hasRunningTask = block.metadata.backgroundTasks.some(
         (task) => task.status === "running",
@@ -1608,6 +1652,24 @@ function resolveAssistantTargetFromEvent(
 }
 
 function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: string): Message[] {
+  // 已持久化消息快照按消息 ID 合并，不创建助手轮次或改变其他消息。
+  if (event.type === "MessageUpdated") {
+    if (event.message.threadId !== threadId) {
+      return messages;
+    }
+    const normalizedMessage = normalizeMessages([event.message])[0];
+    const messageIndex = messages.findIndex((message) => message.id === normalizedMessage.id);
+    if (messageIndex < 0) {
+      return [...messages, normalizedMessage];
+    }
+    if (messages[messageIndex] === normalizedMessage) {
+      return messages;
+    }
+    return messages.map((message, index) =>
+      index === messageIndex ? normalizedMessage : message,
+    );
+  }
+
   if (event.type === "UsageLimitsUpdated") {
     return messages;
   }
@@ -2036,7 +2098,9 @@ function applyStreamEvent(messages: Message[], event: StreamEvent, threadId: str
       if (
         block.type === "notice" &&
         block.kind === "claude_background_tasks" &&
-        block.metadata?.backgroundTasks
+        block.metadata !== undefined &&
+        "backgroundTasks" in block.metadata &&
+        Array.isArray(block.metadata.backgroundTasks)
       ) {
         const hasRunningTask = block.metadata.backgroundTasks.some(
           (task) => task.status === "running",
@@ -2113,6 +2177,50 @@ export const useChatStore = create<ChatState>((set, get) => ({
   contextUsageLoading: false,
   usageLimits: null,
   usageLimitsLoading: false,
+  refreshContextUsage: async (threadId) => {
+    const bindSeq = activeThreadBindSeq;
+    const startingState = get();
+    const contextUsageAtStart = startingState.contextUsage;
+    if (startingState.threadId !== threadId) {
+      return;
+    }
+
+    // 读取开始时保留当前会话正在恢复的提示状态。
+    set((state) =>
+      state.threadId === threadId && state.contextUsage === contextUsageAtStart
+        ? { ...state, contextUsageLoading: true }
+        : state,
+    );
+    try {
+      const refreshedContextUsage = await ipc.getCliContextUsage(threadId);
+      if (
+        bindSeq !== activeThreadBindSeq ||
+        get().threadId !== threadId ||
+        get().contextUsage !== contextUsageAtStart
+      ) {
+        return;
+      }
+      set((state) => {
+        if (
+          bindSeq !== activeThreadBindSeq ||
+          state.threadId !== threadId ||
+          state.contextUsage !== contextUsageAtStart
+        ) {
+          return state;
+        }
+        return {
+          ...state,
+          contextUsage: refreshedContextUsage ?? state.contextUsage,
+          contextUsageLoading: false,
+        };
+      });
+    } catch (error) {
+      console.error(`Failed to refresh CLI context usage for thread ${threadId}:`, error);
+      if (bindSeq === activeThreadBindSeq && get().threadId === threadId) {
+        set({ contextUsageLoading: false });
+      }
+    }
+  },
   setActiveThread: async (threadId) => {
     const currentThreadId = get().threadId;
     const currentUnlisten = get().unlisten;
@@ -2486,6 +2594,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }
         recordPendingTurnLatencyMetrics(threadId, event);
         enqueueStreamEvent(queuedStreamEvents, event);
+        if (eventContainsCompletedContextCompaction(event)) {
+          void get().refreshContextUsage(threadId);
+        }
         eventRateWindowCount += 1;
         const now = performance.now();
         if (now - eventRateWindowStartedAt >= 1000) {
@@ -2605,6 +2716,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       if (shouldRefreshContextUsage) {
         const refreshRestoredContextUsage = async () => {
+          const contextUsageAtStart = get().contextUsage;
           console.info("[context-usage] historical restore start", {
             phase: "get_cli_context_usage-start",
             operation: "get_cli_context_usage",
@@ -2622,7 +2734,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
               storeThreadId: get().threadId,
               restoredContextUsage,
             });
-            if (bindSeq !== activeThreadBindSeq || get().threadId !== threadId) {
+            if (
+              bindSeq !== activeThreadBindSeq ||
+              get().threadId !== threadId ||
+              get().contextUsage !== contextUsageAtStart
+            ) {
               console.info("[context-usage] stale historical restore response discarded", {
                 phase: "restore-stale-validation",
                 operation: "get_cli_context_usage",
@@ -2641,10 +2757,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
               restoredContextUsage,
               contextUsageLoading: get().contextUsageLoading,
             });
-            set((state) => ({
-              contextUsage: restoredContextUsage ?? state.contextUsage,
-              contextUsageLoading: false,
-            }));
+            set((state) => {
+              if (
+                bindSeq !== activeThreadBindSeq ||
+                state.threadId !== threadId ||
+                state.contextUsage !== contextUsageAtStart
+              ) {
+                return state;
+              }
+              return {
+                ...state,
+                contextUsage: restoredContextUsage ?? state.contextUsage,
+                contextUsageLoading: false,
+              };
+            });
             console.info("[context-usage] historical restore store write complete", {
               phase: "restore-store-write-complete",
               threadId,

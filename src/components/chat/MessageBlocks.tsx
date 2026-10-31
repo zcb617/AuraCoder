@@ -44,6 +44,7 @@ import type {
   ClaudeBackgroundTask,
   ClaudeBackgroundTaskMetadata,
   ContentBlock,
+  ContextCompactionMetadata,
   DiffBlock,
   MessageStatus,
   NoticeBlock,
@@ -1200,6 +1201,46 @@ function NoticeBlockView({
   messageId?: string;
   onLoadActionOutput?: (actionId: string) => Promise<void>;
 }) {
+  const { t } = useTranslation("chat");
+  const contextCompactionMetadata = isContextCompactionMetadata(block.metadata)
+    ? block.metadata
+    : null;
+  const isLegacyContextCompactionNotice =
+    block.kind === "context_compacted" ||
+    block.kind.startsWith("codex_context_compaction_");
+  if (contextCompactionMetadata || isLegacyContextCompactionNotice) {
+    const status = contextCompactionMetadata?.status ?? "completed";
+    const statusTranslationKey = status === "in_progress" ? "inProgress" : status;
+    const error = contextCompactionMetadata?.error;
+    const CompactionIcon =
+      status === "in_progress"
+        ? Loader2
+        : status === "completed"
+          ? CheckCircle2
+          : status === "failed"
+            ? XCircle
+            : AlertTriangle;
+    return (
+      <div className="msg-notice">
+        <span className="msg-block-tile msg-block-tile--info">
+          <CompactionIcon
+            size={11}
+            className={status === "in_progress" ? "chat-send-spinner" : undefined}
+          />
+        </span>
+        <div className="msg-notice-content">
+          <div className="msg-notice-title">{t("messageBlocks.contextCompaction.title")}</div>
+          <div className="msg-notice-message">
+            {t(`messageBlocks.contextCompaction.${statusTranslationKey}`)}
+          </div>
+          {typeof error === "string" && error.trim().length > 0 && (
+            <div className="msg-notice-message">{error}</div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   if (
     block.kind === "claude_background_tasks" &&
     isClaudeBackgroundTaskMetadata(block.metadata)
@@ -1232,6 +1273,21 @@ function NoticeBlockView({
         <div className="msg-notice-message">{block.message}</div>
       </div>
     </div>
+  );
+}
+
+/** 收窄压缩 Notice 元数据，避免误读 Claude 后台任务结构。 */
+function isContextCompactionMetadata(metadata: unknown): metadata is ContextCompactionMetadata {
+  if (typeof metadata !== "object" || metadata === null) {
+    return false;
+  }
+  const value = metadata as { type?: unknown; status?: unknown };
+  return (
+    value.type === "context_compaction" &&
+    (value.status === "in_progress" ||
+      value.status === "completed" ||
+      value.status === "failed" ||
+      value.status === "unconfirmed")
   );
 }
 

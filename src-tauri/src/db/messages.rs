@@ -403,6 +403,32 @@ pub fn bind_local_turn_to_remote_turn(
     Ok(())
 }
 
+/// 仅将手动压缩状态消息绑定到对应压缩轮次，供历史导入按轮次去重。
+pub fn bind_message_to_remote_turn(
+    db: &Database,
+    thread_id: &str,
+    message_id: &str,
+    remote_turn_id: &str,
+) -> anyhow::Result<()> {
+    let remote_turn_id = remote_turn_id.trim();
+    anyhow::ensure!(!remote_turn_id.is_empty(), "压缩轮次标识不能为空");
+
+    let conn = db.connect()?;
+    let affected = conn
+        .execute(
+            "UPDATE messages
+             SET remote_turn_id = ?1
+             WHERE id = ?2 AND thread_id = ?3 AND role = 'assistant'",
+            params![remote_turn_id, message_id, thread_id],
+        )
+        .context("failed to bind compaction message to remote turn id")?;
+    anyhow::ensure!(
+        affected == 1,
+        "无法将压缩状态消息绑定到对应会话轮次"
+    );
+    Ok(())
+}
+
 pub fn drop_last_turns(db: &Database, thread_id: &str, num_turns: u32) -> anyhow::Result<usize> {
     let messages = get_thread_messages(db, thread_id)?;
     let user_message_indexes = messages

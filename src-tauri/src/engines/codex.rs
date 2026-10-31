@@ -2032,7 +2032,10 @@ impl CodexEngine {
         })
     }
 
-    pub async fn compact_thread(&self, engine_thread_id: &str) -> anyhow::Result<Option<(u64, u64)>> {
+    pub async fn compact_thread(
+        &self,
+        engine_thread_id: &str,
+    ) -> anyhow::Result<(String, Option<(u64, u64)>)> {
         let transport = self.ensure_ready_transport().await?;
         // app-server 重启后历史会话可能尚未加载；只恢复原会话，不创建替代会话。
         request_with_fallback(
@@ -2100,7 +2103,7 @@ impl CodexEngine {
                     anyhow::ensure!(status == Some("completed") && compacted,
                         "Codex 压缩未成功完成: {params}");
                     log::info!("Codex compaction completed: engine_thread_id={engine_thread_id} turn_id={turn_id:?} usage={usage:?}");
-                    return Ok(usage);
+                    return Ok((turn_id.clone().context("压缩轮次ID缺失")?, usage));
                 }
             }
         }).await.context("等待 Codex 压缩结果超时，尚未确认完成，请勿重复提交")?;
@@ -6123,6 +6126,10 @@ fn extract_imported_messages_from_turns(turns: &[serde_json::Value]) -> Vec<Impo
                         "level": "info",
                         "title": "Context compacted",
                         "message": "Codex compacted the thread context.",
+                        "metadata": {
+                            "type": "context_compaction",
+                            "status": "completed",
+                        },
                     }));
                 }
                 "enteredReviewMode" | "exitedReviewMode" => {

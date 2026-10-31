@@ -1977,11 +1977,12 @@ impl CliTool for OpenCodeCli {
         Err(Self::unsupported("会话回滚"))
     }
 
+    // 旧返回值不含压缩轮次标识，保留迁移留痕：async fn compact_thread(...) -> Result<()>;
     async fn compact_thread(
         &self,
         context: &CliExecutionContext,
         _engine_thread_id: &str,
-    ) -> Result<()> {
+    ) -> Result<super::CliCompactionResult> {
         self.load_workspace(context).await?;
         Err(Self::unsupported("会话压缩"))
     }

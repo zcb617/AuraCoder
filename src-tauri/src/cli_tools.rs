@@ -258,6 +258,13 @@ pub struct CliForkedThread {
     pub active_flags: Vec<String>,
 }
 
+/// 压缩完成后用于将本地状态消息绑定到 CLI 历史轮次的结果。
+#[derive(Debug, Clone)]
+pub struct CliCompactionResult {
+    /// Codex 返回的压缩轮次标识，用于导入历史去重。
+    pub remote_turn_id: String,
+}
+
 /// 用户开始代码审查后得到的审查会话。
 #[derive(Debug)]
 pub struct CliReviewStarted {
@@ -636,11 +643,12 @@ pub trait CliTool: Send + Sync {
     ) -> Result<ThreadSyncSnapshot>;
 
     /// 用户在 Codex 会话中执行压缩时，压缩当前会话的历史上下文，并继续保留当前会话。
+    // 旧业务返回值不含压缩轮次标识，保留迁移留痕：async fn compact_thread(...) -> Result<()>;
     async fn compact_thread(
         &self,
         context: &CliExecutionContext,
         engine_thread_id: &str,
-    ) -> Result<()>;
+    ) -> Result<CliCompactionResult>;
 
     /// 用户在 Codex 会话中开始代码审查时，创建审查任务，并将审查过程和结果显示在对应的审查会话中。
     async fn start_review(

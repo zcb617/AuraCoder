@@ -21,12 +21,55 @@ pub struct TurnEventMapper {
     latest_usage_limits: UsageLimitsSnapshot,
     streamed_agent_message_items: HashSet<String>,
     streamed_realtime_transcript: bool,
+    /// 跟踪主线程是否已开始压缩，用于把无确认结果转换为可见状态。
+    compaction_in_progress: bool,
 }
 
 pub struct ApprovalRequest {
     pub approval_id: String,
     pub server_method: String,
     pub event: EngineEvent,
+}
+
+/// 生成可在对话中原位更新的 Codex 上下文压缩状态通知。
+fn context_compaction_notice(status: &str, error: Option<&str>) -> EngineEvent {
+    let (level, title, message) = match status {
+        "in_progress" => (
+            "info",
+            "Context compaction",
+            "Compacting context...",
+        ),
+        "completed" => (
+            "info",
+            "Context compaction",
+            "Context compaction completed.",
+        ),
+        "failed" => (
+            "error",
+            "Context compaction",
+            "Context compaction failed.",
+        ),
+        _ => (
+            "warning",
+            "Context compaction",
+            "Context compaction result is unconfirmed.",
+        ),
+    };
+    let mut metadata = serde_json::json!({
+        "type": "context_compaction",
+        "status": status,
+    });
+    if let Some(error) = error {
+        metadata["error"] = serde_json::Value::String(error.to_string());
+    }
+
+    EngineEvent::Notice {
+        kind: "context_compaction".to_string(),
+        level: level.to_string(),
+        title: title.to_string(),
+        message: message.to_string(),
+        metadata: Some(metadata),
+    }
 }
 
 impl TurnEventMapper {
@@ -56,6 +99,14 @@ impl TurnEventMapper {
             }],
             "turncompleted" => {
                 let mut events = Vec::new();
+                // 压缩没有收到对应完成通知时，将当前状态明确落为未确认。
+                if subagent_thread_id.is_none() && self.compaction_in_progress {
+                    self.compaction_in_progress = false;
+                    events.push(context_compaction_notice(
+                        "unconfirmed",
+                        Some("Codex 未返回上下文压缩完成确认。"),
+                    ));
+                }
                 let token_usage =
                     extract_token_usage(params).or_else(|| self.latest_token_usage.clone());
                 let status = extract_turn_completion_status(params);
@@ -217,16 +268,16 @@ impl TurnEventMapper {
                     Vec::new()
                 }
             }
-            "threadcompacted" | "contextcompacted" => vec![EngineEvent::Notice {
-                kind: "context_compacted".to_string(),
-                level: "info".to_string(),
-                title: "Context compacted".to_string(),
-                message:
-                    "Codex compacted the active thread context to keep the conversation moving."
-                        .to_string(),
-                // Codex 上下文压缩通知不附带 Claude 后台任务元数据。
-                metadata: None,
-            }],
+            "threadcompacted" | "contextcompacted" => {
+                // 旧逻辑保留，不执行，已改为使用统一 context_compaction 契约：
+                // vec![EngineEvent::Notice { kind: "context_compacted".to_string(), ... }]
+                if subagent_thread_id.is_some() {
+                    Vec::new()
+                } else {
+                    self.compaction_in_progress = false;
+                    vec![context_compaction_notice("completed", None)]
+                }
+            }
             "warning" => vec![map_simple_notice(
                 "codex_warning",
                 "warning",
@@ -317,10 +368,17 @@ impl TurnEventMapper {
                     .get("willRetry")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                vec![EngineEvent::Error {
+                let mut events = Vec::new();
+                // 主线程压缩在非重试错误时结束为失败，随后仍透传原引擎错误。
+                if subagent_thread_id.is_none() && self.compaction_in_progress && !recoverable {
+                    self.compaction_in_progress = false;
+                    events.push(context_compaction_notice("failed", Some(&message)));
+                }
+                events.push(EngineEvent::Error {
                     message,
                     recoverable,
-                }]
+                });
+                events
             }
             _ => Vec::new(),
         }
@@ -500,6 +558,15 @@ impl TurnEventMapper {
         let item_type =
             extract_any_string(item, &["type"]).unwrap_or_else(|| "unknown".to_string());
 
+        // 主线程的压缩 item 开始时写入同一个状态块，子代理压缩不影响主会话状态。
+        if item_type == "contextCompaction" {
+            if subagent_thread_id.is_some() {
+                return Vec::new();
+            }
+            self.compaction_in_progress = true;
+            return vec![context_compaction_notice("in_progress", None)];
+        }
+
         if item_type == "collabAgentToolCall"
             && extract_any_string(item, &["tool"])
                 .is_some_and(|tool| tool.eq_ignore_ascii_case("wait"))
@@ -673,6 +740,26 @@ impl TurnEventMapper {
 
         let item_type =
             extract_any_string(item, &["type"]).unwrap_or_else(|| "unknown".to_string());
+
+        // 主线程的压缩 item 完成时先发布本条通知携带的真实上下文用量。
+        if item_type == "contextCompaction" {
+            if subagent_thread_id.is_some() {
+                return Vec::new();
+            }
+            self.compaction_in_progress = false;
+            let mut events = Vec::new();
+            if let Some(context_update) = extract_context_usage_limits(params) {
+                self.latest_usage_limits.current_tokens = context_update.current_tokens;
+                self.latest_usage_limits.max_context_tokens = context_update.max_context_tokens;
+                self.latest_usage_limits.context_window_percent =
+                    context_update.context_window_percent;
+                events.push(EngineEvent::UsageLimitsUpdated {
+                    usage: self.latest_usage_limits.clone(),
+                });
+            }
+            events.push(context_compaction_notice("completed", None));
+            return events;
+        }
 
         if item_type == "collabAgentToolCall"
             && extract_any_string(item, &["tool"])
