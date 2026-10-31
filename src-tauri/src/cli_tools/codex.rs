@@ -467,15 +467,11 @@ impl CodexCli {
         let approval = permission_choice(&values, "approval")?;
         let sandbox = permission_choice(&values, "sandbox")?;
         let network = permission_choice(&values, "network")?;
-        let autonomy_is_empty = values
-            .get("autonomyPreset")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty);
+        // autonomyPreset=[] 表示高级权限字段自定义，不能据此清除已选择的 approval、sandbox 或 network。
         let (approval_raw, mut sandbox_raw, network_raw) = match preset {
             Some("automatic") => (None, None, None),
-            None if autonomy_is_empty
-                || (approval.is_none() && sandbox.is_none() && network.is_none()) =>
-            {
+            // 旧守卫会把空 autonomyPreset 当作全部权限清空，导致自定义高级字段无法保存。
+            None if approval.is_none() && sandbox.is_none() && network.is_none() => {
                 (None, None, None)
             }
             Some("read-only") => (Some("untrusted"), Some("read-only"), Some(false)),
@@ -1232,20 +1228,79 @@ impl CliTool for CodexCli {
     /// 将 Codex 的原始权限字段转换为统一运行时权限结构。
     async fn runtime_permissions(
         &self,
-        _context: &CliExecutionContext,
+        context: &CliExecutionContext,
         thread: &ThreadDto,
     ) -> Result<CliRuntimePermissions> {
+        // 根据本次执行上下文读取真实 workspace，并确认线程与 Codex 工作区绑定一致。
+        let workspace = self.load_workspace(context).await?;
+        anyhow::ensure!(
+            thread.engine_id == "codex",
+            "当前线程不属于 Codex，不能读取 Codex 运行时权限"
+        );
+        anyhow::ensure!(
+            thread.workspace_id == workspace.id,
+            "当前线程不属于本次 Codex 操作的 workspace"
+        );
+
+        // 复用统一组件映射读取 approval 语义，避免另行解析原始权限字段。
+        let component = match Self::permissions_from_thread(thread, false) {
+            Ok(component) => component,
+            Err(error) => {
+                log::error!(
+                    "Codex 运行时权限组件解析失败: thread_id={} workspace_id={} error={error:#}",
+                    thread.id,
+                    workspace.id
+                );
+                return Err(error);
+            }
+        };
+        let automatic_approval =
+            permission_choice(&component, "approval")? == Some("automatic");
+        let use_auto_review = matches!(
+            &workspace.trust_level,
+            &crate::models::TrustLevelDto::Trusted
+        ) && automatic_approval;
+
         let object = thread
             .permission_mode
             .as_deref()
             .and_then(|value| serde_json::from_str::<Value>(value).ok())
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
+
+        // 保留原有策略字段读取方式，并将空白审核者视为未配置。
+        let approval_policy = object
+            .get("approvalPolicy")
+            .or_else(|| object.get("sandboxApprovalPolicy"))
+            .cloned();
+        let stored_reviewer = object
+            .get("approvalsReviewer")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|reviewer| !reviewer.is_empty())
+            .map(str::to_owned);
+        let final_reviewer = if use_auto_review {
+            "auto_review".to_string()
+        } else {
+            stored_reviewer.unwrap_or_else(|| "user".to_string())
+        };
+
+        // 记录实际工作区信任状态和最终审核者，便于追踪 auto_review 派生决策。
+        log::debug!(
+            "Codex 运行时审核决策: thread_id={} workspace_id={} trust_level={:?} automatic_approval={} approvals_reviewer={}",
+            thread.id,
+            workspace.id,
+            &workspace.trust_level,
+            automatic_approval,
+            final_reviewer
+        );
+
         Ok(CliRuntimePermissions {
-            approval_policy: object
-                .get("approvalPolicy")
-                .or_else(|| object.get("sandboxApprovalPolicy"))
-                .cloned(),
+            approval_policy: if use_auto_review {
+                Some(json!("on-request"))
+            } else {
+                approval_policy
+            },
             sandbox_mode: object
                 .get("sandboxMode")
                 .and_then(Value::as_str)
@@ -1255,10 +1310,7 @@ impl CliTool for CodexCli {
                 .or_else(|| object.get("sandboxAllowNetwork"))
                 .and_then(Value::as_bool),
             permission_profile: object.get("permissionProfile").cloned(),
-            approvals_reviewer: object
-                .get("approvalsReviewer")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            approvals_reviewer: Some(final_reviewer),
         })
     }
 
