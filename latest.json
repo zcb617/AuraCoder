@@ -1,0 +1,19 @@
+{
+  "version": "1.0.26",
+  "notes": "本次更新主要改善 Codex 的上下文压缩、速度选择和操作审批，让界面显示与实际执行保持一致。\r\n\r\n- **修复 SSH 远程会话无法压缩的问题**  \r\n  SSH 远程项目中的 Codex 会话现在也支持手动压缩上下文，长对话可以继续在原会话中进行。\r\n\r\n- **在对话中显示压缩过程和结果**  \r\n  无论手动触发还是对话过程中自动触发，都会在对话内显示“正在压缩上下文…”，完成后更新为“上下文压缩完成”。结果会保留在对话记录中，方便回看。压缩完成后，上下文用量和剩余空间也会同步更新；遇到异常时，会显示具体原因。\r\n\r\n- **修复“标准速度”仍可能请求 Fast 的问题**  \r\n  选择“标准”时，现在会明确使用标准速度，避免继续沿用会话之前的 Fast 设置。只有主动选择 Fast，才会按 Fast 模式发起请求。\r\n\r\n- **受信任工作区支持 Codex 自动审核**  \r\n  在受信任的工作区中，将“审批”设为“自动”后，需要审批的操作会交给 Codex 自动评估并决定是否允许，减少手动确认。也可以按需要选择“操作前询问”等审批方式。\r\n\r\n- **修复自定义权限设置保存异常**  \r\n  修复了单独调整审批、沙箱或网络选项时，设置可能被清除的问题，确保明确选择的权限选项能够正确保存。\r\n",
+  "pub_date": "2026-10-31T14:48:27Z",
+  "platforms": {
+    "linux-x86_64-deb": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRL0xxd0huak5DQTVLenJpekI0djF3cDkvMitBZUppaWV5Sm9PYUE4NXV5YjArQVN1UG5Ta1RwRDczaVY0MERiNXFseUp2VmRROFhaSThUL0Q2RVI1eVpjOFd5Tkc3UFFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNDU4MDk1CWZpbGU6QXVyYUNvZGVyXzEuMC4yNl9hbWQ2NC5kZWIKd0JPZVo4d1E4aWcrMTVqOG4rREhkdWI1bjMzV1FLM29Fbkg2MVdQVkZ4RjFqY0FBc2FBalNoVEYvNWMwd1dLR2haMDBqNWdNb2NRaGRpSWYrSVF6QlE9PQo=",
+      "url": "https://github.com/zcb617/AuraCoder/releases/download/v1.0.26/AuraCoder_1.0.26_amd64.deb"
+    },
+    "linux-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRL0xxd0huak5DQTVLenJpekI0djF3cDkvMitBZUppaWV5Sm9PYUE4NXV5YjArQVN1UG5Ta1RwRDczaVY0MERiNXFseUp2VmRROFhaSThUL0Q2RVI1eVpjOFd5Tkc3UFFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNDU4MDk1CWZpbGU6QXVyYUNvZGVyXzEuMC4yNl9hbWQ2NC5kZWIKd0JPZVo4d1E4aWcrMTVqOG4rREhkdWI1bjMzV1FLM29Fbkg2MVdQVkZ4RjFqY0FBc2FBalNoVEYvNWMwd1dLR2haMDBqNWdNb2NRaGRpSWYrSVF6QlE9PQo=",
+      "url": "https://github.com/zcb617/AuraCoder/releases/download/v1.0.26/AuraCoder_1.0.26_amd64.deb"
+    },
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRL0xxd0huak5DQS94OGhrajRwaVY0d01CakhsNkxmMjhlMUhiYnVyMzkxc0xGYkZ2Y0hLbzJGREZPcmJtZGRrZGVMZHhPQlJQSFVPam1vVGZUWlBHL1Q2ZGdKMTE1aEFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzNDU4Njk0CWZpbGU6QXVyYUNvZGVyXzEuMC4yNl94NjQtc2V0dXAuZXhlClZOQXR4cTFRK1lJVUc4VnRkUkMweWNNNS9Ya3BxM2RSZmVhRHAxK0lqUlQ4T0VXUWErMlhHOXJZOTlLSDZoZElkWCtBRWNFUTBEcW9SNkpjd3VMY0NnPT0K",
+      "url": "https://github.com/zcb617/AuraCoder/releases/download/v1.0.26/AuraCoder_1.0.26_x64-setup.exe"
+    }
+  }
+}
