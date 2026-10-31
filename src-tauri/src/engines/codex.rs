@@ -4851,6 +4851,8 @@ async fn build_turn_start_params(
         should_use_native_collaboration_mode(plan_mode_activation, runtime);
     let mut turn_params = serde_json::json!({
       "threadId": thread_id,
+      // 每轮明确发送界面速度；缺失运行时或空选择均表示标准，不能继续继承旧 Fast。
+      "serviceTier": codex_request_service_tier(runtime.and_then(|runtime| runtime.service_tier.as_deref())),
       "input": build_turn_input_items(
           input,
           matches!(plan_mode_activation, PlanModeActivation::PromptPrefix)
@@ -4890,12 +4892,8 @@ async fn build_turn_start_params(
                     serde_json::Value::String(effort.clone()),
                 );
             }
-            if let Some(service_tier) = runtime.service_tier.as_ref() {
-                params.insert(
-                    "serviceTier".to_string(),
-                    serde_json::Value::String(service_tier.clone()),
-                );
-            }
+            // 旧逻辑仅在 Some 时传 serviceTier，现由上面的每轮显式值替代。
+            // if let Some(service_tier) = runtime.service_tier.as_ref() { ... }
             if let Some(personality) = runtime.personality.as_ref() {
                 params.insert(
                     "personality".to_string(),
@@ -5409,7 +5407,12 @@ fn build_thread_resume_params(
     params.insert("approvalPolicy".to_string(), approval_policy.clone());
     insert_permission_or_sandbox(&mut params, permission_profile, sandbox_mode);
     insert_optional_string(&mut params, "approvalsReviewer", approvals_reviewer);
-    insert_optional_string(&mut params, "serviceTier", service_tier);
+    // 旧逻辑省略标准速度：insert_optional_string(&mut params, "serviceTier", service_tier);
+    insert_optional_string(
+        &mut params,
+        "serviceTier",
+        Some(codex_request_service_tier(service_tier)),
+    );
     insert_optional_string(&mut params, "personality", personality);
     params.insert(
         "persistExtendedHistory".to_string(),
@@ -5446,7 +5449,12 @@ fn build_thread_start_params(
         "approvalsReviewer",
         sandbox.approvals_reviewer.as_deref(),
     );
-    insert_optional_string(&mut params, "serviceTier", sandbox.service_tier.as_deref());
+    // 旧逻辑省略标准速度：insert_optional_string(&mut params, "serviceTier", sandbox.service_tier.as_deref());
+    insert_optional_string(
+        &mut params,
+        "serviceTier",
+        Some(codex_request_service_tier(sandbox.service_tier.as_deref())),
+    );
     insert_optional_string(&mut params, "personality", sandbox.personality.as_deref());
     params.insert(
         "experimentalRawEvents".to_string(),
@@ -5497,7 +5505,12 @@ fn build_thread_fork_params(
         "approvalsReviewer",
         sandbox.approvals_reviewer.as_deref(),
     );
-    insert_optional_string(&mut params, "serviceTier", sandbox.service_tier.as_deref());
+    // 旧逻辑省略标准速度：insert_optional_string(&mut params, "serviceTier", sandbox.service_tier.as_deref());
+    insert_optional_string(
+        &mut params,
+        "serviceTier",
+        Some(codex_request_service_tier(sandbox.service_tier.as_deref())),
+    );
     insert_optional_string(&mut params, "personality", sandbox.personality.as_deref());
     serde_json::Value::Object(params)
 }
@@ -5515,6 +5528,14 @@ fn insert_permission_or_sandbox(
             serde_json::Value::String(sandbox_mode.to_string()),
         );
     }
+}
+
+/// AuraCoder 界面中的空速度选择表示标准；协议层必须显式覆盖服务端继承值。
+fn codex_request_service_tier(value: Option<&str>) -> &str {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default")
 }
 
 fn insert_optional_string(
@@ -5949,7 +5970,9 @@ fn thread_runtime_from_start_response(
         // The requested AuraCoder effort is authoritative for the subsequent turn/start.
         // reasoning_effort: extract_any_string(response, &["reasoningEffort", "reasoning_effort"]),
         reasoning_effort: requested_reasoning_effort.clone(),
-        service_tier: extract_any_string(response, &["serviceTier", "service_tier"]),
+        // 与推理强度相同，以界面请求值为准，不能将服务端默认 Fast 回填到后续轮次。
+        // service_tier: extract_any_string(response, &["serviceTier", "service_tier"]),
+        service_tier: fallback_service_tier,
         personality: extract_any_string(response, &["personality"]),
         output_schema: fallback_output_schema,
         auto_approve_mcp_elicitations: fallback_auto_approve_mcp_elicitations,
@@ -5960,9 +5983,8 @@ fn thread_runtime_from_start_response(
     // if runtime.reasoning_effort.is_none() {
     //     runtime.reasoning_effort = fallback_reasoning_effort;
     // }
-    if runtime.service_tier.is_none() {
-        runtime.service_tier = fallback_service_tier;
-    }
+    // 旧逻辑仅在响应未给速度时使用界面值，保留迁移留痕：
+    // if runtime.service_tier.is_none() { runtime.service_tier = fallback_service_tier; }
     if runtime.personality.is_none() {
         runtime.personality = fallback_personality;
     }
