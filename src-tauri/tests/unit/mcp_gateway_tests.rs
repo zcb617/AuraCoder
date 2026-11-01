@@ -155,13 +155,37 @@
             None,
         )
         .expect("message should be inserted");
+        /*
         state.auracoder_thread_mcp_service.bind_engine_thread(
             "codex",
             "engine-thread",
             &workspace.id,
         );
+        */
+        let source_thread = crate::db::threads::create_thread(
+            &state.db,
+            &workspace.id,
+            "codex",
+            "model",
+            "Gateway trusted source",
+        )
+        .expect("source thread should be created");
+        let source_message = crate::db::messages::insert_assistant_placeholder(
+            &state.db,
+            &source_thread.id,
+            Some("codex"),
+            Some("model"),
+            None,
+        )
+        .expect("assistant source message should be inserted");
+        /*
         gateway
             .register_trusted_context(&lease.token, "engine-thread", "turn-1")
+            .await
+            .expect("trusted context should be registered");
+        */
+        gateway
+            .register_trusted_context(&lease.token, "engine-thread", &source_message.id)
             .await
             .expect("trusted context should be registered");
         let with_context = client

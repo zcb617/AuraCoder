@@ -9,7 +9,7 @@ use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    auracoder_thread_mcp_service::AuraCoderThreadMcpService,
+    // auracoder_thread_mcp_service::AuraCoderThreadMcpService,
     computer_control_service::ComputerControlService,
     engines::{
         claude_sidecar::ClaudeSidecarEngine,
@@ -544,6 +544,7 @@ impl EngineManager {
         self.claude.set_computer_control_service(service);
     }
 
+/*
     /// 将 AuraCoder 本地会话工具配置到三个本机引擎。
     pub fn set_auracoder_thread_mcp_service(&self, service: Arc<AuraCoderThreadMcpService>) {
         self.codex.set_auracoder_thread_mcp_service(service.clone());
@@ -551,6 +552,7 @@ impl EngineManager {
             .set_auracoder_thread_mcp_service(service.clone());
         self.opencode.set_auracoder_thread_mcp_service(service);
     }
+*/
 
     pub fn set_local_codex_computer_control_service(&self, service: Arc<ComputerControlService>) {
         self.codex.set_computer_control_service(service);

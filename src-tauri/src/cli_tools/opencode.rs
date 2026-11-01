@@ -123,7 +123,7 @@ impl OpenCodeCli {
             endpoint_generation,
         ));
         engine.set_computer_control_service(self.state.computer_control_service.clone());
-        engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
+        // engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
         engines.insert(cwd.to_string(), (endpoint_generation, engine.clone()));
         Ok(engine)
     }

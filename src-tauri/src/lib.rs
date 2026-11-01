@@ -303,9 +303,11 @@ pub fn run() {
             state
                 .engines
                 .set_computer_control_service(state.computer_control_service.clone());
+            /*
             state.engines.set_auracoder_thread_mcp_service(
                 state.auracoder_thread_mcp_service.clone(),
             );
+            */
             // 旧调用会移动 resource_dir，导致本地 CLI 生命周期拿不到同一资源根目录：
             // state.engines.set_resource_dir(resource_dir);
             state.engines.set_resource_dir(resource_dir.clone());

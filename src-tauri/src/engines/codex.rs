@@ -322,12 +322,14 @@ pub struct CodexEngine {
     mcp_gateway_token: Arc<std::sync::Mutex<Option<String>>>,
     computer_control_service:
         Arc<std::sync::Mutex<Option<Arc<crate::computer_control_service::ComputerControlService>>>>,
+    /*
     /// AuraCoder 本地会话读取工具服务。
     auracoder_thread_mcp_service: Arc<
         std::sync::Mutex<
             Option<Arc<crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService>>,
         >,
     >,
+    */
     transport_target: CodexTransportTarget,
 }
 
@@ -408,7 +410,7 @@ impl Default for CodexEngine {
             mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
             mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
-            auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
+            // auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             transport_target: CodexTransportTarget::Local,
         }
     }
@@ -763,10 +765,11 @@ impl Engine for CodexEngine {
             }
         }
 
-        let mut dynamic_tools = match self.computer_control_service() {
+        let dynamic_tools = match self.computer_control_service() {
             Some(service) => service.dynamic_tools_spec().map_err(anyhow::Error::msg)?,
             None => serde_json::Value::Array(Vec::new()),
         };
+/*
         if let Some(service) = self.auracoder_thread_mcp_service() {
             let auracoder_tools = service.dynamic_tools_spec();
             if let (serde_json::Value::Array(existing), serde_json::Value::Array(auracoder)) =
@@ -775,6 +778,8 @@ impl Engine for CodexEngine {
                 existing.extend(auracoder);
             }
         }
+*/
+
         let start_params = build_thread_start_params(
             model,
             &cwd,
@@ -1345,6 +1350,7 @@ impl Engine for CodexEngine {
                         }
                         let raw_tool = extract_any_string(&params, &["tool", "name"])
                             .unwrap_or_default();
+/*
                         if namespace.as_deref()
                             == Some(crate::auracoder_thread_mcp_service::PANES_THREAD_NAMESPACE)
                         {
@@ -1369,6 +1375,30 @@ impl Engine for CodexEngine {
                                 ),
                             };
                             transport.respond_success(&raw_id, response).await.ok();
+                            continue;
+                        }
+*/
+
+                        if namespace.as_deref()
+                            == Some(crate::auracoder_thread_mcp_service::PANES_THREAD_NAMESPACE)
+                        {
+                            log::warn!(
+                                "Codex 旧会话工具入口已停用: thread_id={} turn_id={} tool={}",
+                                call_thread_id,
+                                call_turn_id,
+                                raw_tool
+                            );
+                            let response = crate::computer_control_service::dynamic_tool_failure(
+                                "tool_not_allowed: 旧会话工具入口已停用，请使用统一 MCP 会话工具",
+                            );
+                            if let Err(error) = transport.respond_success(&raw_id, response).await {
+                                log::error!(
+                                    "Codex 旧会话工具失败响应发送失败: thread_id={} turn_id={} tool={} error={error:#}",
+                                    call_thread_id,
+                                    call_turn_id,
+                                    raw_tool
+                                );
+                            }
                             continue;
                         }
                         let tool = raw_tool
@@ -1896,6 +1926,7 @@ impl CodexEngine {
         }
     }
 
+/*
     /// 设置 AuraCoder 本地会话读取工具服务。
     pub fn set_auracoder_thread_mcp_service(
         &self,
@@ -1905,6 +1936,7 @@ impl CodexEngine {
             *current = Some(service);
         }
     }
+*/
 
     fn computer_control_service(
         &self,
@@ -1915,6 +1947,7 @@ impl CodexEngine {
             .and_then(|service| service.clone())
     }
 
+/*
     /// 获取当前配置的 AuraCoder 本地会话读取工具服务。
     fn auracoder_thread_mcp_service(
         &self,
@@ -1924,6 +1957,7 @@ impl CodexEngine {
             .ok()
             .and_then(|service| service.clone())
     }
+*/
 
     pub fn new_remote_websocket(url: String) -> Self {
         let (runtime_events, _) = broadcast::channel(256);
@@ -1934,7 +1968,7 @@ impl CodexEngine {
             mcp_gateway_endpoint: Arc::new(std::sync::Mutex::new(None)),
             mcp_gateway_token: Arc::new(std::sync::Mutex::new(None)),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
-            auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
+            // auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             transport_target: CodexTransportTarget::WebSocket(url),
         }
     }

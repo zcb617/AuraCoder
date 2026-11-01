@@ -31,7 +31,7 @@ use crate::models::{
     OpenCodeAgentDto, OpenCodeCommandDto, OpenCodeMcpServerDto, OpenCodeRuntimeCatalogDto,
 };
 use crate::{
-    auracoder_thread_mcp_service::AuraCoderThreadMcpService,
+    // auracoder_thread_mcp_service::AuraCoderThreadMcpService,
     computer_control_service::ComputerControlService,
 };
 
@@ -69,8 +69,10 @@ pub struct OpenCodeEngine {
     http: reqwest::Client,
     /// 本机计算机控制服务，用于将 GUI 工具注入当前回合。
     computer_control_service: Arc<std::sync::Mutex<Option<Arc<ComputerControlService>>>>,
+    /*
     /// AuraCoder 本地会话读取工具服务。
     auracoder_thread_mcp_service: Arc<std::sync::Mutex<Option<Arc<AuraCoderThreadMcpService>>>>,
+    */
     /// 当前协议客户端绑定的传输 endpoint。
     target: OpenCodeTransportTarget,
 }
@@ -789,7 +791,7 @@ impl Default for OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
-            auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
+            // auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Local,
         }
     }
@@ -1347,7 +1349,7 @@ impl OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
-            auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
+            // auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::LocalHttp(Arc::new(LocalOpenCodeEndpoint {
                 cwd,
                 base_url,
@@ -1364,12 +1366,14 @@ impl OpenCodeEngine {
         }
     }
 
+/*
     /// 设置 AuraCoder 本地会话读取工具服务。
     pub fn set_auracoder_thread_mcp_service(&self, service: Arc<AuraCoderThreadMcpService>) {
         if let Ok(mut current) = self.auracoder_thread_mcp_service.lock() {
             *current = Some(service);
         }
     }
+*/
 
     pub fn new_remote_http(base_url: String, password: String) -> Self {
         let (event_bus, _) = broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
@@ -1378,7 +1382,7 @@ impl OpenCodeEngine {
             state: Arc::new(Mutex::new(OpenCodeState::default())),
             http: reqwest::Client::new(),
             computer_control_service: Arc::new(std::sync::Mutex::new(None)),
-            auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
+            // auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
             target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
                 base_url,
                 password,
@@ -4344,6 +4348,7 @@ fn write_opencode_computer_control_tool(
     Ok(())
 }
 
+/*
 /// 为 OpenCode 导出 AuraCoder 会话读取工具，复用本机回调服务器。
 fn write_opencode_auracoder_thread_mcp_tool(
     run_dir: &Path,
@@ -4409,12 +4414,13 @@ fn write_opencode_auracoder_thread_mcp_tool(
     }
     Ok(())
 }
+*/
 
 async fn run_opencode_callback_server(
     listener: AsyncTcpListener,
     callback_token: String,
     computer_control_service: Option<Arc<ComputerControlService>>,
-    auracoder_thread_mcp_service: Option<Arc<AuraCoderThreadMcpService>>,
+    // auracoder_thread_mcp_service: Option<Arc<AuraCoderThreadMcpService>>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -4424,9 +4430,10 @@ async fn run_opencode_callback_server(
                 let Ok((stream, _)) = accepted else { continue };
                 let token = callback_token.clone();
                 let service = computer_control_service.clone();
-                let auracoder_thread_service = auracoder_thread_mcp_service.clone();
+                // let auracoder_thread_service = auracoder_thread_mcp_service.clone();
                 tokio::spawn(async move {
-                    handle_opencode_callback(stream, &token, service, auracoder_thread_service).await;
+                    // handle_opencode_callback(stream, &token, service, auracoder_thread_service).await;
+                    handle_opencode_callback(stream, &token, service).await;
                 });
             }
         }
@@ -4437,7 +4444,7 @@ async fn handle_opencode_callback(
     mut stream: tokio::net::TcpStream,
     callback_token: &str,
     computer_control_service: Option<Arc<ComputerControlService>>,
-    auracoder_thread_mcp_service: Option<Arc<AuraCoderThreadMcpService>>,
+    // auracoder_thread_mcp_service: Option<Arc<AuraCoderThreadMcpService>>,
 ) {
     let mut buffer = Vec::with_capacity(4096);
     let mut chunk = [0_u8; 4096];
@@ -4533,6 +4540,7 @@ async fn handle_opencode_callback(
         .cloned()
         .unwrap_or_else(|| json!({}));
     let result = if tool_kind == "auracoder_thread" {
+/*
         match auracoder_thread_mcp_service.as_ref() {
             Some(service) => {
                 service
@@ -4541,6 +4549,16 @@ async fn handle_opencode_callback(
             }
             None => Err("AuraCoder 会话 MCP 服务尚未绑定到 OpenCode 引擎".to_string()),
         }
+*/
+
+        log::warn!(
+            "OpenCode 旧会话工具入口已停用: thread_id={} turn_id={} tool={} call_id={}，请使用统一 MCP 会话工具",
+            thread_id,
+            turn_id,
+            tool,
+            call_id
+        );
+        Err("tool_not_allowed: 旧会话工具入口已停用，请使用统一 MCP 会话工具".to_string())
     } else {
         match computer_control_service.as_ref() {
             Some(service) => {
@@ -4562,6 +4580,14 @@ async fn handle_opencode_callback(
     match result {
         Ok(value) => write_opencode_http_response(&mut stream, 200, value).await,
         Err(error) => {
+            log::error!(
+                "OpenCode callback 工具执行失败: tool_kind={} tool={} thread_id={} turn_id={} call_id={} error={error:#}",
+                tool_kind,
+                tool,
+                thread_id,
+                turn_id,
+                call_id
+            );
             write_opencode_http_response(
                 &mut stream,
                 200,

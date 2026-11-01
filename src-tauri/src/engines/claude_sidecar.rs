@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    auracoder_thread_mcp_service::AuraCoderThreadMcpService,
+    // auracoder_thread_mcp_service::AuraCoderThreadMcpService,
     common::MANUAL_STOP,
     computer_control_service::ComputerControlService, process_utils, runtime_env,
 };
@@ -946,8 +946,10 @@ pub struct ClaudeSidecarEngine {
     state: Arc<Mutex<ClaudeState>>,
     /// 当前 Claude 会话使用的电脑操作服务引用。
     computer_control_service: Arc<StdMutex<Option<Arc<ComputerControlService>>>>,
+    /*
     /// 当前 Claude 会话使用的 AuraCoder 本地会话读取工具服务引用。
     auracoder_thread_mcp_service: Arc<StdMutex<Option<Arc<AuraCoderThreadMcpService>>>>,
+    */
     /// 本地 Claude 会话使用的 MCP Gateway Endpoint。
     mcp_gateway_endpoint: Arc<StdMutex<Option<String>>>,
     /// 本地 Claude 会话访问 MCP Gateway 使用的鉴权令牌。
@@ -987,6 +989,7 @@ impl ClaudeSidecarEngine {
         }
     }
 
+/*
     /// 设置 AuraCoder 本地会话读取工具服务。
     pub fn set_auracoder_thread_mcp_service(&self, service: Arc<AuraCoderThreadMcpService>) {
         // 旧实现保留迁移留痕：异步运行线程内不能使用 blocking_lock。
@@ -996,6 +999,7 @@ impl ClaudeSidecarEngine {
             *current = Some(service);
         }
     }
+*/
 
     pub fn set_resource_dir(&self, resource_dir: Option<PathBuf>) {
         let mut state = self.state.blocking_lock();

@@ -14,7 +14,7 @@ fn test_remote_engine(base_url: String) -> OpenCodeEngine {
         state: Arc::new(Mutex::new(OpenCodeState::default())),
         http: reqwest::Client::new(),
         computer_control_service: Arc::new(std::sync::Mutex::new(None)),
-        auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
+        // auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
         target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
             base_url,
             password: "runtime-secret".to_string(),
@@ -236,7 +236,7 @@ async fn remote_event_pump_subscribes_to_each_workspace_directory() {
         state: Arc::new(Mutex::new(OpenCodeState::default())),
         http: reqwest::Client::new(),
         computer_control_service: Arc::new(std::sync::Mutex::new(None)),
-        auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
+        // auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
         target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
             base_url: format!("http://{address}"),
             password: "runtime-secret".to_string(),
@@ -314,7 +314,7 @@ async fn read_session_requests_only_id_path_with_basic_auth() {
         state: Arc::new(Mutex::new(OpenCodeState::default())),
         http: reqwest::Client::new(),
         computer_control_service: Arc::new(std::sync::Mutex::new(None)),
-        auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
+        // auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
         target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
             base_url: format!("http://{address}"),
             password: "runtime-secret".to_string(),
@@ -352,7 +352,7 @@ async fn read_session_preserves_http_404_for_cli_mapping() {
         state: Arc::new(Mutex::new(OpenCodeState::default())),
         http: reqwest::Client::new(),
         computer_control_service: Arc::new(std::sync::Mutex::new(None)),
-        auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
+        // auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
         target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
             base_url: format!("http://{address}"),
             password: "runtime-secret".to_string(),
@@ -424,7 +424,7 @@ async fn set_session_permission_mode_patches_permission_and_updates_cache() {
         state: Arc::new(Mutex::new(OpenCodeState::default())),
         http: reqwest::Client::new(),
         computer_control_service: Arc::new(std::sync::Mutex::new(None)),
-        auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
+        // auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
         target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
             base_url: format!("http://{address}"),
             password: "runtime-secret".to_string(),
@@ -566,7 +566,7 @@ async fn set_session_permission_mode_http_failure_does_not_update_cache() {
         state: Arc::new(Mutex::new(OpenCodeState::default())),
         http: reqwest::Client::new(),
         computer_control_service: Arc::new(std::sync::Mutex::new(None)),
-        auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
+        // auracoder_thread_mcp_service: Arc::new(std::sync::Mutex::new(None)),
         target: OpenCodeTransportTarget::Remote(Arc::new(RemoteOpenCodeEndpoint {
             base_url: format!("http://{address}"),
             password: "runtime-secret".to_string(),
@@ -1626,6 +1626,8 @@ fn opencode_schema_source_supports_zod_types_constraints_and_errors() {
     assert!(mismatched_constraint.to_string().contains("minimum"));
 }
 
+/*
+旧生成函数随重复会话入口停用，旧请求响应由下面的回调迁移测试覆盖。
 #[test]
 fn generated_auracoder_thread_tools_use_independent_default_exports() {
     let run_dir = std::env::temp_dir().join(format!(
@@ -1698,6 +1700,56 @@ fn generated_auracoder_thread_tools_use_independent_default_exports() {
     assert!(!tools_dir.join("auracoder_thread_mcp.ts").exists());
 
     let _ = std::fs::remove_dir_all(run_dir);
+}
+*/
+
+/// 验证旧 OpenCode 会话回调收到稳定错误响应并正常结束 HTTP 请求。
+#[tokio::test]
+async fn legacy_thread_callback_returns_mcp_migration_error() {
+    let listener = AsyncTcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("temporary callback listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("temporary callback listener should expose its address");
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .expect("temporary callback request should be accepted");
+        handle_opencode_callback(stream, "thread-token", None).await;
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{address}/invoke"))
+        .header("x-auracoder-computer-control-token", "thread-token")
+        .json(&json!({
+            "toolKind": "auracoder_thread",
+            "threadId": "legacy-thread",
+            "turnId": "legacy-turn",
+            "callId": "legacy-call",
+            "tool": "get_auracoder_thread_message_count",
+            "arguments": {"thread_id": "target-thread"}
+        }))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .expect("legacy callback request should complete");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response
+        .json()
+        .await
+        .expect("legacy callback response should be JSON");
+    assert_eq!(body["isError"], true);
+    let error = body["error"]
+        .as_str()
+        .expect("legacy callback response should include its error");
+    assert!(error.starts_with("tool_not_allowed:"));
+    assert!(error.contains("统一 MCP"));
+    assert_eq!(body["content"][0]["text"].as_str(), Some(error));
+    server_task
+        .await
+        .expect("legacy callback server task should complete");
 }
 
 #[test]

@@ -82,6 +82,7 @@
         );
     }
 
+    /*
     #[tokio::test]
     async fn reads_count_and_descending_pages_with_workspace_isolation() {
         let db = test_database();
@@ -231,6 +232,120 @@
             isolation_error,
             "AuraCoder 会话工具只允许读取当前项目的会话"
         );
+    }
+    */
+
+    /// 验证公共只读服务按创建时间倒序分页，并保留 typed 字段与参数校验。
+    #[tokio::test]
+    async fn reads_count_and_descending_pages() {
+        let db = test_database();
+        let workspace = crate::db::workspaces::upsert_workspace(
+            &db,
+            &std::env::temp_dir()
+                .join(format!(
+                    "auracoder-thread-mcp-query-workspace-{}",
+                    uuid::Uuid::new_v4()
+                ))
+                .to_string_lossy(),
+        )
+        .expect("workspace");
+        let target_thread = crate::db::threads::create_thread(
+            &db,
+            &workspace.id,
+            "claude",
+            "model",
+            "Referenced thread",
+        )
+        .expect("target thread");
+        let early = crate::db::messages::insert_user_message(
+            &db,
+            &target_thread.id,
+            "早",
+            None,
+            Some("claude"),
+            Some("model"),
+            None,
+        )
+        .expect("early message");
+        let middle = crate::db::messages::insert_user_message(
+            &db,
+            &target_thread.id,
+            "中",
+            None,
+            Some("claude"),
+            Some("model"),
+            None,
+        )
+        .expect("middle message");
+        let late = crate::db::messages::insert_user_message(
+            &db,
+            &target_thread.id,
+            "晚",
+            None,
+            Some("claude"),
+            Some("model"),
+            None,
+        )
+        .expect("late message");
+        {
+            let conn = db.connect().expect("database connection");
+            conn.execute(
+                "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+                params!["2026-08-22T00:00:01Z", early.id],
+            )
+            .expect("early timestamp");
+            conn.execute(
+                "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+                params!["2026-08-22T00:00:02Z", middle.id],
+            )
+            .expect("middle timestamp");
+            conn.execute(
+                "UPDATE messages SET created_at = ?1 WHERE id = ?2",
+                params!["2026-08-22T00:00:03Z", late.id],
+            )
+            .expect("late timestamp");
+        }
+
+        let service = AuraCoderThreadMcpService::new(db);
+        assert_eq!(
+            service
+                .thread_message_count(&target_thread.id)
+                .await
+                .expect("message count"),
+            3
+        );
+        let first_page = service
+            .thread_messages_page(&target_thread.id, 1, 2)
+            .await
+            .expect("first message page");
+        assert_eq!(first_page.len(), 2);
+        assert_eq!(first_page[0].content.as_deref(), Some("晚"));
+        assert_eq!(first_page[1].content.as_deref(), Some("中"));
+        let second_page = service
+            .thread_messages_page(&target_thread.id, 2, 2)
+            .await
+            .expect("second message page");
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].content.as_deref(), Some("早"));
+
+        // 序列化每条 typed 消息，确认稳定 snake_case 时间字段和记录字段。
+        for message in first_page.iter().chain(second_page.iter()) {
+            let value = serde_json::to_value(message).expect("message record should serialize");
+            assert!(value.get("id").is_some());
+            assert!(value.get("role").is_some());
+            assert!(value.get("content").is_some());
+            assert!(value.get("created_at").is_some());
+            assert!(value.get("createdAt").is_none());
+        }
+
+        assert!(service
+            .thread_messages_page(&target_thread.id, 0, 2)
+            .await
+            .is_err());
+        assert!(service
+            .thread_messages_page(&target_thread.id, 1, 0)
+            .await
+            .is_err());
     }
 
     fn test_database() -> Database {

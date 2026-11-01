@@ -1,16 +1,16 @@
-//! AuraCoder 本地会话读取工具服务。
+//! AuraCoder 公共 SQLite 只读会话工具服务。
 //!
-//! 该服务只访问 AuraCoder 自己的 SQLite 数据库，不依赖 CUA，也不访问 CLI
-//! 远端会话。各本机引擎在创建/发送线程时登记来源工作区，工具调用只能
-//! 读取同一工作区中的线程。
+//! 该服务只读取 AuraCoder 自己的 SQLite 会话数据，来源校验与项目访问授权由
+//! BaseCliMcp 负责。
 
-use std::{collections::HashMap, sync::Mutex};
+// use std::{collections::HashMap, sync::Mutex};
 
+use anyhow::Context;
 use serde_json::{json, Value};
 
 use crate::{
     db::{messages, threads, Database},
-    models::ThreadDto,
+    // models::ThreadDto,
 };
 
 /// AuraCoder 会话 MCP 的命名空间。
@@ -20,16 +20,18 @@ pub const PANES_THREAD_NAMESPACE: &str = "auracoder_thread";
 pub struct AuraCoderThreadMcpService {
     /// AuraCoder 主数据库连接池。
     db: Database,
+    /*
     /// 引擎线程到 AuraCoder 工作区的来源登记。
     bindings: Mutex<HashMap<(String, String), String>>,
+    */
 }
 
 impl AuraCoderThreadMcpService {
-    /// 创建绑定到指定 AuraCoder 数据库的会话工具服务。
+    /// 创建绑定到指定 AuraCoder 数据库的公共只读会话工具服务。
     pub fn new(db: Database) -> Self {
         Self {
             db,
-            bindings: Mutex::new(HashMap::new()),
+            // bindings: Mutex::new(HashMap::new()),
         }
     }
 
@@ -65,6 +67,7 @@ impl AuraCoderThreadMcpService {
         ]
     }
 
+/*
     /// 返回 Codex dynamicTools 所需的会话工具命名空间。
     pub fn dynamic_tools_spec(&self) -> Value {
         let tools = self
@@ -86,7 +89,10 @@ impl AuraCoderThreadMcpService {
             "tools": tools
         }])
     }
+*/
 
+
+/*
     /// 登记引擎线程所属的 AuraCoder 工作区。
     pub fn bind_engine_thread(&self, engine_id: &str, engine_thread_id: &str, workspace_id: &str) {
         let engine_id = engine_id.trim();
@@ -102,7 +108,10 @@ impl AuraCoderThreadMcpService {
             );
         }
     }
+*/
 
+
+/*
     /// 查询可信引擎线程登记的 AuraCoder 项目范围。
     pub fn workspace_for_engine_thread(
         &self,
@@ -118,7 +127,10 @@ impl AuraCoderThreadMcpService {
             .cloned()
             .ok_or_else(|| "当前引擎线程尚未登记 AuraCoder 项目范围".to_string())
     }
+*/
 
+
+/*
     /// 读取目标 AuraCoder 会话所属的项目，不判断调用方是否有权访问。
     pub async fn thread_workspace(&self, thread_id: &str) -> Result<Option<String>, String> {
         let db = self.db.clone();
@@ -131,7 +143,29 @@ impl AuraCoderThreadMcpService {
         .await
         .map_err(|error| format!("AuraCoder 会话项目查询任务失败：{error}"))?
     }
+*/
 
+
+    /// 读取目标 AuraCoder 会话所属的项目，为 BaseCliMcp 提供来源范围校验数据。
+    pub async fn thread_workspace(&self, thread_id: &str) -> anyhow::Result<Option<String>> {
+        let db = self.db.clone();
+        let thread_id = thread_id.trim().to_string();
+        let log_thread_id = thread_id.clone();
+
+        // 在线程池执行只读 Mapper 查询，并保留任务错误和数据库错误。
+        let result = tokio::task::spawn_blocking(move || {
+            threads::get_thread(&db, &thread_id).map(|thread| thread.map(|value| value.workspace_id))
+        })
+        .await
+        .context("AuraCoder 会话项目查询任务失败")
+        .and_then(|result| result);
+        if let Err(error) = &result {
+            log::error!("AuraCoder 会话项目查询失败: thread_id={} error={error:#}", log_thread_id);
+        }
+        result
+    }
+
+/*
     /// 读取目标 AuraCoder 会话所属的引擎标识，不判断调用方是否有权访问。
     pub async fn thread_engine(&self, thread_id: &str) -> Result<Option<String>, String> {
         let db = self.db.clone();
@@ -144,7 +178,29 @@ impl AuraCoderThreadMcpService {
         .await
         .map_err(|error| format!("AuraCoder 会话引擎查询任务失败：{error}"))?
     }
+*/
 
+
+    /// 读取目标 AuraCoder 会话所属的引擎标识，为 BaseCliMcp 判断同步条件提供数据。
+    pub async fn thread_engine(&self, thread_id: &str) -> anyhow::Result<Option<String>> {
+        let db = self.db.clone();
+        let thread_id = thread_id.trim().to_string();
+        let log_thread_id = thread_id.clone();
+
+        // 在线程池执行只读 Mapper 查询，并保留任务错误和数据库错误。
+        let result = tokio::task::spawn_blocking(move || {
+            threads::get_thread(&db, &thread_id).map(|thread| thread.map(|value| value.engine_id))
+        })
+        .await
+        .context("AuraCoder 会话引擎查询任务失败")
+        .and_then(|result| result);
+        if let Err(error) = &result {
+            log::error!("AuraCoder 会话引擎查询失败: thread_id={} error={error:#}", log_thread_id);
+        }
+        result
+    }
+
+/*
     /// 读取目标 AuraCoder 会话的消息数量，不判断调用方是否有权访问。
     pub async fn thread_message_count(&self, thread_id: &str) -> Result<Value, String> {
         let db = self.db.clone();
@@ -160,7 +216,29 @@ impl AuraCoderThreadMcpService {
         .await
         .map_err(|error| format!("AuraCoder 会话消息数量查询任务失败：{error}"))?
     }
+*/
 
+
+    /// 读取目标 AuraCoder 会话的消息数量，向调用方返回数据库查询错误。
+    pub async fn thread_message_count(&self, thread_id: &str) -> anyhow::Result<u64> {
+        let db = self.db.clone();
+        let thread_id = thread_id.trim().to_string();
+        let log_thread_id = thread_id.clone();
+
+        // 在线程池执行只读 Mapper 查询，并保留任务错误和数据库错误。
+        let result = tokio::task::spawn_blocking(move || {
+            messages::count_thread_messages(&db, &thread_id)
+        })
+        .await
+        .context("AuraCoder 会话消息数量查询任务失败")
+        .and_then(|result| result);
+        if let Err(error) = &result {
+            log::error!("AuraCoder 会话消息数量查询失败: thread_id={} error={error:#}", log_thread_id);
+        }
+        result
+    }
+
+/*
     /// 按创建时间倒序分页读取目标 AuraCoder 会话消息，不判断调用方是否有权访问。
     pub async fn thread_messages_page(
         &self,
@@ -183,7 +261,39 @@ impl AuraCoderThreadMcpService {
         .await
         .map_err(|error| format!("AuraCoder 会话消息分页查询任务失败：{error}"))?
     }
+*/
 
+
+    /// 按创建时间倒序分页读取目标 AuraCoder 会话消息并保留数据库查询错误。
+    pub async fn thread_messages_page(
+        &self,
+        thread_id: &str,
+        page: u64,
+        page_size: u64,
+    ) -> anyhow::Result<Vec<messages::AuraCoderThreadMessageRecord>> {
+        let db = self.db.clone();
+        let thread_id = thread_id.trim().to_string();
+        let log_thread_id = thread_id.clone();
+
+        // 在线程池执行只读 Mapper 查询，并保留任务错误和数据库错误。
+        let result = tokio::task::spawn_blocking(move || {
+            messages::get_thread_messages_page_desc(&db, &thread_id, page, page_size)
+        })
+        .await
+        .context("AuraCoder 会话消息分页查询任务失败")
+        .and_then(|result| result);
+        if let Err(error) = &result {
+            log::error!(
+                "AuraCoder 会话消息分页查询失败: thread_id={} page={} page_size={} error={error:#}",
+                log_thread_id,
+                page,
+                page_size
+            );
+        }
+        result
+    }
+
+/*
     /// 按引擎来源读取一个会话工具。
     pub async fn invoke_for_engine(
         &self,
@@ -259,8 +369,13 @@ impl AuraCoderThreadMcpService {
         .await
         .map_err(|error| format!("AuraCoder 会话工具查询任务失败：{error}"))?
     }
+*/
+
+
+
 }
 
+/*
 /// 验证被读取会话与引擎来源属于同一 AuraCoder 工作区。
 fn ensure_workspace(thread: &ThreadDto, source_workspace: &str) -> Result<(), String> {
     if thread.workspace_id != source_workspace {
@@ -268,6 +383,8 @@ fn ensure_workspace(thread: &ThreadDto, source_workspace: &str) -> Result<(), St
     }
     Ok(())
 }
+*/
+
 
 #[cfg(test)]
 #[path = "../tests/unit/auracoder_thread_mcp_service_tests.rs"]

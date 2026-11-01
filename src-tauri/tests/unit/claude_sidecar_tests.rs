@@ -36,12 +36,14 @@
             "test-mcp-gateway-token".to_string(),
         );
 
+        /*
         let db_path = std::env::temp_dir().join(format!(
             "claude-sidecar-services-{}.db",
             uuid::Uuid::new_v4()
         ));
         let db = crate::db::Database::open(db_path).expect("test database");
         engine.set_auracoder_thread_mcp_service(Arc::new(AuraCoderThreadMcpService::new(db)));
+        */
 
         let computer_control_service = engine
             .computer_control_service
@@ -52,6 +54,7 @@
             "computer control service should be saved"
         );
 
+        /*
         let auracoder_thread_mcp_service = engine
             .auracoder_thread_mcp_service
             .lock()
@@ -60,6 +63,8 @@
             auracoder_thread_mcp_service.is_some(),
             "AuraCoder thread MCP service should be saved"
         );
+        */
+
         let mcp_gateway_endpoint = engine
             .mcp_gateway_endpoint
             .lock()
