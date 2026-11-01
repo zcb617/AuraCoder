@@ -83,6 +83,7 @@ const DATABASE_SERVICE_PATHS = new Set([
   "src-tauri/src/services/chat_service.rs",
   "src-tauri/src/services/ssh_connection_service.rs",
   "src-tauri/src/services/thread_service.rs",
+  "src-tauri/src/services/workspace_service.rs",
 ]);
 
 /**
@@ -1325,6 +1326,7 @@ function runSelfChecks() {
     "src-tauri/src/services/ssh_connection_service.rs",
     "src-tauri/src/scheduled_tasks/manager.rs",
     "src-tauri/src/services/thread_service.rs",
+    "src-tauri/src/services/workspace_service.rs",
   ]) {
     assert.equal(
       findSampleFindings(file, "db::threads::get_thread();").some(

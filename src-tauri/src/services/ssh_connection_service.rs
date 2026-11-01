@@ -9,9 +9,9 @@ use crate::{
     db::{self, ssh_connections::SshConnectionRecord, Database},
     models::{
         SshConfigHostDto, SshConnectionDto, SshConnectionImportResultDto, SshConnectionInput,
-        SshConnectionTestDto,
+        SshConnectionTestDto, SshRemoteDirectoryDto,
     },
-    ssh::{config, gateway, known_hosts},
+    ssh::{config, gateway, known_hosts, runtime::quote_posix},
     state::AppState,
 };
 
@@ -532,6 +532,131 @@ impl SshConnectionService {
         result
     }
 
+    /// 检测可用 SSH 连接并返回有效的远端 HOME 目录信息。
+    pub async fn get_ssh_connection_home(&self, connection_id: String) -> Result<SshConnectionTestDto> {
+        // 检测前读取可用配置，检测后按配置版本保存结果并再次确认连接仍可用。
+        let log_connection_id = connection_id.clone();
+        let result = async {
+            let record = run_db(self.state.db.clone(), move |db| {
+                load_usable_ssh_connection(db, &connection_id)
+            })
+            .await
+            .context("读取 SSH 目录检测连接失败")?;
+            let probe = gateway::test(&record).await;
+            let save_record = record.clone();
+            let save_probe = probe.clone();
+            run_db(self.state.db.clone(), move |db| {
+                save_directory_probe_result(db, &save_record, &save_probe)
+            })
+            .await
+            .context("保存 SSH 目录检测结果失败")?;
+
+            if !probe.ok {
+                if let Some(error) = probe.error.as_deref() {
+                    anyhow::bail!("无法连接 SSH 远端主机：{error}");
+                }
+                anyhow::bail!("无法连接 SSH 远端主机");
+            }
+            if probe
+                .home
+                .as_deref()
+                .is_none_or(|home| !is_absolute_remote_path(home))
+            {
+                anyhow::bail!("远端未返回有效的 HOME 目录");
+            }
+            Ok(probe)
+        }
+        .await;
+        if let Err(error) = &result {
+            log::error!(
+                "获取 SSH 连接 HOME 目录失败: connection_id={} error={error:#}",
+                log_connection_id
+            );
+        }
+        result
+    }
+
+    /// 列出 SSH 连接指定目录下具备目录类型的直接子目录。
+    pub async fn list_ssh_directories(
+        &self,
+        connection_id: String,
+        path: String,
+    ) -> Result<Vec<SshRemoteDirectoryDto>> {
+        // 校验远端路径并通过连接网关查询直接子目录及其读写标志。
+        let log_connection_id = connection_id.clone();
+        let result = async {
+            let path = path.trim().to_string();
+            validate_remote_path(&path).context("校验 SSH 目录浏览路径失败")?;
+            let record = run_db(self.state.db.clone(), move |db| {
+                load_usable_ssh_connection(db, &connection_id)
+            })
+            .await
+            .context("读取 SSH 目录浏览连接失败")?;
+            let quoted_path = quote_posix(&path);
+            let command = format!(
+                "base={quoted_path}; [ -d \"$base\" ] && [ -r \"$base\" ] && [ -x \"$base\" ] || exit 21; find \"$base\" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | while IFS= read -r child; do readable=0; enterable=0; [ -r \"$child\" ] && readable=1; [ -x \"$child\" ] && enterable=1; printf '__PANES_DIR__%s\\t%s\\t%s\\n' \"$child\" \"$readable\" \"$enterable\"; done"
+            );
+            let output = gateway::run_command(&record, &command)
+                .await
+                .context("查询 SSH 远端子目录失败")?;
+            parse_remote_directories(&output).context("解析 SSH 远端子目录失败")
+        }
+        .await;
+        if let Err(error) = &result {
+            log::error!(
+                "列出 SSH 远端目录失败: connection_id={} error={error:#}",
+                log_connection_id
+            );
+        }
+        result
+    }
+
+    /// 解析 SSH 连接下的目录或其可访问父目录。
+    pub async fn resolve_ssh_directory(
+        &self,
+        connection_id: String,
+        path: String,
+        parent: Option<bool>,
+    ) -> Result<SshRemoteDirectoryDto> {
+        // 校验远端路径后执行解析命令，并返回首个可访问目录结果。
+        let log_connection_id = connection_id.clone();
+        let result = async {
+            let path = path.trim().to_string();
+            validate_remote_path(&path).context("校验 SSH 远端目录路径失败")?;
+            let record = run_db(self.state.db.clone(), move |db| {
+                load_usable_ssh_connection(db, &connection_id)
+            })
+            .await
+            .context("读取 SSH 目录解析连接失败")?;
+            let quoted_path = quote_posix(&path);
+            let command = if parent.unwrap_or(false) {
+                format!(
+                    "candidate=$(dirname -- {quoted_path} 2>/dev/null) || exit 21; resolved=$(realpath -- \"$candidate\" 2>/dev/null) || exit 21; [ -d \"$resolved\" ] && [ -r \"$resolved\" ] && [ -x \"$resolved\" ] || exit 22; readable=0; enterable=0; [ -r \"$resolved\" ] && readable=1; [ -x \"$resolved\" ] && enterable=1; printf '__PANES_DIR__%s\\t%s\\t%s\\n' \"$resolved\" \"$readable\" \"$enterable\""
+                )
+            } else {
+                format!(
+                    "resolved=$(realpath -- {quoted_path} 2>/dev/null) || exit 21; [ -d \"$resolved\" ] && [ -r \"$resolved\" ] && [ -x \"$resolved\" ] || exit 22; readable=0; enterable=0; [ -r \"$resolved\" ] && readable=1; [ -x \"$resolved\" ] && enterable=1; printf '__PANES_DIR__%s\\t%s\\t%s\\n' \"$resolved\" \"$readable\" \"$enterable\""
+                )
+            };
+            let output = gateway::run_command(&record, &command)
+                .await
+                .context("解析 SSH 远端目录失败")?;
+            parse_remote_directories(&output)
+                .context("解析 SSH 远端目录结果失败")?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("远端目录解析失败"))
+        }
+        .await;
+        if let Err(error) = &result {
+            log::error!(
+                "解析 SSH 远端目录失败: connection_id={} error={error:#}",
+                log_connection_id
+            );
+        }
+        result
+    }
+
     /// 检测连接、条件保存检测状态，并为有效结果注册支持的远端 CLI 服务。
     async fn test_and_register_cli_tunnels(
         &self,
@@ -635,6 +760,99 @@ where
     tokio::task::spawn_blocking(move || operation(&db))
         .await
         .context("SSH 数据库任务执行失败")?
+}
+
+/// 读取未删除且已启用的 SSH 连接配置，不执行远端操作。
+fn load_usable_ssh_connection(db: &Database, connection_id: &str) -> Result<SshConnectionRecord> {
+    // 按连接 ID 查询一次记录，并在发起 SSH 操作前验证其可用状态。
+    let record = db::ssh_connections::find(db, connection_id)?
+        .ok_or_else(|| anyhow::anyhow!("SSH 连接不存在"))?;
+    if record.dto.deleted_at.is_some() {
+        anyhow::bail!("SSH 连接已删除，请先恢复连接");
+    }
+    if !record.dto.enabled {
+        anyhow::bail!("SSH 连接已禁用");
+    }
+    Ok(record)
+}
+
+/// 仅在连接配置版本仍匹配且连接保持可用时保存目录探测结果。
+fn save_directory_probe_result(
+    db: &Database,
+    record: &SshConnectionRecord,
+    probe: &SshConnectionTestDto,
+) -> Result<()> {
+    // 校验探测结果归属后按配置版本条件保存，并确认保存后连接仍可用于目录选择。
+    if probe.connection_id != record.dto.id {
+        anyhow::bail!("SSH 检测结果与连接配置不匹配");
+    }
+    let recorded = db::ssh_connections::record_test_if_current(
+        db,
+        &record.dto.id,
+        &record.dto.updated_at,
+        probe.ok,
+        probe.error.as_deref(),
+    )?;
+    if !recorded {
+        anyhow::bail!("SSH 连接配置已变化或已删除，检测结果未保存");
+    }
+    let current = load_usable_ssh_connection(db, &record.dto.id)?;
+    if current.dto.updated_at != record.dto.updated_at {
+        anyhow::bail!("SSH 连接配置已变化，检测结果未保存");
+    }
+    Ok(())
+}
+
+/// 判断远端路径是否为不含控制字符的绝对路径。
+fn is_absolute_remote_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.contains('\0')
+        && !path.contains('\n')
+        && !path.contains('\r')
+        && !path.contains('\t')
+}
+
+/// 校验 SSH 远端目录参数为合法的绝对路径。
+fn validate_remote_path(path: &str) -> Result<()> {
+    if !is_absolute_remote_path(path.trim()) {
+        anyhow::bail!("远端目录必须是绝对路径");
+    }
+    Ok(())
+}
+
+/// 解析远端目录标记行并按目录名不区分大小写排序。
+fn parse_remote_directories(output: &str) -> Result<Vec<SshRemoteDirectoryDto>> {
+    // 跳过无效标记或路径行，并按协议字段保留可读和可进入状态。
+    let mut directories = Vec::new();
+    for line in output.lines() {
+        let Some(payload) = line.strip_prefix("__PANES_DIR__") else {
+            continue;
+        };
+        let mut fields = payload.splitn(3, '\t');
+        let Some(path) = fields.next() else {
+            continue;
+        };
+        let readable = fields.next() == Some("1");
+        let enterable = fields.next() == Some("1");
+        if !is_absolute_remote_path(path) {
+            continue;
+        }
+        let name = path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("/")
+            .to_string();
+        directories.push(SshRemoteDirectoryDto {
+            path: path.to_string(),
+            name,
+            readable,
+            enterable,
+        });
+    }
+    directories.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    Ok(directories)
 }
 
 /// 校验手动创建和 SSH 配置导入共用的连接必填项与端口规则。
