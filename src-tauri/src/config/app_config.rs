@@ -4,16 +4,17 @@ use std::{
     fs,
     path::PathBuf,
     */
-    sync::{Mutex, MutexGuard, OnceLock},
-    time::Duration,
+    /* sync::{Mutex, MutexGuard, OnceLock}, */
+    /* time::Duration, */
 };
 
-use anyhow::Context;
-use rusqlite::{params, Connection};
+/* use anyhow::Context; */
+/* use rusqlite::{params, Connection}; */
 use serde::{Deserialize, Serialize};
 
-use crate::runtime_env;
+/* use crate::runtime_env; */
 
+/*
 /// 将配置字典中的单个 JSON 文本应用到目标字段，损坏值只影响当前字段。
 macro_rules! apply_config_json {
     ($key:expr, $raw:expr, $target:expr) => {
@@ -23,7 +24,7 @@ macro_rules! apply_config_json {
         }
     };
 }
-
+*/
 pub const DEFAULT_TERMINAL_FONT_SIZE: u32 = 12;
 pub const MIN_TERMINAL_FONT_SIZE: u32 = 8;
 pub const MAX_TERMINAL_FONT_SIZE: u32 = 32;
@@ -165,18 +166,20 @@ pub struct ComputerControlAuthorizationConfig {
     pub turn_id: String,
 }
 
+/*
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaudeCodeSessionMode {
     ReuseSession,
     PerTurn,
 }
-
+*/
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClaudeCodeConfig {
     pub session_mode: String,
 }
 
+/*
 impl ClaudeCodeConfig {
     pub fn session_mode(&self) -> ClaudeCodeSessionMode {
         match self.session_mode.trim() {
@@ -185,7 +188,7 @@ impl ClaudeCodeConfig {
         }
     }
 }
-
+*/
 impl Default for ClaudeCodeConfig {
     fn default() -> Self {
         Self {
@@ -221,6 +224,7 @@ impl RemoteAccessConfig {
         self == &Self::default()
     }
 
+/*
     pub fn ensure_identity(&mut self) -> bool {
         if !self.tunnel_id.trim().is_empty() && self.credential.trim().len() >= 32 {
             return false;
@@ -239,6 +243,7 @@ impl RemoteAccessConfig {
         self.devices.clear();
         self.device_credential.clear();
     }
+*/
 }
 
 impl Default for RemoteAccessConfig {
@@ -523,17 +528,20 @@ impl AppConfig {
             .filter(|preset| VALID_AUTONOMY_PRESETS.contains(preset))
     }
 
+/*
     pub fn load_or_create() -> anyhow::Result<Self> {
         let _guard = lock_config()?;
         Self::load_or_create_unlocked()
     }
-
+*/
+/*
     #[allow(dead_code)]
     pub fn save(&self) -> anyhow::Result<()> {
         let _guard = lock_config()?;
         self.save_unlocked()
     }
-
+*/
+/*
     pub fn mutate<T>(f: impl FnOnce(&mut Self) -> anyhow::Result<T>) -> anyhow::Result<T> {
         let _guard = lock_config()?;
         let mut config = Self::load_or_create_unlocked()?;
@@ -541,7 +549,7 @@ impl AppConfig {
         config.save_unlocked()?;
         Ok(result)
     }
-
+*/
     /*
     pub fn set_display_scale(display_scale: u32) -> anyhow::Result<u32> {
         if normalize_display_scale(display_scale) != display_scale {
@@ -564,6 +572,7 @@ impl AppConfig {
     }
     */
 
+/*
     fn load_or_create_unlocked() -> anyhow::Result<Self> {
         runtime_env::migrate_legacy_app_data_dir()
             .context("failed to migrate legacy app data dir")?;
@@ -604,7 +613,8 @@ impl AppConfig {
         save_config_dictionary(&mut connection, &config)?;
         Ok(config)
     }
-
+*/
+/*
     fn save_unlocked(&self) -> anyhow::Result<()> {
         /* SQLite 字典持久化已替代以下旧 TOML 写入逻辑，保留原代码以便追溯。
         let path = Self::path();
@@ -622,7 +632,7 @@ impl AppConfig {
         let mut connection = open_config_database()?;
         save_config_dictionary(&mut connection, self)
     }
-
+*/
     /* 配置文件已取消，停用原用于定位 config.toml 的公开接口。
     pub fn path() -> PathBuf {
         runtime_env::config_path()
@@ -653,6 +663,7 @@ fn default_notification_sound() -> Option<&'static str> {
     }
 }
 
+/*
 /// 打开运行期工作区数据库，并设置配置读写使用的五秒锁等待时间。
 fn open_config_database() -> anyhow::Result<Connection> {
     let database_path = runtime_env::app_data_dir().join("workspaces.db");
@@ -898,7 +909,7 @@ fn lock_config() -> anyhow::Result<MutexGuard<'static, ()>> {
         .lock()
         .map_err(|_| anyhow::anyhow!("config lock poisoned"))
 }
-
+*/
 /* SQLite 字典持久化已替代旧 TOML 原子替换逻辑，保留原函数体以便追溯。
 fn replace_file(temp_path: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
@@ -933,10 +944,11 @@ fn replace_file(temp_path: &std::path::Path, path: &std::path::Path) -> std::io:
 }
 */
 
+/*
 #[cfg(test)]
 #[path = "../../tests/unit/chat_input_height_config_tests.rs"]
 mod chat_input_height_config_tests;
-
+*/
 #[cfg(test)]
 #[path = "../../tests/unit/app_config_tests.rs"]
 mod tests;

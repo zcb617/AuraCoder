@@ -2,8 +2,9 @@ use anyhow::Context;
 use serde_json::json;
 use crate::runtime_env;
 
+use crate::services::app_config_service::AppConfigService;
 use crate::{
-    config::app_config::AppConfig,
+    // config::app_config::AppConfig,
     db,
     models::{
         CliContextUsageDto, PermissionComponentJson, ThreadDto, ThreadStatusDto, ThreadUpdateDto,
@@ -147,7 +148,8 @@ impl ThreadService {
                     let config_write_lock = state.config_write_lock.clone();
                     let _guard = config_write_lock.lock_owned().await;
                     tokio::task::spawn_blocking(move || {
-                        AppConfig::mutate(|config| {
+                        // AppConfig::mutate(|config| {
+                        AppConfigService::mutate(|config| {
                             config.general.default_autonomy_preset = default_autonomy_preset.clone();
                             Ok(())
                         })

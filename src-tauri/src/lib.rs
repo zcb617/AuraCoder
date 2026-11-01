@@ -44,7 +44,8 @@ use std::sync::{
 };
 
 use cli_tools::factory::CliToolFactory;
-use config::app_config::AppConfig;
+// use config::app_config::AppConfig;
+use services::app_config_service::AppConfigService;
 use db::Database;
 use db::UnsupportedDatabaseVersion;
 use engines::EngineManager;
@@ -96,7 +97,8 @@ pub fn run() {
         eprintln!("AuraCoder 启动时初始化日志失败: {error:#}");
         return;
     }
-    let gpu_acceleration_enabled = AppConfig::load_or_create()
+    // let gpu_acceleration_enabled = AppConfig::load_or_create()
+    let gpu_acceleration_enabled = AppConfigService::load_or_create()
         .map(|config| {
             config.general.gpu_acceleration_enabled.unwrap_or_else(|| {
                 // 平台默认值：Linux 关闭，其他开启
@@ -138,10 +140,16 @@ pub fn run() {
             log::warn!("runtime recovery failed, continuing startup: {error}");
         }
     }
-    let mut app_config = AppConfig::load_or_create().expect("failed to load config");
-    if app_config.remote_access.enabled && app_config.remote_access.ensure_identity() {
+    // let mut app_config = AppConfig::load_or_create().expect("failed to load config");
+    let mut app_config = AppConfigService::load_or_create().expect("failed to load config");
+    // if app_config.remote_access.enabled && app_config.remote_access.ensure_identity() {
+    if app_config.remote_access.enabled && AppConfigService::ensure_remote_identity(&mut app_config.remote_access) {
+        /*
         app_config
             .save()
+            .expect("failed to persist remote access identity");
+        */
+        AppConfigService::save(&app_config)
             .expect("failed to persist remote access identity");
     }
     let app_locale = resolve_app_locale(app_config.general.locale.as_deref());

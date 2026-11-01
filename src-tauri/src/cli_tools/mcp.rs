@@ -5,12 +5,13 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::{CliExecutionContext, CliLocationKind, McpInvocationContext, McpToolResult};
+use crate::services::app_config_service::AppConfigService;
 use crate::{
     computer_control_service::{
         is_known_mcp_computer_tool, mcp_operation_kind, mcp_request_targets_current_process,
         resolve_mcp_target, ComputerControlAuthorization, ComputerControlTool,
     },
-    config::app_config::AppConfig,
+    // config::app_config::AppConfig,
     models::{EngineInfoDto, ThreadDto},
     state::AppState,
 };
@@ -653,7 +654,8 @@ impl BaseCliMcp {
             return McpToolResult::error("tool_not_found", "未知的 MCP 工具");
         }
 
-        let computer_control_enabled = match AppConfig::load_or_create() {
+        // let computer_control_enabled = match AppConfig::load_or_create() {
+        let computer_control_enabled = match AppConfigService::load_or_create() {
             Ok(config) => config.computer_control.enabled,
             Err(error) => {
                 log::error!(
@@ -1051,7 +1053,8 @@ pub(crate) mod thread_business {
         }
 
         pub(crate) async fn create_thread_record(&self, cli: &dyn CliTool, engine_id: &str, workspace_id: String, model_id: String, title: String, reasoning_effort: Option<String>, service_tier: Option<String>) -> anyhow::Result<ThreadDto> {
-            let preset = tokio::task::spawn_blocking(|| AppConfig::load_or_create().map(|config| config.default_autonomy_preset().map(ToOwned::to_owned))).await.context("读取新线程默认设置任务失败")??;
+            // let preset = tokio::task::spawn_blocking(|| AppConfig::load_or_create().map(|config| config.default_autonomy_preset().map(ToOwned::to_owned))).await.context("读取新线程默认设置任务失败")??;
+            let preset = tokio::task::spawn_blocking(|| AppConfigService::load_or_create().map(|config| config.default_autonomy_preset().map(ToOwned::to_owned))).await.context("读取新线程默认设置任务失败")??;
             self.create_thread_record_inner(cli, engine_id, workspace_id, model_id, title, reasoning_effort, service_tier, preset).await.map_err(anyhow::Error::msg)
         }
         #[allow(clippy::too_many_arguments)]

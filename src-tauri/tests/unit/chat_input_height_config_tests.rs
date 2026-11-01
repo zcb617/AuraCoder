@@ -1,7 +1,23 @@
 use rusqlite::Connection;
 
-use super::{load_config_dictionary, save_config_dictionary, AppConfig};
+// use super::{load_config_dictionary, save_config_dictionary, AppConfig};
+use super::{decode_config_dictionary, encode_config_dictionary};
+use crate::config::app_config::AppConfig;
+use crate::db::app_config as config_mapper;
 
+/// 从测试连接读取原始配置项并调用生产配置解码器。
+fn load_config_dictionary(connection: &Connection) -> anyhow::Result<AppConfig> {
+    config_mapper::load_entries_from_connection(connection).map(decode_config_dictionary)
+}
+
+/// 通过生产配置编码器和 Mapper 事务写入测试连接。
+fn save_config_dictionary(
+    connection: &mut Connection,
+    config: &AppConfig,
+) -> anyhow::Result<()> {
+    let entries = encode_config_dictionary(config)?;
+    config_mapper::save_entries_on_connection(connection, &entries)
+}
 /// 创建只包含配置字典表的内存数据库，验证缺失配置不影响其他默认配置。
 fn memory_config_database() -> Connection {
     let connection = Connection::open_in_memory().expect("memory database should open");

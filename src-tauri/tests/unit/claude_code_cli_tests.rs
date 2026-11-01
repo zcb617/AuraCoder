@@ -49,6 +49,36 @@ fn test_app_state() -> AppState {
     }
 }
 
+/// 验证 Claude 会话模式只由 Claude CLI 按本机或 SSH 执行位置解释。
+#[test]
+fn session_mode_is_interpreted_only_by_claude_cli() {
+    for (session_mode, expected_reuse) in [
+        ("reuse_session", true),
+        ("unknown", true),
+        ("", true),
+        (" per_turn ", false),
+        ("per_turn", false),
+    ] {
+        let mut state = test_app_state();
+        Arc::make_mut(&mut state.config).claude_code.session_mode = session_mode.to_string();
+        let cli = ClaudeCodeCli::new(state);
+        let local_context = CliExecutionContext {
+            workspace_id: "workspace-test".to_string(),
+            root_path: "/tmp/workspace-test".to_string(),
+            location_kind: CliLocationKind::Local,
+            ssh_connection_id: None,
+        };
+        let mut ssh_context = local_context.clone();
+        ssh_context.location_kind = CliLocationKind::Ssh;
+        ssh_context.ssh_connection_id = Some("ssh-test".to_string());
+
+        assert!(!cli.uses_reuse_session(&local_context));
+        assert_eq!(
+            cli.uses_reuse_session(&ssh_context),
+            expected_reuse
+        );
+    }
+}
 /// 验证未登记远端服务时，SSH Claude 归档接口仍按既有空操作语义返回。
 /// 验证未登记远端服务时，SSH Claude 归档接口仍按既有空操作语义返回。
 #[tokio::test]

@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
     cli_tools::engine_check,
-    config::app_config::ClaudeCodeSessionMode,
+    // config::app_config::ClaudeCodeSessionMode,
     db,
     engines::{
         capabilities_for_engine,
@@ -981,11 +981,13 @@ impl ClaudeCodeCli {
     //     }
     // }
 
+    /// 根据 Claude 会话原始配置仅为 SSH CLI 选择会话复用策略。
     fn uses_reuse_session(&self, context: &CliExecutionContext) -> bool {
+        // context.location_kind == CliLocationKind::Ssh
+        //     && self.state.config.claude_code.session_mode() == ClaudeCodeSessionMode::ReuseSession
         context.location_kind == CliLocationKind::Ssh
-            && self.state.config.claude_code.session_mode() == ClaudeCodeSessionMode::ReuseSession
+            && self.state.config.claude_code.session_mode.trim() != "per_turn"
     }
-
     fn unsupported(action: &str) -> anyhow::Error {
         anyhow::anyhow!("Claude Code 当前不支持{action}，不会调用 Codex、OpenCode 或本机替代实现")
     }

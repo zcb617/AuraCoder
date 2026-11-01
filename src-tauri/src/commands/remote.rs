@@ -1,6 +1,8 @@
 use tauri::{AppHandle, Emitter, State};
 
-use crate::{config::app_config::AppConfig, remote::RemoteAccessStatusDto, state::AppState};
+// use crate::{config::app_config::AppConfig, remote::RemoteAccessStatusDto, state::AppState};
+use crate::services::app_config_service::AppConfigService;
+use crate::{remote::RemoteAccessStatusDto, state::AppState};
 
 #[tauri::command]
 pub async fn get_remote_access_status(
@@ -17,10 +19,12 @@ pub async fn set_remote_access_enabled(
 ) -> Result<RemoteAccessStatusDto, String> {
     let _write_guard = state.config_write_lock.lock().await;
     let config = tokio::task::spawn_blocking(move || {
-        AppConfig::mutate(|config| {
+        // AppConfig::mutate(|config| {
+        AppConfigService::mutate(|config| {
             config.remote_access.enabled = enabled;
             if enabled {
-                config.remote_access.ensure_identity();
+                // config.remote_access.ensure_identity();
+                AppConfigService::ensure_remote_identity(&mut config.remote_access);
             }
             Ok(config.remote_access.clone())
         })
@@ -43,8 +47,10 @@ pub async fn regenerate_remote_access_identity(
 ) -> Result<RemoteAccessStatusDto, String> {
     let _write_guard = state.config_write_lock.lock().await;
     let config = tokio::task::spawn_blocking(move || {
-        AppConfig::mutate(|config| {
-            config.remote_access.regenerate_identity();
+        // AppConfig::mutate(|config| {
+        AppConfigService::mutate(|config| {
+            // config.remote_access.regenerate_identity();
+            AppConfigService::regenerate_remote_identity(&mut config.remote_access);
             Ok(config.remote_access.clone())
         })
     })
@@ -81,7 +87,8 @@ pub async fn revoke_remote_device(
     }
     let _write_guard = state.config_write_lock.lock().await;
     let config = tokio::task::spawn_blocking(move || {
-        AppConfig::mutate(|config| {
+        // AppConfig::mutate(|config| {
+        AppConfigService::mutate(|config| {
             let removed = if device_id == "legacy" {
                 let existed = !config.remote_access.device_credential.is_empty();
                 config.remote_access.device_credential.clear();

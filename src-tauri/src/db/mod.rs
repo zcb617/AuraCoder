@@ -11,6 +11,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::runtime_env;
 
+pub mod app_config;
 pub mod actions;
 pub mod extensions;
 pub mod messages;
@@ -416,748 +417,752 @@ fn configure_connection(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+// #[cfg(test)]
+// mod migration_tests {
+//     use super::*;
+//     use std::sync::{Arc, Mutex};
+//     use uuid::Uuid;
+//
+//     fn test_db() -> Database {
+//         let path =
+//             std::env::temp_dir().join(format!("auracoder-db-migrations-{}.db", Uuid::new_v4()));
+//         let db = Database {
+//             path,
+//             pool: Arc::new(ConnectionPool {
+//                 idle: Mutex::new(Vec::new()),
+//                 max_idle: SQLITE_POOL_MAX_IDLE,
+//             }),
+//         };
+//         db.run_migrations()
+//             .expect("failed to initialize test database");
+//         db
+//     }
+//
+//     #[test]
+//     fn baseline_and_migrations_record_the_integer_version() {
+//         let db = test_db();
+//         let conn = Connection::open(&db.path).expect("failed to open migrated test database");
+//         let version = conn
+//             .query_row(
+//                 "SELECT version FROM schema_version WHERE id = 1",
+//                 [],
+//                 |row| row.get::<_, u64>(0),
+//             )
+//             .expect("failed to read schema version");
+//         assert_eq!(version, migrations::SUPPORTED_DATABASE_VERSION);
+//
+//         let workspace_columns = conn
+//             .prepare("PRAGMA table_info(workspaces)")
+//             .expect("failed to inspect workspace schema")
+//             .query_map([], |row| row.get::<_, String>(1))
+//             .expect("failed to read workspace schema")
+//             .collect::<Result<Vec<_>, _>>()
+//             .expect("failed to decode workspace schema");
+//         assert!(workspace_columns.iter().any(|name| name == "location_kind"));
+//
+//         let ssh_columns = conn
+//             .prepare("PRAGMA table_info(ssh_connections)")
+//             .expect("failed to inspect SSH schema")
+//             .query_map([], |row| row.get::<_, String>(1))
+//             .expect("failed to read SSH schema")
+//             .collect::<Result<Vec<_>, _>>()
+//             .expect("failed to decode SSH schema");
+//         assert!(ssh_columns.iter().any(|name| name == "connection_status"));
+//     }
+//
+//     #[test]
+//     fn migration_105_accepts_development_versions_and_preserves_data() {
+//         for version in [101_u64, 102, 103] {
+//             let path = std::env::temp_dir().join(format!(
+//                 "auracoder-db-migration-105-from-{version}-{}.db",
+//                 Uuid::new_v4()
+//             ));
+//             let db = Database {
+//                 path,
+//                 pool: Arc::new(ConnectionPool {
+//                     idle: Mutex::new(Vec::new()),
+//                     max_idle: SQLITE_POOL_MAX_IDLE,
+//                 }),
+//             };
+//             let conn = Connection::open(&db.path).expect("failed to create development database");
+//             configure_connection(&conn).expect("failed to configure development database");
+//             conn.execute_batch(include_str!("migrations/baseline.sql"))
+//                 .expect("failed to initialize baseline schema");
+//             conn.execute_batch(include_str!("migrations/100.sql"))
+//                 .expect("failed to initialize baseline version");
+//             conn.execute_batch(
+//                 "CREATE TABLE ssh_connections (
+//                     id TEXT PRIMARY KEY,
+//                     display_name TEXT NOT NULL,
+//                     source_kind TEXT NOT NULL CHECK (source_kind IN ('ssh_config', 'manual')),
+//                     config_alias TEXT,
+//                     host_name TEXT NOT NULL,
+//                     user_name TEXT NOT NULL,
+//                     port INTEGER NOT NULL DEFAULT 22,
+//                     identity_file TEXT,
+//                     host_key_type TEXT NOT NULL,
+//                     host_key_base64 TEXT NOT NULL,
+//                     enabled INTEGER NOT NULL DEFAULT 1,
+//                     last_connected_at TEXT,
+//                     last_error TEXT,
+//                     deleted_at TEXT,
+//                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+//                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+//                 );
+//                 INSERT INTO ssh_connections (
+//                     id, display_name, source_kind, host_name, user_name,
+//                     host_key_type, host_key_base64
+//                 ) VALUES (
+//                     'ssh-1', 'existing ssh', 'manual', 'example.com', 'user',
+//                     'ssh-ed25519', 'abc'
+//                 );",
+//             )
+//             .expect("failed to initialize version 101 SSH schema");
+//
+//             if version >= 102 {
+//                 conn.execute_batch(
+//                     "CREATE TABLE workspaces_new (
+//                         id TEXT PRIMARY KEY,
+//                         name TEXT NOT NULL,
+//                         root_path TEXT NOT NULL,
+//                         location_kind TEXT NOT NULL DEFAULT 'local'
+//                             CHECK (location_kind IN ('local', 'ssh')),
+//                         ssh_connection_id TEXT REFERENCES ssh_connections(id) ON DELETE RESTRICT,
+//                         scan_depth INTEGER NOT NULL DEFAULT 3,
+//                         startup_preset_json TEXT,
+//                         startup_preset_updated_at TEXT,
+//                         archived_at TEXT,
+//                         created_at TEXT NOT NULL DEFAULT (datetime('now')),
+//                         last_opened_at TEXT NOT NULL DEFAULT (datetime('now')),
+//                         git_repo_selection_configured INTEGER NOT NULL DEFAULT 0,
+//                         CHECK (
+//                             (location_kind = 'local' AND ssh_connection_id IS NULL)
+//                             OR (location_kind = 'ssh' AND ssh_connection_id IS NOT NULL)
+//                         )
+//                     );
+//                     DROP TABLE workspaces;
+//                     ALTER TABLE workspaces_new RENAME TO workspaces;
+//                     CREATE UNIQUE INDEX idx_workspaces_local_root
+//                         ON workspaces(root_path) WHERE location_kind = 'local';
+//                     CREATE UNIQUE INDEX idx_workspaces_remote_root
+//                         ON workspaces(ssh_connection_id, root_path) WHERE location_kind = 'ssh';
+//                     CREATE INDEX idx_workspaces_ssh_connection
+//                         ON workspaces(ssh_connection_id);",
+//                 )
+//                 .expect("failed to initialize version 102 workspace schema");
+//                 conn.execute(
+//                     "INSERT INTO workspaces (
+//                         id, name, root_path, location_kind, ssh_connection_id
+//                     ) VALUES ('workspace-1', 'existing remote', '/srv/project', 'ssh', 'ssh-1')",
+//                     [],
+//                 )
+//                 .expect("failed to insert existing remote workspace");
+//             } else {
+//                 conn.execute(
+//                     "INSERT INTO workspaces (id, name, root_path)
+//                      VALUES ('workspace-1', 'existing local', 'D:/project')",
+//                     [],
+//                 )
+//                 .expect("failed to insert existing local workspace");
+//             }
+//
+//             if version >= 103 {
+//                 conn.execute_batch(
+//                     "ALTER TABLE ssh_connections
+//                      ADD COLUMN connection_status TEXT NOT NULL DEFAULT 'unknown'
+//                      CHECK (connection_status IN (
+//                          'unknown', 'connecting', 'ok', 'failed', 'disabled', 'deleted'
+//                      ));",
+//                 )
+//                 .expect("failed to initialize version 103 SSH schema");
+//             }
+//             conn.execute(
+//                 "UPDATE schema_version
+//                  SET version = ?1, migration_file = ?2, applied_at = datetime('now')
+//                  WHERE id = 1",
+//                 params![version, format!("{version}.sql")],
+//             )
+//             .expect("failed to record development database version");
+//             drop(conn);
+//
+//             db.run_migrations()
+//                 .expect("105.sql should accept the development database version");
+//             let conn = Connection::open(&db.path).expect("failed to reopen upgraded database");
+//             let upgraded_version = read_schema_version(&conn)
+//                 .expect("failed to read upgraded version")
+//                 .expect("upgraded version row should exist");
+//             assert_eq!(upgraded_version, migrations::SUPPORTED_DATABASE_VERSION);
+//             assert_eq!(
+//                 conn.query_row(
+//                     "SELECT COUNT(*) FROM ssh_connections WHERE id = 'ssh-1'",
+//                     [],
+//                     |row| row.get::<_, u64>(0),
+//                 )
+//                 .expect("failed to check existing SSH connection"),
+//                 1
+//             );
+//             assert_eq!(
+//                 conn.query_row(
+//                     "SELECT COUNT(*) FROM workspaces WHERE id = 'workspace-1'",
+//                     [],
+//                     |row| row.get::<_, u64>(0),
+//                 )
+//                 .expect("failed to check existing workspace"),
+//                 1
+//             );
+//             if version >= 102 {
+//                 assert_eq!(
+//                     conn.query_row(
+//                         "SELECT location_kind || ':' || ssh_connection_id
+//                          FROM workspaces WHERE id = 'workspace-1'",
+//                         [],
+//                         |row| row.get::<_, String>(0),
+//                     )
+//                     .expect("failed to check existing remote workspace"),
+//                     "ssh:ssh-1"
+//                 );
+//             }
+//         }
+//     }
+//
+//     /// 验证 107 到 108 将旧仓库转换为 Workspace，并同步迁移会话与定时任务归属。
+//     #[test]
+//     fn migration_108_rebuilds_project_schema_and_cleans_all_terminal_worktrees() {
+//         let path = std::env::temp_dir().join(format!(
+//             "auracoder-db-migration-108-from-107-{}.db",
+//             Uuid::new_v4()
+//         ));
+//         let db = Database {
+//             path,
+//             pool: Arc::new(ConnectionPool {
+//                 idle: Mutex::new(Vec::new()),
+//                 max_idle: SQLITE_POOL_MAX_IDLE,
+//             }),
+//         };
+//         let conn = Connection::open(&db.path).expect("failed to create 107 database");
+//         configure_connection(&conn).expect("failed to configure 107 database");
+//         conn.execute_batch(
+//             r#"
+//             CREATE TABLE schema_version (
+//                 id INTEGER PRIMARY KEY CHECK (id = 1),
+//                 version INTEGER NOT NULL,
+//                 migration_file TEXT NOT NULL,
+//                 applied_at TEXT NOT NULL
+//             );
+//             INSERT INTO schema_version (id, version, migration_file, applied_at)
+//             VALUES (1, 107, '107.sql', datetime('now'));
+//             CREATE TABLE ssh_connections (
+//                 id TEXT PRIMARY KEY,
+//                 display_name TEXT NOT NULL,
+//                 source_kind TEXT NOT NULL,
+//                 config_alias TEXT,
+//                 host_name TEXT NOT NULL,
+//                 user_name TEXT NOT NULL,
+//                 port INTEGER NOT NULL DEFAULT 22,
+//                 identity_file TEXT,
+//                 host_key_type TEXT NOT NULL,
+//                 host_key_base64 TEXT NOT NULL,
+//                 enabled INTEGER NOT NULL DEFAULT 1,
+//                 connection_status TEXT NOT NULL DEFAULT 'ok',
+//                 last_connected_at TEXT,
+//                 last_error TEXT,
+//                 deleted_at TEXT,
+//                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+//                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+//             );
+//             INSERT INTO ssh_connections (
+//                 id, display_name, source_kind, host_name, user_name,
+//                 host_key_type, host_key_base64
+//             ) VALUES (
+//                 'ssh-1', 'existing ssh', 'manual', 'example.com', 'user',
+//                 'ssh-ed25519', 'abc'
+//             );
+//             CREATE TABLE workspaces (
+//                 id TEXT PRIMARY KEY,
+//                 name TEXT NOT NULL,
+//                 root_path TEXT NOT NULL,
+//                 location_kind TEXT NOT NULL DEFAULT 'local',
+//                 ssh_connection_id TEXT,
+//                 scan_depth INTEGER NOT NULL DEFAULT 3,
+//                 startup_preset_json TEXT,
+//                 startup_preset_updated_at TEXT,
+//                 archived_at TEXT,
+//                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+//                 last_opened_at TEXT NOT NULL DEFAULT (datetime('now')),
+//                 git_repo_selection_configured INTEGER NOT NULL DEFAULT 0
+//             );
+//             CREATE TABLE repos (
+//                 id TEXT PRIMARY KEY,
+//                 workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+//                 name TEXT NOT NULL,
+//                 path TEXT NOT NULL,
+//                 default_branch TEXT NOT NULL,
+//                 is_active INTEGER NOT NULL,
+//                 is_discovered INTEGER NOT NULL,
+//                 trust_level TEXT NOT NULL
+//             );
+//             CREATE TABLE threads (
+//                 id TEXT PRIMARY KEY,
+//                 workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+//                 repo_id TEXT REFERENCES repos(id) ON DELETE SET NULL,
+//                 engine_id TEXT NOT NULL,
+//                 model_id TEXT NOT NULL,
+//                 engine_thread_id TEXT,
+//                 engine_metadata_json TEXT,
+//                 engine_capabilities_json TEXT,
+//                 title TEXT,
+//                 status TEXT NOT NULL DEFAULT 'idle',
+//                 archived_at TEXT,
+//                 message_count INTEGER NOT NULL DEFAULT 0,
+//                 total_tokens INTEGER NOT NULL DEFAULT 0,
+//                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+//                 last_activity_at TEXT NOT NULL DEFAULT (datetime('now')),
+//                 plan_mode INTEGER,
+//                 send_method TEXT,
+//                 reasoning_effort TEXT,
+//                 permission_mode TEXT
+//             );
+//             CREATE INDEX idx_threads_repo ON threads(repo_id);
+//             CREATE TABLE messages (
+//                 id TEXT PRIMARY KEY,
+//                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+//                 role TEXT NOT NULL,
+//                 content TEXT,
+//                 blocks_json TEXT,
+//                 turn_engine_id TEXT,
+//                 remote_turn_id TEXT,
+//                 turn_model_id TEXT,
+//                 turn_reasoning_effort TEXT,
+//                 schema_version INTEGER NOT NULL DEFAULT 1,
+//                 stream_seq INTEGER NOT NULL DEFAULT 0,
+//                 status TEXT NOT NULL DEFAULT 'completed',
+//                 token_input INTEGER DEFAULT 0,
+//                 token_output INTEGER DEFAULT 0,
+//                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+//             );
+//             CREATE TABLE actions (
+//                 id TEXT PRIMARY KEY,
+//                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+//                 message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+//                 engine_action_id TEXT,
+//                 action_type TEXT NOT NULL,
+//                 summary TEXT NOT NULL,
+//                 details_json TEXT NOT NULL,
+//                 status TEXT NOT NULL DEFAULT 'running',
+//                 truncated INTEGER NOT NULL DEFAULT 0,
+//                 result_json TEXT,
+//                 duration_ms INTEGER,
+//                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+//             );
+//             CREATE TABLE approvals (
+//                 id TEXT PRIMARY KEY,
+//                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+//                 message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+//                 action_type TEXT NOT NULL,
+//                 summary TEXT NOT NULL,
+//                 details_json TEXT NOT NULL,
+//                 status TEXT NOT NULL DEFAULT 'pending',
+//                 decision TEXT,
+//                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+//                 answered_at TEXT
+//             );
+//             CREATE TABLE engine_event_logs (
+//                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+//                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+//                 message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+//                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+//                 event_json TEXT NOT NULL
+//             );
+//             CREATE TABLE extension_catalog_snapshots (
+//                 provider_id TEXT NOT NULL,
+//                 context_key TEXT NOT NULL,
+//                 kind TEXT NOT NULL CHECK(kind IN ('skill', 'plugin', 'mcp')),
+//                 items_json TEXT NOT NULL,
+//                 fetched_at TEXT,
+//                 last_attempt_at TEXT,
+//                 next_refresh_at TEXT,
+//                 last_error TEXT,
+//                 failure_count INTEGER NOT NULL DEFAULT 0,
+//                 PRIMARY KEY (provider_id, context_key, kind)
+//             );
+//             CREATE TABLE scheduled_tasks (
+//                 id TEXT PRIMARY KEY,
+//                 description TEXT NOT NULL,
+//                 enabled INTEGER NOT NULL DEFAULT 1,
+//                 execution_device_id TEXT NOT NULL DEFAULT 'local',
+//                 target_type TEXT NOT NULL,
+//                 workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+//                 thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL,
+//                 runtime_config_json TEXT,
+//                 schedule_type TEXT NOT NULL,
+//                 schedule_json TEXT NOT NULL,
+//                 timezone TEXT NOT NULL,
+//                 next_run_at TEXT,
+//                 last_run_at TEXT,
+//                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+//                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+//                 CHECK (target_type IN ('existing_thread', 'new_thread')),
+//                 CHECK (schedule_type IN ('interval', 'daily', 'weekly'))
+//             );
+//             CREATE TABLE scheduled_task_runs (
+//                 id TEXT PRIMARY KEY,
+//                 task_id TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+//                 scheduled_for TEXT NOT NULL,
+//                 started_at TEXT,
+//                 finished_at TEXT,
+//                 thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL,
+//                 assistant_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+//                 status TEXT NOT NULL DEFAULT 'queued',
+//                 error_message TEXT,
+//                 result_preview TEXT,
+//                 acknowledged_at TEXT,
+//                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+//                 CHECK (status IN (
+//                     'queued',
+//                     'running',
+//                     'needs_confirmation',
+//                     'completed',
+//                     'error',
+//                     'interrupted',
+//                     'skipped'
+//                 )),
+//                 UNIQUE(task_id, scheduled_for)
+//             );
+//             INSERT INTO workspaces (
+//                 id, name, root_path, location_kind, ssh_connection_id, startup_preset_json
+//             ) VALUES (
+//                 'workspace-home', 'Home', '/home/user', 'local', NULL,
+//                 '{"worktree":"/tmp/old","terminal":{"groups":[
+//                   {"id":"g0","name":"Group 0","root":"/tmp/g0","layout":"split","cwd":"/tmp/g0","harness":"codex","worktree":"/tmp/w0"},
+//                   {"id":"g1","name":"Group 1","root":"/tmp/g1","layout":"split","cwd":"/tmp/g1","harness":"codex","worktree":"/tmp/w1"},
+//                   {"id":"g2","name":"Group 2","root":"/tmp/g2","layout":"split","cwd":"/tmp/g2","harness":"codex","worktree":"/tmp/w2"},
+//                   {"id":"g3","name":"Group 3","root":"/tmp/g3","layout":"split","cwd":"/tmp/g3","harness":"codex","worktree":"/tmp/w3"},
+//                   {"id":"g4","name":"Group 4","root":"/tmp/g4","layout":"split","cwd":"/tmp/g4","harness":"codex","worktree":"/tmp/w4"},
+//                   {"id":"g5","name":"Group 5","root":"/tmp/g5","layout":"split","cwd":"/tmp/g5","harness":"codex","worktree":"/tmp/w5"},
+//                   {"id":"g6","name":"Group 6","root":"/tmp/g6","layout":"split","cwd":"/tmp/g6","harness":"codex","worktree":"/tmp/w6"},
+//                   {"id":"g7","name":"Group 7","root":"/tmp/g7","layout":"split","cwd":"/tmp/g7","harness":"codex","worktree":"/tmp/w7"},
+//                   {"id":"g8","name":"Group 8","root":"/tmp/g8","layout":"split","cwd":"/tmp/g8","harness":"codex","worktree":"/tmp/w8"},
+//                   {"id":"g9","name":"Group 9","root":"/tmp/g9","layout":"split","cwd":"/tmp/g9","harness":"codex","worktree":"/tmp/w9"},
+//                   {"id":"g10","name":"Group 10","root":"/tmp/g10","layout":"split","cwd":"/tmp/g10","harness":"codex","worktree":"/tmp/w10"}
+//                 ]}}'
+//             );
+//             INSERT INTO workspaces (
+//                 id, name, root_path, location_kind, ssh_connection_id
+//             ) VALUES
+//                 ('workspace-existing', 'Existing', '/repo/existing', 'local', NULL),
+//                 ('workspace-ssh', 'Remote Home', '/remote/home', 'ssh', 'ssh-1');
+//             INSERT INTO repos (
+//                 id, workspace_id, name, path, default_branch, is_active, is_discovered, trust_level
+//             ) VALUES
+//                 ('repo-new', 'workspace-home', 'New Repo', '/home/user/new-repo', 'main', 1, 0, 'trusted'),
+//                 ('repo-new-duplicate', 'workspace-home', 'Duplicate New Repo', '/home/user/new-repo', 'main', 1, 0, 'trusted'),
+//                 ('repo-existing', 'workspace-home', 'Existing Repo', '/repo/existing', 'main', 1, 0, 'trusted'),
+//                 ('repo-ssh', 'workspace-ssh', 'Remote Repo', '/remote/home/project', 'main', 1, 0, 'trusted');
+//             INSERT INTO threads (id, workspace_id, repo_id, engine_id, model_id, title)
+//             VALUES
+//                 ('thread-repo-new', 'workspace-home', 'repo-new', 'codex', 'model', 'New Repo Thread'),
+//                 ('thread-repo-existing', 'workspace-home', 'repo-existing', 'codex', 'model', 'Existing Repo Thread'),
+//                 ('thread-home', 'workspace-home', NULL, 'codex', 'model', 'Home Thread'),
+//                 ('thread-remote', 'workspace-ssh', 'repo-ssh', 'codex', 'model', 'Remote Thread');
+//             INSERT INTO messages (id, thread_id, role, content)
+//             VALUES
+//                 ('message-new', 'thread-repo-new', 'user', 'new message'),
+//                 ('message-existing', 'thread-repo-existing', 'user', 'existing message'),
+//                 ('message-home', 'thread-home', 'user', 'home message'),
+//                 ('message-remote', 'thread-remote', 'user', 'remote message');
+//             INSERT INTO scheduled_tasks (
+//                 id, description, enabled, execution_device_id, target_type,
+//                 workspace_id, thread_id, runtime_config_json, schedule_type,
+//                 schedule_json, timezone, next_run_at, last_run_at, created_at, updated_at
+//             ) VALUES (
+//                 'task-108', 'Migration test task', 1, 'local', 'existing_thread',
+//                 'workspace-home', 'thread-repo-new',
+//                 '{"repoId":"repo-new","workspaceWritableRoots":["/home/user"],"workspaceWriteOptIn":true,"keep":"yes"}',
+//                 'interval', '{}', 'UTC', NULL, NULL, datetime('now'), datetime('now')
+//             );
+//             "#,
+//         )
+//         .expect("failed to seed 107 database");
+//         drop(conn);
+//
+//         db.run_migrations()
+//             .expect("failed to migrate 107 database to 108");
+//         let conn = Connection::open(&db.path).expect("failed to open migrated 108 database");
+//
+//         assert_eq!(
+//             conn.query_row("SELECT COUNT(*) FROM workspaces", [], |row| row
+//                 .get::<_, u64>(0))
+//                 .expect("failed to count migrated workspaces"),
+//             5
+//         );
+//         let new_repo_workspace_id: String = conn
+//             .query_row(
+//                 "SELECT id FROM workspaces
+//                  WHERE root_path = '/home/user/new-repo' AND location_kind = 'local'",
+//                 [],
+//                 |row| row.get(0),
+//             )
+//             .expect("failed to find new local repository workspace");
+//         let existing_repo_workspace_id: String = conn
+//             .query_row(
+//                 "SELECT id FROM workspaces
+//                  WHERE root_path = '/repo/existing' AND location_kind = 'local'",
+//                 [],
+//                 |row| row.get(0),
+//             )
+//             .expect("failed to find existing repository workspace");
+//         let ssh_repo_workspace_id: String = conn
+//             .query_row(
+//                 "SELECT id FROM workspaces
+//                  WHERE root_path = '/remote/home/project'
+//                    AND location_kind = 'ssh'
+//                    AND ssh_connection_id = 'ssh-1'",
+//                 [],
+//                 |row| row.get(0),
+//             )
+//             .expect("failed to find SSH repository workspace");
+//         assert_eq!(
+//             conn.query_row(
+//                 "SELECT COUNT(*) FROM workspaces
+//                  WHERE root_path = '/home/user/new-repo' AND location_kind = 'local'",
+//                 [],
+//                 |row| row.get::<_, u64>(0),
+//             )
+//             .expect("failed to count new local repository workspaces"),
+//             1
+//         );
+//         assert_eq!(existing_repo_workspace_id, "workspace-existing");
+//         assert_eq!(
+//             conn.query_row(
+//                 "SELECT location_kind || ':' || ssh_connection_id
+//                  FROM workspaces WHERE id = ?1",
+//                 [&ssh_repo_workspace_id],
+//                 |row| row.get::<_, String>(0),
+//             )
+//             .expect("failed to inspect SSH repository workspace"),
+//             "ssh:ssh-1"
+//         );
+//         assert_eq!(
+//             conn.query_row("SELECT COUNT(*) FROM threads", [], |row| row
+//                 .get::<_, u64>(0))
+//                 .expect("failed to count migrated threads"),
+//             4
+//         );
+//         assert_eq!(
+//             conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row
+//                 .get::<_, u64>(0))
+//                 .expect("failed to count migrated messages"),
+//             4
+//         );
+//         assert_eq!(
+//             conn.query_row(
+//                 "SELECT content FROM messages WHERE id = 'message-new'",
+//                 [],
+//                 |row| row.get::<_, String>(0),
+//             )
+//             .expect("failed to inspect migrated message identity"),
+//             "new message"
+//         );
+//         assert_eq!(
+//             conn.query_row(
+//                 "SELECT workspace_id FROM threads WHERE id = 'thread-repo-new'",
+//                 [],
+//                 |row| row.get::<_, String>(0),
+//             )
+//             .expect("failed to inspect new repository thread workspace"),
+//             new_repo_workspace_id
+//         );
+//         assert_eq!(
+//             conn.query_row(
+//                 "SELECT workspace_id FROM threads WHERE id = 'thread-repo-existing'",
+//                 [],
+//                 |row| row.get::<_, String>(0),
+//             )
+//             .expect("failed to inspect existing repository thread workspace"),
+//             existing_repo_workspace_id
+//         );
+//         assert_eq!(
+//             conn.query_row(
+//                 "SELECT workspace_id FROM threads WHERE id = 'thread-home'",
+//                 [],
+//                 |row| row.get::<_, String>(0),
+//             )
+//             .expect("failed to inspect home thread workspace"),
+//             "workspace-home"
+//         );
+//         assert_eq!(
+//             conn.query_row(
+//                 "SELECT workspace_id FROM threads WHERE id = 'thread-remote'",
+//                 [],
+//                 |row| row.get::<_, String>(0),
+//             )
+//             .expect("failed to inspect remote thread workspace"),
+//             ssh_repo_workspace_id
+//         );
+//         let supported_migration = migrations::MIGRATIONS
+//             .iter()
+//             .find(|migration| migration.version == migrations::SUPPORTED_DATABASE_VERSION)
+//             .expect("supported migration should be registered");
+//         assert_eq!(
+//             conn.query_row(
+//                 "SELECT version || ':' || migration_file FROM schema_version WHERE id = 1",
+//                 [],
+//                 |row| row.get::<_, String>(0),
+//             )
+//             .expect("failed to inspect migrated schema version"),
+//             format!(
+//                 "{}:{}",
+//                 migrations::SUPPORTED_DATABASE_VERSION,
+//                 supported_migration.file
+//             )
+//         );
+//         assert_eq!(
+//             conn.query_row(
+//                 "SELECT id || ':' || trust_level FROM workspaces",
+//                 [],
+//                 |row| row.get::<_, String>(0),
+//             )
+//             .expect("failed to inspect migrated workspace"),
+//             "workspace-home:standard"
+//         );
+//
+//         for table in ["repos", "idx_threads_repo"] {
+//             let exists = conn
+//                 .query_row(
+//                     "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+//                     [table],
+//                     |row| row.get::<_, u64>(0),
+//                 )
+//                 .expect("failed to inspect removed repository objects");
+//             assert_eq!(exists, 0, "legacy object should be removed: {table}");
+//         }
+//         for column in ["scan_depth", "git_repo_selection_configured"] {
+//             let exists = conn
+//                 .prepare("PRAGMA table_info(workspaces)")
+//                 .expect("failed to inspect workspace columns")
+//                 .query_map([], |row| row.get::<_, String>(1))
+//                 .expect("failed to read workspace columns")
+//                 .collect::<Result<Vec<_>, _>>()
+//                 .expect("failed to decode workspace columns")
+//                 .iter()
+//                 .any(|name| name == column);
+//             assert!(
+//                 !exists,
+//                 "legacy workspace column should be removed: {column}"
+//             );
+//         }
+//         let thread_columns = conn
+//             .prepare("PRAGMA table_info(threads)")
+//             .expect("failed to inspect thread columns")
+//             .query_map([], |row| row.get::<_, String>(1))
+//             .expect("failed to read thread columns")
+//             .collect::<Result<Vec<_>, _>>()
+//             .expect("failed to decode thread columns");
+//         assert!(!thread_columns.iter().any(|name| name == "repo_id"));
+//
+//         let task_workspace_id: String = conn
+//             .query_row(
+//                 "SELECT workspace_id FROM scheduled_tasks WHERE id = 'task-108'",
+//                 [],
+//                 |row| row.get(0),
+//             )
+//             .expect("failed to inspect migrated scheduled task workspace");
+//         assert_eq!(task_workspace_id, new_repo_workspace_id);
+//         let runtime_config: String = conn
+//             .query_row(
+//                 "SELECT runtime_config_json FROM scheduled_tasks WHERE id = 'task-108'",
+//                 [],
+//                 |row| row.get(0),
+//             )
+//             .expect("failed to load migrated scheduled task");
+//         let runtime_config: serde_json::Value =
+//             serde_json::from_str(&runtime_config).expect("migrated runtime config should be JSON");
+//         assert_eq!(runtime_config.get("keep"), Some(&serde_json::json!("yes")));
+//         for removed_key in ["repoId", "workspaceWritableRoots", "workspaceWriteOptIn"] {
+//             assert!(runtime_config.get(removed_key).is_none());
+//         }
+//
+//         let preset: String = conn
+//             .query_row(
+//                 "SELECT startup_preset_json FROM workspaces WHERE id = 'workspace-home'",
+//                 [],
+//                 |row| row.get(0),
+//             )
+//             .expect("failed to load migrated startup preset");
+//         let preset: serde_json::Value =
+//             serde_json::from_str(&preset).expect("migrated startup preset should be JSON");
+//         assert!(preset.get("worktree").is_none());
+//         let groups = preset["terminal"]["groups"]
+//             .as_array()
+//             .expect("terminal groups should remain an array");
+//         assert_eq!(groups.len(), 11);
+//         for group in groups {
+//             assert!(group.get("worktree").is_none());
+//             assert!(group.get("id").is_some());
+//             assert!(group.get("name").is_some());
+//             assert!(group.get("root").is_some());
+//             assert!(group.get("layout").is_some());
+//             assert!(group.get("cwd").is_some());
+//             assert!(group.get("harness").is_some());
+//         }
+//
+//         let foreign_key_errors = conn
+//             .prepare("PRAGMA foreign_key_check")
+//             .expect("failed to prepare foreign key check")
+//             .query_map([], |_| Ok(()))
+//             .expect("failed to run foreign key check")
+//             .collect::<Result<Vec<_>, _>>()
+//             .expect("failed to collect foreign key check");
+//         assert!(foreign_key_errors.is_empty());
+//     }
+//
+//     #[test]
+//     fn migrations_are_idempotent_after_the_target_version() {
+//         let db = test_db();
+//         db.run_migrations()
+//             .expect("running migrations a second time should succeed");
+//         let conn = Connection::open(&db.path).expect("failed to reopen migrated database");
+//         let version = conn
+//             .query_row(
+//                 "SELECT version FROM schema_version WHERE id = 1",
+//                 [],
+//                 |row| row.get::<_, u64>(0),
+//             )
+//             .expect("failed to read schema version after rerun");
+//         assert_eq!(version, migrations::SUPPORTED_DATABASE_VERSION);
+//     }
+//
+//     #[test]
+//     fn every_migration_file_updates_the_schema_version_it_declares() {
+//         for migration in migrations::MIGRATIONS {
+//             assert!(migration.sql.contains("schema_version"));
+//             assert!(migration.sql.contains(&migration.version.to_string()));
+//             assert!(migration.sql.contains(migration.file));
+//         }
+//     }
+//
+//     #[test]
+//     fn version_100_only_bootstraps_the_version_table() {
+//         let sql = migrations::MIGRATIONS
+//             .iter()
+//             .find(|migration| migration.version == migrations::BASELINE_VERSION)
+//             .expect("baseline migration should be registered")
+//             .sql;
+//         assert!(sql.contains("CREATE TABLE IF NOT EXISTS schema_version"));
+//         assert!(sql.contains("INSERT INTO schema_version"));
+//         assert!(!sql.contains("ALTER TABLE"));
+//         assert!(!sql.contains("UPDATE schema_version"));
+//     }
+//
+//     #[test]
+//     fn migration_list_starts_at_the_declared_baseline() {
+//         assert_eq!(
+//             migrations::MIGRATIONS[0].version,
+//             migrations::BASELINE_VERSION
+//         );
+//     }
+// }
+
 #[cfg(test)]
-mod migration_tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-    use uuid::Uuid;
-
-    fn test_db() -> Database {
-        let path =
-            std::env::temp_dir().join(format!("auracoder-db-migrations-{}.db", Uuid::new_v4()));
-        let db = Database {
-            path,
-            pool: Arc::new(ConnectionPool {
-                idle: Mutex::new(Vec::new()),
-                max_idle: SQLITE_POOL_MAX_IDLE,
-            }),
-        };
-        db.run_migrations()
-            .expect("failed to initialize test database");
-        db
-    }
-
-    #[test]
-    fn baseline_and_migrations_record_the_integer_version() {
-        let db = test_db();
-        let conn = Connection::open(&db.path).expect("failed to open migrated test database");
-        let version = conn
-            .query_row(
-                "SELECT version FROM schema_version WHERE id = 1",
-                [],
-                |row| row.get::<_, u64>(0),
-            )
-            .expect("failed to read schema version");
-        assert_eq!(version, migrations::SUPPORTED_DATABASE_VERSION);
-
-        let workspace_columns = conn
-            .prepare("PRAGMA table_info(workspaces)")
-            .expect("failed to inspect workspace schema")
-            .query_map([], |row| row.get::<_, String>(1))
-            .expect("failed to read workspace schema")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("failed to decode workspace schema");
-        assert!(workspace_columns.iter().any(|name| name == "location_kind"));
-
-        let ssh_columns = conn
-            .prepare("PRAGMA table_info(ssh_connections)")
-            .expect("failed to inspect SSH schema")
-            .query_map([], |row| row.get::<_, String>(1))
-            .expect("failed to read SSH schema")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("failed to decode SSH schema");
-        assert!(ssh_columns.iter().any(|name| name == "connection_status"));
-    }
-
-    #[test]
-    fn migration_105_accepts_development_versions_and_preserves_data() {
-        for version in [101_u64, 102, 103] {
-            let path = std::env::temp_dir().join(format!(
-                "auracoder-db-migration-105-from-{version}-{}.db",
-                Uuid::new_v4()
-            ));
-            let db = Database {
-                path,
-                pool: Arc::new(ConnectionPool {
-                    idle: Mutex::new(Vec::new()),
-                    max_idle: SQLITE_POOL_MAX_IDLE,
-                }),
-            };
-            let conn = Connection::open(&db.path).expect("failed to create development database");
-            configure_connection(&conn).expect("failed to configure development database");
-            conn.execute_batch(include_str!("migrations/baseline.sql"))
-                .expect("failed to initialize baseline schema");
-            conn.execute_batch(include_str!("migrations/100.sql"))
-                .expect("failed to initialize baseline version");
-            conn.execute_batch(
-                "CREATE TABLE ssh_connections (
-                    id TEXT PRIMARY KEY,
-                    display_name TEXT NOT NULL,
-                    source_kind TEXT NOT NULL CHECK (source_kind IN ('ssh_config', 'manual')),
-                    config_alias TEXT,
-                    host_name TEXT NOT NULL,
-                    user_name TEXT NOT NULL,
-                    port INTEGER NOT NULL DEFAULT 22,
-                    identity_file TEXT,
-                    host_key_type TEXT NOT NULL,
-                    host_key_base64 TEXT NOT NULL,
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    last_connected_at TEXT,
-                    last_error TEXT,
-                    deleted_at TEXT,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-                );
-                INSERT INTO ssh_connections (
-                    id, display_name, source_kind, host_name, user_name,
-                    host_key_type, host_key_base64
-                ) VALUES (
-                    'ssh-1', 'existing ssh', 'manual', 'example.com', 'user',
-                    'ssh-ed25519', 'abc'
-                );",
-            )
-            .expect("failed to initialize version 101 SSH schema");
-
-            if version >= 102 {
-                conn.execute_batch(
-                    "CREATE TABLE workspaces_new (
-                        id TEXT PRIMARY KEY,
-                        name TEXT NOT NULL,
-                        root_path TEXT NOT NULL,
-                        location_kind TEXT NOT NULL DEFAULT 'local'
-                            CHECK (location_kind IN ('local', 'ssh')),
-                        ssh_connection_id TEXT REFERENCES ssh_connections(id) ON DELETE RESTRICT,
-                        scan_depth INTEGER NOT NULL DEFAULT 3,
-                        startup_preset_json TEXT,
-                        startup_preset_updated_at TEXT,
-                        archived_at TEXT,
-                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                        last_opened_at TEXT NOT NULL DEFAULT (datetime('now')),
-                        git_repo_selection_configured INTEGER NOT NULL DEFAULT 0,
-                        CHECK (
-                            (location_kind = 'local' AND ssh_connection_id IS NULL)
-                            OR (location_kind = 'ssh' AND ssh_connection_id IS NOT NULL)
-                        )
-                    );
-                    DROP TABLE workspaces;
-                    ALTER TABLE workspaces_new RENAME TO workspaces;
-                    CREATE UNIQUE INDEX idx_workspaces_local_root
-                        ON workspaces(root_path) WHERE location_kind = 'local';
-                    CREATE UNIQUE INDEX idx_workspaces_remote_root
-                        ON workspaces(ssh_connection_id, root_path) WHERE location_kind = 'ssh';
-                    CREATE INDEX idx_workspaces_ssh_connection
-                        ON workspaces(ssh_connection_id);",
-                )
-                .expect("failed to initialize version 102 workspace schema");
-                conn.execute(
-                    "INSERT INTO workspaces (
-                        id, name, root_path, location_kind, ssh_connection_id
-                    ) VALUES ('workspace-1', 'existing remote', '/srv/project', 'ssh', 'ssh-1')",
-                    [],
-                )
-                .expect("failed to insert existing remote workspace");
-            } else {
-                conn.execute(
-                    "INSERT INTO workspaces (id, name, root_path)
-                     VALUES ('workspace-1', 'existing local', 'D:/project')",
-                    [],
-                )
-                .expect("failed to insert existing local workspace");
-            }
-
-            if version >= 103 {
-                conn.execute_batch(
-                    "ALTER TABLE ssh_connections
-                     ADD COLUMN connection_status TEXT NOT NULL DEFAULT 'unknown'
-                     CHECK (connection_status IN (
-                         'unknown', 'connecting', 'ok', 'failed', 'disabled', 'deleted'
-                     ));",
-                )
-                .expect("failed to initialize version 103 SSH schema");
-            }
-            conn.execute(
-                "UPDATE schema_version
-                 SET version = ?1, migration_file = ?2, applied_at = datetime('now')
-                 WHERE id = 1",
-                params![version, format!("{version}.sql")],
-            )
-            .expect("failed to record development database version");
-            drop(conn);
-
-            db.run_migrations()
-                .expect("105.sql should accept the development database version");
-            let conn = Connection::open(&db.path).expect("failed to reopen upgraded database");
-            let upgraded_version = read_schema_version(&conn)
-                .expect("failed to read upgraded version")
-                .expect("upgraded version row should exist");
-            assert_eq!(upgraded_version, migrations::SUPPORTED_DATABASE_VERSION);
-            assert_eq!(
-                conn.query_row(
-                    "SELECT COUNT(*) FROM ssh_connections WHERE id = 'ssh-1'",
-                    [],
-                    |row| row.get::<_, u64>(0),
-                )
-                .expect("failed to check existing SSH connection"),
-                1
-            );
-            assert_eq!(
-                conn.query_row(
-                    "SELECT COUNT(*) FROM workspaces WHERE id = 'workspace-1'",
-                    [],
-                    |row| row.get::<_, u64>(0),
-                )
-                .expect("failed to check existing workspace"),
-                1
-            );
-            if version >= 102 {
-                assert_eq!(
-                    conn.query_row(
-                        "SELECT location_kind || ':' || ssh_connection_id
-                         FROM workspaces WHERE id = 'workspace-1'",
-                        [],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .expect("failed to check existing remote workspace"),
-                    "ssh:ssh-1"
-                );
-            }
-        }
-    }
-
-    /// 验证 107 到 108 将旧仓库转换为 Workspace，并同步迁移会话与定时任务归属。
-    #[test]
-    fn migration_108_rebuilds_project_schema_and_cleans_all_terminal_worktrees() {
-        let path = std::env::temp_dir().join(format!(
-            "auracoder-db-migration-108-from-107-{}.db",
-            Uuid::new_v4()
-        ));
-        let db = Database {
-            path,
-            pool: Arc::new(ConnectionPool {
-                idle: Mutex::new(Vec::new()),
-                max_idle: SQLITE_POOL_MAX_IDLE,
-            }),
-        };
-        let conn = Connection::open(&db.path).expect("failed to create 107 database");
-        configure_connection(&conn).expect("failed to configure 107 database");
-        conn.execute_batch(
-            r#"
-            CREATE TABLE schema_version (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                version INTEGER NOT NULL,
-                migration_file TEXT NOT NULL,
-                applied_at TEXT NOT NULL
-            );
-            INSERT INTO schema_version (id, version, migration_file, applied_at)
-            VALUES (1, 107, '107.sql', datetime('now'));
-            CREATE TABLE ssh_connections (
-                id TEXT PRIMARY KEY,
-                display_name TEXT NOT NULL,
-                source_kind TEXT NOT NULL,
-                config_alias TEXT,
-                host_name TEXT NOT NULL,
-                user_name TEXT NOT NULL,
-                port INTEGER NOT NULL DEFAULT 22,
-                identity_file TEXT,
-                host_key_type TEXT NOT NULL,
-                host_key_base64 TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                connection_status TEXT NOT NULL DEFAULT 'ok',
-                last_connected_at TEXT,
-                last_error TEXT,
-                deleted_at TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            INSERT INTO ssh_connections (
-                id, display_name, source_kind, host_name, user_name,
-                host_key_type, host_key_base64
-            ) VALUES (
-                'ssh-1', 'existing ssh', 'manual', 'example.com', 'user',
-                'ssh-ed25519', 'abc'
-            );
-            CREATE TABLE workspaces (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                root_path TEXT NOT NULL,
-                location_kind TEXT NOT NULL DEFAULT 'local',
-                ssh_connection_id TEXT,
-                scan_depth INTEGER NOT NULL DEFAULT 3,
-                startup_preset_json TEXT,
-                startup_preset_updated_at TEXT,
-                archived_at TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                last_opened_at TEXT NOT NULL DEFAULT (datetime('now')),
-                git_repo_selection_configured INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE repos (
-                id TEXT PRIMARY KEY,
-                workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                path TEXT NOT NULL,
-                default_branch TEXT NOT NULL,
-                is_active INTEGER NOT NULL,
-                is_discovered INTEGER NOT NULL,
-                trust_level TEXT NOT NULL
-            );
-            CREATE TABLE threads (
-                id TEXT PRIMARY KEY,
-                workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-                repo_id TEXT REFERENCES repos(id) ON DELETE SET NULL,
-                engine_id TEXT NOT NULL,
-                model_id TEXT NOT NULL,
-                engine_thread_id TEXT,
-                engine_metadata_json TEXT,
-                engine_capabilities_json TEXT,
-                title TEXT,
-                status TEXT NOT NULL DEFAULT 'idle',
-                archived_at TEXT,
-                message_count INTEGER NOT NULL DEFAULT 0,
-                total_tokens INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                last_activity_at TEXT NOT NULL DEFAULT (datetime('now')),
-                plan_mode INTEGER,
-                send_method TEXT,
-                reasoning_effort TEXT,
-                permission_mode TEXT
-            );
-            CREATE INDEX idx_threads_repo ON threads(repo_id);
-            CREATE TABLE messages (
-                id TEXT PRIMARY KEY,
-                thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-                role TEXT NOT NULL,
-                content TEXT,
-                blocks_json TEXT,
-                turn_engine_id TEXT,
-                remote_turn_id TEXT,
-                turn_model_id TEXT,
-                turn_reasoning_effort TEXT,
-                schema_version INTEGER NOT NULL DEFAULT 1,
-                stream_seq INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'completed',
-                token_input INTEGER DEFAULT 0,
-                token_output INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE actions (
-                id TEXT PRIMARY KEY,
-                thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-                message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
-                engine_action_id TEXT,
-                action_type TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                details_json TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'running',
-                truncated INTEGER NOT NULL DEFAULT 0,
-                result_json TEXT,
-                duration_ms INTEGER,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE approvals (
-                id TEXT PRIMARY KEY,
-                thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-                message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
-                action_type TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                details_json TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                decision TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                answered_at TEXT
-            );
-            CREATE TABLE engine_event_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
-                message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                event_json TEXT NOT NULL
-            );
-            CREATE TABLE extension_catalog_snapshots (
-                provider_id TEXT NOT NULL,
-                context_key TEXT NOT NULL,
-                kind TEXT NOT NULL CHECK(kind IN ('skill', 'plugin', 'mcp')),
-                items_json TEXT NOT NULL,
-                fetched_at TEXT,
-                last_attempt_at TEXT,
-                next_refresh_at TEXT,
-                last_error TEXT,
-                failure_count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (provider_id, context_key, kind)
-            );
-            CREATE TABLE scheduled_tasks (
-                id TEXT PRIMARY KEY,
-                description TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                execution_device_id TEXT NOT NULL DEFAULT 'local',
-                target_type TEXT NOT NULL,
-                workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-                thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL,
-                runtime_config_json TEXT,
-                schedule_type TEXT NOT NULL,
-                schedule_json TEXT NOT NULL,
-                timezone TEXT NOT NULL,
-                next_run_at TEXT,
-                last_run_at TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                CHECK (target_type IN ('existing_thread', 'new_thread')),
-                CHECK (schedule_type IN ('interval', 'daily', 'weekly'))
-            );
-            CREATE TABLE scheduled_task_runs (
-                id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
-                scheduled_for TEXT NOT NULL,
-                started_at TEXT,
-                finished_at TEXT,
-                thread_id TEXT REFERENCES threads(id) ON DELETE SET NULL,
-                assistant_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
-                status TEXT NOT NULL DEFAULT 'queued',
-                error_message TEXT,
-                result_preview TEXT,
-                acknowledged_at TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                CHECK (status IN (
-                    'queued',
-                    'running',
-                    'needs_confirmation',
-                    'completed',
-                    'error',
-                    'interrupted',
-                    'skipped'
-                )),
-                UNIQUE(task_id, scheduled_for)
-            );
-            INSERT INTO workspaces (
-                id, name, root_path, location_kind, ssh_connection_id, startup_preset_json
-            ) VALUES (
-                'workspace-home', 'Home', '/home/user', 'local', NULL,
-                '{"worktree":"/tmp/old","terminal":{"groups":[
-                  {"id":"g0","name":"Group 0","root":"/tmp/g0","layout":"split","cwd":"/tmp/g0","harness":"codex","worktree":"/tmp/w0"},
-                  {"id":"g1","name":"Group 1","root":"/tmp/g1","layout":"split","cwd":"/tmp/g1","harness":"codex","worktree":"/tmp/w1"},
-                  {"id":"g2","name":"Group 2","root":"/tmp/g2","layout":"split","cwd":"/tmp/g2","harness":"codex","worktree":"/tmp/w2"},
-                  {"id":"g3","name":"Group 3","root":"/tmp/g3","layout":"split","cwd":"/tmp/g3","harness":"codex","worktree":"/tmp/w3"},
-                  {"id":"g4","name":"Group 4","root":"/tmp/g4","layout":"split","cwd":"/tmp/g4","harness":"codex","worktree":"/tmp/w4"},
-                  {"id":"g5","name":"Group 5","root":"/tmp/g5","layout":"split","cwd":"/tmp/g5","harness":"codex","worktree":"/tmp/w5"},
-                  {"id":"g6","name":"Group 6","root":"/tmp/g6","layout":"split","cwd":"/tmp/g6","harness":"codex","worktree":"/tmp/w6"},
-                  {"id":"g7","name":"Group 7","root":"/tmp/g7","layout":"split","cwd":"/tmp/g7","harness":"codex","worktree":"/tmp/w7"},
-                  {"id":"g8","name":"Group 8","root":"/tmp/g8","layout":"split","cwd":"/tmp/g8","harness":"codex","worktree":"/tmp/w8"},
-                  {"id":"g9","name":"Group 9","root":"/tmp/g9","layout":"split","cwd":"/tmp/g9","harness":"codex","worktree":"/tmp/w9"},
-                  {"id":"g10","name":"Group 10","root":"/tmp/g10","layout":"split","cwd":"/tmp/g10","harness":"codex","worktree":"/tmp/w10"}
-                ]}}'
-            );
-            INSERT INTO workspaces (
-                id, name, root_path, location_kind, ssh_connection_id
-            ) VALUES
-                ('workspace-existing', 'Existing', '/repo/existing', 'local', NULL),
-                ('workspace-ssh', 'Remote Home', '/remote/home', 'ssh', 'ssh-1');
-            INSERT INTO repos (
-                id, workspace_id, name, path, default_branch, is_active, is_discovered, trust_level
-            ) VALUES
-                ('repo-new', 'workspace-home', 'New Repo', '/home/user/new-repo', 'main', 1, 0, 'trusted'),
-                ('repo-new-duplicate', 'workspace-home', 'Duplicate New Repo', '/home/user/new-repo', 'main', 1, 0, 'trusted'),
-                ('repo-existing', 'workspace-home', 'Existing Repo', '/repo/existing', 'main', 1, 0, 'trusted'),
-                ('repo-ssh', 'workspace-ssh', 'Remote Repo', '/remote/home/project', 'main', 1, 0, 'trusted');
-            INSERT INTO threads (id, workspace_id, repo_id, engine_id, model_id, title)
-            VALUES
-                ('thread-repo-new', 'workspace-home', 'repo-new', 'codex', 'model', 'New Repo Thread'),
-                ('thread-repo-existing', 'workspace-home', 'repo-existing', 'codex', 'model', 'Existing Repo Thread'),
-                ('thread-home', 'workspace-home', NULL, 'codex', 'model', 'Home Thread'),
-                ('thread-remote', 'workspace-ssh', 'repo-ssh', 'codex', 'model', 'Remote Thread');
-            INSERT INTO messages (id, thread_id, role, content)
-            VALUES
-                ('message-new', 'thread-repo-new', 'user', 'new message'),
-                ('message-existing', 'thread-repo-existing', 'user', 'existing message'),
-                ('message-home', 'thread-home', 'user', 'home message'),
-                ('message-remote', 'thread-remote', 'user', 'remote message');
-            INSERT INTO scheduled_tasks (
-                id, description, enabled, execution_device_id, target_type,
-                workspace_id, thread_id, runtime_config_json, schedule_type,
-                schedule_json, timezone, next_run_at, last_run_at, created_at, updated_at
-            ) VALUES (
-                'task-108', 'Migration test task', 1, 'local', 'existing_thread',
-                'workspace-home', 'thread-repo-new',
-                '{"repoId":"repo-new","workspaceWritableRoots":["/home/user"],"workspaceWriteOptIn":true,"keep":"yes"}',
-                'interval', '{}', 'UTC', NULL, NULL, datetime('now'), datetime('now')
-            );
-            "#,
-        )
-        .expect("failed to seed 107 database");
-        drop(conn);
-
-        db.run_migrations()
-            .expect("failed to migrate 107 database to 108");
-        let conn = Connection::open(&db.path).expect("failed to open migrated 108 database");
-
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM workspaces", [], |row| row
-                .get::<_, u64>(0))
-                .expect("failed to count migrated workspaces"),
-            5
-        );
-        let new_repo_workspace_id: String = conn
-            .query_row(
-                "SELECT id FROM workspaces
-                 WHERE root_path = '/home/user/new-repo' AND location_kind = 'local'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("failed to find new local repository workspace");
-        let existing_repo_workspace_id: String = conn
-            .query_row(
-                "SELECT id FROM workspaces
-                 WHERE root_path = '/repo/existing' AND location_kind = 'local'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("failed to find existing repository workspace");
-        let ssh_repo_workspace_id: String = conn
-            .query_row(
-                "SELECT id FROM workspaces
-                 WHERE root_path = '/remote/home/project'
-                   AND location_kind = 'ssh'
-                   AND ssh_connection_id = 'ssh-1'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("failed to find SSH repository workspace");
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM workspaces
-                 WHERE root_path = '/home/user/new-repo' AND location_kind = 'local'",
-                [],
-                |row| row.get::<_, u64>(0),
-            )
-            .expect("failed to count new local repository workspaces"),
-            1
-        );
-        assert_eq!(existing_repo_workspace_id, "workspace-existing");
-        assert_eq!(
-            conn.query_row(
-                "SELECT location_kind || ':' || ssh_connection_id
-                 FROM workspaces WHERE id = ?1",
-                [&ssh_repo_workspace_id],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("failed to inspect SSH repository workspace"),
-            "ssh:ssh-1"
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM threads", [], |row| row
-                .get::<_, u64>(0))
-                .expect("failed to count migrated threads"),
-            4
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row
-                .get::<_, u64>(0))
-                .expect("failed to count migrated messages"),
-            4
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT content FROM messages WHERE id = 'message-new'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("failed to inspect migrated message identity"),
-            "new message"
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT workspace_id FROM threads WHERE id = 'thread-repo-new'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("failed to inspect new repository thread workspace"),
-            new_repo_workspace_id
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT workspace_id FROM threads WHERE id = 'thread-repo-existing'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("failed to inspect existing repository thread workspace"),
-            existing_repo_workspace_id
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT workspace_id FROM threads WHERE id = 'thread-home'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("failed to inspect home thread workspace"),
-            "workspace-home"
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT workspace_id FROM threads WHERE id = 'thread-remote'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("failed to inspect remote thread workspace"),
-            ssh_repo_workspace_id
-        );
-        let supported_migration = migrations::MIGRATIONS
-            .iter()
-            .find(|migration| migration.version == migrations::SUPPORTED_DATABASE_VERSION)
-            .expect("supported migration should be registered");
-        assert_eq!(
-            conn.query_row(
-                "SELECT version || ':' || migration_file FROM schema_version WHERE id = 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("failed to inspect migrated schema version"),
-            format!(
-                "{}:{}",
-                migrations::SUPPORTED_DATABASE_VERSION,
-                supported_migration.file
-            )
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT id || ':' || trust_level FROM workspaces",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("failed to inspect migrated workspace"),
-            "workspace-home:standard"
-        );
-
-        for table in ["repos", "idx_threads_repo"] {
-            let exists = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
-                    [table],
-                    |row| row.get::<_, u64>(0),
-                )
-                .expect("failed to inspect removed repository objects");
-            assert_eq!(exists, 0, "legacy object should be removed: {table}");
-        }
-        for column in ["scan_depth", "git_repo_selection_configured"] {
-            let exists = conn
-                .prepare("PRAGMA table_info(workspaces)")
-                .expect("failed to inspect workspace columns")
-                .query_map([], |row| row.get::<_, String>(1))
-                .expect("failed to read workspace columns")
-                .collect::<Result<Vec<_>, _>>()
-                .expect("failed to decode workspace columns")
-                .iter()
-                .any(|name| name == column);
-            assert!(
-                !exists,
-                "legacy workspace column should be removed: {column}"
-            );
-        }
-        let thread_columns = conn
-            .prepare("PRAGMA table_info(threads)")
-            .expect("failed to inspect thread columns")
-            .query_map([], |row| row.get::<_, String>(1))
-            .expect("failed to read thread columns")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("failed to decode thread columns");
-        assert!(!thread_columns.iter().any(|name| name == "repo_id"));
-
-        let task_workspace_id: String = conn
-            .query_row(
-                "SELECT workspace_id FROM scheduled_tasks WHERE id = 'task-108'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("failed to inspect migrated scheduled task workspace");
-        assert_eq!(task_workspace_id, new_repo_workspace_id);
-        let runtime_config: String = conn
-            .query_row(
-                "SELECT runtime_config_json FROM scheduled_tasks WHERE id = 'task-108'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("failed to load migrated scheduled task");
-        let runtime_config: serde_json::Value =
-            serde_json::from_str(&runtime_config).expect("migrated runtime config should be JSON");
-        assert_eq!(runtime_config.get("keep"), Some(&serde_json::json!("yes")));
-        for removed_key in ["repoId", "workspaceWritableRoots", "workspaceWriteOptIn"] {
-            assert!(runtime_config.get(removed_key).is_none());
-        }
-
-        let preset: String = conn
-            .query_row(
-                "SELECT startup_preset_json FROM workspaces WHERE id = 'workspace-home'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("failed to load migrated startup preset");
-        let preset: serde_json::Value =
-            serde_json::from_str(&preset).expect("migrated startup preset should be JSON");
-        assert!(preset.get("worktree").is_none());
-        let groups = preset["terminal"]["groups"]
-            .as_array()
-            .expect("terminal groups should remain an array");
-        assert_eq!(groups.len(), 11);
-        for group in groups {
-            assert!(group.get("worktree").is_none());
-            assert!(group.get("id").is_some());
-            assert!(group.get("name").is_some());
-            assert!(group.get("root").is_some());
-            assert!(group.get("layout").is_some());
-            assert!(group.get("cwd").is_some());
-            assert!(group.get("harness").is_some());
-        }
-
-        let foreign_key_errors = conn
-            .prepare("PRAGMA foreign_key_check")
-            .expect("failed to prepare foreign key check")
-            .query_map([], |_| Ok(()))
-            .expect("failed to run foreign key check")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("failed to collect foreign key check");
-        assert!(foreign_key_errors.is_empty());
-    }
-
-    #[test]
-    fn migrations_are_idempotent_after_the_target_version() {
-        let db = test_db();
-        db.run_migrations()
-            .expect("running migrations a second time should succeed");
-        let conn = Connection::open(&db.path).expect("failed to reopen migrated database");
-        let version = conn
-            .query_row(
-                "SELECT version FROM schema_version WHERE id = 1",
-                [],
-                |row| row.get::<_, u64>(0),
-            )
-            .expect("failed to read schema version after rerun");
-        assert_eq!(version, migrations::SUPPORTED_DATABASE_VERSION);
-    }
-
-    #[test]
-    fn every_migration_file_updates_the_schema_version_it_declares() {
-        for migration in migrations::MIGRATIONS {
-            assert!(migration.sql.contains("schema_version"));
-            assert!(migration.sql.contains(&migration.version.to_string()));
-            assert!(migration.sql.contains(migration.file));
-        }
-    }
-
-    #[test]
-    fn version_100_only_bootstraps_the_version_table() {
-        let sql = migrations::MIGRATIONS
-            .iter()
-            .find(|migration| migration.version == migrations::BASELINE_VERSION)
-            .expect("baseline migration should be registered")
-            .sql;
-        assert!(sql.contains("CREATE TABLE IF NOT EXISTS schema_version"));
-        assert!(sql.contains("INSERT INTO schema_version"));
-        assert!(!sql.contains("ALTER TABLE"));
-        assert!(!sql.contains("UPDATE schema_version"));
-    }
-
-    #[test]
-    fn migration_list_starts_at_the_declared_baseline() {
-        assert_eq!(
-            migrations::MIGRATIONS[0].version,
-            migrations::BASELINE_VERSION
-        );
-    }
-}
+#[path = "../../tests/unit/database_migration_tests.rs"]
+mod migration_tests;

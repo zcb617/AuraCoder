@@ -15,6 +15,7 @@ use crate::{
         AgentNotificationSettingsStatusDto,
     },
 };
+use crate::services::app_config_service::AppConfigService;
 use tauri::{State, Webview};
 // #[cfg(not(target_os = "macos"))]
 // use tauri_plugin_notification::NotificationExt;
@@ -143,7 +144,8 @@ fn preview_notification_sound_windows(app: tauri::AppHandle, sound: &str) -> Res
 #[tauri::command]
 pub async fn get_app_locale() -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
-        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        // let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        let config = AppConfigService::load_or_create().map_err(err_to_string)?;
         Ok(resolve_app_locale(config.general.locale.as_deref()).to_string())
     })
     .await
@@ -158,7 +160,8 @@ pub async fn set_app_locale(state: State<'_, AppState>, locale: String) -> Resul
     tokio::task::spawn_blocking(move || {
         let normalized =
             normalize_app_locale(&locale).ok_or_else(|| format!("unsupported locale: {locale}"))?;
-        AppConfig::mutate(|config| {
+        // AppConfig::mutate(|config| {
+        AppConfigService::mutate(|config| {
             config.general.locale = Some(normalized.to_string());
             Ok(normalized.to_string())
         })
@@ -171,7 +174,8 @@ pub async fn set_app_locale(state: State<'_, AppState>, locale: String) -> Resul
 #[tauri::command]
 pub async fn get_app_theme() -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
-        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        // let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        let config = AppConfigService::load_or_create().map_err(err_to_string)?;
         Ok(config.theme_preference().to_string())
     })
     .await
@@ -187,7 +191,8 @@ pub async fn set_app_theme(state: State<'_, AppState>, theme: String) -> Result<
         if !crate::config::app_config::VALID_THEME_PREFERENCES.contains(&theme.as_str()) {
             return Err(format!("unsupported theme preference: {theme}"));
         }
-        AppConfig::mutate(|config| {
+        // AppConfig::mutate(|config| {
+        AppConfigService::mutate(|config| {
             config.general.theme = theme.clone();
             Ok(theme)
         })
@@ -200,7 +205,8 @@ pub async fn set_app_theme(state: State<'_, AppState>, theme: String) -> Result<
 #[tauri::command]
 pub async fn get_display_scale(webview: Webview) -> Result<u32, String> {
     let display_scale = tokio::task::spawn_blocking(move || {
-        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        // let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        let config = AppConfigService::load_or_create().map_err(err_to_string)?;
         Ok::<u32, String>(config.display_scale())
     })
     .await
@@ -226,7 +232,8 @@ pub async fn set_display_scale(
         if !crate::config::app_config::VALID_DISPLAY_SCALES.contains(&display_scale) {
             return Err(format!("unsupported display scale: {display_scale}"));
         }
-        AppConfig::mutate(|config| {
+        // AppConfig::mutate(|config| {
+        AppConfigService::mutate(|config| {
             config.ui.display_scale = display_scale;
             Ok(display_scale)
         })
@@ -247,7 +254,8 @@ pub async fn set_display_scale(
 pub async fn get_transcript_width(webview: Webview) -> Result<String, String> {
     let _ = webview;
     tokio::task::spawn_blocking(move || {
-        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        // let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        let config = AppConfigService::load_or_create().map_err(err_to_string)?;
         Ok(config.transcript_width())
     })
     .await
@@ -271,13 +279,15 @@ pub async fn set_transcript_width(
     let _guard = config_write_lock.lock_owned().await;
 
     tokio::task::spawn_blocking(move || {
-        AppConfig::mutate(|config| {
+        // AppConfig::mutate(|config| {
+        AppConfigService::mutate(|config| {
             config.ui.transcript_width = Some(normalized.clone());
             Ok(())
         })
         .map_err(err_to_string)?;
 
-        let persisted = AppConfig::load_or_create()
+        // let persisted = AppConfig::load_or_create()
+        let persisted = AppConfigService::load_or_create()
             .map_err(err_to_string)?
             .transcript_width();
         if persisted != normalized {
@@ -296,7 +306,8 @@ pub async fn set_transcript_width(
 pub async fn get_chat_input_height(webview: Webview) -> Result<Option<u32>, String> {
     let _ = webview;
     tokio::task::spawn_blocking(move || {
-        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        // let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        let config = AppConfigService::load_or_create().map_err(err_to_string)?;
         Ok(config.chat_input_height())
     })
     .await
@@ -318,13 +329,15 @@ pub async fn set_chat_input_height(
     let _guard = config_write_lock.lock_owned().await;
 
     tokio::task::spawn_blocking(move || {
-        AppConfig::mutate(|config| {
+        // AppConfig::mutate(|config| {
+        AppConfigService::mutate(|config| {
             config.ui.chat_input_height = Some(normalized);
             Ok(())
         })
         .map_err(err_to_string)?;
 
-        let persisted = AppConfig::load_or_create()
+        // let persisted = AppConfig::load_or_create()
+        let persisted = AppConfigService::load_or_create()
             .map_err(err_to_string)?
             .chat_input_height()
             .ok_or_else(|| "chat input height is missing after persistence".to_string())?;
@@ -342,7 +355,8 @@ pub async fn set_chat_input_height(
 #[tauri::command]
 pub async fn get_terminal_accelerated_rendering() -> Result<bool, String> {
     tokio::task::spawn_blocking(move || {
-        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        // let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        let config = AppConfigService::load_or_create().map_err(err_to_string)?;
         Ok(config.terminal_accelerated_rendering_enabled())
     })
     .await
@@ -358,10 +372,17 @@ pub async fn set_terminal_accelerated_rendering(
     let _guard = config_write_lock.lock_owned().await;
 
     tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        /*
         let mut config = AppConfig::load_or_create().map_err(err_to_string)?;
         config.general.terminal_accelerated_rendering = if enabled { None } else { Some(false) };
         config.save().map_err(err_to_string)?;
         Ok(enabled)
+        */
+        AppConfigService::mutate(|config| {
+            config.general.terminal_accelerated_rendering = if enabled { None } else { Some(false) };
+            Ok(enabled)
+        })
+        .map_err(err_to_string)
     })
     .await
     .map_err(err_to_string)?
@@ -370,7 +391,8 @@ pub async fn set_terminal_accelerated_rendering(
 #[tauri::command]
 pub async fn get_terminal_font_size() -> Result<u32, String> {
     tokio::task::spawn_blocking(move || {
-        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        // let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        let config = AppConfigService::load_or_create().map_err(err_to_string)?;
         Ok(config.terminal_font_size())
     })
     .await
@@ -387,7 +409,8 @@ pub async fn set_terminal_font_size(
 
     tokio::task::spawn_blocking(move || -> Result<u32, String> {
         let clamped = clamp_terminal_font_size(font_size);
-        AppConfig::mutate(|config| {
+        // AppConfig::mutate(|config| {
+        AppConfigService::mutate(|config| {
             config.general.terminal_font_size = Some(clamped);
             Ok(clamped)
         })
@@ -400,7 +423,8 @@ pub async fn set_terminal_font_size(
 #[tauri::command]
 pub async fn get_default_autonomy_preset() -> Result<Option<String>, String> {
     tokio::task::spawn_blocking(|| -> Result<Option<String>, String> {
-        let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        // let config = AppConfig::load_or_create().map_err(err_to_string)?;
+        let config = AppConfigService::load_or_create().map_err(err_to_string)?;
         Ok(config.default_autonomy_preset().map(ToOwned::to_owned))
     })
     .await
@@ -424,7 +448,8 @@ pub async fn set_default_autonomy_preset(
     let _guard = config_write_lock.lock_owned().await;
 
     tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
-        AppConfig::mutate(|config| {
+        // AppConfig::mutate(|config| {
+        AppConfigService::mutate(|config| {
             config.general.default_autonomy_preset = normalized.clone();
             Ok(normalized)
         })
@@ -452,10 +477,17 @@ pub async fn set_chat_notifications_enabled(
     let _guard = config_write_lock.lock_owned().await;
 
     tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        /*
         let mut config = AppConfig::load_or_create().map_err(err_to_string)?;
         config.general.chat_notifications = if enabled { Some(true) } else { None };
         config.save().map_err(err_to_string)?;
         Ok(enabled)
+        */
+        AppConfigService::mutate(|config| {
+            config.general.chat_notifications = if enabled { Some(true) } else { None };
+            Ok(enabled)
+        })
+        .map_err(err_to_string)
     })
     .await
     .map_err(err_to_string)?
@@ -470,10 +502,17 @@ pub async fn set_terminal_notifications_enabled(
     let _guard = config_write_lock.lock_owned().await;
 
     tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        /*
         let mut config = AppConfig::load_or_create().map_err(err_to_string)?;
         config.general.terminal_notifications = if enabled { Some(true) } else { None };
         config.save().map_err(err_to_string)?;
         Ok(enabled)
+        */
+        AppConfigService::mutate(|config| {
+            config.general.terminal_notifications = if enabled { Some(true) } else { None };
+            Ok(enabled)
+        })
+        .map_err(err_to_string)
     })
     .await
     .map_err(err_to_string)?
@@ -509,7 +548,8 @@ pub async fn set_notification_sound(
             normalized_sound
         };
 
-        AppConfig::mutate(|config| {
+        // AppConfig::mutate(|config| {
+        AppConfigService::mutate(|config| {
             config.general.notification_sound = Some(persisted_sound.clone());
             Ok(persisted_sound.clone())
         })
