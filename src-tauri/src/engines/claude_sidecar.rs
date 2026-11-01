@@ -35,6 +35,24 @@ use super::{
     TurnCompletionStatus, TurnInput, TurnInputItem,
 };
 
+/// Claude sidecar 明确返回当前审批不存在或已不再等待时使用的业务错误。
+#[derive(Debug)]
+pub(crate) enum ClaudeApprovalResponseError {
+    /// sidecar 已明确确认该审批不能再接受响应。
+    NotPending,
+}
+
+impl std::fmt::Display for ClaudeApprovalResponseError {
+    /// 为 Claude 审批状态错误提供可记录的诊断文本。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPending => formatter.write_str("Claude approval is not pending"),
+        }
+    }
+}
+
+impl std::error::Error for ClaudeApprovalResponseError {}
+
 const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const NODE_RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLAUDE_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(12);
@@ -178,6 +196,9 @@ enum SidecarEvent {
         success: bool,
         /// 审批处理失败时返回的原始错误信息。
         error: Option<String>,
+        /// sidecar 能明确识别审批业务状态时返回的结构化错误编码。
+        #[serde(default, rename = "errorCode")]
+        error_code: Option<String>,
     },
     /// Sidecar 对活动查询权限策略更新命令的处理回执。
     PermissionPolicyUpdateResult {
@@ -3227,6 +3248,7 @@ impl Engine for ClaudeSidecarEngine {
                         approval_id: response_approval_id,
                         success,
                         error,
+                        error_code,
                     }) if id.as_deref() == Some(request_id.as_str()) => {
                         if response_approval_id.as_deref() != Some(approval_id) {
                             let received_approval_id =
@@ -3241,6 +3263,12 @@ impl Engine for ClaudeSidecarEngine {
                         let error = error.unwrap_or_else(|| {
                             "Claude sidecar returned no approval error details.".to_string()
                         });
+                        if error_code.as_deref() == Some("APPROVAL_NOT_PENDING") {
+                            return Err(anyhow::Error::new(
+                                ClaudeApprovalResponseError::NotPending,
+                            )
+                            .context(error));
+                        }
                         anyhow::bail!(
                             "Claude approval response failed for approval {approval_id}: {error}"
                         );
@@ -3542,11 +3570,13 @@ mod tests {
                 approval_id,
                 success,
                 error,
+                error_code,
                 ..
             } => {
                 assert_eq!(approval_id.as_deref(), Some("approval-1"));
                 assert!(!success);
                 assert_eq!(error.as_deref(), Some("approval-1 is unknown"));
+                assert_eq!(error_code, None);
             }
             other => panic!("unexpected event variant: {other:?}"),
         }

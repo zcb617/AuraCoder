@@ -10,6 +10,7 @@ pub(crate) use mcp::{BaseCliMcp, CliMcpRuntime};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -24,6 +25,10 @@ use crate::{
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
         ThreadDto, ThreadStatusDto, WorkspaceDto,
+        chat::{
+            ApprovalResponseOutcomeDto, ApprovalResponseRequest, ChatBusinessError,
+            ChatReviewRequest, SendMessageRequest, SteerMessageRequest,
+        },
     },
 };
 
@@ -600,4 +605,66 @@ pub trait CliTool: Send + Sync {
         cancellation: CancellationToken,
         started_tx: oneshot::Sender<CliReviewStarted>,
     ) -> Result<()>;
+
+    /// 通过当前 CLI 实现提交普通聊天消息并维持本轮生命周期。
+    async fn submit_chat_message(
+        self: Arc<Self>,
+        app: tauri::AppHandle,
+        request: SendMessageRequest,
+    ) -> Result<String, ChatBusinessError>;
+
+    /// 通过当前 CLI 实现向正在执行的线程追加聊天消息。
+    async fn submit_chat_steer(
+        self: Arc<Self>,
+        app: tauri::AppHandle,
+        request: SteerMessageRequest,
+    ) -> Result<crate::models::SteerReceiptDto, ChatBusinessError>;
+
+    /// 通过当前 CLI 实现处理本地审批答复及结果持久化。
+    async fn answer_chat_approval(
+        self: Arc<Self>,
+        request: ApprovalResponseRequest,
+    ) -> Result<ApprovalResponseOutcomeDto, ChatBusinessError>;
+
+    /// 取消指定线程当前持有的聊天回合。
+    async fn cancel_chat_turn(&self, thread_id: &str) -> Result<(), ChatBusinessError>;
+
+    /// 重启当前 CLI 对应线程的远端服务。
+    async fn restart_chat_service(&self, thread_id: &str) -> Result<(), ChatBusinessError>;
+
+    /// 通过当前 CLI 实现启动并提交代码审查业务。
+    async fn submit_chat_review(
+        self: Arc<Self>,
+        app: tauri::AppHandle,
+        request: ChatReviewRequest,
+    ) -> Result<ThreadDto, ChatBusinessError>;
+
+    /// 根据当前 CLI 权限规则构造一轮聊天使用的沙箱策略。
+    fn chat_sandbox(
+        &self,
+        thread: &ThreadDto,
+        writable_roots: Vec<String>,
+        reasoning_effort: Option<String>,
+        model_supports_personality: bool,
+    ) -> SandboxPolicy;
+
+    /// 将统一审批输入转换为当前 CLI 原生审批响应。
+    fn normalize_chat_approval(&self, response: Value) -> Result<Value, ChatBusinessError>;
+
+    /// 按当前 CLI 原生审批详情解析审批响应路由。
+    fn chat_approval_route(
+        &self,
+        details: &Value,
+    ) -> Result<Option<ApprovalRequestRoute>, ChatBusinessError>;
+
+    /// 将当前 CLI 原生审批失败转换为结构化业务错误。
+    fn classify_chat_approval_error(&self, error: &anyhow::Error) -> ChatBusinessError;
+
+    /// 在公共聊天事件处理前处理当前 CLI 的专属事件业务。
+    async fn on_chat_event(
+        &self,
+        thread: &ThreadDto,
+        assistant_message_id: &str,
+        event: &EngineEvent,
+    ) -> anyhow::Result<()>;
 }

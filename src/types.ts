@@ -664,6 +664,40 @@ export interface ApprovalBlock {
   responseData?: Record<string, unknown>;
 }
 
+/** 后端审批答复在已持久化结果之外返回的业务提示。 */
+export interface ChatBusinessWarning {
+  /** 标识提示对应的审批业务场景。 */
+  code: string;
+  /** 展示给用户的业务说明。 */
+  message: string;
+}
+
+/** 后端已保存的审批答复、审批消息和线程状态。 */
+export interface ApprovalResponseOutcome {
+  /** 本次答复对应的审批标识。 */
+  approvalId: string;
+  /** 后端保存的审批状态。 */
+  status: ApprovalBlock["status"];
+  /** 后端保存的审批决定；未保存决定时为空。 */
+  decision: string | null;
+  /** 后端答复事务更新后的线程。 */
+  thread: Thread;
+  /** 后端答复事务更新后的审批消息；未返回消息时为空。 */
+  message: Message | null;
+  /** 已保存结果附带的业务提示；无提示时为空。 */
+  warning: ChatBusinessWarning | null;
+}
+
+/** 后端返回的审批业务错误和可选的已保存结果。 */
+export interface ChatBusinessError {
+  /** 标识失败对应的审批业务场景。 */
+  code: string;
+  /** 展示给用户的业务说明。 */
+  message: string;
+  /** 失败发生前已保存的审批结果；没有保存结果时为空或缺省。 */
+  outcome?: ApprovalResponseOutcome | null;
+}
+
 export type ApprovalDecision =
   | "accept"
   | "accept_for_session"

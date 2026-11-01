@@ -706,6 +706,8 @@
       "expiredQuestions_other": "有 {{count}} 个问题已随会话结束而失效。",
       "expiredError": "该审批已随会话结束而失效，请发送新消息继续。",
       "cancelledLocallyError": "无法向 Codex 提交取消，本次审批已在本地取消，可以发送新消息继续。",
+      "expiredStatusError": "该审批已失效，请根据当前会话状态继续操作。",
+      "operationFailedError": "审批操作失败，请确认当前会话状态后重试。",
       "dynamicToolPrompt": "无需手写 JSON 即可响应动态工具调用。",
       "mcpElicitationPrompt": "此 MCP 服务正在请求授权。",
       "showAdvancedJson": "显示高级 JSON",

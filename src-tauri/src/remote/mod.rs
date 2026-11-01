@@ -24,15 +24,15 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    commands::{
-        chat::{
-            cancel_turn_inner, save_pasted_image_attachment, ChatAttachmentPayload,
-            ChatMessageService, SendMessageRequest,
-        },
-    },
     config::app_config::{AppConfig, RemoteAccessConfig, RemoteDeviceConfig},
     // 历史分页已恢复：MessageWindowCursorDto 用于 message.list 游标分页。
-    models::{EngineInfoDto, MessageWindowCursorDto, ThreadDto},
+    models::{
+        chat::{ChatAttachmentPayload, SendMessageRequest},
+        EngineInfoDto, MessageWindowCursorDto, ThreadDto,
+    },
+    services::chat_service::{
+        read_attachment_preview, save_pasted_image_attachment, ChatService,
+    },
     services::thread_service::ThreadService,
     state::AppState,
 };
@@ -1828,7 +1828,7 @@ impl RemoteTunnelManager {
                                                                 .filter(|value| !value.is_empty())
                                                                 .map(str::to_string);
                                                             match file_path {
-                                                                Some(file_path) => crate::commands::chat::read_attachment_preview(
+                                                                Some(file_path) => read_attachment_preview(
                                                                     file_path,
                                                                     mime_type,
                                                                     preview_file_path,
@@ -2121,7 +2121,7 @@ impl RemoteTunnelManager {
                                                                                 .await
                                                                             {
                                                                                 Ok(()) => {
-                                                                                    let send_result = ChatMessageService::new(&state).send_message(
+                                                                                    let send_result = ChatService::new(state.clone()).send_message(
                                                                                         app.clone(),
                                                                                         SendMessageRequest {
                                                                                             thread_id,
@@ -2139,7 +2139,8 @@ impl RemoteTunnelManager {
                                                                                             referenced_thread_id: None,
                                                                                         },
                                                                                     )
-                                                                                    .await;
+                                                                                    .await
+                                                                                    .map_err(|error| error.message);
                                                                                     match send_result {
                                                                                         Ok(assistant_message_id) => {
                                                                                             manager.commit_batch(&device_id, batch_id).await;
@@ -2199,7 +2200,7 @@ impl RemoteTunnelManager {
                                                                         Err("message or attachment is required".to_string())
                                                                     } else {
                                                                         // 缺少 batch_id 或 attachment_key 的请求沿用旧 file_path 路径。
-                                                                        ChatMessageService::new(&state).send_message(
+                                                                        ChatService::new(state.clone()).send_message(
                                                                             app.clone(),
                                                                             SendMessageRequest {
                                                                                 thread_id,
@@ -2218,6 +2219,7 @@ impl RemoteTunnelManager {
                                                                             },
                                                                         )
                                                                         .await
+                                                                        .map_err(|error| error.message)
                                                                         .map(|assistant_message_id| json!({ "assistant_message_id": assistant_message_id }))
                                                                     }
                                                                 }
@@ -2240,7 +2242,11 @@ impl RemoteTunnelManager {
                                                 .map(str::to_string)
                                                 .ok_or_else(|| "thread_id is required".to_string());
                                             match thread_id {
-                                                Ok(thread_id) => cancel_turn_inner(&state, thread_id).await.map(|_| json!({})),
+                                                Ok(thread_id) => ChatService::new(state.clone())
+                                                    .cancel_turn(thread_id)
+                                                    .await
+                                                    .map(|_| json!({}))
+                                                    .map_err(|error| error.message),
                                                 Err(error) => Err(error),
                                             }
                                         }
@@ -2716,9 +2722,9 @@ mod tests {
         relay_attachment_url, remote_batch_key, resolve_remote_runtime_update,
         truncate_mobile_text, RemoteBatchState, RemoteTunnelManager,
     };
-    use crate::commands::chat::ChatAttachmentPayload;
     use crate::config::app_config::RemoteAccessConfig;
     use crate::models::{
+        chat::ChatAttachmentPayload,
         EngineCapabilitiesDto, EngineInfoDto, EngineModelDto, MessageDto, MessageStatusDto,
         MessageWindowCursorDto, ThreadDto, ThreadStatusDto,
     };

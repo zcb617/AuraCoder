@@ -706,6 +706,8 @@
       "expiredQuestions_other": "{{count}} questions expired with the session.",
       "expiredError": "This approval expired with the session. Send a new message to continue.",
       "cancelledLocallyError": "The cancellation could not be sent to Codex. This approval was cancelled locally. You can send a new message to continue.",
+      "expiredStatusError": "This approval has expired. Continue based on the current conversation state.",
+      "operationFailedError": "The approval operation failed. Check the current conversation state and try again.",
       "dynamicToolPrompt": "Respond to the dynamic tool call without hand-writing JSON.",
       "mcpElicitationPrompt": "This MCP server is requesting authorization.",
       "showAdvancedJson": "Show advanced JSON",

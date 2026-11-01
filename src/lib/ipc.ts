@@ -7,6 +7,7 @@ import type { TranscriptWidth } from "./transcriptWidth";
 import type { ThemePreference } from "./theme";
 import type {
   ApprovalResponse,
+  ApprovalResponseOutcome,
   ActionOutputPayload,
   AttachmentPreview,
   BrowserAnnotationAttachment,
@@ -744,9 +745,9 @@ export const ipc = {
   cancelTurn: (threadId: string) => invoke<void>("cancel_turn", { threadId }),
   restartRemoteCliService: (threadId: string) =>
     invoke<void>("restart_remote_cli_service", { threadId }),
-  // 业务说明：提交审批响应，并接收 Codex 本地取消后重读的线程状态。
+  // 业务说明：提交审批响应，并接收后端已保存的审批结果。
   respondApproval: (threadId: string, approvalId: string, response: ApprovalResponse) =>
-    invoke<{ thread: Thread } | null>("respond_to_approval", { threadId, approvalId, response }),
+    invoke<ApprovalResponseOutcome>("respond_to_approval", { threadId, approvalId, response }),
   getThreadMessages: (threadId: string) =>
     invoke<Message[]>("get_thread_messages", { threadId }),
   getThreadMessagesWindow: (

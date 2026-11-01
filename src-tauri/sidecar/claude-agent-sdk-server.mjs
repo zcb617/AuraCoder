@@ -4335,7 +4335,7 @@ function assertClaudeApprovalResponseShape(response) {
 }
 
 /** 向 Rust 返回审批响应处理结果，确保调用方只依据明确回执判断审批是否成功。 */
-function emitApprovalResponseResult(requestId, approvalId, success, error) {
+function emitApprovalResponseResult(requestId, approvalId, success, error, errorCode) {
   const result = {
     // 将审批响应命令的顶层请求标识回传给等待方。
     ...(requestId ? { id: requestId } : {}),
@@ -4345,6 +4345,8 @@ function emitApprovalResponseResult(requestId, approvalId, success, error) {
     success,
     // 失败时保留 sidecar 原始错误文本，便于 Rust 和前端展示。
     ...(error ? { error } : {}),
+    // 仅在 sidecar 能明确识别业务状态时提供结构化错误编码。
+    ...(errorCode ? { errorCode } : {}),
   };
   traceClaudeSdk("approval_response_result", {
     // 记录命令请求标识，便于关联 Rust 的审批等待日志。
@@ -4355,6 +4357,8 @@ function emitApprovalResponseResult(requestId, approvalId, success, error) {
     success,
     // 记录原始异常信息，不在 sidecar 日志层吞掉错误。
     ...(error ? { error } : {}),
+    // 记录可供 Rust 分类的结构化审批错误编码。
+    ...(errorCode ? { errorCode } : {}),
   });
   emit({
     // 标识这是审批响应回执，而不是普通审批请求事件。
@@ -4454,6 +4458,7 @@ function handleApprovalResponse(params = {}, requestId) {
       approvalId,
       false,
       `Claude approval ID ${approvalId} is unknown or no longer pending.`,
+      "APPROVAL_NOT_PENDING",
     );
     return;
   }

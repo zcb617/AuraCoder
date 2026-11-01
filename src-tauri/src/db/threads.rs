@@ -71,8 +71,17 @@ pub fn set_claude_sync_required(
     Ok(())
 }
 
+/// 按精确线程 ID 读取线程及统一权限对象 A。
 pub fn get_thread(db: &Database, thread_id: &str) -> anyhow::Result<Option<ThreadDto>> {
     let conn = db.connect()?;
+    get_thread_on_connection(&conn, thread_id)
+}
+
+/// 使用调用方提供的连接读取线程，复用完整的权限对象 A 行映射。
+pub(super) fn get_thread_on_connection(
+    conn: &rusqlite::Connection,
+    thread_id: &str,
+) -> anyhow::Result<Option<ThreadDto>> {
     conn.query_row(
         "SELECT id, workspace_id, engine_id, model_id, engine_thread_id, engine_metadata_json,
             COALESCE(title, ''), status, message_count, total_tokens, context_current_tokens, context_max_tokens,

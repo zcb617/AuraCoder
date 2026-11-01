@@ -621,6 +621,33 @@ pub fn complete_assistant_message(
 /// 与 `get_thread_messages` 相同地补齐已处理审批块，但不会扫描整个会话。
 pub fn get_message(db: &Database, message_id: &str) -> anyhow::Result<Option<MessageDto>> {
     let conn = db.connect()?;
+    get_message_on_connection(&conn, message_id)
+}
+
+/// 查询线程中最新助手消息的标识，供审批归属校验避免加载完整聊天历史。
+pub fn latest_chat_assistant_message_id(
+    db: &Database,
+    thread_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let conn = db.connect()?;
+    conn.query_row(
+        "SELECT id FROM messages
+         WHERE thread_id = ?1
+           AND role = 'assistant'
+         ORDER BY julianday(created_at) DESC, rowid DESC
+         LIMIT 1",
+        params![thread_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .context("failed to load latest chat assistant message id")
+}
+
+/// 使用调用方提供的连接读取消息，供原子 Mapper 事务复用既有 DTO 映射。
+pub(super) fn get_message_on_connection(
+    conn: &Connection,
+    message_id: &str,
+) -> anyhow::Result<Option<MessageDto>> {
     let mut message = conn
         .query_row(
             "SELECT id, thread_id, role, content, blocks_json, schema_version, status,
@@ -635,7 +662,7 @@ pub fn get_message(db: &Database, message_id: &str) -> anyhow::Result<Option<Mes
 
     if let Some(message) = message.as_mut() {
         if let Some(blocks) = message.blocks.as_mut() {
-            reconcile_answered_approvals_for_message(&conn, &message.id, blocks)?;
+            reconcile_answered_approvals_for_message(conn, &message.id, blocks)?;
         }
     }
     Ok(message)

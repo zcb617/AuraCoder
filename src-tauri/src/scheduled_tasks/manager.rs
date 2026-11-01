@@ -6,12 +6,13 @@ use tauri::{AppHandle, Emitter};
 use tokio::{sync::Notify, time::sleep};
 
 use crate::{
-    commands::{
-        chat::{ChatMessageService, SendMessageRequest},
-    },
     db,
-    models::{ScheduledTaskDto, ScheduledTaskRunDto, ThreadDto},
+    models::{
+        chat::SendMessageRequest, MessageStatusDto, ScheduledTaskDto, ScheduledTaskRunDto,
+        ThreadDto,
+    },
     runtime_env,
+    services::chat_service::ChatService,
     state::AppState,
 };
 
@@ -246,7 +247,7 @@ async fn execute_claimed_task_inner(
         sleep(THREAD_BUSY_RETRY_DELAY).await;
     }
 
-    ChatMessageService::new(state).send_message(
+    ChatService::new(state.clone()).send_message(
         app.clone(),
         SendMessageRequest {
             thread_id: thread.id.clone(),
@@ -264,7 +265,8 @@ async fn execute_claimed_task_inner(
             referenced_thread_id: None,
         },
     )
-    .await?;
+    .await
+    .map_err(|error| error.message)?;
     emit_task_updated(app, &task.id);
     Ok(())
 }
@@ -344,6 +346,49 @@ pub fn emit_task_updated(app: &AppHandle, task_id: &str) {
             task_id: task_id.to_string(),
         },
     );
+}
+
+/// 根据聊天助手消息的终态完成关联的定时任务运行，并通知调度器刷新任务状态。
+pub(crate) async fn finish_chat_run(
+    app: &AppHandle,
+    state: &AppState,
+    assistant_message_id: &str,
+    status: &MessageStatusDto,
+    preview: Option<String>,
+) -> anyhow::Result<()> {
+    // 仅将真实终态映射为定时任务状态；流式状态不代表本轮已经结束。
+    let run_status = match status {
+        MessageStatusDto::Completed => "completed",
+        MessageStatusDto::Interrupted => "interrupted",
+        MessageStatusDto::Error => "error",
+        MessageStatusDto::Streaming => {
+            log::warn!("skip scheduled task completion for streaming assistant message {assistant_message_id}");
+            return Ok(());
+        }
+    };
+    let error_message = matches!(status, MessageStatusDto::Error)
+        .then_some("The scheduled task turn ended with an error.");
+
+    // 通过 Mapper 按助手消息定位并结算定时任务运行记录。
+    let db = state.db.clone();
+    let assistant_message_id = assistant_message_id.to_string();
+    let task_id = tauri::async_runtime::spawn_blocking(move || {
+        db::scheduled_tasks::finish_run_by_message(
+            &db,
+            &assistant_message_id,
+            run_status,
+            preview.as_deref(),
+            error_message,
+        )
+    })
+    .await??;
+
+    // 仅在确有关联任务时广播更新并唤醒调度器。
+    if let Some(task_id) = task_id {
+        emit_task_updated(app, &task_id);
+        state.scheduled_tasks.wake();
+    }
+    Ok(())
 }
 
 #[cfg(test)]

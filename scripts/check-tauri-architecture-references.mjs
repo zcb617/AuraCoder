@@ -72,13 +72,15 @@ const SKIPPED_DIRECTORY_NAMES = new Set([
 ]);
 
 /**
- * 只允许三个 CLI Service、公共基础实现 BaseCliMcp 和 ThreadService 直接访问数据库 Mapper。
+ * 只允许三个 CLI Service、公共基础实现 BaseCliMcp、聊天 Service、定时任务管理器和 ThreadService 直接访问数据库 Mapper。
  */
 const DATABASE_SERVICE_PATHS = new Set([
   "src-tauri/src/cli_tools/claude_code.rs",
   "src-tauri/src/cli_tools/codex.rs",
   "src-tauri/src/cli_tools/mcp.rs",
   "src-tauri/src/cli_tools/opencode.rs",
+  "src-tauri/src/scheduled_tasks/manager.rs",
+  "src-tauri/src/services/chat_service.rs",
   "src-tauri/src/services/thread_service.rs",
 ]);
 
@@ -655,7 +657,7 @@ function moduleReferencePattern(moduleNames) {
 }
 
 /**
- * 判断路径是否属于允许直接调用数据库 Mapper 的 CLI Service、公共基础实现、ThreadService 或 Mapper 目录。
+ * 判断路径是否属于允许直接调用数据库 Mapper 的 CLI Service、公共基础实现、聊天 Service、定时任务管理器、ThreadService 或 Mapper 目录。
  * @param {string} filePath 仓库相对路径。
  * @returns {boolean} 是否不受 REF-09 约束。
  */
@@ -678,7 +680,7 @@ function databaseRulesForPath(filePath) {
   }
 
   const direction =
-    "业务数据库访问仅允许已列明的 CLI Service、公共基础实现 BaseCliMcp 和 ThreadService 调用 Mapper；其他调用方应进入对应 Service，SQL 保留在 Mapper 层。";
+    "业务数据库访问仅允许已列明的 CLI Service、公共基础实现 BaseCliMcp、聊天 Service ChatService、定时任务管理器和 ThreadService 调用 Mapper；其他调用方应进入对应 Service，SQL 保留在 Mapper 层。";
   return [
     defineRule("REF-09", /\b(?:db|mapper|mappers)\s*::/g, direction),
     defineRule(
@@ -1143,6 +1145,11 @@ function runSelfChecks() {
     "REF-10 必须拒绝业务模块反向引用 Controller",
   );
   assert.ok(
+    findSampleFindings("src-tauri/src/services/other.rs", "use crate::commands::chat::send_message;")
+      .some((finding) => finding.rule === "REF-10"),
+    "REF-10 必须继续拒绝普通 Service 反向引用 Controller",
+  );
+  assert.ok(
     findSampleFindings("src-tauri/src/commands/example.rs", "use super::{threads, chat};")
       .some((finding) => finding.rule === "REF-10"),
     "REF-10 必须拒绝 Controller 之间的业务复用",
@@ -1244,12 +1251,14 @@ function runSelfChecks() {
     "REF-09 数据库连接 API 样例未被识别",
   );
 
-  // 验证允许的 Service 实现及 src-tauri/src/db 目录可直接访问 Mapper。
+  // 验证允许的业务实现路径及 src-tauri/src/db 目录可直接访问 Mapper。
   for (const file of [
     "src-tauri/src/cli_tools/codex.rs",
     "src-tauri/src/cli_tools/opencode.rs",
     "src-tauri/src/cli_tools/claude_code.rs",
     "src-tauri/src/cli_tools/mcp.rs",
+    "src-tauri/src/services/chat_service.rs",
+    "src-tauri/src/scheduled_tasks/manager.rs",
     "src-tauri/src/services/thread_service.rs",
   ]) {
     assert.equal(
@@ -1260,6 +1269,13 @@ function runSelfChecks() {
       `REF-09 不应限制允许的 Service 实现: ${file}`,
     );
   }
+  assert.equal(
+    findSampleFindings("src-tauri/src/services/other.rs", "db::threads::get_thread();").some(
+      (finding) => finding.rule === "REF-09",
+    ),
+    true,
+    "REF-09 必须继续限制普通 Service 的数据库访问",
+  );
   assert.equal(
     findSampleFindings("src-tauri/src/db/actions.rs", "db::threads::get_thread();").some(
       (finding) => finding.rule === "REF-09",

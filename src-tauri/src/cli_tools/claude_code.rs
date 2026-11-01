@@ -28,9 +28,11 @@ use crate::{
             // 旧历史响应类型导入保留迁移留痕；当前入口通过返回值类型推断使用历史结果。
             // ClaudeSessionHistory,
             ClaudeSessionSummary,
+            ClaudeApprovalResponseError,
             ClaudeSidecarEngine,
         },
-        map_engine_capabilities, map_model_info, map_provider_usage, ApprovalRequestRoute,
+        approval_response_route_for_engine, map_engine_capabilities, map_model_info,
+        map_provider_usage, normalize_approval_response_for_engine, ApprovalRequestRoute,
         CodexRuntimeEvent, Engine, EngineCapabilities, EngineEvent, EngineSteerReceipt,
         EngineThread, ModelInfo, SandboxPolicy, ThreadScope, ThreadSyncSnapshot, TurnInput,
     },
@@ -41,7 +43,11 @@ use crate::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionCatalogRefreshErrorDto, ExtensionItemDto,
-        OpenCodeRuntimeCatalogDto, ThreadDto, ThreadStatusDto, WorkspaceDto,
+        OpenCodeRuntimeCatalogDto, SteerReceiptDto, ThreadDto, ThreadStatusDto, WorkspaceDto,
+    },
+    models::chat::{
+        ApprovalResponseOutcomeDto, ApprovalResponseRequest, ChatBusinessError,
+        ChatReviewRequest, SendMessageRequest, SteerMessageRequest,
     },
     path_utils, remote_project_claude_runtime_service, ssh,
     state::AppState,
@@ -923,6 +929,146 @@ impl ClaudeCodeCli {
 
 #[async_trait]
 impl CliTool for ClaudeCodeCli {
+    /// 使用同一个 Claude 实例委托公共流程完成用户消息发送。
+    async fn submit_chat_message(
+        self: Arc<Self>,
+        app: tauri::AppHandle,
+        request: SendMessageRequest,
+    ) -> std::result::Result<String, ChatBusinessError> {
+        // 将当前实现实例传给公共流程，保持本轮生命周期占用归属不变。
+        let cli: Arc<dyn CliTool> = self.clone();
+        self.mcp.submit_chat_message(cli, app, request).await
+    }
+
+    /// 返回 Claude 不支持运行中追加消息的明确业务错误。
+    async fn submit_chat_steer(
+        self: Arc<Self>,
+        _app: tauri::AppHandle,
+        _request: SteerMessageRequest,
+    ) -> std::result::Result<SteerReceiptDto, ChatBusinessError> {
+        Err(ChatBusinessError::new(
+            "UNSUPPORTED_OPERATION",
+            "Claude Code 暂不支持运行中追加消息",
+        ))
+    }
+
+    /// 使用同一个 Claude 实例委托公共流程处理审批答复。
+    async fn answer_chat_approval(
+        self: Arc<Self>,
+        request: ApprovalResponseRequest,
+    ) -> std::result::Result<ApprovalResponseOutcomeDto, ChatBusinessError> {
+        // 将当前实现实例传给公共流程，保持审批对应的 CLI 生命周期归属不变。
+        let cli: Arc<dyn CliTool> = self.clone();
+        self.mcp.answer_chat_approval(cli, request).await
+    }
+
+    /// 按当前 Claude 线程取消正在执行的聊天回合。
+    async fn cancel_chat_turn(
+        &self,
+        thread_id: &str,
+    ) -> std::result::Result<(), ChatBusinessError> {
+        self.mcp.cancel_chat_turn(thread_id).await
+    }
+
+    /// 通过公共 CLI 服务流程重启当前 Claude 聊天服务。
+    async fn restart_chat_service(
+        &self,
+        thread_id: &str,
+    ) -> std::result::Result<(), ChatBusinessError> {
+        self.mcp.restart_chat_service(self, thread_id).await
+    }
+
+    /// 返回 Claude 不支持代码审查的明确业务错误。
+    async fn submit_chat_review(
+        self: Arc<Self>,
+        _app: tauri::AppHandle,
+        _request: ChatReviewRequest,
+    ) -> std::result::Result<ThreadDto, ChatBusinessError> {
+        Err(ChatBusinessError::new(
+            "UNSUPPORTED_OPERATION",
+            "Claude Code 暂不支持代码审查",
+        ))
+    }
+
+    /// 为 Claude 创建仅含公共非权限上下文的沙箱策略，专属字段由原权限解析覆盖。
+    fn chat_sandbox(
+        &self,
+        _thread: &ThreadDto,
+        writable_roots: Vec<String>,
+        reasoning_effort: Option<String>,
+        _model_supports_personality: bool,
+    ) -> SandboxPolicy {
+        // Claude 的沙箱只接收工作区与思考强度，原权限解析会设置本次运行的权限字段。
+        SandboxPolicy {
+            writable_roots,
+            allow_network: false,
+            auto_approve_mcp_elicitations: false,
+            approval_policy: None,
+            permission_profile: None,
+            approvals_reviewer: None,
+            reasoning_effort,
+            sandbox_mode: None,
+            service_tier: None,
+            personality: None,
+            output_schema: None,
+            opencode_agent: None,
+        }
+    }
+
+    /// 按 Claude 原生格式规范化审批答复，并将格式问题转为业务错误。
+    fn normalize_chat_approval(
+        &self,
+        response: Value,
+    ) -> std::result::Result<Value, ChatBusinessError> {
+        // 保留底层完整错误日志，向聊天业务调用方返回稳定的中文校验错误。
+        normalize_approval_response_for_engine("claude", response).map_err(|error| {
+            log::error!("Claude 审批答复格式校验失败: {error}");
+            ChatBusinessError::new("VALIDATION_FAILED", "审批答复格式无效")
+        })
+    }
+
+    /// 按 Claude 既有审批格式返回原生答复路由语义。
+    fn chat_approval_route(
+        &self,
+        details: &Value,
+    ) -> std::result::Result<Option<ApprovalRequestRoute>, ChatBusinessError> {
+        Ok(approval_response_route_for_engine("claude", details))
+    }
+
+    /// 按结构化审批错误类型分类结果，不依据 sidecar 错误文案判断业务状态。
+    fn classify_chat_approval_error(&self, error: &anyhow::Error) -> ChatBusinessError {
+        // 只从错误链中的明确类型判断审批未待处理或 sidecar 传输不可用。
+        let not_pending = error
+            .chain()
+            .any(|cause| cause.downcast_ref::<ClaudeApprovalResponseError>().is_some());
+        let transport_unavailable = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|request_error| {
+                    request_error.is_connect() || request_error.is_timeout()
+                })
+        });
+        log::error!("Claude 审批原生操作失败: {error:#}");
+
+        if not_pending {
+            ChatBusinessError::new("APPROVAL_NOT_PENDING", "该审批已失效或不再等待响应")
+        } else if transport_unavailable {
+            ChatBusinessError::new("CLI_UNAVAILABLE", "Claude 审批服务暂时不可用")
+        } else {
+            ChatBusinessError::new("CHAT_OPERATION_FAILED", "Claude 审批操作失败")
+        }
+    }
+
+    /// Claude 不需要对共享聊天事件执行额外副作用。
+    async fn on_chat_event(
+        &self,
+        _thread: &ThreadDto,
+        _assistant_message_id: &str,
+        _event: &EngineEvent,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn list_codex_thread_records(&self, _workspace_id: String, _cursor: Option<String>, _limit: Option<u32>, _search_term: Option<String>, _archived: Option<bool>) -> Result<crate::models::CodexRemoteThreadPageDto> {
         anyhow::bail!("claude 不支持此线程业务操作：list_codex_thread_records")
     }

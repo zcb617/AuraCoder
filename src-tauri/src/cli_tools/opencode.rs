@@ -17,7 +17,8 @@ use super::{
 use crate::{
     db,
     engines::{
-        capabilities_for_engine, map_engine_capabilities, map_model_info, opencode::OpenCodeEngine,
+        approval_response_route_for_engine, capabilities_for_engine, map_engine_capabilities,
+        map_model_info, normalize_approval_response_for_engine, opencode::OpenCodeEngine,
         ApprovalRequestRoute, CodexRuntimeEvent, Engine, EngineCapabilities, EngineEvent,
         EngineSteerReceipt, EngineThread, ModelInfo, OpenCodeRemoteSessionSummary, SandboxPolicy,
         ThreadScope, ThreadSyncSnapshot, TurnInput,
@@ -29,7 +30,11 @@ use crate::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
-        PermissionComponentJson, ThreadDto, ThreadStatusDto, WorkspaceDto,
+        PermissionComponentJson, SteerReceiptDto, ThreadDto, ThreadStatusDto, WorkspaceDto,
+    },
+    models::chat::{
+        ApprovalResponseOutcomeDto, ApprovalResponseRequest, ChatBusinessError, ChatReviewRequest,
+        SendMessageRequest, SteerMessageRequest,
     },
     path_utils, remote_project_opencode_runtime_service, ssh,
     state::AppState,
@@ -431,6 +436,150 @@ impl CliTool for OpenCodeCli {
             anyhow::bail!("service tier is only supported for Codex threads")
         }
         Ok(None)
+    }
+
+    /// 使用同一个 OpenCode 实例委托公共流程完成用户消息发送。
+    async fn submit_chat_message(
+        self: Arc<Self>,
+        app: tauri::AppHandle,
+        request: SendMessageRequest,
+    ) -> std::result::Result<String, ChatBusinessError> {
+        // 将当前实现实例传给公共流程，保持本轮生命周期占用归属不变。
+        let cli: Arc<dyn CliTool> = self.clone();
+        self.mcp.submit_chat_message(cli, app, request).await
+    }
+
+    /// 返回 OpenCode 不支持运行中追加消息的明确业务错误。
+    async fn submit_chat_steer(
+        self: Arc<Self>,
+        _app: tauri::AppHandle,
+        _request: SteerMessageRequest,
+    ) -> std::result::Result<SteerReceiptDto, ChatBusinessError> {
+        Err(ChatBusinessError::new(
+            "UNSUPPORTED_OPERATION",
+            "OpenCode 暂不支持运行中追加消息",
+        ))
+    }
+
+    /// 使用同一个 OpenCode 实例委托公共流程处理审批答复。
+    async fn answer_chat_approval(
+        self: Arc<Self>,
+        request: ApprovalResponseRequest,
+    ) -> std::result::Result<ApprovalResponseOutcomeDto, ChatBusinessError> {
+        // 将当前实现实例传给公共流程，保持审批对应的 CLI 生命周期归属不变。
+        let cli: Arc<dyn CliTool> = self.clone();
+        self.mcp.answer_chat_approval(cli, request).await
+    }
+
+    /// 按当前 OpenCode 线程取消正在执行的聊天回合。
+    async fn cancel_chat_turn(
+        &self,
+        thread_id: &str,
+    ) -> std::result::Result<(), ChatBusinessError> {
+        self.mcp.cancel_chat_turn(thread_id).await
+    }
+
+    /// 通过公共 CLI 服务流程重启当前 OpenCode 聊天服务。
+    async fn restart_chat_service(
+        &self,
+        thread_id: &str,
+    ) -> std::result::Result<(), ChatBusinessError> {
+        self.mcp.restart_chat_service(self, thread_id).await
+    }
+
+    /// 返回 OpenCode 不支持代码审查的明确业务错误。
+    async fn submit_chat_review(
+        self: Arc<Self>,
+        _app: tauri::AppHandle,
+        _request: ChatReviewRequest,
+    ) -> std::result::Result<ThreadDto, ChatBusinessError> {
+        Err(ChatBusinessError::new(
+            "UNSUPPORTED_OPERATION",
+            "OpenCode 暂不支持代码审查",
+        ))
+    }
+
+    /// 为 OpenCode 创建仅含公共非权限上下文的沙箱策略，并读取 OpenCode 专属 Agent 配置。
+    fn chat_sandbox(
+        &self,
+        thread: &ThreadDto,
+        writable_roots: Vec<String>,
+        reasoning_effort: Option<String>,
+        _supports_personality: bool,
+    ) -> SandboxPolicy {
+        // 从当前线程 metadata 读取 OpenCode Agent，其余专属配置不混入公共权限上下文。
+        let opencode_agent = thread
+            .engine_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("opencodeAgent"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        SandboxPolicy {
+            writable_roots,
+            allow_network: false,
+            auto_approve_mcp_elicitations: false,
+            approval_policy: None,
+            permission_profile: None,
+            approvals_reviewer: None,
+            reasoning_effort,
+            sandbox_mode: None,
+            service_tier: None,
+            personality: None,
+            output_schema: None,
+            opencode_agent,
+        }
+    }
+
+    /// 按 OpenCode 原生格式规范化审批答复，并将格式问题转为业务错误。
+    fn normalize_chat_approval(
+        &self,
+        response: Value,
+    ) -> std::result::Result<Value, ChatBusinessError> {
+        // 保留底层完整错误日志，向聊天业务调用方返回稳定的中文校验错误。
+        normalize_approval_response_for_engine("opencode", response).map_err(|error| {
+            log::error!("OpenCode 审批答复格式校验失败: {error}");
+            ChatBusinessError::new("VALIDATION_FAILED", "审批答复格式无效")
+        })
+    }
+
+    /// 按 OpenCode 既有审批格式解析原生答复路由。
+    fn chat_approval_route(
+        &self,
+        details: &Value,
+    ) -> std::result::Result<Option<ApprovalRequestRoute>, ChatBusinessError> {
+        Ok(approval_response_route_for_engine("opencode", details))
+    }
+
+    /// 根据 OpenCode 审批错误链分类传输不可用或原生操作失败。
+    fn classify_chat_approval_error(&self, error: &anyhow::Error) -> ChatBusinessError {
+        // 只依据错误链中的 reqwest 传输类型分类，不依据 HTTP 状态或错误文案推断审批状态。
+        let transport_unavailable = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|request_error| {
+                    request_error.is_connect() || request_error.is_timeout()
+                })
+        });
+        log::error!("OpenCode 审批原生操作失败: {error:#}");
+
+        if transport_unavailable {
+            ChatBusinessError::new("CLI_UNAVAILABLE", "OpenCode 审批服务暂时不可用")
+        } else {
+            ChatBusinessError::new("CHAT_OPERATION_FAILED", "OpenCode 审批操作失败")
+        }
+    }
+
+    /// OpenCode 不需要对共享聊天事件执行额外副作用。
+    async fn on_chat_event(
+        &self,
+        _thread: &ThreadDto,
+        _assistant_message_id: &str,
+        _event: &EngineEvent,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
 

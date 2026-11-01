@@ -1774,7 +1774,8 @@ impl Engine for CodexEngine {
         let (raw_request_id, method) =
             resolve_approval_response_target(pending.as_ref(), route.as_ref()).map_err(
                 |reason| {
-                    anyhow::anyhow!(approval_response_target_error_message(reason, approval_id))
+                    anyhow::Error::new(reason)
+                        .context(approval_response_target_error_message(reason, approval_id))
                 },
             )?;
         let normalized_response = normalize_approval_response(Some(method), response);
@@ -8061,9 +8062,11 @@ async fn resolve_pending_approval_request(
     Some(approval_id)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApprovalResponseTargetError {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ApprovalResponseTargetError {
+    #[error("Codex approval runtime connection was reset")]
     RuntimeReset,
+    #[error("Codex approval request metadata is missing")]
     MissingRequestMetadata,
 }
 

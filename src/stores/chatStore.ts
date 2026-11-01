@@ -5,8 +5,10 @@ import { t } from "../i18n";
 import { useThreadStore } from "./threadStore";
 import type {
   ApprovalResponse,
+  ApprovalResponseOutcome,
   ActionBlock,
   ApprovalBlock,
+  ChatBusinessError,
   AttachmentBlock,
   ChatAttachment,
   ChatInputItem,
@@ -395,66 +397,6 @@ function enqueueStreamEvent(queue: StreamEvent[], event: StreamEvent) {
   queue.push(event);
 }
 
-function resolveApprovalDecision(response: ApprovalResponse): ApprovalBlock["decision"] {
-  if ("decision" in response && typeof response.decision === "string") {
-    const decision = String(response.decision).trim();
-    if (decision === "deny") {
-      return "decline";
-    }
-    if (decision === "acceptForSession") {
-      return "accept_for_session";
-    }
-    return decision as ApprovalBlock["decision"];
-  }
-
-  if ("action" in response && typeof response.action === "string") {
-    const action = String(response.action).trim();
-    if (action === "accept" || action === "decline" || action === "cancel") {
-      return action;
-    }
-    return "custom";
-  }
-
-  if ("permissions" in response) {
-    const scope = response.scope;
-    const permissions =
-      typeof response.permissions === "object" &&
-      response.permissions !== null &&
-      !Array.isArray(response.permissions)
-        ? (response.permissions as Record<string, unknown>)
-        : null;
-    const hasGrantedPermission =
-      permissions !== null &&
-      Object.values(permissions).some((value) => {
-        if (Array.isArray(value)) {
-          return value.length > 0;
-        }
-        if (typeof value === "object" && value !== null) {
-          return Object.values(value as Record<string, unknown>).some((nested) => {
-            if (Array.isArray(nested)) {
-              return nested.length > 0;
-            }
-            if (typeof nested === "object" && nested !== null) {
-              return Object.keys(nested as Record<string, unknown>).length > 0;
-            }
-            return nested === true || (typeof nested === "string" && nested.toLowerCase() !== "none");
-          });
-        }
-        return value === true || (typeof value === "string" && value.toLowerCase() !== "none");
-      });
-
-    if (!hasGrantedPermission) {
-      return "decline";
-    }
-    if (scope === "session") {
-      return "accept_for_session";
-    }
-    return "accept";
-  }
-
-  return "custom";
-}
-
 function normalizeActionOutputStream(
   stream: unknown,
 ): ActionBlock["outputChunks"][number]["stream"] {
@@ -540,42 +482,6 @@ function expireApprovalInMessages(
     };
     return nextMessages;
   }
-  return messages;
-}
-
-function restoreApprovalInMessages(
-  messages: Message[],
-  approvalId: string,
-  previousApproval: ApprovalBlock,
-): Message[] {
-  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
-    const message = messages[messageIndex];
-    const blocks = message.blocks;
-    if (!blocks || blocks.length === 0) {
-      continue;
-    }
-
-    const approvalIndex = blocks.findIndex(
-      (block) => block.type === "approval" && block.approvalId === approvalId,
-    );
-    if (approvalIndex < 0) {
-      continue;
-    }
-
-    if (blocks[approvalIndex] === previousApproval) {
-      return messages;
-    }
-
-    const nextBlocks = [...blocks];
-    nextBlocks[approvalIndex] = previousApproval;
-    const nextMessages = [...messages];
-    nextMessages[messageIndex] = {
-      ...message,
-      blocks: nextBlocks,
-    };
-    return nextMessages;
-  }
-
   return messages;
 }
 
@@ -3141,120 +3047,40 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ error: String(error) });
     }
   },
-  // 业务说明：等待 sidecar 审批回执成功后，再结算可见线程中的审批状态。
+  // 业务说明：提交审批答复，并依据后端已保存结果同步线程和审批卡片。
   respondApproval: async (approvalId, response, threadIdOverride) => {
     const threadId = threadIdOverride ?? get().threadId;
     if (!threadId) {
-      set({ error: "No active thread selected" });
+      set({ error: t("chat:messageBlocks.approval.operationFailedError") });
       return false;
-    }
-
-    // Only inspect the visible transcript when it belongs to the target thread.
-    const decision = resolveApprovalDecision(response);
-    const responseData = typeof response === "object" && response !== null && !Array.isArray(response)
-      ? response as Record<string, unknown>
-      : undefined;
-    let previousApproval: ApprovalBlock | null = null;
-    if (get().threadId === threadId) {
-      set((state) => {
-        for (const message of state.messages) {
-          const approval = message.blocks?.find(
-            (block): block is ApprovalBlock =>
-              block.type === "approval" && block.approvalId === approvalId,
-          );
-          if (approval) {
-            previousApproval = approval;
-            break;
-          }
-        }
-
-        // 旧逻辑会在 IPC 调用前乐观标记 answered，现保留迁移留痕但不再执行：
-        // const nextMessages = resolveApprovalInMessages(state.messages, approvalId, decision, responseData);
-        // if (nextMessages === state.messages) {
-        //   return state;
-        // }
-        // return { ...state, messages: nextMessages };
-        return state;
-      });
     }
 
     try {
       const outcome = await ipc.respondApproval(threadId, approvalId, response);
-      // 业务说明：后端已在本地取消审批时同步线程状态并保留已回答的取消记录。
-      if (outcome) {
-        useThreadStore.getState().applyThreadUpdateLocal(outcome.thread);
-        if (get().threadId === threadId) {
-          set((state) => {
-            if (state.threadId !== threadId) {
-              return state;
-            }
-            const streaming = isThreadStatusStreaming(outcome.thread.status);
-            return {
-              ...state,
-              messages: resolveApprovalInMessages(
-                state.messages,
-                approvalId,
-                "cancel",
-                responseData,
-              ),
-              status: outcome.thread.status,
-              streaming,
-              turnStartedAt: streaming ? state.turnStartedAt : null,
-              error: t("chat:messageBlocks.approval.cancelledLocallyError"),
-            };
-          });
-        }
-        return true;
-      }
-      if (get().threadId === threadId) {
-        set((state) => {
-          if (state.threadId !== threadId) {
-            return state;
-          }
-          const nextMessages = resolveApprovalInMessages(
-            state.messages,
-            approvalId,
-            decision,
-            responseData,
-          );
-          return {
-            ...state,
-            messages: nextMessages,
-            status: "streaming",
-            streaming: true,
-          };
-        });
-      }
-      return true;
+      return applyApprovalResponseOutcome(threadId, outcome);
     } catch (error) {
-      const rawError = String(error);
-      // 审批已随轮次结束被后端作废（sidecar 回执 "unknown or no longer pending"）时，卡片直接置灰并提示业务文案。
-      const approvalStale = rawError.includes("no longer pending");
-      set((state) => ({
-        ...(state.threadId === threadId
-          ? approvalStale
-            ? {
-                messages: expireApprovalInMessages(state.messages, approvalId),
-                // 审批已被后端判死，挂着它的轮次早已结束；若当前状态仍停在 awaiting_approval
-                //（例如重启后从旧数据恢复出的假进行中），一并复位解锁输入框；
-                // 正在 streaming 的新轮次不动。
-                ...(state.status === "awaiting_approval"
-                  ? { status: "idle" as const, streaming: false }
-                  : {}),
-              }
-            : previousApproval
-              ? { messages: restoreApprovalInMessages(state.messages, approvalId, previousApproval) }
-              : {}
-          : {}),
-        error: approvalStale ? t("chat:messageBlocks.approval.expiredError") : rawError,
-      }));
-      // 侧边栏线程状态同步复位（仅当它还停在 awaiting_approval）。
-      if (approvalStale) {
-        const threadState = useThreadStore.getState();
-        const staleThread = threadState.threads.find((thread) => thread.id === threadId);
-        if (staleThread && staleThread.status === "awaiting_approval") {
-          threadState.applyThreadUpdateLocal({ ...staleThread, status: "idle" });
+      // 业务说明：结构化错误携带已保存结果时先同步真实结果，否则只提示且保留审批卡片。
+      const businessError =
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        typeof error.code === "string" &&
+        "message" in error &&
+        typeof error.message === "string"
+          ? error as ChatBusinessError
+          : null;
+      if (businessError) {
+        if (businessError.outcome) {
+          applyApprovalResponseOutcome(threadId, businessError.outcome, businessError.message);
+        } else if (get().threadId === threadId) {
+          set({ error: businessError.message });
         }
+        return false;
+      }
+
+      // 非结构化异常只提供通用失败提示，不从异常文案推断审批状态。
+      if (get().threadId === threadId) {
+        set({ error: t("chat:messageBlocks.approval.operationFailedError") });
       }
       return false;
     }
@@ -3347,6 +3173,119 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 }));
+
+/** 业务说明：应用审批事务返回的已保存结果，并只更新对应的可见聊天线程。 */
+function applyApprovalResponseOutcome(
+  threadId: string,
+  outcome: ApprovalResponseOutcome,
+  fallbackErrorMessage?: string,
+): boolean {
+  // 业务说明：校验后端结果的线程归属，阻止错误线程的消息或状态进入当前聊天。
+  if (
+    outcome.thread.id !== threadId ||
+    (outcome.message !== null && outcome.message.threadId !== threadId)
+  ) {
+    console.error("[chat] Approval response outcome thread mismatch", {
+      targetThreadId: threadId,
+      outcomeThreadId: outcome.thread.id,
+      messageThreadId: outcome.message?.threadId ?? null,
+    });
+    if (useChatStore.getState().threadId === threadId) {
+      useChatStore.setState({
+        error: t("chat:messageBlocks.approval.operationFailedError"),
+      });
+    }
+    return false;
+  }
+
+  // 业务说明：同步后端返回的线程实体，确保侧边栏使用事务后的状态。
+  useThreadStore.getState().applyThreadUpdateLocal(outcome.thread);
+
+  const warning = outcome.warning;
+  let errorMessage = fallbackErrorMessage;
+  if (warning) {
+    errorMessage = warning.message;
+  } else if (outcome.status === "expired") {
+    errorMessage = t("chat:messageBlocks.approval.expiredStatusError");
+  }
+
+  // 业务说明：后台线程的答复只更新线程列表，不覆盖当前可见会话状态。
+  if (useChatStore.getState().threadId !== threadId) {
+    return true;
+  }
+
+  const backendMessage = outcome.message;
+  const decision = outcome.decision === null
+    ? undefined
+    : outcome.decision as ApprovalBlock["decision"];
+  useChatStore.setState((state) => {
+    if (state.threadId !== threadId) {
+      return state;
+    }
+
+    // 业务说明：已有消息时只合并目标审批块，保留本地已到达的其他消息进度。
+    let messages = state.messages;
+    if (backendMessage) {
+      const messageIndex = state.messages.findIndex((message) => message.id === backendMessage.id);
+      if (messageIndex < 0) {
+        messages = [...state.messages, backendMessage];
+        messages.sort(
+          (leftMessage, rightMessage) =>
+            Date.parse(leftMessage.createdAt) - Date.parse(rightMessage.createdAt),
+        );
+      } else {
+        const currentMessage = state.messages[messageIndex];
+        const backendApprovalBlock = backendMessage.blocks?.find(
+          (block): block is ApprovalBlock =>
+            block.type === "approval" && block.approvalId === outcome.approvalId,
+        );
+        let nextMessage = currentMessage;
+        if (backendApprovalBlock) {
+          const currentBlocks = currentMessage.blocks ?? [];
+          const approvalIndex = currentBlocks.findIndex(
+            (block) => block.type === "approval" && block.approvalId === outcome.approvalId,
+          );
+          const nextBlocks = [...currentBlocks];
+          if (approvalIndex < 0) {
+            nextBlocks.push(backendApprovalBlock);
+          } else {
+            nextBlocks[approvalIndex] = backendApprovalBlock;
+          }
+          nextMessage = { ...currentMessage, blocks: nextBlocks };
+        }
+
+        // 业务说明：只允许把本地流式消息推进到后端已确认的终态，不回退本地终态。
+        if (currentMessage.status === "streaming" && backendMessage.status !== "streaming") {
+          nextMessage = { ...nextMessage, status: backendMessage.status };
+        }
+        if (nextMessage !== currentMessage) {
+          messages = [...state.messages];
+          messages[messageIndex] = nextMessage;
+        }
+
+        if (!backendApprovalBlock && outcome.status === "answered") {
+          messages = resolveApprovalInMessages(messages, outcome.approvalId, decision);
+        } else if (!backendApprovalBlock && outcome.status === "expired") {
+          messages = expireApprovalInMessages(messages, outcome.approvalId);
+        }
+      }
+    } else if (outcome.status === "answered") {
+      messages = resolveApprovalInMessages(state.messages, outcome.approvalId, decision);
+    } else if (outcome.status === "expired") {
+      messages = expireApprovalInMessages(state.messages, outcome.approvalId);
+    }
+
+    const streaming = isThreadStatusStreaming(outcome.thread.status);
+    return {
+      messages,
+      status: outcome.thread.status,
+      streaming,
+      turnStartedAt: streaming ? state.turnStartedAt : null,
+      error: errorMessage,
+    };
+  });
+  return true;
+}
 
 /**
  * 标记指定线程已经收到会话启动事件，供消息面板关闭后续首轮占位提示。

@@ -3,9 +3,258 @@ use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 
 use crate::engines::events::{ActionResult, ActionType};
+use crate::models::{MessageDto, MessageStatusDto, ThreadDto, ThreadStatusDto};
 use crate::runtime_env;
 
 use super::Database;
+
+/// 保存聊天审批答复前所需的持久化归属和路由详情。
+#[derive(Debug, Clone)]
+pub struct ChatApprovalRecord {
+    /// 审批所属线程，用于校验答复目标。
+    pub thread_id: String,
+    /// 审批所在消息，用于同步审批卡片状态。
+    pub message_id: String,
+    /// 审批当前持久化状态。
+    pub status: String,
+    /// 审批已经保存的决定；仍在等待时通常为空。
+    pub decision: Option<String>,
+    /// 审批路由及业务详情，必须按数据库原文解析。
+    pub details: Value,
+}
+
+/// 按审批标识读取持久化归属、状态和路由详情。
+pub fn get_chat_approval_record(
+    db: &Database,
+    approval_id: &str,
+) -> anyhow::Result<Option<ChatApprovalRecord>> {
+    let conn = db.connect()?;
+    let record = conn
+        .query_row(
+            "SELECT thread_id, message_id, status, decision, details_json
+             FROM approvals
+             WHERE id = ?1",
+            params![approval_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .context("failed to load chat approval record")?;
+
+    let Some((thread_id, message_id, status, decision, details_json)) = record else {
+        return Ok(None);
+    };
+
+    // 保留数据库审批详情的真实解析结果，避免用空对象替代损坏的路由数据。
+    let details = serde_json::from_str::<Value>(&details_json)
+        .context("failed to parse chat approval details_json")?;
+
+    Ok(Some(ChatApprovalRecord {
+        thread_id,
+        message_id,
+        status,
+        decision,
+        details,
+    }))
+}
+
+/// 统计同一线程中除当前审批外仍待处理的审批记录。
+pub fn count_other_pending_chat_approvals(
+    db: &Database,
+    thread_id: &str,
+    approval_id: &str,
+) -> anyhow::Result<i64> {
+    let conn = db.connect()?;
+    let count = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM approvals
+             WHERE thread_id = ?1
+               AND id <> ?2
+               AND status = 'pending'",
+            params![thread_id, approval_id],
+            |row| row.get(0),
+        )
+        .context("failed to count other pending chat approvals")?;
+    Ok(count)
+}
+
+/// 在单个 SQLite 事务内保存审批、审批消息块、可选消息状态和线程状态。
+pub fn settle_chat_approval(
+    db: &Database,
+    thread_id: &str,
+    approval_id: &str,
+    status: &str,
+    decision: Option<&str>,
+    thread_status: ThreadStatusDto,
+    message_status: Option<MessageStatusDto>,
+) -> anyhow::Result<(ThreadDto, MessageDto)> {
+    // 只接受 Service 契约规定的两种结算状态，不在 Mapper 推导业务状态。
+    if status != "answered" && status != "expired" {
+        anyhow::bail!("unsupported chat approval settlement status: {status}");
+    }
+
+    let mut conn = db.connect()?;
+    let tx = conn.transaction().context("failed to start chat approval transaction")?;
+
+    // 先读取审批并校验归属和 pending 状态，所有校验均发生在任何写入之前。
+    let approval = tx
+        .query_row(
+            "SELECT thread_id, message_id, status
+             FROM approvals
+             WHERE id = ?1",
+            params![approval_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .context("failed to load approval for settlement")?;
+    let Some((approval_thread_id, message_id, current_status)) = approval else {
+        anyhow::bail!("chat approval not found: {approval_id}");
+    };
+    if approval_thread_id != thread_id {
+        anyhow::bail!("chat approval does not belong to thread: {thread_id}");
+    }
+    if current_status != "pending" {
+        anyhow::bail!("chat approval is not pending: {approval_id}");
+    }
+
+    // 验证审批消息仍属于目标线程，并严格解析消息块以避免覆盖损坏数据。
+    let message_record = tx
+        .query_row(
+            "SELECT thread_id, blocks_json
+             FROM messages
+             WHERE id = ?1",
+            params![message_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .context("failed to load approval message for settlement")?;
+    let Some((message_thread_id, raw_blocks)) = message_record else {
+        anyhow::bail!("chat approval message not found: {message_id}");
+    };
+    if message_thread_id != thread_id {
+        anyhow::bail!("chat approval message does not belong to thread: {thread_id}");
+    }
+    let raw_blocks = raw_blocks.context("chat approval message has no blocks_json")?;
+    let mut blocks = serde_json::from_str::<Value>(&raw_blocks)
+        .context("failed to parse chat approval message blocks_json")?;
+    let Some(items) = blocks.as_array_mut() else {
+        anyhow::bail!("chat approval message blocks_json is not an array");
+    };
+
+    // 只改目标审批卡片的既有状态字段，保留其他卡片及 response/details 等业务数据。
+    let mut approval_block_found = false;
+    for block in items.iter_mut() {
+        let Some(object) = block.as_object_mut() else {
+            continue;
+        };
+        if object.get("type").and_then(Value::as_str) != Some("approval") {
+            continue;
+        }
+        let block_approval_id = object
+            .get("approvalId")
+            .and_then(Value::as_str)
+            .or_else(|| object.get("approval_id").and_then(Value::as_str));
+        if block_approval_id != Some(approval_id) {
+            continue;
+        }
+
+        approval_block_found = true;
+        if status == "answered" {
+            if object.get("status").and_then(Value::as_str) != Some("answered") {
+                object.insert("status".to_string(), Value::String("answered".to_string()));
+            }
+            if let Some(decision) = decision {
+                if object.get("decision").and_then(Value::as_str) != Some(decision) {
+                    object.insert("decision".to_string(), Value::String(decision.to_string()));
+                }
+            }
+        } else {
+            object.insert("status".to_string(), Value::String("expired".to_string()));
+        }
+    }
+    if !approval_block_found {
+        anyhow::bail!("chat approval block not found in message: {approval_id}");
+    }
+
+    // 使用 Service 指定的审批与线程状态受控写入，并验证每条 SQL 恰好更新一行。
+    let answered_at = if status == "answered" {
+        Some(runtime_env::system_time_rfc3339())
+    } else {
+        None
+    };
+    let approval_rows = tx
+        .execute(
+            "UPDATE approvals
+             SET status = ?1,
+                 decision = COALESCE(?2, decision),
+                 answered_at = CASE WHEN ?1 = 'answered' THEN ?3 ELSE answered_at END
+             WHERE id = ?4
+               AND thread_id = ?5
+               AND status = 'pending'",
+            params![status, decision, answered_at, approval_id, thread_id],
+        )
+        .context("failed to settle chat approval")?;
+    if approval_rows != 1 {
+        anyhow::bail!("chat approval settlement affected {approval_rows} rows");
+    }
+
+    // 将可选消息状态按既有 DTO 字符串映射保存；None 时沿用数据库原状态。
+    let blocks_json = blocks.to_string();
+    let message_status = message_status.map(|status| status.as_str().to_string());
+    let message_rows = tx
+        .execute(
+            "UPDATE messages
+             SET blocks_json = ?1,
+                 status = COALESCE(?2, status)
+             WHERE id = ?3
+               AND thread_id = ?4
+               AND blocks_json = ?5",
+            params![blocks_json, message_status, message_id, thread_id, raw_blocks],
+        )
+        .context("failed to update chat approval message blocks")?;
+    if message_rows != 1 {
+        anyhow::bail!("chat approval message update affected {message_rows} rows");
+    }
+
+    let thread_rows = tx
+        .execute(
+            "UPDATE threads SET status = ?1 WHERE id = ?2",
+            params![thread_status.as_str(), thread_id],
+        )
+        .context("failed to update thread status after chat approval")?;
+    if thread_rows != 1 {
+        anyhow::bail!("chat approval thread update affected {thread_rows} rows");
+    }
+
+    // 在同一事务中读取 Mapper 原有 DTO 映射结果，确保返回值对应本次写入。
+    let thread = super::threads::get_thread_on_connection(&tx, thread_id)?
+        .context("thread not found after chat approval settlement")?;
+    let message = super::messages::get_message_on_connection(&tx, &message_id)?
+        .context("message not found after chat approval settlement")?;
+    tx.commit()
+        .context("failed to commit chat approval transaction")?;
+
+    Ok((thread, message))
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn insert_action_started(

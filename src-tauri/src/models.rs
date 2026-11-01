@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod chat;
+
 /// 表示前端展示、编辑并由数据库保存的统一线程权限对象，不包含 CLI 原生权限。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

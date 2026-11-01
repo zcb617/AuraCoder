@@ -1,10 +1,12 @@
 use std::sync::Arc;
+use std::{collections::HashMap, time::Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
+use tauri::Emitter;
 
 use super::{
     BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
@@ -12,6 +14,7 @@ use super::{
     CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult, map_context_usage,
 };
 use crate::{
+    cli_tools::mcp::chat_business::*,
     db,
     engines::{
         capabilities_for_engine,
@@ -19,7 +22,7 @@ use crate::{
         map_engine_capabilities, map_model_info, map_provider_usage,
         ApprovalRequestRoute, CodexRuntimeEvent, Engine, EngineCapabilities, EngineEvent,
         EngineSteerReceipt, EngineThread, ModelInfo, SandboxPolicy, ThreadScope,
-        ThreadSyncSnapshot, TurnInput,
+        ThreadSyncSnapshot, TurnCompletionStatus, TurnInput,
     },
     extensions,
     local_cli_service_lifecycle::{LocalCliHandle, LocalCliServiceLifecycle},
@@ -28,7 +31,11 @@ use crate::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
-        ThreadDto, ThreadStatusDto, WorkspaceDto,
+        MessageStatusDto, ThreadDto, ThreadStatusDto, ThreadUpdateDto, WorkspaceDto,
+    },
+    models::chat::{
+        ApprovalResponseOutcomeDto, ApprovalResponseRequest, ChatBusinessError, ChatReviewRequest,
+        CodexReviewDeliveryPayload, CodexReviewTargetPayload, SteerMessageRequest,
     },
     path_utils, remote_project_codex_runtime_service, remote_project_session_refresh_service, ssh,
     state::AppState,
@@ -382,6 +389,1673 @@ impl CodexCli {
     }
 }
 
+impl CodexCli {
+    /// 校验 Codex 审查请求、创建审查消息，并以当前 CLI 实例启动后台轮次。
+    async fn start_codex_review(
+        self: Arc<Self>,
+        app: tauri::AppHandle,
+        request: ChatReviewRequest,
+    ) -> std::result::Result<ThreadDto, ChatBusinessError> {
+        let state = self.state.clone();
+        let ChatReviewRequest {
+            thread_id,
+            target,
+            delivery,
+        } = request;
+
+        // 同一线程已有活动轮次时拒绝重复创建审查任务。
+        if state.turns.get(&thread_id).await.is_some() {
+            return Err(ChatBusinessError::new(
+                "CHAT_OPERATION_FAILED",
+                "本线程已有正在运行的任务，请停止后再发起审查",
+            ));
+        }
+
+        // 读取并验证审查源线程及其 workspace，避免审查错误引擎或 SSH 线程。
+        let db = state.db.clone();
+        let lookup_thread_id = thread_id.clone();
+        let source_thread = thread_business::run_db(db.clone(), move |db| {
+            db::threads::get_thread(db, &lookup_thread_id)
+        })
+        .await
+        .map_err(|error| {
+            log::error!("Codex 审查读取源线程失败: thread_id={thread_id} error={error}");
+            ChatBusinessError::new("CHAT_OPERATION_FAILED", "读取审查会话失败")
+        })?
+        .ok_or_else(|| ChatBusinessError::new("CHAT_OPERATION_FAILED", "审查会话不存在"))?;
+
+        if source_thread.engine_id != "codex" {
+            return Err(ChatBusinessError::new(
+                "UNSUPPORTED_OPERATION",
+                "原生代码审查仅支持 Codex 会话",
+            ));
+        }
+
+        let workspace_id = source_thread.workspace_id.clone();
+        let source_workspace = thread_business::run_db(db.clone(), move |db| {
+            db::workspaces::find_workspace_by_id(db, &workspace_id)?.ok_or_else(|| {
+                anyhow::anyhow!("workspace not found: {workspace_id}")
+            })
+        })
+        .await
+        .map_err(|error| {
+            log::error!(
+                "Codex 审查读取 workspace 失败: thread_id={} error={error}",
+                source_thread.id
+            );
+            ChatBusinessError::new("CHAT_OPERATION_FAILED", "读取审查项目失败")
+        })?;
+        if source_workspace.location_kind == "ssh" {
+            return Err(ChatBusinessError::new(
+                "UNSUPPORTED_OPERATION",
+                "SSH 远端 Codex 暂不支持原生代码审查",
+            ));
+        }
+
+        let source_engine_thread_id = source_thread.engine_thread_id.clone().ok_or_else(|| {
+            ChatBusinessError::new("VALIDATION_FAILED", "Codex 审查会话尚未初始化")
+        })?;
+        let effective_delivery = delivery.unwrap_or(CodexReviewDeliveryPayload::Inline);
+        let (target_payload, review_message, review_title) =
+            Self::normalize_codex_review_target(&target).map_err(|error| {
+                log::error!("Codex 审查目标无效: thread_id={thread_id} error={error}");
+                ChatBusinessError::new("VALIDATION_FAILED", "代码审查目标无效")
+            })?;
+        let initial_turn_model_id = source_thread.model_id.clone();
+        let reasoning_effort = source_thread.reasoning_effort.clone();
+
+        // 在数据库写入前登记本轮占用，避免同一线程并发启动审查或聊天。
+        let cancellation = CancellationToken::new();
+        if !state
+            .turns
+            .try_register(&source_thread.id, cancellation.clone())
+            .await
+        {
+            return Err(ChatBusinessError::new(
+                "CHAT_OPERATION_FAILED",
+                "本线程已有正在运行的任务，请停止后再发起审查",
+            ));
+        }
+
+        // 按原内联或独立投递规则创建用户消息和助手占位消息。
+        let (review_thread, assistant_message_id) = match thread_business::run_db(db.clone(), {
+            let source_thread = source_thread.clone();
+            let review_message = review_message.clone();
+            let review_title = review_title.clone();
+            let initial_turn_model_id = initial_turn_model_id.clone();
+            let reasoning_effort = reasoning_effort.clone();
+            let detached = matches!(effective_delivery, CodexReviewDeliveryPayload::Detached);
+            move |db| {
+                let review_thread = if detached {
+                    let created = db::threads::create_thread(
+                        db,
+                        &source_thread.workspace_id,
+                        &source_thread.engine_id,
+                        &initial_turn_model_id,
+                        &review_title,
+                    )?;
+                    if let Some(metadata) = Self::clone_codex_review_metadata(
+                        source_thread.engine_metadata.as_ref(),
+                        &initial_turn_model_id,
+                    ) {
+                        db::threads::update_engine_metadata(db, &created.id, &metadata)?;
+                    }
+                    created
+                } else {
+                    source_thread.clone()
+                };
+
+                let user_blocks = build_user_blocks(&review_message, &[], &[], false, false, None);
+                db::messages::insert_user_message(
+                    db,
+                    &review_thread.id,
+                    &review_message,
+                    Some(serde_json::to_value(&user_blocks)?),
+                    Some(source_thread.engine_id.as_str()),
+                    Some(initial_turn_model_id.as_str()),
+                    reasoning_effort.as_deref(),
+                )?;
+                let assistant_message = db::messages::insert_assistant_placeholder(
+                    db,
+                    &review_thread.id,
+                    Some(source_thread.engine_id.as_str()),
+                    Some(initial_turn_model_id.as_str()),
+                    reasoning_effort.as_deref(),
+                )?;
+                db::threads::update_thread_status(db, &review_thread.id, ThreadStatusDto::Streaming)?;
+                let updated_thread = db::threads::get_thread(db, &review_thread.id)?
+                    .ok_or_else(|| anyhow::anyhow!("review thread not found after setup"))?;
+                Ok((updated_thread, assistant_message.id))
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                state.turns.finish(&source_thread.id).await;
+                log::error!(
+                    "Codex 审查消息持久化失败: thread_id={} error={error}",
+                    source_thread.id
+                );
+                return Err(ChatBusinessError::new(
+                    "PERSISTENCE_FAILED",
+                    "创建代码审查消息失败",
+                ));
+            }
+        };
+
+        if matches!(effective_delivery, CodexReviewDeliveryPayload::Detached)
+            && !state
+                .turns
+                .try_register(&review_thread.id, cancellation.clone())
+                .await
+        {
+            log::warn!(
+                "failed to register cancellation token for detached review thread {}",
+                review_thread.id
+            );
+        }
+
+        let state_for_task = state.clone();
+        let app_for_task = app.clone();
+        let cli_for_task = self.clone();
+        let source_thread_for_task = source_thread.clone();
+        let review_thread_for_task = review_thread.clone();
+        let source_engine_thread_id_for_task = source_engine_thread_id.clone();
+        let assistant_message_id_for_task = assistant_message_id.clone();
+        let delivery_label = match effective_delivery {
+            CodexReviewDeliveryPayload::Inline => "inline".to_string(),
+            CodexReviewDeliveryPayload::Detached => "detached".to_string(),
+        };
+
+        // 后台轮次接收当前 Arc<Self> 的克隆，维持 CLI 实例及生命周期占用一致。
+        tokio::spawn(async move {
+            cli_for_task
+                .run_codex_review_turn(
+                    app_for_task,
+                    state_for_task,
+                    source_thread_for_task,
+                    review_thread_for_task,
+                    source_engine_thread_id_for_task,
+                    assistant_message_id_for_task,
+                    initial_turn_model_id,
+                    target_payload,
+                    delivery_label,
+                    cancellation,
+                )
+                .await;
+        });
+
+        Ok(review_thread)
+    }
+
+    /// 按 Codex 审查目标生成原生请求、用户消息和线程标题。
+    pub(crate) fn normalize_codex_review_target(
+        target: &CodexReviewTargetPayload,
+    ) -> std::result::Result<(Value, String, String), String> {
+        match target {
+            CodexReviewTargetPayload::UncommittedChanges => Ok((
+                serde_json::json!({"type": "uncommittedChanges"}),
+                "Review uncommitted changes.".to_string(),
+                "Review: Uncommitted changes".to_string(),
+            )),
+            CodexReviewTargetPayload::BaseBranch { branch } => {
+                let branch = branch.trim();
+                if branch.is_empty() {
+                    return Err("Base branch review requires a branch name.".to_string());
+                }
+                Ok((
+                    serde_json::json!({"type": "baseBranch", "branch": branch}),
+                    format!("Review changes against base branch `{branch}`."),
+                    truncate_title(format!("Review: {branch}"), MAX_THREAD_TITLE_CHARS),
+                ))
+            }
+            CodexReviewTargetPayload::Commit { sha, title } => {
+                let sha = sha.trim();
+                if sha.is_empty() {
+                    return Err("Commit review requires a commit SHA.".to_string());
+                }
+                let short_sha = sha.chars().take(12).collect::<String>();
+                let normalized_title = title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned);
+                let message = match normalized_title.as_deref() {
+                    Some(title) => format!("Review commit `{sha}`: {title}"),
+                    None => format!("Review commit `{sha}`."),
+                };
+                let target = match normalized_title {
+                    Some(title) => serde_json::json!({
+                        "type": "commit",
+                        "sha": sha,
+                        "title": title,
+                    }),
+                    None => serde_json::json!({"type": "commit", "sha": sha}),
+                };
+                Ok((
+                    target,
+                    message,
+                    truncate_title(format!("Review: {short_sha}"), MAX_THREAD_TITLE_CHARS),
+                ))
+            }
+            CodexReviewTargetPayload::Custom { instructions } => {
+                let instructions = instructions.trim();
+                if instructions.is_empty() {
+                    return Err("Custom review requires instructions.".to_string());
+                }
+                Ok((
+                    serde_json::json!({"type": "custom", "instructions": instructions}),
+                    instructions.to_string(),
+                    "Review: Custom".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// 复制 Codex 会话 metadata 给独立审查线程，并清除仅属于运行时的字段。
+    pub(crate) fn clone_codex_review_metadata(existing: Option<&Value>, model_id: &str) -> Option<Value> {
+        let mut metadata = existing.cloned().unwrap_or_else(|| serde_json::json!({}));
+        if !metadata.is_object() {
+            metadata = serde_json::json!({});
+        }
+
+        let object = metadata.as_object_mut()?;
+        object.remove("manualTitle");
+        object.remove("manualTitleUpdatedAt");
+        object.remove("codexPreview");
+        object.remove("codexThreadStatus");
+        object.remove("codexThreadActiveFlags");
+        object.remove("codexSyncRequired");
+        object.remove("codexSyncReason");
+        let _ = model_id;
+        Some(metadata)
+    }
+
+    /// 使用同一个 Codex CLI 实例观察原生审查事件并完成线程收尾。
+    async fn run_codex_review_turn(
+        self: Arc<Self>,
+        app: tauri::AppHandle,
+        state: AppState,
+        source_thread: crate::models::ThreadDto,
+        review_thread: crate::models::ThreadDto,
+        source_engine_thread_id: String,
+        assistant_message_id: String,
+        initial_turn_model_id: String,
+        target: Value,
+        delivery: String,
+        cancellation: CancellationToken,
+    ) {
+        let max_output_chars = state.config.debug.max_action_output_chars;
+        let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAPACITY);
+        let (started_tx, started_rx) = oneshot::channel();
+
+        let codex: Arc<dyn CliTool> = self.clone();
+        let (context, context_error) = match self
+            .execution_context(Some(source_thread.workspace_id.as_str()))
+            .await
+        {
+            Ok(context) => (Some(context), None),
+            Err(error) => {
+                log::error!("Codex 审查读取执行上下文失败: thread_id={} error={error:#}", source_thread.id);
+                (None, Some(format!("读取 Codex 项目失败：{error:#}")))
+            }
+        };
+        let source_engine_thread_id_for_engine = source_engine_thread_id.clone();
+        let target_for_engine = target.clone();
+        let delivery_for_engine = delivery.clone();
+        let cancellation_for_engine = cancellation.clone();
+
+        let mut engine_task = tokio::spawn(async move {
+            let Some(context) = context else {
+                let message = context_error.unwrap_or_else(|| "读取 Codex 项目失败".to_string());
+                let _ = event_tx
+                    .send(EngineEvent::Error {
+                        message,
+                        recoverable: false,
+                    })
+                    .await;
+                return Ok(());
+            };
+            let cli: &dyn CliTool = codex.as_ref();
+            cli.start_review(
+                &context,
+                &source_engine_thread_id_for_engine,
+                target_for_engine,
+                Some(delivery_for_engine.as_str()),
+                event_tx,
+                cancellation_for_engine,
+                started_tx,
+            )
+            .await
+        });
+
+        let state_for_started = state.clone();
+        let app_for_started = app.clone();
+        let review_thread_for_started = review_thread.clone();
+        let started_task = tokio::spawn(async move {
+            let Ok(started) = started_rx.await else {
+                return;
+            };
+
+            let updated_thread = match run_db(state_for_started.db.clone(), {
+                let review_thread_id = review_thread_for_started.id.clone();
+                let review_thread_engine_id = review_thread_for_started.engine_thread_id.clone();
+                let review_thread_model_id = review_thread_for_started.model_id.clone();
+                let review_thread_metadata = review_thread_for_started.engine_metadata.clone();
+                let review_thread_status = review_thread_for_started.status.clone();
+                let review_thread_title = review_thread_for_started.title.clone();
+                let review_thread_workspace_id = review_thread_for_started.workspace_id.clone();
+                move |db| {
+                    if review_thread_engine_id.as_deref() == Some(started.review_thread_id.as_str()) {
+                        return db::threads::get_thread(db, &review_thread_id)?.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "review thread not found after review/start: {review_thread_id}"
+                            )
+                        });
+                    }
+
+                    db::threads::set_engine_thread_id(db, &review_thread_id, &started.review_thread_id)?;
+                    let current = db::threads::get_thread(db, &review_thread_id)?.ok_or_else(|| {
+                        anyhow::anyhow!("review thread not found after engine thread update")
+                    })?;
+                    let metadata = current.engine_metadata.or(review_thread_metadata.clone());
+                    db::threads::update_thread_runtime_snapshot(
+                        db,
+                        &review_thread_id,
+                        Some(&review_thread_title),
+                        Some(review_thread_status.clone()),
+                        metadata.as_ref(),
+                    )?;
+                    db::threads::get_thread(db, &review_thread_id)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "review thread not found after runtime snapshot update: {review_thread_workspace_id}:{review_thread_model_id}"
+                        )
+                    })
+                }
+            })
+            .await
+            {
+                Ok(thread) => thread,
+                Err(error) => {
+                    log::warn!("failed to persist codex review thread id: {error}");
+                    return;
+                }
+            };
+
+            let _ = app_for_started.emit(
+                "thread-updated",
+                ThreadUpdatedEvent {
+                    thread_id: updated_thread.id.clone(),
+                    workspace_id: updated_thread.workspace_id.clone(),
+                    thread: Some(updated_thread),
+                },
+            );
+        });
+
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        let mut action_index: HashMap<String, usize> = HashMap::new();
+        let mut approval_index: HashMap<String, usize> = HashMap::new();
+        let mut message_status = MessageStatusDto::Streaming;
+        let mut thread_status = ThreadStatusDto::Streaming;
+        let mut turn_model_id = initial_turn_model_id;
+        let mut token_usage: Option<(u64, u64)> = None;
+        let mut blocks_dirty = false;
+        let mut message_state_dirty = false;
+        let mut thread_status_dirty = false;
+        let mut turn_model_dirty = false;
+        let mut last_persist_at = Instant::now();
+        let mut last_blocks_persist_at = Instant::now();
+        let mut last_persisted_thread_status = thread_status.clone();
+        let stream_event_topic = format!("stream-event-{}", review_thread.id);
+        let approval_event_topic = format!("approval-request-{}", review_thread.id);
+        let mut pending_event: Option<EngineEvent> = None;
+
+        let initial_turn_started_event = EngineEvent::TurnStarted {
+            client_turn_id: None,
+            remote_turn_id: None,
+        };
+        let initial_progress = process_stream_event(
+            &app,
+            &state,
+            &review_thread,
+            &assistant_message_id,
+            &stream_event_topic,
+            &approval_event_topic,
+            &initial_turn_started_event,
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            max_output_chars,
+            self.as_ref(),
+        )
+        .await;
+        let initial_force_persist = apply_stream_progress(
+            initial_progress,
+            &mut message_status,
+            &mut thread_status,
+            &mut turn_model_id,
+            &mut token_usage,
+            &mut blocks_dirty,
+            &mut message_state_dirty,
+            &mut thread_status_dirty,
+            &mut turn_model_dirty,
+        );
+        flush_stream_state(
+            &state,
+            &review_thread,
+            &assistant_message_id,
+            &blocks,
+            &message_status,
+            &thread_status,
+            &turn_model_id,
+            &mut blocks_dirty,
+            &mut message_state_dirty,
+            &mut thread_status_dirty,
+            &mut turn_model_dirty,
+            &mut last_persisted_thread_status,
+            &mut last_persist_at,
+            &mut last_blocks_persist_at,
+            initial_force_persist,
+        )
+        .await;
+
+        if let Err(error) = started_task.await {
+            log::warn!("failed to join codex review start task: {error}");
+        }
+
+        /*
+         * 旧 review 实现将通道关闭、EngineTask 错误和取消后的 Streaming 状态直接收尾。
+         * 保留旧代码，新的 review 轮次观察和唯一收尾在下方实现。
+        loop {
+            let incoming_event = if pending_event.is_some() {
+                match tokio::time::timeout(
+                    STREAM_EVENT_COALESCE_IDLE_FLUSH_INTERVAL,
+                    receive_engine_event_with_diagnostics(&mut event_rx, "review_coalesce"),
+                )
+                .await
+                {
+                    Ok(event) => event,
+                    Err(_) => {
+                        if let Some(event) = pending_event.take() {
+                            let progress = process_stream_event(
+                                &app,
+                                &state,
+                                &review_thread,
+                                &assistant_message_id,
+                                &stream_event_topic,
+                                &approval_event_topic,
+                                &event,
+                                &mut blocks,
+                                &mut action_index,
+                                &mut approval_index,
+                                max_output_chars,
+                                self.as_ref(),
+                            )
+                            .await;
+                            let force_persist = apply_stream_progress(
+                                progress,
+                                &mut message_status,
+                                &mut thread_status,
+                                &mut turn_model_id,
+                                &mut token_usage,
+                                &mut blocks_dirty,
+                                &mut message_state_dirty,
+                                &mut thread_status_dirty,
+                                &mut turn_model_dirty,
+                            );
+                            flush_stream_state(
+                                &state,
+                                &review_thread,
+                                &assistant_message_id,
+                                &blocks,
+                                &message_status,
+                                &thread_status,
+                                &turn_model_id,
+                                &mut blocks_dirty,
+                                &mut message_state_dirty,
+                                &mut thread_status_dirty,
+                                &mut turn_model_dirty,
+                                &mut last_persisted_thread_status,
+                                &mut last_persist_at,
+                                &mut last_blocks_persist_at,
+                                force_persist,
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                receive_engine_event_with_diagnostics(&mut event_rx, "review_direct").await
+            };
+
+            let Some(incoming_event) = incoming_event else {
+                crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                    "at": runtime_env::system_time_rfc3339(),
+                    "event": "engine_event_channel_closed",
+                    "consumer": "review",
+                    "thread_id": review_thread.id.clone(),
+                }))
+                .await;
+                break;
+            };
+
+            let mut current_event = incoming_event;
+
+            loop {
+                if let Some(previous_event) = pending_event.take() {
+                    match try_coalesce_stream_events(previous_event, current_event) {
+                        Ok(merged_event) => {
+                            if coalesced_event_content_len(&merged_event)
+                                >= STREAM_EVENT_COALESCE_MAX_CHARS
+                            {
+                                let progress = process_stream_event(
+                                    &app,
+                                    &state,
+                                    &review_thread,
+                                    &assistant_message_id,
+                                    &stream_event_topic,
+                                    &approval_event_topic,
+                                    &merged_event,
+                                    &mut blocks,
+                                    &mut action_index,
+                                    &mut approval_index,
+                                    max_output_chars,
+                                    self.as_ref(),
+                                )
+                                .await;
+                                let force_persist = apply_stream_progress(
+                                    progress,
+                                    &mut message_status,
+                                    &mut thread_status,
+                                    &mut turn_model_id,
+                                    &mut token_usage,
+                                    &mut blocks_dirty,
+                                    &mut message_state_dirty,
+                                    &mut thread_status_dirty,
+                                    &mut turn_model_dirty,
+                                );
+                                flush_stream_state(
+                                    &state,
+                                    &review_thread,
+                                    &assistant_message_id,
+                                    &blocks,
+                                    &message_status,
+                                    &thread_status,
+                                    &turn_model_id,
+                                    &mut blocks_dirty,
+                                    &mut message_state_dirty,
+                                    &mut thread_status_dirty,
+                                    &mut turn_model_dirty,
+                                    &mut last_persisted_thread_status,
+                                    &mut last_persist_at,
+                                    &mut last_blocks_persist_at,
+                                    force_persist,
+                                )
+                                .await;
+                            } else {
+                                pending_event = Some(merged_event);
+                            }
+                            break;
+                        }
+                        Err((unmerged_previous_event, unmerged_current_event)) => {
+                            let progress = process_stream_event(
+                                &app,
+                                &state,
+                                &review_thread,
+                                &assistant_message_id,
+                                &stream_event_topic,
+                                &approval_event_topic,
+                                &unmerged_previous_event,
+                                &mut blocks,
+                                &mut action_index,
+                                &mut approval_index,
+                                max_output_chars,
+                                self.as_ref(),
+                            )
+                            .await;
+                            let force_persist = apply_stream_progress(
+                                progress,
+                                &mut message_status,
+                                &mut thread_status,
+                                &mut turn_model_id,
+                                &mut token_usage,
+                                &mut blocks_dirty,
+                                &mut message_state_dirty,
+                                &mut thread_status_dirty,
+                                &mut turn_model_dirty,
+                            );
+                            flush_stream_state(
+                                &state,
+                                &review_thread,
+                                &assistant_message_id,
+                                &blocks,
+                                &message_status,
+                                &thread_status,
+                                &turn_model_id,
+                                &mut blocks_dirty,
+                                &mut message_state_dirty,
+                                &mut thread_status_dirty,
+                                &mut turn_model_dirty,
+                                &mut last_persisted_thread_status,
+                                &mut last_persist_at,
+                                &mut last_blocks_persist_at,
+                                force_persist,
+                            )
+                            .await;
+                            current_event = unmerged_current_event;
+                        }
+                    }
+                } else if is_coalescable_stream_event(&current_event) {
+                    pending_event = Some(current_event);
+                    break;
+                } else {
+                    let progress = process_stream_event(
+                        &app,
+                        &state,
+                        &review_thread,
+                        &assistant_message_id,
+                        &stream_event_topic,
+                        &approval_event_topic,
+                        &current_event,
+                        &mut blocks,
+                        &mut action_index,
+                        &mut approval_index,
+                        max_output_chars,
+                        self.as_ref(),
+                    )
+                    .await;
+                    let force_persist = apply_stream_progress(
+                        progress,
+                        &mut message_status,
+                        &mut thread_status,
+                        &mut turn_model_id,
+                        &mut token_usage,
+                        &mut blocks_dirty,
+                        &mut message_state_dirty,
+                        &mut thread_status_dirty,
+                        &mut turn_model_dirty,
+                    );
+                    flush_stream_state(
+                        &state,
+                        &review_thread,
+                        &assistant_message_id,
+                        &blocks,
+                        &message_status,
+                        &thread_status,
+                        &turn_model_id,
+                        &mut blocks_dirty,
+                        &mut message_state_dirty,
+                        &mut thread_status_dirty,
+                        &mut turn_model_dirty,
+                        &mut last_persisted_thread_status,
+                        &mut last_persist_at,
+                        &mut last_blocks_persist_at,
+                        force_persist,
+                    )
+                    .await;
+                    break;
+                }
+            }
+        }
+
+        if let Some(event) = pending_event.take() {
+            let progress = process_stream_event(
+                &app,
+                &state,
+                &review_thread,
+                &assistant_message_id,
+                &stream_event_topic,
+                &approval_event_topic,
+                &event,
+                &mut blocks,
+                &mut action_index,
+                &mut approval_index,
+                max_output_chars,
+                self.as_ref(),
+            )
+            .await;
+            let force_persist = apply_stream_progress(
+                progress,
+                &mut message_status,
+                &mut thread_status,
+                &mut turn_model_id,
+                &mut token_usage,
+                &mut blocks_dirty,
+                &mut message_state_dirty,
+                &mut thread_status_dirty,
+                &mut turn_model_dirty,
+            );
+            flush_stream_state(
+                &state,
+                &review_thread,
+                &assistant_message_id,
+                &blocks,
+                &message_status,
+                &thread_status,
+                &turn_model_id,
+                &mut blocks_dirty,
+                &mut message_state_dirty,
+                &mut thread_status_dirty,
+                &mut turn_model_dirty,
+                &mut last_persisted_thread_status,
+                &mut last_persist_at,
+                &mut last_blocks_persist_at,
+                force_persist,
+            )
+            .await;
+        }
+
+        match engine_task.await {
+            Ok(Ok(())) => {
+                crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                    "at": runtime_env::system_time_rfc3339(),
+                    "event": "engine_task_complete",
+                    "consumer": "review",
+                    "thread_id": review_thread.id.clone(),
+                    "result": "ok",
+                }))
+                .await;
+            }
+            Ok(Err(error)) => {
+                crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                    "at": runtime_env::system_time_rfc3339(),
+                    "event": "engine_task_complete",
+                    "consumer": "review",
+                    "thread_id": review_thread.id.clone(),
+                    "result": "error",
+                    "error": error.to_string(),
+                }))
+                .await;
+                blocks.push(ContentBlock::Error {
+                    message: format!("Engine error: {error}"),
+                });
+                blocks_dirty = true;
+                if message_status != MessageStatusDto::Error {
+                    message_status = MessageStatusDto::Error;
+                    message_state_dirty = true;
+                }
+                if thread_status != ThreadStatusDto::Error {
+                    thread_status = ThreadStatusDto::Error;
+                    thread_status_dirty = true;
+                }
+                let _ = app.emit(
+                    &stream_event_topic,
+                    EngineEvent::Error {
+                        message: format!("{error}"),
+                        recoverable: false,
+                    },
+                );
+            }
+            Err(error) => {
+                crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                    "at": runtime_env::system_time_rfc3339(),
+                    "event": "engine_task_complete",
+                    "consumer": "review",
+                    "thread_id": review_thread.id.clone(),
+                    "result": "join_error",
+                    "error": error.to_string(),
+                }))
+                .await;
+                blocks.push(ContentBlock::Error {
+                    message: format!("Engine task join error: {error}"),
+                });
+                blocks_dirty = true;
+                if message_status != MessageStatusDto::Error {
+                    message_status = MessageStatusDto::Error;
+                    message_state_dirty = true;
+                }
+                if thread_status != ThreadStatusDto::Error {
+                    thread_status = ThreadStatusDto::Error;
+                    thread_status_dirty = true;
+                }
+            }
+        }
+
+        if cancellation.is_cancelled() && matches!(message_status, MessageStatusDto::Streaming) {
+            message_status = MessageStatusDto::Interrupted;
+            message_state_dirty = true;
+            thread_status = ThreadStatusDto::Idle;
+            thread_status_dirty = true;
+        }
+
+        flush_stream_state(
+            &state,
+            &review_thread,
+            &assistant_message_id,
+            &blocks,
+            &message_status,
+            &thread_status,
+            &turn_model_id,
+            &mut blocks_dirty,
+            &mut message_state_dirty,
+            &mut thread_status_dirty,
+            &mut turn_model_dirty,
+            &mut last_persisted_thread_status,
+            &mut last_persist_at,
+            &mut last_blocks_persist_at,
+            true,
+        )
+        .await;
+
+        state.turns.finish(&source_thread.id).await;
+        state.turns.finish(&review_thread.id).await;
+        */
+
+        /// 代码审查轮次唯一允许的两个终止信号，异常只能继续观察。
+        enum ReviewEndSignal {
+            /// 收到并交付引擎的正常完成事件。
+            TaskCompletedAndDelivered,
+            /// 用户通过当前线程取消令牌主动停止本轮。
+            UserClickedStop,
+        }
+
+        #[derive(Debug)]
+        enum ReviewObservationWait {
+            /// 当前原生审查任务已返回或发生 join 错误。
+            Engine(std::result::Result<anyhow::Result<()>, tokio::task::JoinError>),
+            /// 收到下一条引擎事件，None 表示事件通道关闭。
+            Event(Option<EngineEvent>),
+            /// 合并缓冲空闲，需要刷新待处理的事件。
+            FlushPending,
+            /// 当前线程 CancellationToken 已被用户取消。
+            UserClickedStop,
+            /// 审查事件在设定观察窗口内无新进展。
+            TimedOut,
+        }
+
+        // 将审查异常转换为固定安全提示，避免原始异常进入前端错误状态。
+        macro_rules! emit_safe_review_notice {
+            () => {{
+                let notice = EngineEvent::Notice {
+                    kind: "turn_exception_observed".to_string(),
+                    level: "info".to_string(),
+                    title: "执行提示".to_string(),
+                    message: "执行出现异常，请重试或停止本轮".to_string(),
+                    // 审查异常安全提示不附带原始异常或后台任务元数据。
+                    metadata: None,
+                };
+                let progress = process_stream_event(
+                    &app,
+                    &state,
+                    &review_thread,
+                    &assistant_message_id,
+                    &stream_event_topic,
+                    &approval_event_topic,
+                    &notice,
+                    &mut blocks,
+                    &mut action_index,
+                    &mut approval_index,
+                    max_output_chars,
+                    self.as_ref(),
+                )
+                .await;
+                let force_persist = apply_stream_progress(
+                    progress,
+                    &mut message_status,
+                    &mut thread_status,
+                    &mut turn_model_id,
+                    &mut token_usage,
+                    &mut blocks_dirty,
+                    &mut message_state_dirty,
+                    &mut thread_status_dirty,
+                    &mut turn_model_dirty,
+                );
+                flush_stream_state(
+                    &state,
+                    &review_thread,
+                    &assistant_message_id,
+                    &blocks,
+                    &message_status,
+                    &thread_status,
+                    &turn_model_id,
+                    &mut blocks_dirty,
+                    &mut message_state_dirty,
+                    &mut thread_status_dirty,
+                    &mut turn_model_dirty,
+                    &mut last_persisted_thread_status,
+                    &mut last_persist_at,
+                    &mut last_blocks_persist_at,
+                    force_persist,
+                )
+                .await;
+            }};
+        }
+
+        let mut engine_task_finished = false;
+        let mut event_channel_closed = false;
+        let mut completed_turn_event: Option<EngineEvent> = None;
+        let end_signal = 'review_turn_loop: loop {
+            let wait = if pending_event.is_some() {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => ReviewObservationWait::UserClickedStop,
+                    result = &mut engine_task, if !engine_task_finished => ReviewObservationWait::Engine(result),
+                    event = receive_engine_event_with_diagnostics(&mut event_rx, "review_coalesce"), if !event_channel_closed => ReviewObservationWait::Event(event),
+                    _ = tokio::time::sleep(STREAM_EVENT_COALESCE_IDLE_FLUSH_INTERVAL) => ReviewObservationWait::FlushPending,
+                    _ = tokio::time::sleep(TURN_EVENT_IDLE_TIMEOUT) => ReviewObservationWait::TimedOut,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => ReviewObservationWait::UserClickedStop,
+                    result = &mut engine_task, if !engine_task_finished => ReviewObservationWait::Engine(result),
+                    event = receive_engine_event_with_diagnostics(&mut event_rx, "review_direct"), if !event_channel_closed => ReviewObservationWait::Event(event),
+                    _ = tokio::time::sleep(TURN_EVENT_IDLE_TIMEOUT) => ReviewObservationWait::TimedOut,
+                }
+            };
+
+            log::info!(
+                "codex review turn wait result: thread_id={}, engine_id={}, source_engine_thread_id={}, wait={wait:?}",
+                review_thread.id,
+                review_thread.engine_id,
+                source_engine_thread_id,
+            );
+
+            let incoming_event = match wait {
+                ReviewObservationWait::Engine(Ok(Ok(()))) => {
+                    engine_task_finished = true;
+                    crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                        "at": runtime_env::system_time_rfc3339(),
+                        "event": "engine_task_complete",
+                        "consumer": "review",
+                        "thread_id": review_thread.id.clone(),
+                        "engine_id": review_thread.engine_id.clone(),
+                        "engine_thread_id": source_engine_thread_id.clone(),
+                        "result": "ok",
+                    }))
+                    .await;
+                    continue;
+                }
+                ReviewObservationWait::Engine(Ok(Err(error))) => {
+                    engine_task_finished = true;
+                    let raw_error = error.to_string();
+                    log::error!(
+                        "codex review engine task returned error: engine_id={}, thread_id={}, source_engine_thread_id={}, raw_error={raw_error}",
+                        review_thread.engine_id,
+                        review_thread.id,
+                        source_engine_thread_id,
+                    );
+                    crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                        "at": runtime_env::system_time_rfc3339(),
+                        "event": "turn_exception_observed",
+                        "consumer": "review",
+                        "failure_kind": "engine_task",
+                        "engine_id": review_thread.engine_id.clone(),
+                        "thread_id": review_thread.id.clone(),
+                        "engine_thread_id": source_engine_thread_id.clone(),
+                        "recoverable": false,
+                        "raw_error": raw_error,
+                    }))
+                    .await;
+                    emit_safe_review_notice!();
+                    continue;
+                }
+                ReviewObservationWait::Engine(Err(error)) => {
+                    engine_task_finished = true;
+                    let raw_error = error.to_string();
+                    log::error!(
+                        "codex review engine task join error: engine_id={}, thread_id={}, source_engine_thread_id={}, raw_error={raw_error}",
+                        review_thread.engine_id,
+                        review_thread.id,
+                        source_engine_thread_id,
+                    );
+                    crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                        "at": runtime_env::system_time_rfc3339(),
+                        "event": "turn_exception_observed",
+                        "consumer": "review",
+                        "failure_kind": "engine_task_join",
+                        "engine_id": review_thread.engine_id.clone(),
+                        "thread_id": review_thread.id.clone(),
+                        "engine_thread_id": source_engine_thread_id.clone(),
+                        "recoverable": false,
+                        "raw_error": raw_error,
+                    }))
+                    .await;
+                    emit_safe_review_notice!();
+                    continue;
+                }
+                ReviewObservationWait::Event(Some(event)) => event,
+                ReviewObservationWait::Event(None) => {
+                    event_channel_closed = true;
+                    let raw_error = "代码审查事件接收通道已关闭";
+                    crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                        "at": runtime_env::system_time_rfc3339(),
+                        "event": "engine_event_channel_closed",
+                        "consumer": "review",
+                        "engine_id": review_thread.engine_id.clone(),
+                        "thread_id": review_thread.id.clone(),
+                        "engine_thread_id": source_engine_thread_id.clone(),
+                        "recoverable": false,
+                        "raw_error": raw_error,
+                    }))
+                    .await;
+                    emit_safe_review_notice!();
+                    continue;
+                }
+                ReviewObservationWait::FlushPending => {
+                    if let Some(event) = pending_event.take() {
+                        let progress = process_stream_event(
+                            &app,
+                            &state,
+                            &review_thread,
+                            &assistant_message_id,
+                            &stream_event_topic,
+                            &approval_event_topic,
+                            &event,
+                            &mut blocks,
+                            &mut action_index,
+                            &mut approval_index,
+                            max_output_chars,
+                            self.as_ref(),
+                        )
+                        .await;
+                        let force_persist = apply_stream_progress(
+                            progress,
+                            &mut message_status,
+                            &mut thread_status,
+                            &mut turn_model_id,
+                            &mut token_usage,
+                            &mut blocks_dirty,
+                            &mut message_state_dirty,
+                            &mut thread_status_dirty,
+                            &mut turn_model_dirty,
+                        );
+                        flush_stream_state(
+                            &state,
+                            &review_thread,
+                            &assistant_message_id,
+                            &blocks,
+                            &message_status,
+                            &thread_status,
+                            &turn_model_id,
+                            &mut blocks_dirty,
+                            &mut message_state_dirty,
+                            &mut thread_status_dirty,
+                            &mut turn_model_dirty,
+                            &mut last_persisted_thread_status,
+                            &mut last_persist_at,
+                            &mut last_blocks_persist_at,
+                            force_persist,
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                ReviewObservationWait::UserClickedStop => {
+                    break 'review_turn_loop ReviewEndSignal::UserClickedStop;
+                }
+                ReviewObservationWait::TimedOut => {
+                    let raw_error = "代码审查本轮在15分钟内没有收到新的执行事件";
+                    log::warn!(
+                        "codex review turn observation timed out: engine_id={}, thread_id={}, source_engine_thread_id={}, raw_error={raw_error}",
+                        review_thread.engine_id,
+                        review_thread.id,
+                        source_engine_thread_id,
+                    );
+                    crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                        "at": runtime_env::system_time_rfc3339(),
+                        "event": "turn_exception_observed",
+                        "consumer": "review",
+                        "failure_kind": "timeout",
+                        "engine_id": review_thread.engine_id.clone(),
+                        "thread_id": review_thread.id.clone(),
+                        "engine_thread_id": source_engine_thread_id.clone(),
+                        "recoverable": false,
+                        "raw_error": raw_error,
+                    }))
+                    .await;
+                    emit_safe_review_notice!();
+                    continue;
+                }
+            };
+
+            log::info!(
+                "codex review incoming EngineEvent before processing: thread_id={}, engine_id={}, source_engine_thread_id={}, event={incoming_event:?}",
+                review_thread.id,
+                review_thread.engine_id,
+                source_engine_thread_id,
+            );
+
+            let mut current_event = match &incoming_event {
+                EngineEvent::Error {
+                    message,
+                    recoverable,
+                } => {
+                    let raw_error = message.clone();
+                    crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                        "at": runtime_env::system_time_rfc3339(),
+                        "event": "turn_exception_observed",
+                        "consumer": "review",
+                        "engine_id": review_thread.engine_id.clone(),
+                        "thread_id": review_thread.id.clone(),
+                        "engine_thread_id": source_engine_thread_id.clone(),
+                        "recoverable": *recoverable,
+                        "raw_error": raw_error,
+                    }))
+                    .await;
+                    EngineEvent::Notice {
+                        kind: "turn_exception_observed".to_string(),
+                        level: "info".to_string(),
+                        title: "执行提示".to_string(),
+                        message: "执行出现异常，请重试或停止本轮".to_string(),
+                        // 审查异常安全提示不附带原始异常或结构化后台任务元数据。
+                        metadata: None,
+                    }
+                }
+                EngineEvent::TurnCompleted {
+                    status: TurnCompletionStatus::Failed,
+                    ..
+                }
+                | EngineEvent::TurnCompleted {
+                    status: TurnCompletionStatus::Interrupted,
+                    ..
+                } => {
+                    let status = match &incoming_event {
+                        EngineEvent::TurnCompleted { status, .. } => match status {
+                            TurnCompletionStatus::Failed => "failed",
+                            TurnCompletionStatus::Interrupted => "interrupted",
+                            TurnCompletionStatus::Completed => "completed",
+                        },
+                        _ => "unknown",
+                    };
+                    crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                        "at": runtime_env::system_time_rfc3339(),
+                        "event": "turn_completion_observed",
+                        "consumer": "review",
+                        "engine_id": review_thread.engine_id.clone(),
+                        "thread_id": review_thread.id.clone(),
+                        "engine_thread_id": source_engine_thread_id.clone(),
+                        "status": status,
+                    }))
+                    .await;
+                    EngineEvent::Notice {
+                        kind: "turn_exception_observed".to_string(),
+                        level: "info".to_string(),
+                        title: "执行提示".to_string(),
+                        message: "执行出现异常，请重试或停止本轮".to_string(),
+                        // 审查未完成报告不附带原始异常或结构化后台任务元数据。
+                        metadata: None,
+                    }
+                }
+                _ => incoming_event.clone(),
+            };
+
+            loop {
+                if let Some(previous_event) = pending_event.take() {
+                    let coalesce_result = if matches!(
+                        &current_event,
+                        EngineEvent::TurnCompleted {
+                            status: TurnCompletionStatus::Completed,
+                            ..
+                        }
+                    ) {
+                        Err((previous_event, current_event))
+                    } else {
+                        try_coalesce_stream_events(previous_event, current_event)
+                    };
+                    match coalesce_result {
+                        Ok(merged_event) => {
+                            if coalesced_event_content_len(&merged_event)
+                                >= STREAM_EVENT_COALESCE_MAX_CHARS
+                            {
+                                let progress = process_stream_event(
+                                    &app,
+                                    &state,
+                                    &review_thread,
+                                    &assistant_message_id,
+                                    &stream_event_topic,
+                                    &approval_event_topic,
+                                    &merged_event,
+                                    &mut blocks,
+                                    &mut action_index,
+                                    &mut approval_index,
+                                    max_output_chars,
+                                    self.as_ref(),
+                                )
+                                .await;
+                                let force_persist = apply_stream_progress(
+                                    progress,
+                                    &mut message_status,
+                                    &mut thread_status,
+                                    &mut turn_model_id,
+                                    &mut token_usage,
+                                    &mut blocks_dirty,
+                                    &mut message_state_dirty,
+                                    &mut thread_status_dirty,
+                                    &mut turn_model_dirty,
+                                );
+                                flush_stream_state(
+                                    &state,
+                                    &review_thread,
+                                    &assistant_message_id,
+                                    &blocks,
+                                    &message_status,
+                                    &thread_status,
+                                    &turn_model_id,
+                                    &mut blocks_dirty,
+                                    &mut message_state_dirty,
+                                    &mut thread_status_dirty,
+                                    &mut turn_model_dirty,
+                                    &mut last_persisted_thread_status,
+                                    &mut last_persist_at,
+                                    &mut last_blocks_persist_at,
+                                    force_persist,
+                                )
+                                .await;
+                            } else {
+                                pending_event = Some(merged_event);
+                            }
+                            break;
+                        }
+                        Err((unmerged_previous_event, unmerged_current_event)) => {
+                            let progress = process_stream_event(
+                                &app,
+                                &state,
+                                &review_thread,
+                                &assistant_message_id,
+                                &stream_event_topic,
+                                &approval_event_topic,
+                                &unmerged_previous_event,
+                                &mut blocks,
+                                &mut action_index,
+                                &mut approval_index,
+                                max_output_chars,
+                                self.as_ref(),
+                            )
+                            .await;
+                            let force_persist = apply_stream_progress(
+                                progress,
+                                &mut message_status,
+                                &mut thread_status,
+                                &mut turn_model_id,
+                                &mut token_usage,
+                                &mut blocks_dirty,
+                                &mut message_state_dirty,
+                                &mut thread_status_dirty,
+                                &mut turn_model_dirty,
+                            );
+                            flush_stream_state(
+                                &state,
+                                &review_thread,
+                                &assistant_message_id,
+                                &blocks,
+                                &message_status,
+                                &thread_status,
+                                &turn_model_id,
+                                &mut blocks_dirty,
+                                &mut message_state_dirty,
+                                &mut thread_status_dirty,
+                                &mut turn_model_dirty,
+                                &mut last_persisted_thread_status,
+                                &mut last_persist_at,
+                                &mut last_blocks_persist_at,
+                                force_persist,
+                            )
+                            .await;
+                            current_event = unmerged_current_event;
+                        }
+                    }
+                } else if matches!(
+                    &current_event,
+                    EngineEvent::TurnCompleted {
+                        status: TurnCompletionStatus::Completed,
+                        ..
+                    }
+                ) {
+                    completed_turn_event = Some(current_event);
+                    break 'review_turn_loop ReviewEndSignal::TaskCompletedAndDelivered;
+                } else if is_coalescable_stream_event(&current_event) {
+                    pending_event = Some(current_event);
+                    break;
+                } else {
+                    let progress = process_stream_event(
+                        &app,
+                        &state,
+                        &review_thread,
+                        &assistant_message_id,
+                        &stream_event_topic,
+                        &approval_event_topic,
+                        &current_event,
+                        &mut blocks,
+                        &mut action_index,
+                        &mut approval_index,
+                        max_output_chars,
+                        self.as_ref(),
+                    )
+                    .await;
+                    let force_persist = apply_stream_progress(
+                        progress,
+                        &mut message_status,
+                        &mut thread_status,
+                        &mut turn_model_id,
+                        &mut token_usage,
+                        &mut blocks_dirty,
+                        &mut message_state_dirty,
+                        &mut thread_status_dirty,
+                        &mut turn_model_dirty,
+                    );
+                    flush_stream_state(
+                        &state,
+                        &review_thread,
+                        &assistant_message_id,
+                        &blocks,
+                        &message_status,
+                        &thread_status,
+                        &turn_model_id,
+                        &mut blocks_dirty,
+                        &mut message_state_dirty,
+                        &mut thread_status_dirty,
+                        &mut turn_model_dirty,
+                        &mut last_persisted_thread_status,
+                        &mut last_persist_at,
+                        &mut last_blocks_persist_at,
+                        force_persist,
+                    )
+                    .await;
+                    break;
+                }
+            }
+        };
+
+        if let Some(event) = pending_event.take() {
+            let progress = process_stream_event(
+                &app,
+                &state,
+                &review_thread,
+                &assistant_message_id,
+                &stream_event_topic,
+                &approval_event_topic,
+                &event,
+                &mut blocks,
+                &mut action_index,
+                &mut approval_index,
+                max_output_chars,
+                self.as_ref(),
+            )
+            .await;
+            let force_persist = apply_stream_progress(
+                progress,
+                &mut message_status,
+                &mut thread_status,
+                &mut turn_model_id,
+                &mut token_usage,
+                &mut blocks_dirty,
+                &mut message_state_dirty,
+                &mut thread_status_dirty,
+                &mut turn_model_dirty,
+            );
+            flush_stream_state(
+                &state,
+                &review_thread,
+                &assistant_message_id,
+                &blocks,
+                &message_status,
+                &thread_status,
+                &turn_model_id,
+                &mut blocks_dirty,
+                &mut message_state_dirty,
+                &mut thread_status_dirty,
+                &mut turn_model_dirty,
+                &mut last_persisted_thread_status,
+                &mut last_persist_at,
+                &mut last_blocks_persist_at,
+                force_persist,
+            )
+            .await;
+        }
+
+        // 用户停止依赖 start_review 的取消令牌完成唯一底层 interrupt；两种收尾都等待任务闭合。
+        if !engine_task_finished {
+            engine_task_finished = true;
+            let engine_task_result = if matches!(&end_signal, ReviewEndSignal::UserClickedStop) {
+                match tokio::time::timeout(TURN_TASK_CLEANUP_TIMEOUT, &mut engine_task).await {
+                    Ok(result) => Some(result),
+                    Err(_) => {
+                        let raw_error = "用户停止后代码审查后台任务未在清理窗口内结束";
+                        log::warn!(
+                            "codex review engine task cleanup timed out: engine_id={}, thread_id={}, source_engine_thread_id={}, raw_error={raw_error}",
+                            review_thread.engine_id,
+                            review_thread.id,
+                            source_engine_thread_id,
+                        );
+                        crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                            "at": runtime_env::system_time_rfc3339(),
+                            "event": "turn_exception_observed",
+                            "consumer": "review",
+                            "failure_kind": "engine_task_cleanup_timeout",
+                            "engine_id": review_thread.engine_id.clone(),
+                            "thread_id": review_thread.id.clone(),
+                            "engine_thread_id": source_engine_thread_id.clone(),
+                            "recoverable": false,
+                            "raw_error": raw_error,
+                        }))
+                        .await;
+                        emit_safe_review_notice!();
+                        engine_task.abort();
+                        let _ = (&mut engine_task).await;
+                        None
+                    }
+                }
+            } else {
+                match tokio::time::timeout(TURN_TASK_CLEANUP_TIMEOUT, &mut engine_task).await {
+                    Ok(result) => Some(result),
+                    Err(_) => {
+                        let raw_error = "正常完成后代码审查后台任务未在清理窗口内结束";
+                        log::warn!(
+                            "codex review engine task cleanup timed out after completion report: engine_id={}, thread_id={}, source_engine_thread_id={}, raw_error={raw_error}",
+                            review_thread.engine_id,
+                            review_thread.id,
+                            source_engine_thread_id,
+                        );
+                        crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                            "at": runtime_env::system_time_rfc3339(),
+                            "event": "turn_exception_observed",
+                            "consumer": "review",
+                            "failure_kind": "engine_task_cleanup_timeout",
+                            "engine_id": review_thread.engine_id.clone(),
+                            "thread_id": review_thread.id.clone(),
+                            "engine_thread_id": source_engine_thread_id.clone(),
+                            "recoverable": false,
+                            "raw_error": raw_error,
+                        }))
+                        .await;
+                        emit_safe_review_notice!();
+                        engine_task.abort();
+                        let _ = (&mut engine_task).await;
+                        None
+                    }
+                }
+            };
+            if let Some(engine_task_result) = engine_task_result {
+                match engine_task_result {
+                Ok(Ok(())) => {
+                    crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                        "at": runtime_env::system_time_rfc3339(),
+                        "event": "engine_task_complete",
+                        "consumer": "review",
+                        "thread_id": review_thread.id.clone(),
+                        "engine_id": review_thread.engine_id.clone(),
+                        "engine_thread_id": source_engine_thread_id.clone(),
+                        "result": "ok",
+                    }))
+                    .await;
+                }
+                Ok(Err(error)) => {
+                    let raw_error = error.to_string();
+                    log::error!(
+                        "codex review engine task returned error during finalization: engine_id={}, thread_id={}, source_engine_thread_id={}, raw_error={raw_error}",
+                        review_thread.engine_id,
+                        review_thread.id,
+                        source_engine_thread_id,
+                    );
+                    crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                        "at": runtime_env::system_time_rfc3339(),
+                        "event": "turn_exception_observed",
+                        "consumer": "review",
+                        "failure_kind": "engine_task",
+                        "engine_id": review_thread.engine_id.clone(),
+                        "thread_id": review_thread.id.clone(),
+                        "engine_thread_id": source_engine_thread_id.clone(),
+                        "recoverable": false,
+                        "raw_error": raw_error,
+                    }))
+                    .await;
+                    emit_safe_review_notice!();
+                }
+                Err(error) => {
+                    let raw_error = error.to_string();
+                    log::error!(
+                        "codex review engine task join error during finalization: engine_id={}, thread_id={}, source_engine_thread_id={}, raw_error={raw_error}",
+                        review_thread.engine_id,
+                        review_thread.id,
+                        source_engine_thread_id,
+                    );
+                    crate::engines::codex::append_codex_transport_log(&serde_json::json!({
+                        "at": runtime_env::system_time_rfc3339(),
+                        "event": "turn_exception_observed",
+                        "consumer": "review",
+                        "failure_kind": "engine_task_join",
+                        "engine_id": review_thread.engine_id.clone(),
+                        "thread_id": review_thread.id.clone(),
+                        "engine_thread_id": source_engine_thread_id.clone(),
+                        "recoverable": false,
+                        "raw_error": raw_error,
+                    }))
+                    .await;
+                    emit_safe_review_notice!();
+                }
+            }
+            }
+        }
+
+        let final_event = match end_signal {
+            ReviewEndSignal::TaskCompletedAndDelivered => completed_turn_event.unwrap_or(
+                EngineEvent::TurnCompleted {
+                    token_usage: None,
+                    status: TurnCompletionStatus::Completed,
+                },
+            ),
+            ReviewEndSignal::UserClickedStop => EngineEvent::TurnCompleted {
+                token_usage: None,
+                status: TurnCompletionStatus::Interrupted,
+            },
+        };
+        let final_progress = process_stream_event(
+            &app,
+            &state,
+            &review_thread,
+            &assistant_message_id,
+            &stream_event_topic,
+            &approval_event_topic,
+            &final_event,
+            &mut blocks,
+            &mut action_index,
+            &mut approval_index,
+            max_output_chars,
+            self.as_ref(),
+        )
+        .await;
+        let final_force_persist = apply_stream_progress(
+            final_progress,
+            &mut message_status,
+            &mut thread_status,
+            &mut turn_model_id,
+            &mut token_usage,
+            &mut blocks_dirty,
+            &mut message_state_dirty,
+            &mut thread_status_dirty,
+            &mut turn_model_dirty,
+        );
+        flush_stream_state(
+            &state,
+            &review_thread,
+            &assistant_message_id,
+            &blocks,
+            &message_status,
+            &thread_status,
+            &turn_model_id,
+            &mut blocks_dirty,
+            &mut message_state_dirty,
+            &mut thread_status_dirty,
+            &mut turn_model_dirty,
+            &mut last_persisted_thread_status,
+            &mut last_persist_at,
+            &mut last_blocks_persist_at,
+            final_force_persist,
+        )
+        .await;
+
+        state.turns.finish(&source_thread.id).await;
+        state.turns.finish(&review_thread.id).await;
+
+        let assistant_message_persisted = match run_db(state.db.clone(), {
+            let assistant_message_id = assistant_message_id.clone();
+            let message_status = message_status.clone();
+            let token_usage = token_usage;
+            move |db| {
+                db::messages::complete_assistant_message(
+                    db,
+                    &assistant_message_id,
+                    message_status,
+                    token_usage,
+                    Some(turn_model_id.as_str()),
+                )
+            }
+        })
+        .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!("failed to complete review assistant message: {error}");
+                false
+            }
+        };
+
+        if assistant_message_persisted && matches!(message_status, MessageStatusDto::Completed) {
+            emit_assistant_message_completed(&app, &state, &review_thread.id, &assistant_message_id)
+                .await;
+        }
+
+        if matches!(message_status, MessageStatusDto::Completed) {
+            if let Err(error) = run_db(state.db.clone(), {
+                let thread_id = review_thread.id.clone();
+                let token_usage = token_usage;
+                move |db| db::threads::bump_message_counters(db, &thread_id, token_usage)
+            })
+            .await
+            {
+                log::warn!("failed to bump review thread counters: {error}");
+            }
+        }
+
+        let latest_review_thread = run_db(state.db.clone(), {
+            let review_thread_id = review_thread.id.clone();
+            move |db| db::threads::get_thread(db, &review_thread_id)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!("failed to load review thread before final thread-updated emit: {error}");
+            None
+        });
+        let (thread_updated_event, final_review_thread) =
+            build_final_thread_event(latest_review_thread, &review_thread);
+        let _ = app.emit("thread-updated", thread_updated_event);
+        finish_scheduled_task_run(
+            &app,
+            &state,
+            &assistant_message_id,
+            &message_status,
+            &blocks,
+        )
+        .await;
+        if let Some(final_review_thread) = final_review_thread.as_ref() {
+            emit_chat_turn_finished(&app, final_review_thread, &message_status, &blocks);
+        }
+    }
+}
+
 #[async_trait]
 impl CliTool for CodexCli {
     async fn list_opencode_thread_records(&self, _workspace_id: String, _cursor: Option<String>, _limit: Option<u32>, _search_term: Option<String>, _archived: Option<bool>) -> Result<crate::models::OpenCodeRemoteSessionPageDto> {
@@ -464,6 +2138,275 @@ impl CliTool for CodexCli {
         self.thread_sync_record(thread_id).await.map_err(anyhow::Error::msg)
     }
 
+    /// 将统一聊天消息提交到当前 Codex CLI，并沿用本轮占用的实现实例。
+    async fn submit_chat_message(
+        self: Arc<Self>,
+        app: tauri::AppHandle,
+        request: crate::models::chat::SendMessageRequest,
+    ) -> std::result::Result<String, ChatBusinessError> {
+        // 将当前 Codex 实例传给共享提交流程，保持整轮生命周期实例一致。
+        let cli: Arc<dyn CliTool> = self.clone();
+        self.mcp.submit_chat_message(cli, app, request).await
+    }
+
+    /// 准备并提交活动 Codex 轮次的追加消息。
+    async fn submit_chat_steer(
+        self: Arc<Self>,
+        app: tauri::AppHandle,
+        request: SteerMessageRequest,
+    ) -> std::result::Result<crate::models::SteerReceiptDto, ChatBusinessError> {
+        // 由 BaseCliMcp 完成共享准备，并通过同一个 CLI 实例调用原生 steer。
+        let cli: Arc<dyn CliTool> = self.clone();
+        self.mcp.submit_chat_steer(cli, app, request).await
+    }
+
+    /// 校验并发送当前 Codex 线程的审批答复。
+    async fn answer_chat_approval(
+        self: Arc<Self>,
+        request: ApprovalResponseRequest,
+    ) -> std::result::Result<ApprovalResponseOutcomeDto, ChatBusinessError> {
+        // 公共流程通过此实例的原生响应路径完成答复和本地状态结算。
+        let cli: Arc<dyn CliTool> = self.clone();
+        self.mcp.answer_chat_approval(cli, request).await
+    }
+
+    /// 取消指定 Codex 线程当前运行的聊天轮次。
+    async fn cancel_chat_turn(
+        &self,
+        thread_id: &str,
+    ) -> std::result::Result<(), ChatBusinessError> {
+        // 公共取消流程依据当前线程 CancellationToken 决定是否中断。
+        self.mcp.cancel_chat_turn(thread_id).await
+    }
+
+    /// 重启指定 Codex 线程所使用的聊天服务。
+    async fn restart_chat_service(
+        &self,
+        thread_id: &str,
+    ) -> std::result::Result<(), ChatBusinessError> {
+        // 公共重启流程只接收当前 Codex 实现，不旁路重建其他 CLI。
+        self.mcp.restart_chat_service(self, thread_id).await
+    }
+
+    /// 创建并启动 Codex 原生代码审查轮次。
+    async fn submit_chat_review(
+        self: Arc<Self>,
+        app: tauri::AppHandle,
+        request: ChatReviewRequest,
+    ) -> std::result::Result<ThreadDto, ChatBusinessError> {
+        CodexCli::start_codex_review(self, app, request).await
+    }
+
+    /// 为公共聊天流程提供 Codex metadata 和本机沙箱策略。
+    fn chat_sandbox(
+        &self,
+        thread: &ThreadDto,
+        writable_roots: Vec<String>,
+        reasoning_effort: Option<String>,
+        model_supports_personality: bool,
+    ) -> SandboxPolicy {
+        // Codex 专属模型 metadata 在实现类解释，统一权限占位值沿用既有默认值。
+        SandboxPolicy {
+            writable_roots,
+            allow_network: false,
+            auto_approve_mcp_elicitations: false,
+            approval_policy: None,
+            permission_profile: None,
+            approvals_reviewer: None,
+            reasoning_effort,
+            sandbox_mode: None,
+            service_tier: thread_business::thread_service_tier(
+                thread.engine_metadata.as_ref(),
+            ),
+            personality: if model_supports_personality {
+                thread_business::thread_personality(thread.engine_metadata.as_ref())
+            } else {
+                None
+            },
+            output_schema: thread_business::thread_output_schema(
+                thread.engine_metadata.as_ref(),
+            ),
+            opencode_agent: None,
+        }
+    }
+
+    /// 将用户审批答复按 Codex 原生协议归一化。
+    fn normalize_chat_approval(
+        &self,
+        response: Value,
+    ) -> std::result::Result<Value, ChatBusinessError> {
+        // 保留引擎统一归一化规则，并将协议校验失败映射为中文业务错误。
+        crate::engines::normalize_approval_response_for_engine("codex", response).map_err(
+            |error| {
+                log::error!("Codex 审批答复格式无效，原始错误：{error}");
+                ChatBusinessError::new("VALIDATION_FAILED", "审批答复格式不正确")
+            },
+        )
+    }
+
+    /// 从审批详情读取 Codex 原生答复路由。
+    fn chat_approval_route(
+        &self,
+        details: &Value,
+    ) -> std::result::Result<Option<ApprovalRequestRoute>, ChatBusinessError> {
+        // 路由结构由引擎协议层解释，Codex 实现只固定当前引擎标识。
+        Ok(crate::engines::approval_response_route_for_engine(
+            "codex", details,
+        ))
+    }
+
+    /// 将 Codex 审批发送失败映射到结构化业务错误。
+    fn classify_chat_approval_error(&self, error: &anyhow::Error) -> ChatBusinessError {
+        // 仅根据保留的原生错误类型分类，不读取底层错误文案。
+        log::error!("Codex 审批答复失败，原始错误：{error:#}");
+        if matches!(
+            error.downcast_ref::<crate::engines::codex::ApprovalResponseTargetError>(),
+            Some(
+                crate::engines::codex::ApprovalResponseTargetError::RuntimeReset
+                    | crate::engines::codex::ApprovalResponseTargetError::MissingRequestMetadata
+            )
+        ) {
+            return ChatBusinessError::new(
+                "APPROVAL_NOT_PENDING",
+                "该审批已失效，请刷新后重试",
+            );
+        }
+
+        ChatBusinessError::new("CLI_UNAVAILABLE", "Codex 当前不可用，审批答复未完成")
+    }
+
+    /// 持久化 Codex 上下文用量事件并允许公共事件处理继续执行。
+    async fn on_chat_event(
+        &self,
+        thread: &ThreadDto,
+        assistant_message_id: &str,
+        event: &EngineEvent,
+    ) -> anyhow::Result<()> {
+        // 仅处理 Codex 上下文用量事件，持久化异常记录日志但不阻断后续公共事件。
+        if thread.engine_id != "codex" {
+            return Ok(());
+        }
+        let EngineEvent::UsageLimitsUpdated { usage } = event else {
+            return Ok(());
+        };
+
+        let mut conversion_failed = false;
+        let context_current_tokens = match usage.current_tokens {
+            Some(value) => match i64::try_from(value) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    conversion_failed = true;
+                    log::error!(
+                        "Codex thread context usage persistence conversion failed: thread_id={} engine_thread_id={:?} workspace_id={} assistant_message_id={} field=current_tokens value={} error={error:?}",
+                        thread.id,
+                        thread.engine_thread_id,
+                        thread.workspace_id,
+                        assistant_message_id,
+                        value
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let context_max_tokens = match usage.max_context_tokens {
+            Some(value) => match i64::try_from(value) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    conversion_failed = true;
+                    log::error!(
+                        "Codex thread context usage persistence conversion failed: thread_id={} engine_thread_id={:?} workspace_id={} assistant_message_id={} field=max_context_tokens value={} error={error:?}",
+                        thread.id,
+                        thread.engine_thread_id,
+                        thread.workspace_id,
+                        assistant_message_id,
+                        value
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
+        // 保留原空字段规则，转换失败或没有上下文字段时不写入线程快照。
+        if conversion_failed {
+            log::error!(
+                "Codex thread context usage persistence skipped after conversion failure: thread_id={} engine_thread_id={:?} workspace_id={} assistant_message_id={} usage={usage:?}",
+                thread.id,
+                thread.engine_thread_id,
+                thread.workspace_id,
+                assistant_message_id
+            );
+            return Ok(());
+        }
+        if context_current_tokens.is_none() && context_max_tokens.is_none() {
+            log::info!(
+                "Codex thread context usage persistence skipped: thread_id={} engine_thread_id={:?} workspace_id={} assistant_message_id={} reason=no_context_fields usage={usage:?}",
+                thread.id,
+                thread.engine_thread_id,
+                thread.workspace_id,
+                assistant_message_id
+            );
+            return Ok(());
+        }
+
+        // 保存 Codex 上下文用量和更新时间；数据库失败记录原始错误并放行公共事件。
+        let context_usage_updated_at = runtime_env::system_time_rfc3339();
+        let update = ThreadUpdateDto {
+            id: thread.id.clone(),
+            context_current_tokens,
+            context_max_tokens,
+            context_usage_updated_at: Some(context_usage_updated_at.clone()),
+            ..Default::default()
+        };
+        let thread_id = thread.id.clone();
+        let engine_thread_id = thread.engine_thread_id.clone();
+        let workspace_id = thread.workspace_id.clone();
+        let assistant_message_id = assistant_message_id.to_string();
+        let db = self.state.db.clone();
+        let current_tokens_for_log = update.context_current_tokens;
+        let max_context_tokens_for_log = update.context_max_tokens;
+        match tokio::task::spawn_blocking(move || db::threads::update_thread(&db, &update)).await {
+            Ok(Ok(updated_thread)) => {
+                log::info!(
+                    "Codex thread context usage persistence succeeded: thread_id={} updated_thread_id={} engine_thread_id={:?} workspace_id={} assistant_message_id={} current_tokens={:?} max_context_tokens={:?} updated_at={}",
+                    thread_id,
+                    updated_thread.id,
+                    engine_thread_id,
+                    workspace_id,
+                    assistant_message_id,
+                    current_tokens_for_log,
+                    max_context_tokens_for_log,
+                    context_usage_updated_at
+                );
+            }
+            Ok(Err(error)) => {
+                log::error!(
+                    "Codex thread context usage persistence failed: thread_id={} engine_thread_id={:?} workspace_id={} assistant_message_id={} current_tokens={:?} max_context_tokens={:?} updated_at={} error={error}",
+                    thread_id,
+                    engine_thread_id,
+                    workspace_id,
+                    assistant_message_id,
+                    current_tokens_for_log,
+                    max_context_tokens_for_log,
+                    context_usage_updated_at
+                );
+            }
+            Err(error) => {
+                log::error!(
+                    "Codex thread context usage persistence task failed: thread_id={} engine_thread_id={:?} workspace_id={} assistant_message_id={} current_tokens={:?} max_context_tokens={:?} updated_at={} error={error}",
+                    thread_id,
+                    engine_thread_id,
+                    workspace_id,
+                    assistant_message_id,
+                    current_tokens_for_log,
+                    max_context_tokens_for_log,
+                    context_usage_updated_at
+                );
+            }
+        }
+        Ok(())
+    }
 
     fn id(&self) -> &str {
         "codex"
