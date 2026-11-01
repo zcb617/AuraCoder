@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 校验 src-tauri 全部代码文件的架构引用关系和调用方向。
+ * 校验仓库全部代码文件的架构引用关系和调用方向。
  * 脚本只检查引用位置与层级方向，不检查业务算法、业务结果或运行时行为。
  */
 
@@ -30,6 +30,7 @@ const CODE_EXTENSIONS = new Set([
   ".ts",
   ".tsx",
   ".jsx",
+  ".vue",
   ".sh",
   ".bash",
   ".zsh",
@@ -41,14 +42,43 @@ const CODE_EXTENSIONS = new Set([
  * 不进入扫描的目录名称，避免把编译产物、依赖、文档和资源当作源码。
  */
 const SKIPPED_DIRECTORY_NAMES = new Set([
+  ".agents",
+  ".claude",
+  ".codex",
+  ".flatpak-builder",
+  ".gradle",
+  ".idea",
+  ".next",
+  ".pnpm-store",
+  ".tmp",
+  ".turbo",
+  ".venv",
+  ".vite",
+  ".worktree",
   ".git",
+  "build",
+  "build-flatpak",
+  "dist",
+  "gen",
   "target",
   "node_modules",
+  "sidecar-dist",
+  "venv",
   "doc",
   "docs",
   "documentation",
   "image",
   "images",
+]);
+
+/**
+ * 只允许三个 CLI Service 及其公共基础实现直接访问数据库 Mapper。
+ */
+const DATABASE_SERVICE_PATHS = new Set([
+  "src-tauri/src/cli_tools/claude_code.rs",
+  "src-tauri/src/cli_tools/codex.rs",
+  "src-tauri/src/cli_tools/mcp.rs",
+  "src-tauri/src/cli_tools/opencode.rs",
 ]);
 
 /**
@@ -101,8 +131,8 @@ function isCodeFile(filePath) {
 }
 
 /**
- * 递归收集 src-tauri 下的全部代码文件，并跳过编译产物、依赖和非源码目录。
- * @param {string} sourceRoot src-tauri 根目录，用于限定根目录下的精确排除路径。
+ * 递归收集仓库下的全部代码文件，并跳过编译产物、依赖和非源码目录。
+ * @param {string} sourceRoot 仓库根目录，用于限定扫描范围。
  * @param {string} directory 当前遍历目录。
  * @param {string[]} files 累积的绝对路径列表。
  * @returns {string[]} 收集到的代码文件绝对路径。
@@ -113,15 +143,6 @@ function collectCodeFiles(sourceRoot, directory = sourceRoot, files = []) {
   }
 
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    if (
-      directory === sourceRoot &&
-      entry.isDirectory() &&
-      entry.name.toLowerCase() === "tests"
-    ) {
-      // 只跳过 src-tauri/tests 及其子目录，保留其它层级名为 tests 的源码目录扫描。
-      continue;
-    }
-
     if (entry.isDirectory() && SKIPPED_DIRECTORY_NAMES.has(entry.name.toLowerCase())) {
       continue;
     }
@@ -214,7 +235,7 @@ function usesHashLineComment(extension) {
 }
 
 /**
- * 清理 Rust、JavaScript、Shell、PowerShell 和 Python 的注释及字符串。
+ * 清理 Rust、JavaScript、Vue、Shell、PowerShell 和 Python 的注释及字符串。
  * 只保留可作为代码引用的字符，换行保留以便输出原始行号。
  * @param {string} source 源码文本。
  * @param {string} extension 文件扩展名。
@@ -224,9 +245,15 @@ function stripCommentsAndStrings(source, extension = ".rs") {
   const output = source.split("");
   const isRust = extension === ".rs";
   const isHashComment = usesHashLineComment(extension);
-  const supportsTemplate = new Set([".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"]).has(
-    extension,
-  );
+  const supportsTemplate = new Set([
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".vue",
+  ]).has(extension);
   let state = "code";
   let blockDepth = 0;
   let quote = "";
@@ -273,6 +300,18 @@ function stripCommentsAndStrings(source, extension = ".rs") {
         blockDepth -= 1;
         state = blockDepth === 0 ? "code" : "block-comment";
         index += 2;
+        continue;
+      }
+      blankRange(output, source, index, index + 1);
+      index += 1;
+      continue;
+    }
+
+    if (state === "html-comment") {
+      if (source.startsWith("-->", index)) {
+        blankRange(output, source, index, index + 3);
+        state = "code";
+        index += 3;
         continue;
       }
       blankRange(output, source, index, index + 1);
@@ -356,6 +395,12 @@ function stripCommentsAndStrings(source, extension = ".rs") {
       blankRange(output, source, index, index + 2);
       state = "powershell-block-comment";
       index += 2;
+      continue;
+    }
+    if (extension === ".vue" && source.startsWith("<!--", index)) {
+      blankRange(output, source, index, index + 4);
+      state = "html-comment";
+      index += 4;
       continue;
     }
 
@@ -461,12 +506,12 @@ function readCodeSource(repositoryRoot, absolutePath) {
 }
 
 /**
- * 读取整个 src-tauri 代码树，不依赖 Git diff，因此历史代码和未跟踪代码均会检查。
+ * 读取整个仓库代码树，不依赖 Git diff，因此历史代码和未跟踪代码均会检查。
  * @param {string} repositoryRoot 仓库根目录。
  * @returns {Map<string, ReturnType<typeof readCodeSource>>} 按仓库相对路径索引的文件快照。
  */
 function readCodeSources(repositoryRoot) {
-  const sourceRoot = join(repositoryRoot, "src-tauri");
+  const sourceRoot = repositoryRoot;
   const sources = new Map();
   for (const absolutePath of collectCodeFiles(sourceRoot)) {
     const source = readCodeSource(repositoryRoot, absolutePath);
@@ -593,6 +638,62 @@ function moduleReferencePattern(moduleNames) {
     ].join("|"),
     "g",
   );
+}
+
+/**
+ * 判断路径是否属于允许直接调用数据库 Mapper 的 CLI Service、公共基础实现或 Mapper 目录。
+ * @param {string} filePath 仓库相对路径。
+ * @returns {boolean} 是否不受 REF-09 约束。
+ */
+function isDatabaseImplementationPath(filePath) {
+  const normalized = normalizePath(filePath);
+  return (
+    DATABASE_SERVICE_PATHS.has(normalized) ||
+    /^src-tauri\/src\/db(?:\/|$)/.test(normalized)
+  );
+}
+
+/**
+ * 为非数据库实现源码构造数据库访问越层引用规则。
+ * @param {string} filePath 仓库相对路径。
+ * @returns {ReturnType<typeof defineRule>[]} 文件适用的数据库访问规则。
+ */
+function databaseRulesForPath(filePath) {
+  if (isDatabaseImplementationPath(filePath)) {
+    return [];
+  }
+
+  const direction =
+    "业务数据库访问只能由 ClaudeCodeCli、CodexCli、OpenCodeCli 及其公共基础实现 BaseCliMcp 调用 Mapper；其他调用方应通过工厂和 CliTool 进入对应 Service，SQL 保留在 Mapper 层。";
+  return [
+    defineRule("REF-09", /\b(?:db|mapper|mappers)\s*::/g, direction),
+    defineRule(
+      "REF-09",
+      /\b(?:pub(?:\s*\([^)]*\))?\s+)?use\s+[^;]*?(?:(?:(?:crate|super|self)(?:\s*::\s*[A-Za-z_]\w*)*\s*::\s*db\s+as\b)|(?:(?:crate|super|self)\s*::\s*db\b|[,{]\s*db\b)\s*(?:as\b|[,};]))[^;]*;/g,
+      direction,
+    ),
+    defineRule("REF-09", /\b(?:rusqlite|sqlx|diesel|sea_orm|tokio_rusqlite|r2d2_sqlite)\b/g, direction),
+    defineRule(
+      "REF-09",
+      /\b(?:Database|Connection|SqliteConnection|SqlitePool|SqlitePoolOptions)\s*::\s*(?:open(?:_in_memory|_with_flags)?|connect|connect_lazy|new)\s*\(/g,
+      direction,
+    ),
+    defineRule(
+      "REF-09",
+      /\b(?:db|database)\s*\.\s*(?:connect|execute(?:_batch)?|prepare(?:_cached)?|query(?:_row|_map)?|transaction(?:_with_behavior)?)\s*\(/g,
+      direction,
+    ),
+    defineRule(
+      "REF-09",
+      /\b(?:conn|connection|tx|transaction)\s*\.\s*(?:execute(?:_batch)?|prepare(?:_cached)?|query(?:_row|_map)?|transaction(?:_with_behavior)?|commit|rollback)\s*\(/g,
+      direction,
+    ),
+    defineRule(
+      "REF-09",
+      /\b(?:[A-Za-z_]\w*(?:Mapper|mapper|_mapper)|mapper|mappers)\s*(?:::|\.)\s*(?:select|find|insert|update|delete|query|save|upsert|list|get|create|count|remove|batch)\w*\b/gi,
+      direction,
+    ),
+  ];
 }
 
 /**
@@ -754,6 +855,8 @@ function rulesForPath(filePath) {
     );
   }
 
+  // 为所有非实现层文件增加数据库访问边界检查。
+  rules.push(...databaseRulesForPath(normalized));
   return rules;
 }
 
@@ -962,7 +1065,7 @@ function checkGlobalStructure(sources) {
 }
 
 /**
- * 对源码树执行所有路径适用的 REF-01 至 REF-08 引用检查。
+ * 对源码树执行所有路径适用的 REF-01 至 REF-09 引用检查。
  * @param {Map<string, ReturnType<typeof readCodeSource>>} sources 文件快照索引。
  * @returns {ReturnType<typeof createFinding>[]} 全量引用违规结果。
  */
@@ -1001,7 +1104,7 @@ function findSampleFindings(filePath, snippet) {
 }
 
 /**
- * 用内存样例验证业务直引、实现类直引、Engine 生命周期和注释字符串过滤。
+ * 用内存样例验证既有架构规则和数据库访问越层规则。
  * REF-08 的真实源码不参与“零违规”断言，因为当前 OpenCode Engine 必须如实报告。
  * @returns {void}
  */
@@ -1033,6 +1136,144 @@ function runSelfChecks() {
       "opencode serve;",
     ).some((finding) => finding.match.includes("opencode serve")),
     "REF-08 opencode serve 样例未被识别",
+  );
+
+  // 验证数据库访问越层规则覆盖模块引用、库 API、Mapper 调用和全仓库路径。
+  assert.ok(
+    findSampleFindings(
+      "src-tauri/src/commands/example.rs",
+      "db::actions::answer_approval();",
+    ).some((finding) => finding.rule === "REF-09"),
+    "REF-09 db 模块调用样例未被识别",
+  );
+  assert.ok(
+    findSampleFindings("src-tauri/src/commands/example.rs", "use crate::db as storage;").some(
+      (finding) => finding.rule === "REF-09",
+    ),
+    "REF-09 db 别名导入样例未被识别",
+  );
+  assert.ok(
+    findSampleFindings(
+      "src-tauri/src/commands/example.rs",
+      "use crate::{db, state::AppState};",
+    ).some((finding) => finding.rule === "REF-09"),
+    "REF-09 花括号 db 导入样例未被识别",
+  );
+  assert.ok(
+    findSampleFindings(
+      "src-tauri/src/commands/example.rs",
+      "use crate::db::actions::answer_approval as answer;",
+    ).some((finding) => finding.rule === "REF-09"),
+    "REF-09 db 深层导入样例未被识别",
+  );
+  assert.ok(
+    findSampleFindings(
+      "src-tauri/src/commands/example.rs",
+      "pub use self::parent::feature::{nested::{db as storage}};",
+    ).some((finding) => finding.rule === "REF-09"),
+    "REF-09 多层嵌套 db 导入样例未被识别",
+  );
+  const databaseApiFindings = findSampleFindings(
+    "src-tauri/src/commands/example.rs",
+    'let _ = rusqlite::Connection::open("database.db"); conn.execute("query");',
+  );
+  assert.ok(
+    databaseApiFindings.some((finding) => finding.match.includes("rusqlite")),
+    "REF-09 原生数据库库引用样例未被识别",
+  );
+  assert.ok(
+    databaseApiFindings.some((finding) => /Connection\s*::\s*open/.test(finding.match)),
+    "REF-09 数据库连接创建样例未被识别",
+  );
+  assert.ok(
+    databaseApiFindings.some((finding) => /conn\s*\.\s*execute/.test(finding.match)),
+    "REF-09 数据库连接 API 样例未被识别",
+  );
+
+  // 验证三个 CLI Service、公共基础实现及 src-tauri/src/db 目录可直接访问 Mapper。
+  for (const file of [
+    "src-tauri/src/cli_tools/codex.rs",
+    "src-tauri/src/cli_tools/opencode.rs",
+    "src-tauri/src/cli_tools/claude_code.rs",
+    "src-tauri/src/cli_tools/mcp.rs",
+  ]) {
+    assert.equal(
+      findSampleFindings(file, "db::threads::get_thread();").some(
+        (finding) => finding.rule === "REF-09",
+      ),
+      false,
+      `REF-09 不应限制允许的 CLI Service 或公共基础实现: ${file}`,
+    );
+  }
+  assert.equal(
+    findSampleFindings("src-tauri/src/db/actions.rs", "db::threads::get_thread();").some(
+      (finding) => finding.rule === "REF-09",
+    ),
+    false,
+    "REF-09 不应限制 Mapper 目录",
+  );
+  assert.equal(
+    findSampleFindings("src-tauri/src/cli_tools.rs", "db::threads::get_thread();").some(
+      (finding) => finding.rule === "REF-09",
+    ),
+    true,
+    "REF-09 必须限制公共 CliTool 接口的数据库访问",
+  );
+  assert.equal(
+    findSampleFindings(
+      "src-tauri/src/cli_tools/factory.rs",
+      "db::threads::get_thread();",
+    ).some((finding) => finding.rule === "REF-09"),
+    true,
+    "REF-09 必须限制 CliToolFactory 的数据库访问",
+  );
+  assert.ok(
+    findSampleFindings("src/stores/example.ts", "approvalMapper.select(id);").some(
+      (finding) => finding.rule === "REF-09",
+    ),
+    "REF-09 仓库根目录前端 Mapper 调用样例未被识别",
+  );
+  assert.ok(
+    findSampleFindings("src/stores/example.ts", "mapper.select(id);").some(
+      (finding) => finding.rule === "REF-09",
+    ),
+    "REF-09 裸 mapper 对象调用样例未被识别",
+  );
+  assert.equal(
+    findSampleFindings("src/stores/example.ts", "mapper.map_notification(event);").some(
+      (finding) => finding.rule === "REF-09",
+    ),
+    false,
+    "REF-09 不应识别 mapper 事件转换调用",
+  );
+  const databaseCommentAndStringSample = `
+    // db::actions::answer_approval();
+    /* use crate::db as storage; */
+    const text = "rusqlite::Connection::open approvalMapper.select";
+  `;
+  assert.equal(
+    findSampleFindings("src-tauri/src/commands/example.rs", databaseCommentAndStringSample).some(
+      (finding) => finding.rule === "REF-09",
+    ),
+    false,
+    "REF-09 不应识别注释和字符串中的数据库引用",
+  );
+  const nonDatabaseMapperSample =
+    "TurnEventMapper::default(); OpenCodeTurnMapper::new(id); codex_event_mapper::extract_persisted_approval_route(details);";
+  assert.equal(
+    findSampleFindings(
+      "src-tauri/src/engines/codex_event_mapper.rs",
+      `fn map_event() { ${nonDatabaseMapperSample} }`,
+    ).some((finding) => finding.rule === "REF-09"),
+    false,
+    "REF-09 不应识别普通事件映射代码",
+  );
+  assert.equal(
+    findSampleFindings("tests/example.rs", "db::actions::answer_approval();").some(
+      (finding) => finding.rule === "REF-09",
+    ),
+    true,
+    "REF-09 必须检查仓库根目录 tests 源码",
   );
 
   const commentedAndStringSample = `
@@ -1095,9 +1336,9 @@ function main() {
     process.stdout.write(
       [
         "Tauri 后端架构引用检查通过。",
-        `全量代码扫描: ${sources.size} 个 src-tauri 代码文件。`,
-        "引用方向规则: REF-01 至 REF-08。",
-        "脚本自检: 业务直引、实现类直引、OpenCode Engine 生命周期和注释字符串过滤均通过。",
+        `全量代码扫描: ${sources.size} 个仓库代码文件。`,
+        "引用方向规则: REF-01 至 REF-09。",
+        "脚本自检: 既有架构引用、数据库访问越层、允许实现层和注释字符串过滤均通过。",
         "依赖检查: 仅使用 Node.js 内置模块，无新增依赖。",
       ].join("\n") + "\n",
     );
