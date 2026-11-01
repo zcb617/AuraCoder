@@ -80,7 +80,6 @@ const DATABASE_SERVICE_PATHS = new Set([
   "src-tauri/src/cli_tools/mcp.rs",
   "src-tauri/src/auracoder_thread_mcp_service.rs",
   "src-tauri/src/cli_tools/opencode.rs",
-  "src-tauri/src/scheduled_tasks/manager.rs",
   "src-tauri/src/services/scheduled_task_service.rs",
   "src-tauri/src/services/chat_service.rs",
   "src-tauri/src/services/ssh_connection_service.rs",
