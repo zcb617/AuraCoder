@@ -1332,7 +1332,8 @@ impl Engine for CodexEngine {
                             extract_any_string(&params, &["namespace", "toolNamespace"]);
                         if let Some(namespace) = namespace.as_deref() {
                             if namespace != "auracoder_computer_control"
-                                && namespace != crate::auracoder_thread_mcp_service::PANES_THREAD_NAMESPACE
+                                // && namespace != crate::auracoder_thread_mcp_service::PANES_THREAD_NAMESPACE
+                                && namespace != crate::services::auracoder_thread_mcp_service::PANES_THREAD_NAMESPACE
                             {
                                 transport
                                     .respond_success(
@@ -1380,7 +1381,8 @@ impl Engine for CodexEngine {
 */
 
                         if namespace.as_deref()
-                            == Some(crate::auracoder_thread_mcp_service::PANES_THREAD_NAMESPACE)
+                            // == Some(crate::auracoder_thread_mcp_service::PANES_THREAD_NAMESPACE)
+                            == Some(crate::services::auracoder_thread_mcp_service::PANES_THREAD_NAMESPACE)
                         {
                             log::warn!(
                                 "Codex 旧会话工具入口已停用: thread_id={} turn_id={} tool={}",

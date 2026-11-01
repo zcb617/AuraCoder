@@ -1,4 +1,4 @@
-mod auracoder_thread_mcp_service;
+// mod auracoder_thread_mcp_service;
 mod cli_service_health;
 pub(crate) mod cli_tools;
 mod commands;
@@ -170,7 +170,8 @@ pub fn run() {
         computer_control_sdk.clone(),
     ));
     let auracoder_thread_mcp_service =
-        Arc::new(auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()));
+        // Arc::new(auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()));
+        Arc::new(services::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()));
     let mcp_gateway = Arc::new(mcp_gateway::AuraCoderMcpGateway::new());
 
     let app_state = AppState {

@@ -1,6 +1,7 @@
     use super::{AuraCoderMcpGateway, GatewayState};
     use crate::{
-        auracoder_thread_mcp_service::AuraCoderThreadMcpService,
+        // auracoder_thread_mcp_service::AuraCoderThreadMcpService,
+        services::auracoder_thread_mcp_service::AuraCoderThreadMcpService,
         cli_tools::{factory::CliToolFactory, CliTool},
         computer_control_service::ComputerControlService,
         config::app_config::AppConfig,

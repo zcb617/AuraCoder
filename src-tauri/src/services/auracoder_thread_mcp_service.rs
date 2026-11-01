@@ -387,5 +387,6 @@ fn ensure_workspace(thread: &ThreadDto, source_workspace: &str) -> Result<(), St
 
 
 #[cfg(test)]
-#[path = "../tests/unit/auracoder_thread_mcp_service_tests.rs"]
+// #[path = "../tests/unit/auracoder_thread_mcp_service_tests.rs"]
+#[path = "../../tests/unit/auracoder_thread_mcp_service_tests.rs"]
 mod tests;

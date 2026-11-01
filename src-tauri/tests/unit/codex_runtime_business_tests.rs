@@ -41,7 +41,8 @@ fn test_state(database: db::Database) -> AppState {
         computer_control_service: Arc::new(crate::computer_control_service::ComputerControlService::default()),
         mcp_gateway: Arc::new(crate::mcp_gateway::AuraCoderMcpGateway::new()),
         auracoder_thread_mcp_service: Arc::new(
-            crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(database),
+            // crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(database),
+            crate::services::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(database),
         ),
         remote_access: Arc::new(crate::remote::RemoteTunnelManager::default()),
         ssh_monitor: Arc::new(crate::ssh::monitor::SshConnectionMonitor::default()),

@@ -43,7 +43,8 @@ fn test_app_state() -> AppState {
             crate::computer_control_service::ComputerControlService::default(),
         ),
         auracoder_thread_mcp_service: Arc::new(
-            crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()),
+            // crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()),
+            crate::services::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()),
         ),
         mcp_gateway: Arc::new(crate::mcp_gateway::AuraCoderMcpGateway::new()),
         remote_access: Arc::new(crate::remote::RemoteTunnelManager::default()),
