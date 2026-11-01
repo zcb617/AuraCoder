@@ -2684,22 +2684,32 @@ pub(crate) async fn cancel_turn_inner(state: &AppState, thread_id: String) -> Re
     Ok(())
 }
 
+/// 业务说明：提交会话审批响应，并返回本地取消后重读的线程状态。
 #[tauri::command]
 pub async fn respond_to_approval(
     state: State<'_, AppState>,
     thread_id: String,
     approval_id: String,
     response: Value,
-) -> Result<(), String> {
+) -> Result<Option<ApprovalResponseOutcomeDto>, String> {
     respond_to_approval_inner(state.inner(), thread_id, approval_id, response).await
 }
 
+/// 本地取消 Codex 审批后返回的数据库线程状态。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalResponseOutcomeDto {
+    /// 本地审批取消完成后从数据库重新读取的会话。
+    pub thread: ThreadDto,
+}
+
+/// 业务说明：将审批响应提交给对应引擎，并持久化审批处理结果。
 pub(crate) async fn respond_to_approval_inner(
     state: &AppState,
     thread_id: String,
     approval_id: String,
     response: Value,
-) -> Result<(), String> {
+) -> Result<Option<ApprovalResponseOutcomeDto>, String> {
     if !response.is_object() {
         return Err("approval response must be a JSON object".to_string());
     }
@@ -2788,6 +2798,65 @@ pub(crate) async fn respond_to_approval_inner(
     };
 
     if let Err(error) = dispatch_result {
+        if thread.engine_id == "codex"
+            && approval_response_decision_for_persistence(&normalized_response) == "cancel"
+        {
+            // 业务说明：Codex 未能收到取消时登记本地取消，并以数据库结果关闭审批。
+            log::warn!("failed to submit Codex approval cancellation {approval_id}: {error}");
+            // 业务说明：确认审批归属并读取消息 ID，避免无效审批取消当前整轮。
+            let message_id = run_db(db.clone(), {
+                let approval_id = approval_id.clone();
+                let thread_id = thread_id.clone();
+                move |db| {
+                    let (approval_thread_id, message_id) =
+                        db::actions::find_approval_context(db, &approval_id)?
+                            .ok_or_else(|| anyhow::anyhow!("approval context not found: {approval_id}"))?;
+                    if approval_thread_id != thread_id {
+                        return Err(anyhow::anyhow!(
+                            "approval {approval_id} belongs to thread {approval_thread_id}, expected {thread_id}"
+                        ));
+                    }
+                    Ok(message_id)
+                }
+            })
+            .await?;
+            cancel_turn_inner(state, thread_id.clone()).await?;
+            // 业务说明：等待唯一轮次收尾解除线程占用，超时后仍继续审批的本地结算。
+            let turn_cleanup_result = tokio::time::timeout(
+                TURN_INTERRUPT_TIMEOUT + TURN_TASK_CLEANUP_TIMEOUT + Duration::from_secs(2),
+                async {
+                    while state.turns.get(&thread_id).await.is_some() {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                },
+            )
+            .await;
+            if let Err(timeout_error) = turn_cleanup_result {
+                log::error!(
+                    "timed out waiting for Codex turn cleanup after cancelling approval {approval_id}: {timeout_error}"
+                );
+            }
+            return run_db(db.clone(), {
+                let approval_id = approval_id.clone();
+                let thread_id = thread_id.clone();
+                move |db| {
+                    db::actions::answer_approval(db, &approval_id, "cancel")?;
+                    db::messages::mark_approval_block_answered(
+                        db,
+                        &message_id,
+                        &approval_id,
+                        "cancel",
+                    )?;
+                    db::threads::refresh_thread_status_after_approval_expired(db, &thread_id)?;
+                    let thread = db::threads::get_thread(db, &thread_id)?.ok_or_else(|| {
+                        anyhow::anyhow!("thread not found after local approval cancellation: {thread_id}")
+                    })?;
+                    Ok(Some(ApprovalResponseOutcomeDto { thread }))
+                }
+            })
+            .await;
+        }
+
         // 引擎已确认该审批不再挂起（sidecar 回报 "unknown or no longer pending"）时，
         // 把持久化审批块从 pending 改为 expired：前端对这条失败只做内存置灰（不落库），
         // 重启后死卡会复活并挡住输入。此处补落库，与运行时 EngineEvent::ApprovalExpired
@@ -2841,7 +2910,7 @@ pub(crate) async fn respond_to_approval_inner(
     })
     .await?;
 
-    Ok(())
+    Ok(None)
 }
 
 async fn load_approval_response_route(

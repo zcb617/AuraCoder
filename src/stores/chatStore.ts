@@ -3179,7 +3179,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
 
     try {
-      await ipc.respondApproval(threadId, approvalId, response);
+      const outcome = await ipc.respondApproval(threadId, approvalId, response);
+      // 业务说明：后端已在本地取消审批时同步线程状态并保留已回答的取消记录。
+      if (outcome) {
+        useThreadStore.getState().applyThreadUpdateLocal(outcome.thread);
+        if (get().threadId === threadId) {
+          set((state) => {
+            if (state.threadId !== threadId) {
+              return state;
+            }
+            const streaming = isThreadStatusStreaming(outcome.thread.status);
+            return {
+              ...state,
+              messages: resolveApprovalInMessages(
+                state.messages,
+                approvalId,
+                "cancel",
+                responseData,
+              ),
+              status: outcome.thread.status,
+              streaming,
+              turnStartedAt: streaming ? state.turnStartedAt : null,
+              error: t("chat:messageBlocks.approval.cancelledLocallyError"),
+            };
+          });
+        }
+        return true;
+      }
       if (get().threadId === threadId) {
         set((state) => {
           if (state.threadId !== threadId) {
