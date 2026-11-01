@@ -406,12 +406,14 @@ function normalizeActionOutputStream(
   return stream === "stderr" || stream === "stdin" ? stream : "stdout";
 }
 
+/** 业务说明：按审批 UUID 将聊天中所有重复展示的待审批块更新为已答复。 */
 function resolveApprovalInMessages(
   messages: Message[],
   approvalId: string,
   decision?: ApprovalBlock["decision"],
   responseData?: Record<string, unknown>,
 ): Message[] {
+  /* 旧逻辑留痕：按首个匹配审批块更新后立即返回，重复展示会继续保持未答复。
   for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
     const message = messages[messageIndex];
     const blocks = message.blocks;
@@ -451,12 +453,64 @@ function resolveApprovalInMessages(
   }
 
   return messages;
+  */
+
+  // 业务说明：只为实际发生变化的审批块复制其消息和数组，并同步更新所有相同 UUID 的展示。
+  let nextMessages: Message[] | null = null;
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+    const message = messages[messageIndex];
+    const blocks = message.blocks;
+    if (!blocks || blocks.length === 0) {
+      continue;
+    }
+
+    let nextBlocks: NonNullable<Message["blocks"]> | null = null;
+    for (let blockIndex = 0; blockIndex < blocks.length; blockIndex += 1) {
+      const block = blocks[blockIndex];
+      if (block.type !== "approval" || block.approvalId !== approvalId) {
+        continue;
+      }
+
+      const approvalBlock = block as ApprovalBlock;
+      if (
+        approvalBlock.status === "answered" &&
+        (decision === undefined || approvalBlock.decision === decision) &&
+        responseData === undefined
+      ) {
+        continue;
+      }
+
+      if (!nextBlocks) {
+        nextBlocks = [...blocks];
+      }
+      nextBlocks[blockIndex] = {
+        ...approvalBlock,
+        status: "answered" as const,
+        ...(decision !== undefined ? { decision } : {}),
+        ...(responseData !== undefined ? { responseData } : {}),
+      };
+    }
+
+    if (nextBlocks) {
+      if (!nextMessages) {
+        nextMessages = [...messages];
+      }
+      nextMessages[messageIndex] = {
+        ...message,
+        blocks: nextBlocks,
+      };
+    }
+  }
+
+  return nextMessages ?? messages;
 }
 
+/** 业务说明：按审批 UUID 将所有重复展示的待处理块标记为已过期。 */
 function expireApprovalInMessages(
   messages: Message[],
   approvalId: string,
 ): Message[] {
+  /* 旧逻辑留痕：首个同 UUID 审批块不是 pending 时提前返回，会漏掉其他重复展示。
   for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
     const message = messages[messageIndex];
     const blocks = message.blocks;
@@ -486,6 +540,49 @@ function expireApprovalInMessages(
     return nextMessages;
   }
   return messages;
+  */
+
+  // 业务说明：只把匹配 UUID 的 pending 审批块改为 expired，保留其他状态和内容引用。
+  let nextMessages: Message[] | null = null;
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+    const message = messages[messageIndex];
+    const blocks = message.blocks;
+    if (!blocks || blocks.length === 0) {
+      continue;
+    }
+
+    let nextBlocks: NonNullable<Message["blocks"]> | null = null;
+    for (let blockIndex = 0; blockIndex < blocks.length; blockIndex += 1) {
+      const block = blocks[blockIndex];
+      if (
+        block.type !== "approval" ||
+        block.approvalId !== approvalId ||
+        block.status !== "pending"
+      ) {
+        continue;
+      }
+
+      if (!nextBlocks) {
+        nextBlocks = [...blocks];
+      }
+      nextBlocks[blockIndex] = {
+        ...block,
+        status: "expired" as const,
+      };
+    }
+
+    if (nextBlocks) {
+      if (!nextMessages) {
+        nextMessages = [...messages];
+      }
+      nextMessages[messageIndex] = {
+        ...message,
+        blocks: nextBlocks,
+      };
+    }
+  }
+
+  return nextMessages ?? messages;
 }
 
 function trimActionOutputChunks(
@@ -3260,6 +3357,7 @@ function applyApprovalResponseOutcome(
     return true;
   }
 
+  /* 旧逻辑留痕：用 outcome.message.id 定位或追加消息，并合并后端审批块、消息状态。
   const backendMessage = outcome.message;
   const decision = outcome.decision === null
     ? undefined
@@ -3321,6 +3419,31 @@ function applyApprovalResponseOutcome(
       messages = expireApprovalInMessages(state.messages, outcome.approvalId);
     }
 
+    const streaming = isThreadStatusStreaming(outcome.thread.status);
+    return {
+      messages,
+      status: outcome.thread.status,
+      streaming,
+      turnStartedAt: streaming ? state.turnStartedAt : null,
+      error: errorMessage,
+    };
+  });
+  */
+
+  const decision = outcome.decision === null
+    ? undefined
+    : outcome.decision as ApprovalBlock["decision"];
+  useChatStore.setState((state) => {
+    if (state.threadId !== threadId) {
+      return state;
+    }
+
+    // 业务说明：只按审批 UUID 更新现有审批块，保持消息列表及非审批内容不变。
+    const messages = outcome.status === "answered"
+      ? resolveApprovalInMessages(state.messages, outcome.approvalId, decision)
+      : outcome.status === "expired"
+        ? expireApprovalInMessages(state.messages, outcome.approvalId)
+        : state.messages;
     const streaming = isThreadStatusStreaming(outcome.thread.status);
     return {
       messages,

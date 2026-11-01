@@ -468,7 +468,7 @@ impl TurnEventMapper {
 
     pub fn map_server_request(
         &mut self,
-        request_id: &str,
+        _request_id: &str,
         raw_request_id: &Value,
         method: &str,
         params: &Value,
@@ -517,8 +517,10 @@ impl TurnEventMapper {
             _ => return None,
         };
 
-        let approval_id = extract_any_string(params, &["approvalId", "itemId", "callId", "id"])
-            .unwrap_or_else(|| request_id.to_string());
+        // 旧 ID 选择逻辑停用留痕；同一审批事件统一使用 AuraCoder 生成的 UUID。
+        // let approval_id = extract_any_string(params, &["approvalId", "itemId", "callId", "id"])
+        //     .unwrap_or_else(|| _request_id.to_string());
+        let approval_id = Uuid::new_v4().to_string();
 
         let mut details = params.clone();
         if let Some(object) = details.as_object_mut() {
@@ -1989,7 +1991,7 @@ mod tests {
     use serde_json::{json, Value};
 
     #[test]
-    fn map_server_request_dynamic_tool_call_uses_call_id() {
+    fn map_server_request_dynamic_tool_call_generates_local_uuid() {
         let mut mapper = TurnEventMapper::default();
         let params = json!({
             "threadId": "thr_123",
@@ -2003,7 +2005,10 @@ mod tests {
             .map_server_request("request-1", &json!(42), "item/tool/call", &params)
             .expect("expected approval request");
 
-        assert_eq!(approval.approval_id, "call_abc");
+        // 旧原生 ID 断言停用留痕：assert_eq!(approval.approval_id, "call_abc");
+        let local_approval_id = approval.approval_id.clone();
+        assert!(Uuid::parse_str(&local_approval_id).is_ok());
+        assert_ne!(local_approval_id, "call_abc");
         assert_eq!(approval.server_method, "item/tool/call");
 
         match approval.event {
@@ -2013,7 +2018,8 @@ mod tests {
                 summary,
                 details,
             } => {
-                assert_eq!(approval_id, "call_abc");
+                // 旧原生 ID 断言停用留痕：assert_eq!(approval_id, "call_abc");
+                assert_eq!(approval_id, local_approval_id);
                 assert!(matches!(action_type, ActionType::Other));
                 assert_eq!(summary, "Codex requested dynamic tool call: my_tool");
                 assert_eq!(
@@ -2056,7 +2062,9 @@ mod tests {
             )
             .expect("expected approval request");
 
-        assert_eq!(approval.approval_id, "item_42");
+        // 旧原生 ID 断言停用留痕：assert_eq!(approval.approval_id, "item_42");
+        assert!(Uuid::parse_str(&approval.approval_id).is_ok());
+        assert_ne!(approval.approval_id, "item_42");
         assert_eq!(approval.server_method, "tool/requestuserinput");
 
         match approval.event {
@@ -2097,7 +2105,9 @@ mod tests {
             )
             .expect("expected approval request");
 
-        assert_eq!(approval.approval_id, "item_84");
+        // 旧原生 ID 断言停用留痕：assert_eq!(approval.approval_id, "item_84");
+        assert!(Uuid::parse_str(&approval.approval_id).is_ok());
+        assert_ne!(approval.approval_id, "item_84");
         assert_eq!(approval.server_method, "item/tool/requestuserinput");
     }
 
@@ -2134,7 +2144,7 @@ mod tests {
     }
 
     #[test]
-    fn map_server_request_permissions_uses_item_id() {
+    fn map_server_request_permissions_generates_local_uuid() {
         let mut mapper = TurnEventMapper::default();
         let params = json!({
             "threadId": "thr_123",
@@ -2157,7 +2167,9 @@ mod tests {
             )
             .expect("expected approval request");
 
-        assert_eq!(approval.approval_id, "perm_42");
+        // 旧原生 ID 断言停用留痕：assert_eq!(approval.approval_id, "perm_42");
+        assert!(Uuid::parse_str(&approval.approval_id).is_ok());
+        assert_ne!(approval.approval_id, "perm_42");
         assert_eq!(approval.server_method, "item/permissions/requestapproval");
 
         match approval.event {
@@ -2185,7 +2197,7 @@ mod tests {
     }
 
     #[test]
-    fn map_server_request_mcp_elicitation_uses_request_id_when_no_stable_id_exists() {
+    fn map_server_request_mcp_elicitation_generates_local_uuid() {
         let mut mapper = TurnEventMapper::default();
         let params = json!({
             "threadId": "thr_123",
@@ -2212,7 +2224,9 @@ mod tests {
             )
             .expect("expected approval request");
 
-        assert_eq!(approval.approval_id, "request-5");
+        // 旧原生 ID 断言停用留痕：assert_eq!(approval.approval_id, "request-5");
+        assert!(Uuid::parse_str(&approval.approval_id).is_ok());
+        assert_ne!(approval.approval_id, "request-5");
         assert_eq!(approval.server_method, "mcpserver/elicitation/request");
 
         match approval.event {

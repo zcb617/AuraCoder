@@ -1487,7 +1487,7 @@ fn apply_resolved_approvals_to_blocks(
     changed
 }
 
-fn normalize_blocks_json_for_message(
+pub(super) fn normalize_blocks_json_for_message(
     conn: &Connection,
     message_id: &str,
     blocks_json: &str,

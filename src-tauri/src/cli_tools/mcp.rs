@@ -1749,53 +1749,25 @@ pub(crate) async fn process_stream_event(
         _ => {}
     }
 
-    // CLI 专属事件已由上方回调处理，公共层转发并持久化统一事件字段。
-    if let Err(error) = app.emit(stream_event_topic, &normalized_event) {
-        log::error!(
-            "聊天流式事件发送失败: thread_id={}, engine_id={}, assistant_message_id={}, topic={}, event_kind={}, error={error:#}",
-            thread.id,
-            thread.engine_id,
-            assistant_message_id,
-            stream_event_topic,
-            chat_engine_event_kind(&normalized_event),
-        );
-    }
-    if let EngineEvent::ApprovalRequested { summary, .. } = &normalized_event {
-        let _ = app.emit(approval_event_topic, &normalized_event);
-        // Unscoped companion event so background threads can surface pending
-        // approvals without a per-thread listener.
-        let _ = app.emit(
-            "chat-approval-requested",
-            ChatApprovalRequestedEvent {
-                thread_id: thread.id.clone(),
-                workspace_id: thread.workspace_id.clone(),
-                engine_id: thread.engine_id.clone(),
-                thread_title: thread.title.clone(),
-                summary: summary.clone(),
-            },
-        );
-        match run_db(state.db.clone(), {
-            let assistant_message_id = assistant_message_id.to_string();
-            move |db| {
-                db::scheduled_tasks::mark_run_needs_confirmation_by_message(
-                    db,
-                    &assistant_message_id,
-                )
-            }
-        })
-        .await
-        {
-            Ok(Some(task_id)) => {
-                crate::services::scheduled_task_service::ScheduledTaskService::emit_task_updated(
-                    app,
-                    &task_id,
-                );
-            }
-            Ok(None) => {}
-            Err(error) => {
-                log::warn!("failed to mark scheduled task as needing confirmation: {error}");
-            }
+    // 审批事件延后到审批记录和展示块保存成功后发送，其他事件仍按原位置转发。
+    let is_approval_request = matches!(
+        &normalized_event,
+        EngineEvent::ApprovalRequested { .. }
+    );
+    let emit_stream_event = || {
+        if let Err(error) = app.emit(stream_event_topic, &normalized_event) {
+            log::error!(
+                "聊天流式事件发送失败: thread_id={}, engine_id={}, assistant_message_id={}, topic={}, event_kind={}, error={error:#}",
+                thread.id,
+                thread.engine_id,
+                assistant_message_id,
+                stream_event_topic,
+                chat_engine_event_kind(&normalized_event),
+            );
         }
+    };
+    if !is_approval_request {
+        emit_stream_event();
     }
 
     let log_event = engine_event_for_debug_log(&normalized_event);
@@ -1879,34 +1851,9 @@ pub(crate) async fn process_stream_event(
             }
         }
         EngineEvent::ApprovalRequested {
-            approval_id,
-            action_type,
-            summary,
-            details,
+            ..
         } => {
-            if let Err(error) = run_db(state.db.clone(), {
-                let approval_id = approval_id.clone();
-                let thread_id = thread.id.clone();
-                let assistant_message_id = assistant_message_id.to_string();
-                let action_type = action_type.clone();
-                let summary = summary.clone();
-                let details = details.clone();
-                move |db| {
-                    db::actions::insert_approval(
-                        db,
-                        &approval_id,
-                        &thread_id,
-                        &assistant_message_id,
-                        &action_type,
-                        &summary,
-                        &details,
-                    )
-                }
-            })
-            .await
-            {
-                log::warn!("failed to persist approval: {error}");
-            }
+            // approvals、卡片与线程状态由下方同一事务统一保存，避免重复插入。
         }
         EngineEvent::ApprovalExpired { approval_id, .. } => {
             // 审批随轮次结束被判死时，同步划掉 approvals 表里的 pending 记录：
@@ -1924,6 +1871,16 @@ pub(crate) async fn process_stream_event(
         _ => {}
     }
 
+    // 审批创建失败时恢复内存中的消息块和索引，避免外层流刷新写入未保存的待审批卡片。
+    let approval_state_snapshot = if is_approval_request {
+        Some((
+            (*blocks).clone(),
+            (*action_index).clone(),
+            (*approval_index).clone(),
+        ))
+    } else {
+        None
+    };
     let progress = apply_event_to_blocks(
         blocks,
         action_index,
@@ -1931,6 +1888,111 @@ pub(crate) async fn process_stream_event(
         &normalized_event,
         max_output_chars,
     );
+    if let EngineEvent::ApprovalRequested {
+        approval_id,
+        action_type,
+        summary,
+        details,
+    } = &normalized_event
+    {
+        // 将审批卡片序列化后与审批记录、线程状态一起提交，确保通知前三项数据完整可读。
+        let blocks_json = match serde_json::to_string(blocks) {
+            Ok(blocks_json) => blocks_json,
+            Err(error) => {
+                log::error!(
+                    "failed to serialize approval display blocks: thread_id={}, assistant_message_id={}, approval_id={}, error={error:#}",
+                    thread.id,
+                    assistant_message_id,
+                    approval_id
+                );
+                if let Some((saved_blocks, saved_action_index, saved_approval_index)) =
+                    approval_state_snapshot
+                {
+                    *blocks = saved_blocks;
+                    *action_index = saved_action_index;
+                    *approval_index = saved_approval_index;
+                }
+                return EventProgress::default();
+            }
+        };
+        if let Err(error) = run_db(state.db.clone(), {
+            let approval_id = approval_id.clone();
+            let assistant_message_id = assistant_message_id.to_string();
+            let thread_id = thread.id.clone();
+            let action_type = action_type.clone();
+            let summary = summary.clone();
+            let details = details.clone();
+            move |db| {
+                db::actions::insert_chat_approval(
+                    db,
+                    &approval_id,
+                    &thread_id,
+                    &assistant_message_id,
+                    &action_type,
+                    &summary,
+                    &details,
+                    &blocks_json,
+                    MessageStatusDto::Streaming,
+                    ThreadStatusDto::AwaitingApproval,
+                )
+            }
+        })
+        .await
+        {
+            log::error!(
+                "failed to persist chat approval transaction: thread_id={}, assistant_message_id={}, approval_id={}, error={error:#}",
+                thread.id,
+                assistant_message_id,
+                approval_id
+            );
+            if let Some((saved_blocks, saved_action_index, saved_approval_index)) =
+                approval_state_snapshot
+            {
+                *blocks = saved_blocks;
+                *action_index = saved_action_index;
+                *approval_index = saved_approval_index;
+            }
+            return EventProgress::default();
+        }
+
+        // 数据库中的审批记录、卡片与线程状态事务提交后，再广播审批相关事件。
+        emit_stream_event();
+        let _ = app.emit(approval_event_topic, &normalized_event);
+        // Unscoped companion event so background threads can surface
+        // approvals without a per-thread listener.
+        let _ = app.emit(
+            "chat-approval-requested",
+            ChatApprovalRequestedEvent {
+                thread_id: thread.id.clone(),
+                workspace_id: thread.workspace_id.clone(),
+                engine_id: thread.engine_id.clone(),
+                thread_title: thread.title.clone(),
+                summary: summary.clone(),
+            },
+        );
+        match run_db(state.db.clone(), {
+            let assistant_message_id = assistant_message_id.to_string();
+            move |db| {
+                db::scheduled_tasks::mark_run_needs_confirmation_by_message(
+                    db,
+                    &assistant_message_id,
+                )
+            }
+        })
+        .await
+        {
+            Ok(Some(task_id)) => {
+                crate::services::scheduled_task_service::ScheduledTaskService::emit_task_updated(
+                    app,
+                    &task_id,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!("failed to mark scheduled task as needing confirmation: {error}");
+            }
+        }
+    }
     if !progress.finalized_actions.is_empty() {
         if let Err(error) = run_db(state.db.clone(), {
             let finalized_actions = progress.finalized_actions.clone();

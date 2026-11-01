@@ -310,6 +310,8 @@ pub fn update_action_completed(
     Ok(())
 }
 
+/// 使用独立数据库连接保存待审批记录，供现有审批保存流程使用。
+#[cfg(test)]
 pub fn insert_approval(
     db: &Database,
     approval_id: &str,
@@ -320,6 +322,28 @@ pub fn insert_approval(
     details: &Value,
 ) -> anyhow::Result<()> {
     let conn = db.connect()?;
+    insert_approval_on_connection(
+        &conn,
+        approval_id,
+        thread_id,
+        message_id,
+        action_type,
+        summary,
+        details,
+    )
+}
+
+/// 在调用方提供的连接上保存待审批记录，供审批事务共用同一连接。
+#[allow(clippy::too_many_arguments)]
+fn insert_approval_on_connection(
+    conn: &rusqlite::Connection,
+    approval_id: &str,
+    thread_id: &str,
+    message_id: &str,
+    action_type: &ActionType,
+    summary: &str,
+    details: &Value,
+) -> anyhow::Result<()> {
     let created_at = runtime_env::system_time_rfc3339();
     conn.execute(
         "INSERT OR REPLACE INTO approvals (
@@ -336,6 +360,83 @@ pub fn insert_approval(
         ],
     )
     .context("failed to insert approval")?;
+    Ok(())
+}
+
+/// 在单个事务中保存待审批记录、助手卡片和线程待审批状态。
+#[allow(clippy::too_many_arguments)]
+pub fn insert_chat_approval(
+    db: &Database,
+    approval_id: &str,
+    thread_id: &str,
+    message_id: &str,
+    action_type: &ActionType,
+    summary: &str,
+    details: &Value,
+    blocks_json: &str,
+    message_status: MessageStatusDto,
+    thread_status: ThreadStatusDto,
+) -> anyhow::Result<()> {
+    // 使用一个连接和事务承载本次审批创建的全部持久化更新。
+    let mut conn = db.connect().context("failed to connect for chat approval")?;
+    let tx = conn
+        .transaction()
+        .context("failed to begin chat approval transaction")?;
+
+    // 先在同一事务中写入 pending 审批记录。
+    insert_approval_on_connection(
+        &tx,
+        approval_id,
+        thread_id,
+        message_id,
+        action_type,
+        summary,
+        details,
+    )
+    .context("failed to insert chat approval")?;
+
+    // 合并既有已答复审批状态，避免新卡片序列化覆盖用户已完成的答复。
+    let normalized_blocks_json = super::messages::normalize_blocks_json_for_message(
+        &tx,
+        message_id,
+        blocks_json,
+    )
+    .context("failed to normalize chat approval blocks")?;
+
+    // 保存审批卡片及调用方指定的助手消息状态，并确认目标消息属于当前线程。
+    let updated_message_rows = tx
+        .execute(
+            "UPDATE messages SET blocks_json=?1,status=?2 WHERE id=?3 AND thread_id=?4",
+            params![
+                normalized_blocks_json,
+                message_status.as_str(),
+                message_id,
+                thread_id
+            ],
+        )
+        .context("failed to update chat approval message")?;
+    if updated_message_rows != 1 {
+        anyhow::bail!(
+            "failed to update chat approval message: expected 1 row, updated {updated_message_rows}"
+        );
+    }
+
+    // 保存调用方指定的线程状态，并确认目标线程存在。
+    let updated_thread_rows = tx
+        .execute(
+            "UPDATE threads SET status=?1 WHERE id=?2",
+            params![thread_status.as_str(), thread_id],
+        )
+        .context("failed to update chat approval thread status")?;
+    if updated_thread_rows != 1 {
+        anyhow::bail!(
+            "failed to update chat approval thread status: expected 1 row, updated {updated_thread_rows}"
+        );
+    }
+
+    // 仅全部数据库更新成功后提交审批创建事务。
+    tx.commit()
+        .context("failed to commit chat approval transaction")?;
     Ok(())
 }
 
