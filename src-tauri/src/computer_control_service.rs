@@ -134,29 +134,87 @@ fn request_pid(arguments: &Value) -> Option<u32> {
 
 /// 判断电脑操作请求是否明确指向当前 AuraCoder 进程。
 fn request_targets_current_process(arguments: &Value) -> bool {
-    request_pid(arguments) == Some(std::process::id())
+    let current_pid = std::process::id();
+
+    // 保留顶层 PID 校验，并覆盖批量工具参数中的嵌套目标。
+    request_pid(arguments) == Some(current_pid)
+        || request_value_contains_pid(arguments, current_pid)
+}
+
+/// 递归检查 JSON 对象和数组中的显式 PID 是否指向指定进程。
+fn request_value_contains_pid(value: &Value, pid: u32) -> bool {
+    match value {
+        Value::Object(object) => {
+            // 检查当前对象的显式 PID 和所有嵌套 JSON 值。
+            object
+                .get("pid")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                == Some(pid)
+                || object
+                    .values()
+                    .any(|value| request_value_contains_pid(value, pid))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|value| request_value_contains_pid(value, pid)),
+        _ => false,
+    }
+}
+
+/// 递归检查 JSON 对象和数组中的桌面范围字段。
+fn request_contains_desktop_scope(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            // 检查当前对象的范围字段，并继续检查嵌套对象和数组。
+            ["scope", "capture_scope"]
+                .iter()
+                .any(|key| {
+                    object
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|scope| scope.eq_ignore_ascii_case("desktop"))
+                })
+                || object
+                    .values()
+                    .any(request_contains_desktop_scope)
+        }
+        Value::Array(values) => values.iter().any(request_contains_desktop_scope),
+        _ => false,
+    }
 }
 
 /// 根据电脑操作参数生成授权展示资源，并保留桌面范围安全限制。
 fn target_resource(tool: &str, arguments: &Value) -> Result<TargetResource, String> {
-    let object = arguments.as_object();
-    let desktop_scope = object
-        .and_then(|value| value.get("scope"))
-        .and_then(Value::as_str)
-        .map(|scope| scope.eq_ignore_ascii_case("desktop"))
-        .unwrap_or(false)
-        || object
-            .and_then(|value| value.get("capture_scope"))
-            .and_then(Value::as_str)
-            .map(|scope| scope.eq_ignore_ascii_case("desktop"))
-            .unwrap_or(false);
-    if desktop_scope {
+    // 原有顶层范围判断替换为递归检查，覆盖批量工具中的嵌套桌面目标。
+    if request_contains_desktop_scope(arguments) {
         return Err(service_error(
             "target_scope_mismatch",
             "AuraCoder 不允许全桌面范围的电脑操作",
         ));
     }
 
+    // 批量操作及脚本由宿主按整体执行申请授权，不伪装成单一应用。
+    match tool {
+        "run_steps" | "run_actions" => {
+            return Ok(TargetResource {
+                key: "tool:run_steps".to_string(),
+                display: "批量电脑操作（包含各步骤访问的应用）".to_string(),
+                scope: "input",
+            });
+        }
+        "run_script" => {
+            // 脚本内部动态目标由 CUA 原生策略逐调用处理；宿主授权覆盖整体脚本执行。
+            return Ok(TargetResource {
+                key: "tool:run_script".to_string(),
+                display: "脚本电脑操作（包含脚本访问的应用）".to_string(),
+                scope: "input",
+            });
+        }
+        _ => {}
+    }
+
+    let object = arguments.as_object();
     for key in ["launch_path", "path"] {
         if let Some(value) = object
             .and_then(|value| value.get(key))
@@ -450,14 +508,36 @@ fn target_is_auracoder(application: &str) -> bool {
 }
 */
 
+/// 按 CUA 工具的业务行为分类，用于授权界面展示操作类型。
 fn operation_kind(tool: &str) -> &'static str {
     match tool {
         "click" | "double_click" | "right_click" | "drag" | "type_text" | "press_key"
         | "hotkey" | "set_value" | "invoke_menu" | "scroll" | "move_cursor" | "zoom"
-        | "bring_to_front" | "launch_app" => "input",
+        | "bring_to_front" | "launch_app" | "run_steps" | "run_actions" | "run_script"
+        | "browser_prepare" | "browser_click" | "browser_type" | "browser_select"
+        | "browser_navigate" | "browser_dialog" | "browser_set_input_files"
+        | "set_window_frame" | "set_agent_cursor_enabled"
+        | "set_agent_cursor_motion" | "set_agent_cursor_theme" => "input",
         "clipboard_read" | "clipboard_write" => "clipboard",
-        "start_session" | "end_session" => "session",
-        _ => "observe",
+        "start_session" | "end_session" | "escalate_session" => "session",
+        "list_apps"
+        | "list_windows"
+        | "get_window_state"
+        | "get_accessibility_tree"
+        | "verify_state"
+        | "get_screen_size"
+        | "get_cursor_position"
+        | "health_report"
+        | "get_guide"
+        | "get_session_state"
+        | "get_session"
+        | "list_sessions"
+        | "get_agent_cursor_state"
+        | "get_desktop_state"
+        | "parse_visual_regions"
+        | "get_browser_state" => "observe",
+        // 旧的未知工具默认 observe 会误分类新增执行工具，因此默认按 input 申请授权。
+        _ => "input",
     }
 }
 
@@ -518,12 +598,12 @@ mod tests {
     }
 
     #[test]
-    fn future_sdk_tool_without_target_uses_derived_tool_resource() {
+    fn future_sdk_tool_without_target_uses_input_resource() {
         let target = target_resource("future_sdk_observer", &json!({}))
             .expect("future SDK tools should receive a derived authorization resource");
 
         assert_eq!(target.key, "tool:future_sdk_observer");
-        assert_eq!(target.scope, "observe");
+        assert_eq!(target.scope, "input");
     }
 
     #[test]
@@ -730,7 +810,14 @@ pub(crate) fn is_known_mcp_computer_tool(tool: &str) -> bool {
             | "get_screen_size"
             | "get_cursor_position"
             | "health_report"
+            | "get_guide"
             | "get_session_state"
+            | "get_session"
+            | "list_sessions"
+            | "get_agent_cursor_state"
+            | "get_desktop_state"
+            | "parse_visual_regions"
+            | "get_browser_state"
             | "click"
             | "double_click"
             | "right_click"
@@ -745,7 +832,22 @@ pub(crate) fn is_known_mcp_computer_tool(tool: &str) -> bool {
             | "zoom"
             | "start_session"
             | "end_session"
+            | "escalate_session"
             | "launch_app"
+            | "run_steps"
+            | "run_actions"
+            | "run_script"
+            | "browser_prepare"
+            | "browser_click"
+            | "browser_type"
+            | "browser_select"
+            | "browser_navigate"
+            | "browser_dialog"
+            | "browser_set_input_files"
+            | "set_window_frame"
+            | "set_agent_cursor_enabled"
+            | "set_agent_cursor_motion"
+            | "set_agent_cursor_theme"
             | "clipboard_read"
             | "clipboard_write"
     )

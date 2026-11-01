@@ -116,9 +116,15 @@ impl CuaDriverSdk {
         activate_wayland_helper_if_installed()
     }
 
+    /// 安装并激活当前 GNOME 版本兼容的 CUA Wayland 辅助组件。
     pub fn install_wayland_helper(&self) -> Result<CuaWaylandHelperStatus, String> {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
+            // 先确认 GNOME 主版本支持官方辅助组件，避免在不支持的桌面环境启动安装器。
+            if !wayland_helper_status().supported {
+                return Err("当前桌面环境不支持 CUA 窗口辅助组件（需要 GNOME 45–49）".to_string());
+            }
+
             if !is_wayland_session() {
                 return Err("Wayland helper is available only in a Wayland session".to_string());
             }
@@ -295,13 +301,15 @@ pub fn is_wayland_session() -> bool {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// 获取 CUA Wayland 辅助组件在当前桌面环境中的兼容、安装和运行状态。
 fn wayland_helper_status() -> CuaWaylandHelperStatus {
     let wayland = is_wayland_session();
+    let supported = is_supported_gnome_version();
     let installed = wayland_helper_install_dir()
         .is_some_and(|directory| wayland_helper_files_exist(&directory));
-    let running = wayland && wayland_helper_dbus_is_running();
+    let running = supported && wayland && wayland_helper_dbus_is_running();
     CuaWaylandHelperStatus {
-        supported: true,
+        supported,
         wayland,
         installed,
         running,
@@ -316,6 +324,54 @@ fn wayland_helper_status() -> CuaWaylandHelperStatus {
         installed: false,
         running: false,
     }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// 读取 GNOME Shell 主版本，供 CUA Wayland 辅助组件判断桌面兼容性。
+fn gnome_shell_major_version() -> Option<u32> {
+    let connection = match zbus::blocking::Connection::session() {
+        Ok(connection) => connection,
+        Err(error) => {
+            log::error!("failed to connect to the GNOME Shell D-Bus service: {error}");
+            return None;
+        }
+    };
+    let proxy = match zbus::blocking::Proxy::new(
+        &connection,
+        "org.gnome.Shell",
+        "/org/gnome/Shell",
+        "org.gnome.Shell",
+    ) {
+        Ok(proxy) => proxy,
+        Err(error) => {
+            log::error!("failed to create the GNOME Shell D-Bus proxy: {error}");
+            return None;
+        }
+    };
+    let version = match proxy.get_property::<String>("ShellVersion") {
+        Ok(version) => version,
+        Err(error) => {
+            log::error!("failed to read GNOME Shell ShellVersion: {error}");
+            return None;
+        }
+    };
+    let Some(major) = version.split('.').next() else {
+        log::error!("failed to parse GNOME Shell ShellVersion: {version:?}");
+        return None;
+    };
+    match major.parse::<u32>() {
+        Ok(major) => Some(major),
+        Err(error) => {
+            log::error!("failed to parse GNOME Shell ShellVersion {version:?}: {error}");
+            None
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// 判断当前 GNOME Shell 主版本是否处于官方辅助组件支持范围。
+fn is_supported_gnome_version() -> bool {
+    gnome_shell_major_version().is_some_and(|major| (45..=49).contains(&major))
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -348,11 +404,35 @@ fn wayland_helper_install_dir_from_env(
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// 判断 CUA Wayland 辅助组件是否已安装且提供当前 SDK 要求的 API 版本。
 fn wayland_helper_files_exist(directory: &Path) -> bool {
-    directory.join("metadata.json").is_file() && directory.join("extension.js").is_file()
+    let metadata_path = directory.join("metadata.json");
+    if !metadata_path.is_file() || !directory.join("extension.js").is_file() {
+        return false;
+    }
+    let metadata_json = match std::fs::read(&metadata_path) {
+        Ok(metadata_json) => metadata_json,
+        Err(error) => {
+            log::error!("failed to read CUA Wayland helper metadata {}: {error}", metadata_path.display());
+            return false;
+        }
+    };
+    let metadata: Value = match serde_json::from_slice(&metadata_json) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            log::error!("failed to parse CUA Wayland helper metadata {}: {error}", metadata_path.display());
+            return false;
+        }
+    };
+    let Some(version) = metadata.get("version").and_then(Value::as_u64) else {
+        log::error!("CUA Wayland helper metadata has no numeric API version: {metadata:?}");
+        return false;
+    };
+    version >= 10
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// 检查已运行的 CUA Wayland 辅助组件是否提供当前 SDK 所需 API。
 fn wayland_helper_dbus_is_running() -> bool {
     let connection = match zbus::blocking::Connection::session() {
         Ok(connection) => connection,
@@ -369,13 +449,14 @@ fn wayland_helper_dbus_is_running() -> bool {
     };
     proxy
         .call::<_, _, u32>("GetVersion", &())
-        .is_ok_and(|version| version >= 8)
+        .is_ok_and(|version| version >= 10)
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// 在兼容的 Wayland 桌面会话中启用已安装的 CUA 辅助组件。
 fn activate_wayland_helper_if_installed() -> Result<CuaWaylandHelperStatus, String> {
     let mut status = wayland_helper_status();
-    if !status.wayland || !status.installed || status.running {
+    if !status.supported || !status.wayland || !status.installed || status.running {
         return Ok(status);
     }
 
@@ -626,6 +707,10 @@ mod native_impl {
     use std::{
         ffi::{c_char, c_void},
         mem, ptr, slice,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
     };
 
     #[repr(C)]
@@ -678,20 +763,37 @@ mod native_impl {
         *mut *mut Operation,
         *mut Buffer,
     ) -> i32;
+    type OperationCancelFn = unsafe extern "C" fn(*mut Operation);
     type OperationReleaseFn = unsafe extern "C" fn(*mut *mut Operation);
 
     struct NativeApi {
+        /// 已加载的官方 CUA 动态库句柄。
         module: *mut c_void,
+        /// 超时后标记原生回调仍可能执行，阻止动态库过早卸载。
+        keep_loaded: AtomicBool,
+        /// 查询动态库 ABI 版本的入口。
         abi_version: AbiVersionFn,
+        /// 判断当前 ABI 版本是否兼容的入口。
         abi_compatible: AbiCompatibleFn,
+        /// 释放动态库返回的缓冲区的入口。
         buffer_free: BufferFreeFn,
+        /// 创建 CUA driver 实例的入口。
         create: CreateFn,
+        /// 销毁 CUA driver 实例的入口。
         destroy: DestroyFn,
+        /// 查询 CUA driver 是否可用的入口。
         available: AvailableFn,
+        /// 获取 driver 元数据 JSON 的入口。
         metadata: JsonFn,
+        /// 获取 driver 工具列表 JSON 的入口。
         list_tools: JsonFn,
+        /// 调用 CUA 工具的入口。
         invoke: InvokeFn,
+        /// 关闭 driver 的异步入口。
         shutdown: ShutdownFn,
+        /// 请求取消仍在运行的异步操作的入口。
+        operation_cancel: OperationCancelFn,
+        /// 释放 CUA 异步操作句柄的入口。
         operation_release: OperationReleaseFn,
     }
 
@@ -699,17 +801,23 @@ mod native_impl {
     unsafe impl Sync for NativeApi {}
 
     struct CompletionState {
+        /// 保存异步操作完成状态和返回内容。
         value: Mutex<Option<(i32, String, String)>>,
+        /// 通知等待方异步操作已经返回。
         wake: Condvar,
     }
 
     struct CompletionContext {
-        api: *const NativeApi,
-        state: *const CompletionState,
+        /// 延长动态库生命周期到原生回调真正执行完毕。
+        api: Arc<NativeApi>,
+        /// 延长完成状态生命周期到原生回调真正执行完毕。
+        state: Arc<CompletionState>,
     }
 
     pub(super) struct Runtime {
-        api: Option<NativeApi>,
+        /// 当前 driver 使用的官方 CUA 动态库 API。
+        api: Option<Arc<NativeApi>>,
+        /// 当前 Runtime 持有的 CUA driver 实例。
         driver: *mut Driver,
     }
 
@@ -814,12 +922,14 @@ mod native_impl {
         Ok(mem::transmute_copy(&address))
     }
 
-    fn load_api(path: &Path) -> Result<NativeApi, RuntimeError> {
+    /// 加载官方 CUA 动态库符号并将模块释放责任交给共享 API 对象。
+    fn load_api(path: &Path) -> Result<Arc<NativeApi>, RuntimeError> {
         let module = unsafe { load_module(path)? };
 
         let result = (|| unsafe {
-            Ok(NativeApi {
+            Ok(Arc::new(NativeApi {
                 module,
+                keep_loaded: AtomicBool::new(false),
                 abi_version: load_symbol(module, b"cua_driver_abi_version_v1\0")?,
                 abi_compatible: load_symbol(module, b"cua_driver_abi_is_compatible_v1\0")?,
                 buffer_free: load_symbol(module, b"cua_driver_buffer_free_v1\0")?,
@@ -830,8 +940,9 @@ mod native_impl {
                 list_tools: load_symbol(module, b"cua_driver_list_tools_json_v1\0")?,
                 invoke: load_symbol(module, b"cua_driver_invoke_v1\0")?,
                 shutdown: load_symbol(module, b"cua_driver_shutdown_v1\0")?,
+                operation_cancel: load_symbol(module, b"cua_driver_operation_cancel_v1\0")?,
                 operation_release: load_symbol(module, b"cua_driver_operation_release_v1\0")?,
-            })
+            }))
         })();
         if result.is_err() {
             unsafe {
@@ -839,6 +950,19 @@ mod native_impl {
             }
         }
         result
+    }
+
+    impl Drop for NativeApi {
+        fn drop(&mut self) {
+            // SDK 进程级异步执行器可能继续引用动态库，因此保留模块映射至进程退出。
+            if self.keep_loaded.load(Ordering::Acquire) {
+                log::debug!(
+                    "CUA SDK asynchronous executor may still reference the module; keeping it loaded until process exit"
+                );
+                return;
+            }
+            unsafe { unload_module(self.module) };
+        }
     }
 
     unsafe fn read_buffer(api: &NativeApi, mut buffer: Buffer) -> String {
@@ -851,6 +975,7 @@ mod native_impl {
         value
     }
 
+    /// 接收 CUA 原生完成回调并回收其独占上下文。
     unsafe extern "C" fn completion_callback(
         context: *mut c_void,
         status: i32,
@@ -860,27 +985,55 @@ mod native_impl {
         if context.is_null() {
             return;
         }
-        let context = &*(context as *const CompletionContext);
-        let api = &*context.api;
-        let result = read_buffer(api, result);
-        let error = read_buffer(api, error);
-        let state = &*context.state;
-        *state.value.lock().expect("CUA completion state poisoned") = Some((status, result, error));
-        state.wake.notify_one();
+        // 原生回调收到该指针后独占并回收已移交的 CompletionContext。
+        let context = Box::from_raw(context as *mut CompletionContext);
+        let result = read_buffer(&context.api, result);
+        let error = read_buffer(&context.api, error);
+        let completed = (status, result, error);
+        match context.state.value.lock() {
+            Ok(mut value) => *value = Some(completed),
+            Err(poisoned) => {
+                log::error!("CUA completion state lock poisoned: {poisoned}");
+                *poisoned.into_inner() = Some(completed);
+            }
+        }
+        context.state.wake.notify_one();
     }
 
-    fn wait_for_completion(state: &CompletionState) -> Result<(i32, String, String), RuntimeError> {
-        let guard = state
-            .value
-            .lock()
-            .map_err(|_| RuntimeError::new("CUA completion state poisoned"))?;
-        let (guard, result) = state
+    /// 按调用预算等待 CUA 原生操作完成并返回其状态及结果。
+    fn wait_for_completion(
+        state: &CompletionState,
+        timeout: Duration,
+    ) -> Result<(i32, String, String), RuntimeError> {
+        let guard = match state.value.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                log::error!("CUA completion state lock poisoned: {error}");
+                let guard = error.into_inner();
+                if let Some(value) = guard.clone() {
+                    return Ok(value);
+                }
+                guard
+            }
+        };
+        let (guard, result) = match state
             .wake
-            .wait_timeout_while(guard, Duration::from_secs(30), |value| value.is_none())
-            .map_err(|_| RuntimeError::new("CUA completion wait failed"))?;
+            .wait_timeout_while(guard, timeout, |value| value.is_none())
+        {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!("CUA completion wait lock poisoned: {error}");
+                let message = error.to_string();
+                let (guard, _) = error.into_inner();
+                if let Some(value) = guard.clone() {
+                    return Ok(value);
+                }
+                return Err(RuntimeError::new(format!("CUA completion wait failed: {message}")));
+            }
+        };
         if result.timed_out() {
             return Err(RuntimeError::new(
-                "CUA native operation timed out after 30 seconds",
+                format!("CUA native operation timed out after {timeout:?}; operation may still be running"),
             ));
         }
         guard
@@ -912,32 +1065,39 @@ mod native_impl {
         })
     }
 
+    /// 提交异步 CUA 调用，在完成或超时后释放操作句柄。
     unsafe fn call_async(
-        api: &NativeApi,
+        api: &Arc<NativeApi>,
         driver: *mut Driver,
         name: Option<&[u8]>,
         arguments: Option<&[u8]>,
         shutdown: bool,
+        tool_name: &str,
+        timeout: Duration,
     ) -> Result<(i32, String, String), RuntimeError> {
-        let state = Box::new(CompletionState {
+        let state = Arc::new(CompletionState {
             value: Mutex::new(None),
             wake: Condvar::new(),
         });
         let context = Box::new(CompletionContext {
-            api: api as *const NativeApi,
-            state: &*state as *const CompletionState,
+            api: Arc::clone(api),
+            state: Arc::clone(&state),
         });
+        // 所有权交给原生 SDK，失败时依据 SDK 契约由当前线程收回。
+        let context = Box::into_raw(context);
         let mut operation = ptr::null_mut();
         let mut error = Buffer {
             data: ptr::null_mut(),
             len: 0,
             capacity: 0,
         };
+        // SDK 的进程级异步执行器可能在回调返回后仍引用动态库代码。
+        api.keep_loaded.store(true, Ordering::Release);
         let status = if shutdown {
             (api.shutdown)(
                 driver,
                 Some(completion_callback),
-                &*context as *const CompletionContext as *mut c_void,
+                context as *mut c_void,
                 &mut operation,
                 &mut error,
             )
@@ -951,13 +1111,15 @@ mod native_impl {
                 arguments.as_ptr(),
                 arguments.len(),
                 Some(completion_callback),
-                &*context as *const CompletionContext as *mut c_void,
+                context as *mut c_void,
                 &mut operation,
                 &mut error,
             )
         };
         let immediate_error = read_buffer(api, error);
         if status != 0 {
+            // SDK 保证 admission 失败时不会回调，因此本线程回收移交的上下文。
+            drop(Box::from_raw(context));
             if !operation.is_null() {
                 (api.operation_release)(&mut operation);
             }
@@ -966,12 +1128,18 @@ mod native_impl {
             )));
         }
 
-        let completed = wait_for_completion(&state);
-        if completed.is_err() {
-            // A late callback must not point to stack memory. Keep the callback
-            // context alive if the native runtime ever violates its time bound.
-            let _ = Box::into_raw(state);
-            let _ = Box::into_raw(context);
+        let completed = wait_for_completion(&state, timeout);
+        if let Err(error) = &completed {
+            if operation.is_null() {
+                log::warn!(
+                    "CUA tool {tool_name} wait failed without a native operation handle; cancellation could not be requested: {error}"
+                );
+            } else {
+                (api.operation_cancel)(operation);
+                log::warn!(
+                    "CUA tool {tool_name} wait failed; cancellation was requested: {error}"
+                );
+            }
         }
         if !operation.is_null() {
             (api.operation_release)(&mut operation);
@@ -980,6 +1148,7 @@ mod native_impl {
     }
 
     impl Runtime {
+        /// 创建 CUA driver，并校验动态库 ABI 和 driver 可用状态。
         pub(super) fn create(path: &Path) -> Result<Self, RuntimeError> {
             unsafe {
                 let api = load_api(path)?;
@@ -992,13 +1161,13 @@ mod native_impl {
                 };
                 let status = (api.abi_version)(&mut version);
                 if status != 0 {
-                    unload_module(api.module);
+                    drop(api);
                     return Err(RuntimeError::new(format!(
                         "CUA ABI version call failed with status {status}"
                     )));
                 }
                 if version.major != ABI_MAJOR || !(api.abi_compatible)(ABI_MAJOR, ABI_MINOR) {
-                    unload_module(api.module);
+                    drop(api);
                     return Err(RuntimeError::new(format!(
                         "CUA ABI mismatch: runtime={}.{}.{} expected={}.{}",
                         version.major, version.minor, version.patch, ABI_MAJOR, ABI_MINOR
@@ -1015,7 +1184,7 @@ mod native_impl {
                 let status = (api.create)(options.as_ptr(), options.len(), &mut driver, &mut error);
                 let error = read_buffer(&api, error);
                 if status != 0 || driver.is_null() {
-                    unload_module(api.module);
+                    drop(api);
                     return Err(RuntimeError::new(format!(
                         "CUA runtime creation failed with status {status}: {error}"
                     )));
@@ -1031,7 +1200,7 @@ mod native_impl {
                 let availability_error = read_buffer(&api, availability_error);
                 if availability_status != 0 || !available {
                     (api.destroy)(&mut driver);
-                    unload_module(api.module);
+                    drop(api);
                     return Err(RuntimeError::new(format!(
                         "CUA runtime is unavailable with status {availability_status}: {availability_error}"
                     )));
@@ -1088,6 +1257,7 @@ mod native_impl {
             unsafe { call_json(api, self.driver, api.list_tools) }
         }
 
+        /// 按工具业务超时预算调用 CUA 工具并校验原生完成状态。
         pub(super) fn invoke(
             &mut self,
             name: &str,
@@ -1097,15 +1267,35 @@ mod native_impl {
                 .api
                 .as_ref()
                 .ok_or_else(|| RuntimeError::new("CUA runtime library is unloaded"))?;
-            let name = name.as_bytes();
+            // run_script 的 SDK 执行预算采用参数 timeout_ms，其他工具统一允许 130 秒。
+            let timeout = if name == "run_script" {
+                let timeout_ms = arguments
+                    .get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(30_000)
+                    .clamp(100, 120_000);
+                Duration::from_millis(timeout_ms + 10_000)
+            } else {
+                Duration::from_secs(130)
+            };
             let arguments = serde_json::to_vec(arguments).map_err(|error| {
                 RuntimeError::new(format!("failed to encode CUA arguments: {error}"))
             })?;
-            let (_, result, error) =
-                unsafe { call_async(api, self.driver, Some(name), Some(&arguments), false)? };
-            if !error.is_empty() {
+            let name_bytes = name.as_bytes();
+            let (status, result, error) = unsafe {
+                call_async(
+                    api,
+                    self.driver,
+                    Some(name_bytes),
+                    Some(&arguments),
+                    false,
+                    name,
+                    timeout,
+                )?
+            };
+            if status != 0 || !error.is_empty() {
                 return Err(RuntimeError::new(format!(
-                    "CUA tool {name:?} failed: {error}"
+                    "CUA tool {name} failed with status {status}: {error}"
                 )));
             }
             serde_json::from_str(&result).map_err(|parse_error| {
@@ -1113,15 +1303,31 @@ mod native_impl {
             })
         }
 
+        /// 在固定 130 秒预算内关闭 CUA driver 并释放其运行资源。
         pub(super) fn shutdown(&mut self) -> Result<(), RuntimeError> {
             let Some(api) = self.api.take() else {
                 return Ok(());
             };
             unsafe {
-                let result = call_async(&api, self.driver, None, None, true);
+                let result = call_async(
+                    &api,
+                    self.driver,
+                    None,
+                    None,
+                    true,
+                    "shutdown",
+                    Duration::from_secs(130),
+                );
                 (api.destroy)(&mut self.driver);
-                unload_module(api.module);
-                result.map(|_| ())
+                result.and_then(|(status, _, error)| {
+                    if status != 0 || !error.is_empty() {
+                        Err(RuntimeError::new(format!(
+                            "CUA shutdown failed with status {status}: {error}"
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                })
             }
         }
     }
@@ -1159,7 +1365,7 @@ mod macos_tests {
             .initialize()
             .expect("macOS CUA runtime should initialize");
         assert_eq!(info.abi_version, "1.1.0");
-        assert_eq!(info.driver_version.as_deref(), Some("0.28.2"));
+        assert_eq!(info.driver_version.as_deref(), Some("0.38.0"));
         assert!(info.embedded);
         let tools = sdk.list_tools().expect("tool inventory should load");
         assert!(tools
@@ -1200,7 +1406,7 @@ mod tests {
         sdk.set_resource_dir(Some(resource_dir));
         let info = sdk.initialize().expect("CUA runtime should initialize");
         assert_eq!(info.abi_version, "1.1.0");
-        assert_eq!(info.driver_version.as_deref(), Some("0.28.2"));
+        assert_eq!(info.driver_version.as_deref(), Some("0.38.0"));
         assert!(info.embedded);
         assert!(sdk
             .list_tools()
@@ -1312,7 +1518,7 @@ mod linux_tests {
             .initialize()
             .expect("Linux CUA runtime should initialize");
         assert_eq!(info.abi_version, "1.1.0");
-        assert_eq!(info.driver_version.as_deref(), Some("0.28.2"));
+        assert_eq!(info.driver_version.as_deref(), Some("0.38.0"));
         assert!(info.embedded);
         let tools = sdk.list_tools().expect("tool inventory should load");
         assert!(tools

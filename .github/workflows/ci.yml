@@ -509,7 +509,7 @@ jobs:
             test -f "$cua_root/manifest.json"
             test -f "$cua_library"
             test -f "$cua_node_runtime"
-            test -f "$cua_root/macos-universal/node-runtime-NOTICE.md"
+            test -f "$cua_root/macos-universal/THIRD_PARTY_NOTICES.md"
             cmp src-tauri/resources/cua-driver/macos-universal/libcua_driver_sdk.dylib "$cua_library"
             cmp src-tauri/resources/cua-driver/macos-universal/cua_driver_node_runtime.node "$cua_node_runtime"
 
