@@ -402,6 +402,92 @@ impl OpenCodeCli {
 }
 #[async_trait]
 impl CliTool for OpenCodeCli {
+    async fn list_codex_thread_records(&self, _workspace_id: String, _cursor: Option<String>, _limit: Option<u32>, _search_term: Option<String>, _archived: Option<bool>) -> Result<crate::models::CodexRemoteThreadPageDto> {
+        anyhow::bail!("opencode 不支持此线程业务操作：list_codex_thread_records")
+    }
+
+    async fn attach_thread_record(&self, _workspace_id: String, _engine_thread_id: String) -> Result<ThreadDto> {
+        anyhow::bail!("opencode 不支持此线程业务操作：attach_thread_record")
+    }
+
+    async fn fork_thread_record(&self, _thread_id: String) -> Result<ThreadDto> {
+        anyhow::bail!("opencode 不支持此线程业务操作：fork_thread_record")
+    }
+
+    async fn rollback_thread_record(&self, _thread_id: String, _num_turns: u32) -> Result<ThreadDto> {
+        anyhow::bail!("opencode 不支持此线程业务操作：rollback_thread_record")
+    }
+
+    async fn compact_thread_record(&self, _app: tauri::AppHandle, _thread_id: String) -> Result<ThreadDto> {
+        anyhow::bail!("opencode 不支持此线程业务操作：compact_thread_record")
+    }
+
+    async fn update_codex_thread_config(&self, _thread_id: String, _update_personality: bool, _personality: Option<String>, _update_service_tier: bool, _service_tier: Option<String>, _update_output_schema: bool, _output_schema: Option<Value>) -> Result<ThreadDto> {
+        anyhow::bail!("opencode 不支持此线程业务操作：update_codex_thread_config")
+    }
+
+    fn normalize_thread_service_tier(&self, value: Option<String>) -> Result<Option<String>> {
+        if value.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+            anyhow::bail!("service tier is only supported for Codex threads")
+        }
+        Ok(None)
+    }
+
+
+    async fn list_opencode_thread_records(&self, workspace_id: String, cursor: Option<String>, limit: Option<u32>, search_term: Option<String>, archived: Option<bool>) -> Result<crate::models::OpenCodeRemoteSessionPageDto> {
+        self.thread_list_records(workspace_id, cursor, limit, search_term, archived).await.map_err(anyhow::Error::msg)
+    }
+
+    async fn attach_opencode_thread_record(&self, workspace_id: String, engine_thread_id: String, cwd: String, model_id: String) -> Result<ThreadDto> {
+        self.thread_attach_record(workspace_id, engine_thread_id, cwd, model_id).await.map_err(anyhow::Error::msg)
+    }
+
+    async fn update_opencode_thread_config(&self, thread_id: String, update_agent: bool, agent: Option<String>) -> Result<ThreadDto> {
+        self.thread_update_config(thread_id, update_agent, agent).await.map_err(anyhow::Error::msg)
+    }
+
+
+    async fn create_thread_record(&self, workspace_id: String, model_id: String, title: String, reasoning_effort: Option<String>, service_tier: Option<String>) -> Result<ThreadDto> {
+        self.mcp.create_thread_record(self, "opencode", workspace_id, model_id, title, reasoning_effort, service_tier).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=opencode operation=create_thread_record error={error:#}"))
+    }
+
+    async fn reconfigure_thread_record(&self, thread_id: String, model_id: String, reasoning_effort: Option<String>, service_tier: Option<String>) -> Result<ThreadDto> {
+        self.mcp.reconfigure_thread_record(self, "opencode", thread_id, model_id, reasoning_effort, service_tier).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=opencode operation=reconfigure_thread_record error={error:#}"))
+    }
+
+    async fn set_thread_reasoning(&self, thread_id: String, reasoning_effort: Option<String>, model_id: Option<String>) -> Result<()> {
+        self.mcp.set_thread_reasoning(self, "opencode", thread_id, reasoning_effort, model_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=opencode operation=set_thread_reasoning error={error:#}"))
+    }
+
+    async fn set_thread_selected_model(&self, thread_id: String, model_id: String) -> Result<ThreadDto> {
+        self.mcp.set_thread_selected_model(self, "opencode", thread_id, model_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=opencode operation=set_thread_selected_model error={error:#}"))
+    }
+
+    async fn delete_thread_record(&self, thread_id: String) -> Result<()> {
+        self.mcp.delete_thread_record(self, "opencode", thread_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=opencode operation=delete_thread_record error={error:#}"))
+    }
+
+    async fn archive_thread_record(&self, thread_id: String) -> Result<()> {
+        self.mcp.archive_thread_record(self, "opencode", thread_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=opencode operation=archive_thread_record error={error:#}"))
+    }
+
+    async fn restore_thread_record(&self, thread_id: String) -> Result<ThreadDto> {
+        self.mcp.restore_thread_record(self, "opencode", thread_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=opencode operation=restore_thread_record error={error:#}"))
+    }
+
+    async fn validate_thread_model(&self, workspace_id: Option<&str>, model_id: &str) -> Result<String> {
+        self.mcp.validate_thread_model(self, "opencode", workspace_id, model_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=opencode operation=validate_thread_model error={error:#}"))
+    }
+
+    async fn validate_thread_reasoning(&self, model_id: &str, reasoning_effort: &str) -> Result<String> {
+        self.mcp.validate_thread_reasoning(self, "opencode", model_id, reasoning_effort).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=opencode operation=validate_thread_reasoning error={error:#}"))
+    }
+
+    async fn sync_thread_record(&self, thread_id: String) -> Result<ThreadDto> {
+        self.thread_sync_record(thread_id).await.map_err(anyhow::Error::msg)
+    }
+
+
     fn id(&self) -> &str {
         "opencode"
     }
@@ -1601,5 +1687,635 @@ impl CliTool for OpenCodeCli {
     ) -> Result<()> {
         self.load_workspace(context).await?;
         Err(Self::unsupported("代码审查"))
+    }
+}
+
+pub(crate) mod thread_business {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use crate::models::{OpenCodeRemoteSessionDto, OpenCodeRemoteSessionPageDto, ThreadUpdateDto, MessageStatusDto};
+    use crate::path_utils::paths_equal;
+    use crate::services::thread_service::normalize_thread_title;
+
+    pub(crate) fn collect_remote_thread_roots(workspace_root: &str) -> std::collections::HashSet<String> {
+        std::iter::once(workspace_root.to_string()).collect()
+    }
+    pub(crate) fn normalize_remote_thread_search_term(search_term: Option<String>) -> Option<String> {
+        search_term
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+    pub(crate) fn parse_codex_remote_thread_cursor(cursor: Option<&str>) -> Result<usize, String> {
+        let Some(cursor) = cursor.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(0);
+        };
+
+        cursor.parse::<usize>().map_err(|_| {
+                format!("invalid Codex remote thread cursor `{cursor}`. expected a non-negative offset")
+        })
+    }
+    pub(crate) fn normalize_codex_remote_thread_limit(limit: Option<u32>) -> usize {
+        limit.unwrap_or(20).clamp(1, 100) as usize
+    }
+    pub(crate) fn codex_remote_thread_timestamp_to_rfc3339(timestamp: i64) -> String {
+        let (seconds, nanos) = if timestamp > 10_000_000_000 {
+            (timestamp / 1000, ((timestamp % 1000) as u32) * 1_000_000)
+        } else {
+            (timestamp, 0)
+        };
+
+        DateTime::<Utc>::from_timestamp(seconds, nanos)
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339()
+    }
+    pub(crate) fn short_thread_label(engine_thread_id: &str) -> String {
+        engine_thread_id.chars().take(8).collect()
+    }
+    pub(crate) fn map_opencode_remote_session_dto(
+        session: OpenCodeRemoteSessionSummary,
+        local_thread_id: Option<String>,
+    ) -> OpenCodeRemoteSessionDto {
+        OpenCodeRemoteSessionDto {
+            engine_thread_id: session.engine_thread_id,
+            title: session.title,
+            cwd: session.cwd,
+            created_at: codex_remote_thread_timestamp_to_rfc3339(session.created_at),
+            updated_at: codex_remote_thread_timestamp_to_rfc3339(session.updated_at),
+            archived: session.archived,
+            local_thread_id,
+        }
+    }
+    pub(crate) fn build_opencode_remote_session_title(session: &OpenCodeRemoteSessionSummary) -> String {
+        if let Some(title) = session
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return normalize_thread_title(title).unwrap_or_else(|_| {
+                    format!(
+                        "OpenCode session {}",
+                        short_thread_label(&session.engine_thread_id)
+                    )
+            });
+        }
+
+        format!(
+            "OpenCode session {}",
+            short_thread_label(&session.engine_thread_id)
+        )
+    }
+    pub(crate) fn build_opencode_remote_session_metadata(
+        existing: Option<&Value>,
+        session: &OpenCodeRemoteSessionSummary,
+        model_id: &str,
+    ) -> Value {
+        let mut metadata = existing.cloned().unwrap_or_else(|| json!({}));
+        if !metadata.is_object() {
+            metadata = json!({});
+        }
+
+        if let Some(object) = metadata.as_object_mut() {
+        // 线程底部六项已迁移到独立列；远端同步只保留 OpenCode 状态 metadata。
+            for key in [
+                "lastModelId",
+                "reasoningEffort",
+            ] {
+                object.remove(key);
+            }
+            object.insert("opencodeRemoteSessionAttached".to_string(), json!(true));
+            object.insert(
+                    "opencodeRemoteArchived".to_string(),
+                json!(session.archived),
+            );
+            object.insert("opencodeRemoteCwd".to_string(), json!(session.cwd));
+            object.insert(
+                    "opencodeRemoteCreatedAt".to_string(),
+                json!(codex_remote_thread_timestamp_to_rfc3339(session.created_at)),
+            );
+            object.insert(
+                    "opencodeRemoteUpdatedAt".to_string(),
+                json!(codex_remote_thread_timestamp_to_rfc3339(session.updated_at)),
+            );
+            object.insert("opencodeTranscriptImported".to_string(), json!(false));
+        }
+
+        metadata
+    }
+    pub(crate) fn normalize_thread_opencode_agent(value: Option<String>) -> Result<Option<String>, String> {
+        let normalized = value
+            .as_deref()
+            .map(str::trim)
+            .filter(|candidate| !candidate.is_empty());
+
+        let Some(normalized) = normalized else {
+            return Ok(None);
+        };
+
+        if normalized.chars().count() > 120 {
+            return Err("invalid OpenCode agent. name is too long".to_string());
+        }
+
+        if !normalized
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        {
+            return Err(
+            "invalid OpenCode agent. expected letters, numbers, dots, dashes, or underscores"
+                    .to_string(),
+            );
+        }
+
+        if normalized == "build" {
+            return Ok(None);
+        }
+
+        Ok(Some(normalized.to_string()))
+    }
+    pub(crate) async fn run_db<T, F>(db: crate::db::Database, operation: F) -> Result<T, String>
+    where
+    T: Send + 'static,
+    F: FnOnce(&crate::db::Database) -> anyhow::Result<T> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || operation(&db))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(err_to_string)
+    }
+    pub(crate) fn err_to_string(error: impl std::fmt::Display) -> String {
+        format!("{error:#}")
+    }
+    impl OpenCodeCli {
+        pub(crate) async fn thread_list_records(&self, workspace_id: String, cursor: Option<String>, limit: Option<u32>, search_term: Option<String>, archived: Option<bool>) -> Result<OpenCodeRemoteSessionPageDto, String> {
+            let state = &self.state;
+
+            let db = state.db.clone();
+            let workspace = run_db(db.clone(), {
+                    let workspace_id = workspace_id.clone();
+                    move |db| {
+                        let workspace = db::workspaces::find_workspace_by_id(db, &workspace_id)?
+                            .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
+                        Ok(workspace)
+                    }
+            })
+                .await?;
+
+            let allowed_roots = collect_remote_thread_roots(&workspace.root_path);
+            let normalized_search_term = normalize_remote_thread_search_term(search_term);
+            let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
+            let cli: &dyn CliTool = self;
+            let parse_timestamp = |value: Option<String>| {
+                value
+                    .as_deref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.timestamp_millis())
+                    .unwrap_or_default()
+            };
+            let mut remote_sessions = cli
+                .list_sessions(&context, normalized_search_term.as_deref(), archived)
+                .await
+                .map_err(err_to_string)?
+                .into_iter()
+                .filter(|session| allowed_roots.contains(session.cwd.as_str()))
+                .map(|session| OpenCodeRemoteSessionSummary {
+                    engine_thread_id: session.engine_thread_id,
+                    title: Some(session.title),
+                    cwd: session.cwd,
+                    created_at: parse_timestamp(session.created_at),
+                    updated_at: parse_timestamp(session.updated_at),
+                    archived: session.archived,
+            })
+                .collect::<Vec<_>>();
+            remote_sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            let mut seen_session_ids = std::collections::HashSet::new();
+            remote_sessions.retain(|session| seen_session_ids.insert(session.engine_thread_id.clone()));
+
+            let offset = parse_codex_remote_thread_cursor(cursor.as_deref())?;
+            let page_size = normalize_codex_remote_thread_limit(limit);
+            let page_end = offset.saturating_add(page_size).min(remote_sessions.len());
+            let page_sessions = if offset >= remote_sessions.len() {
+                Vec::new()
+            } else {
+                remote_sessions[offset..page_end].to_vec()
+            };
+            let next_cursor = (page_end < remote_sessions.len()).then(|| page_end.to_string());
+
+            run_db(db, move |db| {
+                    let sessions = page_sessions
+                        .into_iter()
+                        .map(|session| {
+                            let local_thread_id = db::threads::find_thread_by_engine_thread_id(
+                                db,
+                                "opencode",
+                                &session.engine_thread_id,
+                            )?
+                                .filter(|local| local.workspace_id == workspace_id)
+                                .map(|local| local.id);
+                            Ok(map_opencode_remote_session_dto(session, local_thread_id))
+                    })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+
+                    Ok(OpenCodeRemoteSessionPageDto {
+                            sessions,
+                            next_cursor,
+                    })
+            })
+                .await
+
+        }
+        pub(crate) async fn thread_attach_record(&self, workspace_id: String, engine_thread_id: String, cwd: String, model_id: String) -> Result<ThreadDto, String> {
+            let state = &self.state;
+
+            let normalized_model_id =
+            self.validate_thread_model(Some(&workspace_id), model_id.trim()).await.map_err(err_to_string)?;
+            let db = state.db.clone();
+            let (workspace, existing_local_thread) = run_db(db.clone(), {
+                    let workspace_id = workspace_id.clone();
+                    let engine_thread_id = engine_thread_id.clone();
+                    move |db| {
+                        let workspace = db::workspaces::find_workspace_by_id(db, &workspace_id)?
+                            .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
+                        let existing =
+                        db::threads::find_thread_by_engine_thread_id(db, "opencode", &engine_thread_id)?
+                            .filter(|thread| thread.workspace_id == workspace_id);
+                        Ok((workspace, existing))
+                    }
+            })
+                .await?;
+
+            let allowed_roots = collect_remote_thread_roots(&workspace.root_path);
+            if !allowed_roots.contains(cwd.as_str()) {
+                return Err(format!(
+            "OpenCode session cwd is outside this workspace: {cwd}"
+                ));
+            }
+
+            let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
+            let cli: &dyn CliTool = self;
+            let session = cli
+                .read_session(&context, &engine_thread_id)
+                .await
+                .map_err(err_to_string)?;
+            if !paths_equal(&session.cwd, &cwd) {
+                return Err(format!(
+                        "OpenCode session cwd does not match: expected={cwd} actual={}",
+                        session.cwd
+                ));
+            }
+            let parse_timestamp = |value: Option<String>| {
+                value
+                    .as_deref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.timestamp_millis())
+                    .unwrap_or_default()
+            };
+            let mut remote_session = OpenCodeRemoteSessionSummary {
+                engine_thread_id: session.engine_thread_id,
+                title: Some(session.title),
+                cwd: session.cwd,
+                created_at: parse_timestamp(session.created_at),
+                updated_at: parse_timestamp(session.updated_at),
+                archived: session.archived,
+            };
+            if remote_session.archived {
+                let operation_thread = existing_local_thread.clone().unwrap_or_else(|| ThreadDto {
+                        id: engine_thread_id.clone(),
+                        workspace_id: workspace.id.clone(),
+                        engine_id: "opencode".to_string(),
+                        model_id: normalized_model_id.clone(),
+                        engine_thread_id: Some(engine_thread_id.clone()),
+                        engine_metadata: Some(json!({ "opencodeRemoteCwd": cwd })),
+                        plan_mode: None,
+                        send_method: None,
+                        reasoning_effort: None,
+                        permission_mode: None,
+                        title: remote_session
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| engine_thread_id.clone()),
+                        status: ThreadStatusDto::Idle,
+                        message_count: 0,
+                        total_tokens: 0,
+                        context_current_tokens: None,
+                        context_max_tokens: None,
+                        context_usage_updated_at: None,
+                        created_at: String::new(),
+                        last_activity_at: String::new(),
+                });
+                cli.unarchive_thread(&context, &operation_thread, &engine_thread_id)
+                    .await
+                    .map_err(err_to_string)?;
+                remote_session.archived = false;
+            }
+            let title = build_opencode_remote_session_title(&remote_session);
+    // 只有远端返回并成功解析的更新时间才覆盖本地活动时间，避免写入 Unix epoch。
+            let remote_last_activity_at = (remote_session.updated_at > 0)
+                .then(|| codex_remote_thread_timestamp_to_rfc3339(remote_session.updated_at));
+
+            if let Some(existing) = existing_local_thread {
+                let metadata = build_opencode_remote_session_metadata(
+                    existing.engine_metadata.as_ref(),
+                    &remote_session,
+                    &normalized_model_id,
+                );
+                let existing_last_activity_at = remote_last_activity_at.clone();
+                return run_db(db, move |db| {
+                        let thread = match db::threads::restore_thread(db, &existing.id) {
+                            Ok(restored) => restored,
+                            Err(_) => existing,
+                        };
+                        let updated = db::threads::update_thread_runtime_snapshot(
+                            db,
+                            &thread.id,
+                            Some(&title),
+                            Some(ThreadStatusDto::Idle),
+                            Some(&metadata),
+                        )?;
+            // OpenCode 远端会话只返回模型，其余底部项服务端不提供，按真实返回值落库。
+                        db::threads::update_thread_runtime_selection(
+                            db,
+                            &updated.id,
+                            "opencode",
+                            &normalized_model_id,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )?;
+                        match existing_last_activity_at.as_deref() {
+                            Some(last_activity_at) => {
+                                db::threads::update_thread_last_activity(db, &updated.id, last_activity_at)
+                            }
+                            None => Ok(updated),
+                        }
+                })
+                    .await;
+            }
+
+            let metadata =
+            build_opencode_remote_session_metadata(None, &remote_session, &normalized_model_id);
+            run_db(db, move |db| {
+                    let created = db::threads::create_thread(
+                        db,
+                        &workspace_id,
+                        "opencode",
+                        &normalized_model_id,
+                        &title,
+                    )?;
+                    db::threads::set_engine_thread_id(db, &created.id, &engine_thread_id)?;
+                    let updated = db::threads::update_thread_runtime_snapshot(
+                        db,
+                        &created.id,
+                        Some(&title),
+                        Some(ThreadStatusDto::Idle),
+                        Some(&metadata),
+                    )?;
+        // OpenCode 远端会话只返回模型，其余底部项服务端不提供，按真实返回值落库。
+                    db::threads::update_thread_runtime_selection(
+                        db,
+                        &updated.id,
+                        "opencode",
+                        &normalized_model_id,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?;
+                    match remote_last_activity_at.as_deref() {
+                        Some(last_activity_at) => {
+                            db::threads::update_thread_last_activity(db, &updated.id, last_activity_at)
+                        }
+                        None => Ok(updated),
+                    }
+            })
+                .await
+
+        }
+        pub(crate) async fn thread_update_config(&self, thread_id: String, update_agent: bool, agent: Option<String>) -> Result<ThreadDto, String> {
+            let state = &self.state;
+
+            let db = state.db.clone();
+            let thread = run_db(db.clone(), {
+                    let thread_id = thread_id.clone();
+                    move |db| db::threads::get_thread(db, &thread_id)
+            })
+                .await?
+                .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+            if thread.engine_id != "opencode" {
+                return Err("OpenCode thread config is only available for OpenCode threads".to_string());
+            }
+
+            let normalized_agent = if update_agent {
+                normalize_thread_opencode_agent(agent)?
+            } else {
+                None
+            };
+
+            let mut metadata = thread.engine_metadata.unwrap_or_else(|| json!({}));
+            if !metadata.is_object() {
+                metadata = json!({});
+            }
+
+            if let Some(object) = metadata.as_object_mut() {
+                if update_agent {
+                    match normalized_agent {
+                        Some(value) => {
+                            object.insert("opencodeAgent".to_string(), json!(value));
+                        }
+                        None => {
+                            object.remove("opencodeAgent");
+                        }
+                    }
+                }
+            }
+
+            run_db(db.clone(), {
+                    let thread_id = thread_id.clone();
+                    let metadata = metadata.clone();
+                    move |db| db::threads::update_engine_metadata(db, &thread_id, &metadata)
+            })
+                .await?;
+
+            run_db(db, {
+                    let thread_id = thread_id.clone();
+                    move |db| db::threads::get_thread(db, &thread_id)
+            })
+                .await?
+                .ok_or_else(|| format!("thread not found after OpenCode config update: {thread_id}"))
+
+        }
+        pub(crate) async fn thread_sync_record(&self, thread_id: String) -> Result<ThreadDto, String> {
+            let state = &self.state;
+            let thread = crate::services::thread_service::ThreadService::new(state.clone()).get_thread(&thread_id).await.map_err(err_to_string)?;
+            if thread.engine_id != "opencode" { return Err("线程所属 CLI 与当前实现不一致".to_owned()); }
+            let thread = &thread;
+            let thread_id = thread_id.as_str();
+            let mut summary_synced_thread = thread.clone();
+
+            let message_count = run_db(state.db.clone(), {
+                    let thread_id = thread_id.to_string();
+                    move |db| db::messages::count_thread_messages(db, &thread_id)
+            })
+                .await?;
+            if let Some(engine_thread_id) = thread
+                .engine_thread_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let workspace = run_db(state.db.clone(), {
+                        let workspace_id = thread.workspace_id.clone();
+                        move |db| {
+                            db::workspaces::find_workspace_by_id(db, &workspace_id)?
+                                .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))
+                        }
+                })
+                    .await?;
+                let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
+                let cli: &dyn CliTool = self;
+                let snapshot = match cli.read_session(&context, engine_thread_id).await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        log::debug!("failed to sync OpenCode session {engine_thread_id}: {error}");
+                        return Ok(thread.clone());
+                    }
+                };
+                let parse_timestamp = |value: Option<String>| {
+                    value
+                        .as_deref()
+                        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                        .map(|value| value.timestamp_millis())
+                        .unwrap_or_default()
+                };
+                let session = OpenCodeRemoteSessionSummary {
+                    engine_thread_id: snapshot.engine_thread_id,
+                    title: Some(snapshot.title),
+                    cwd: snapshot.cwd,
+                    created_at: parse_timestamp(snapshot.created_at),
+                    updated_at: parse_timestamp(snapshot.updated_at),
+                    archived: snapshot.archived,
+                };
+                let title = build_opencode_remote_session_title(&session);
+                let metadata = build_opencode_remote_session_metadata(
+                    thread.engine_metadata.as_ref(),
+                    &session,
+                    &thread.model_id,
+                );
+                let thread_id = thread_id.to_string();
+                summary_synced_thread = run_db(state.db.clone(), move |db| {
+                        db::threads::update_thread_runtime_snapshot(
+                            db,
+                            &thread_id,
+                            Some(&title),
+                            Some(ThreadStatusDto::Idle),
+                            Some(&metadata),
+                        )
+                })
+                    .await?;
+                if message_count != 0 {
+                    return Ok(summary_synced_thread);
+                }
+            }
+            if message_count != 0 {
+                return Ok(thread.clone());
+            }
+
+            let Some(engine_thread_id) = thread
+                .engine_thread_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return Ok(thread.clone());
+            };
+
+            let workspace = run_db(state.db.clone(), {
+                    let workspace_id = thread.workspace_id.clone();
+                    move |db| {
+                        db::workspaces::find_workspace_by_id(db, &workspace_id)?
+                            .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))
+                    }
+            })
+                .await?;
+            let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
+            let cli: &dyn CliTool = self;
+            let snapshot = match cli
+                .read_thread_sync_snapshot(&context, thread, engine_thread_id)
+                .await
+            {
+                Ok(Some(snapshot)) => {
+                    snapshot
+                }
+                Ok(None) => {
+                    return Ok(summary_synced_thread);
+                }
+                Err(error) => {
+            // 旧完整历史入口会把原始读取错误返回给点击层和 MCP；两者再回退到本地结果。
+                    let error_text = err_to_string(error);
+                    return Err(error_text);
+            // 旧实现曾在此处记录 debug 后返回本地线程，保留迁移留痕但不再吞掉原生错误：
+            // log::debug!("failed to sync {} thread {}: {error}", thread.engine_id, thread_id);
+            // return Ok(thread.clone());
+                }
+            };
+
+            let imported_messages = snapshot
+                .imported_messages
+                .iter()
+                .map(|message| db::messages::ImportedMessageRecord {
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                    blocks: message.blocks.clone(),
+                    status: MessageStatusDto::from_str(message.status.as_str()),
+                    turn_engine_id: message.turn_engine_id.clone(),
+                    remote_turn_id: message.turn_engine_id.clone(),
+                    turn_model_id: message.turn_model_id.clone(),
+                    turn_reasoning_effort: message.turn_reasoning_effort.clone(),
+                    token_input: message.token_input,
+                    token_output: message.token_output,
+                    created_at: message.created_at.clone(),
+            })
+                .collect::<Vec<_>>();
+            run_db(state.db.clone(), {
+                    let thread_id = thread_id.to_string();
+                    move |db| {
+                        db::messages::append_thread_messages(db, &thread_id, &imported_messages)?;
+                        db::threads::refresh_thread_message_stats(
+                            db,
+                            &thread_id,
+                            db::threads::ThreadMessageStatsActivityPolicy::PreserveExisting,
+                        )?;
+                        Ok::<_, anyhow::Error>(())
+                    }
+            })
+                .await?;
+
+            let title = snapshot
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let updated_thread = run_db(state.db.clone(), {
+                    let thread_id = thread_id.to_string();
+                    let title = title.map(str::to_string);
+                    move |db| {
+                        db::threads::update_thread_runtime_snapshot(
+                            db,
+                            &thread_id,
+                            title.as_deref(),
+                            None,
+                            None,
+                        )
+                    }
+            })
+                .await?;
+
+
+            Ok(updated_thread)
+
+        }
     }
 }

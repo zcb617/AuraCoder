@@ -384,6 +384,87 @@ impl CodexCli {
 
 #[async_trait]
 impl CliTool for CodexCli {
+    async fn list_opencode_thread_records(&self, _workspace_id: String, _cursor: Option<String>, _limit: Option<u32>, _search_term: Option<String>, _archived: Option<bool>) -> Result<crate::models::OpenCodeRemoteSessionPageDto> {
+        anyhow::bail!("codex 不支持此线程业务操作：list_opencode_thread_records")
+    }
+
+    async fn attach_opencode_thread_record(&self, _workspace_id: String, _engine_thread_id: String, _cwd: String, _model_id: String) -> Result<ThreadDto> {
+        anyhow::bail!("codex 不支持此线程业务操作：attach_opencode_thread_record")
+    }
+
+    async fn update_opencode_thread_config(&self, _thread_id: String, _update_agent: bool, _agent: Option<String>) -> Result<ThreadDto> {
+        anyhow::bail!("codex 不支持此线程业务操作：update_opencode_thread_config")
+    }
+
+
+    async fn list_codex_thread_records(&self, workspace_id: String, cursor: Option<String>, limit: Option<u32>, search_term: Option<String>, archived: Option<bool>) -> Result<crate::models::CodexRemoteThreadPageDto> {
+        self.thread_list_records(workspace_id, cursor, limit, search_term, archived).await.map_err(anyhow::Error::msg)
+    }
+
+    async fn attach_thread_record(&self, workspace_id: String, engine_thread_id: String) -> Result<ThreadDto> {
+        self.thread_attach_record(workspace_id, engine_thread_id).await.map_err(anyhow::Error::msg)
+    }
+
+    async fn fork_thread_record(&self, thread_id: String) -> Result<ThreadDto> {
+        self.thread_fork_record(thread_id).await.map_err(anyhow::Error::msg)
+    }
+
+    async fn rollback_thread_record(&self, thread_id: String, num_turns: u32) -> Result<ThreadDto> {
+        self.thread_rollback_record(thread_id, num_turns).await.map_err(anyhow::Error::msg)
+    }
+
+    async fn compact_thread_record(&self, app: tauri::AppHandle, thread_id: String) -> Result<ThreadDto> {
+        self.thread_compact_record(app, thread_id).await.map_err(anyhow::Error::msg)
+    }
+
+    async fn update_codex_thread_config(&self, thread_id: String, update_personality: bool, personality: Option<String>, update_service_tier: bool, service_tier: Option<String>, update_output_schema: bool, output_schema: Option<Value>) -> Result<ThreadDto> {
+        self.thread_update_config(thread_id, update_personality, personality, update_service_tier, service_tier, update_output_schema, output_schema).await.map_err(anyhow::Error::msg)
+    }
+
+    fn normalize_thread_service_tier(&self, value: Option<String>) -> Result<Option<String>> { thread_business::normalize_thread_service_tier(value).map_err(anyhow::Error::msg) }
+
+
+    async fn create_thread_record(&self, workspace_id: String, model_id: String, title: String, reasoning_effort: Option<String>, service_tier: Option<String>) -> Result<ThreadDto> {
+        self.mcp.create_thread_record(self, "codex", workspace_id, model_id, title, reasoning_effort, service_tier).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=codex operation=create_thread_record error={error:#}"))
+    }
+
+    async fn reconfigure_thread_record(&self, thread_id: String, model_id: String, reasoning_effort: Option<String>, service_tier: Option<String>) -> Result<ThreadDto> {
+        self.mcp.reconfigure_thread_record(self, "codex", thread_id, model_id, reasoning_effort, service_tier).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=codex operation=reconfigure_thread_record error={error:#}"))
+    }
+
+    async fn set_thread_reasoning(&self, thread_id: String, reasoning_effort: Option<String>, model_id: Option<String>) -> Result<()> {
+        self.mcp.set_thread_reasoning(self, "codex", thread_id, reasoning_effort, model_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=codex operation=set_thread_reasoning error={error:#}"))
+    }
+
+    async fn set_thread_selected_model(&self, thread_id: String, model_id: String) -> Result<ThreadDto> {
+        self.mcp.set_thread_selected_model(self, "codex", thread_id, model_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=codex operation=set_thread_selected_model error={error:#}"))
+    }
+
+    async fn delete_thread_record(&self, thread_id: String) -> Result<()> {
+        self.mcp.delete_thread_record(self, "codex", thread_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=codex operation=delete_thread_record error={error:#}"))
+    }
+
+    async fn archive_thread_record(&self, thread_id: String) -> Result<()> {
+        self.mcp.archive_thread_record(self, "codex", thread_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=codex operation=archive_thread_record error={error:#}"))
+    }
+
+    async fn restore_thread_record(&self, thread_id: String) -> Result<ThreadDto> {
+        self.mcp.restore_thread_record(self, "codex", thread_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=codex operation=restore_thread_record error={error:#}"))
+    }
+
+    async fn validate_thread_model(&self, workspace_id: Option<&str>, model_id: &str) -> Result<String> {
+        self.mcp.validate_thread_model(self, "codex", workspace_id, model_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=codex operation=validate_thread_model error={error:#}"))
+    }
+
+    async fn validate_thread_reasoning(&self, model_id: &str, reasoning_effort: &str) -> Result<String> {
+        self.mcp.validate_thread_reasoning(self, "codex", model_id, reasoning_effort).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=codex operation=validate_thread_reasoning error={error:#}"))
+    }
+
+    async fn sync_thread_record(&self, thread_id: String) -> Result<ThreadDto> {
+        self.thread_sync_record(thread_id).await.map_err(anyhow::Error::msg)
+    }
+
+
     fn id(&self) -> &str {
         "codex"
     }
@@ -1717,5 +1798,1397 @@ impl CliTool for CodexCli {
             .await?;
         forward_started.await.context("等待代码审查会话失败")??;
         Ok(())
+    }
+}
+
+pub(crate) mod thread_business {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use crate::services::thread_service::normalize_thread_title;
+    use tauri::{AppHandle, Emitter};
+    use crate::{engines::CodexRemoteThreadSummary, models::{CodexRemoteThreadDto, CodexRemoteThreadPageDto, MessageDto, MessageStatusDto, ThreadUpdateDto}, path_utils::paths_equal, services::thread_service::ThreadService};
+    use crate::cli_tools::mcp::thread_business::{validate_model_for_engine_from_catalog, validate_reasoning_effort_from_catalog};
+
+    pub(crate) fn collect_remote_thread_roots(workspace_root: &str) -> std::collections::HashSet<String> {
+        std::iter::once(workspace_root.to_string()).collect()
+    }
+    pub(crate) fn codex_remote_thread_belongs_to_workspace(workspace_root: &str, cwd: &str) -> bool {
+        paths_equal(cwd, workspace_root)
+    }
+    pub(crate) fn normalize_remote_thread_search_term(search_term: Option<String>) -> Option<String> {
+        search_term
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+    pub(crate) fn parse_codex_remote_thread_cursor(cursor: Option<&str>) -> Result<usize, String> {
+        let Some(cursor) = cursor.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(0);
+        };
+
+        cursor.parse::<usize>().map_err(|_| {
+                format!("invalid Codex remote thread cursor `{cursor}`. expected a non-negative offset")
+        })
+    }
+    pub(crate) fn normalize_codex_remote_thread_limit(limit: Option<u32>) -> usize {
+        limit.unwrap_or(20).clamp(1, 100) as usize
+    }
+    pub(crate) fn map_codex_remote_thread_dto(
+        thread: CliSessionSnapshot,
+        local_thread_id: Option<String>,
+    ) -> CodexRemoteThreadDto {
+        let model_provider = thread
+            .metadata
+            .get("codexModelProvider")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        CodexRemoteThreadDto {
+            engine_thread_id: thread.engine_thread_id,
+            title: Some(thread.title),
+            preview: thread.preview.unwrap_or_default(),
+            cwd: thread.cwd,
+            created_at: thread.created_at.unwrap_or_default(),
+            updated_at: thread.updated_at.unwrap_or_default(),
+            model_id: thread.model_id,
+            reasoning_effort: thread.reasoning_effort,
+            model_provider,
+            source_kind: thread.source_kind.unwrap_or_default(),
+            status_type: thread.raw_status.unwrap_or_default(),
+            active_flags: thread.active_flags,
+            archived: thread.archived,
+            local_thread_id,
+        }
+    }
+    pub(crate) fn codex_remote_thread_timestamp_to_rfc3339(timestamp: i64) -> String {
+        let (seconds, nanos) = if timestamp > 10_000_000_000 {
+            (timestamp / 1000, ((timestamp % 1000) as u32) * 1_000_000)
+        } else {
+            (timestamp, 0)
+        };
+
+        DateTime::<Utc>::from_timestamp(seconds, nanos)
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339()
+    }
+    pub(crate) fn build_codex_remote_thread_title(thread: &CodexRemoteThreadSummary) -> String {
+        if let Some(title) = thread
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return normalize_thread_title(title).unwrap_or_else(|_| {
+                    format!(
+                        "Codex thread {}",
+                        short_thread_label(&thread.engine_thread_id)
+                    )
+            });
+        }
+
+        if let Some(preview) = thread
+            .preview
+            .trim()
+            .split('\n')
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return normalize_thread_title(preview).unwrap_or_else(|_| {
+                    format!(
+                        "Codex thread {}",
+                        short_thread_label(&thread.engine_thread_id)
+                    )
+            });
+        }
+
+        format!(
+            "Codex thread {}",
+            short_thread_label(&thread.engine_thread_id)
+        )
+    }
+    pub(crate) fn short_thread_label(engine_thread_id: &str) -> String {
+        engine_thread_id.chars().take(8).collect()
+    }
+    pub(crate) fn build_codex_remote_thread_metadata(
+        thread: &CodexRemoteThreadSummary,
+        model_id: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Value {
+        let _ = model_id;
+        let mut metadata = merge_codex_runtime_metadata(
+            None,
+            Some(thread.status_type.as_str()),
+            &thread.active_flags,
+            Some(thread.preview.as_str()),
+            true,
+            Some("remote_thread_attached"),
+        );
+
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert("codexTranscriptImported".to_string(), json!(false));
+            object.insert(
+                    "codexModelProvider".to_string(),
+                json!(thread.model_provider),
+            );
+            object.insert("codexSourceKind".to_string(), json!(thread.source_kind));
+            object.insert("codexRemoteArchived".to_string(), json!(thread.archived));
+            object.insert("codexRemoteCwd".to_string(), json!(thread.cwd));
+            object.insert(
+                    "codexRemoteCreatedAt".to_string(),
+                json!(codex_remote_thread_timestamp_to_rfc3339(thread.created_at)),
+            );
+            object.insert(
+                    "codexRemoteUpdatedAt".to_string(),
+                json!(codex_remote_thread_timestamp_to_rfc3339(thread.updated_at)),
+            );
+        }
+
+        metadata
+    }
+    pub(crate) fn mark_codex_transcript_imported(mut metadata: Value, imported: bool) -> Value {
+        if imported {
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert("codexTranscriptImported".to_string(), json!(true));
+            }
+        }
+
+        metadata
+    }
+    pub(crate) fn imported_messages_have_streaming_turn(snapshot: &ThreadSyncSnapshot) -> bool {
+        snapshot
+            .imported_messages
+            .iter()
+            .any(|message| message.status == "streaming")
+    }
+    pub(crate) fn merge_codex_runtime_metadata(
+        existing: Option<serde_json::Value>,
+        raw_status: Option<&str>,
+        active_flags: &[String],
+        preview: Option<&str>,
+        sync_required: bool,
+        sync_reason: Option<&str>,
+    ) -> serde_json::Value {
+        let mut metadata = existing.unwrap_or_else(|| json!({}));
+        if !metadata.is_object() {
+            metadata = json!({});
+        }
+
+        if let Some(object) = metadata.as_object_mut() {
+        // 线程底部六项已迁移到独立列；远端同步只保留状态 metadata，清除旧镜像键。
+            for key in [
+                "lastModelId",
+                "reasoningEffort",
+            ] {
+                object.remove(key);
+            }
+            match raw_status.map(str::trim).filter(|value| !value.is_empty()) {
+                Some(status) => {
+                    object.insert("codexThreadStatus".to_string(), json!(status));
+                }
+                None => {
+                    object.remove("codexThreadStatus");
+                }
+            }
+
+            if active_flags.is_empty() {
+                object.remove("codexThreadActiveFlags");
+            } else {
+                object.insert("codexThreadActiveFlags".to_string(), json!(active_flags));
+            }
+
+            match preview.map(str::trim).filter(|value| !value.is_empty()) {
+                Some(preview) => {
+                    object.insert("codexPreview".to_string(), json!(preview));
+                }
+                None => {
+                    object.remove("codexPreview");
+                }
+            }
+
+            object.insert("codexSyncRequired".to_string(), json!(sync_required));
+            if sync_required {
+                object.insert(
+                        "codexSyncUpdatedAt".to_string(),
+                    json!(runtime_env::system_time_rfc3339()),
+                );
+                if let Some(reason) = sync_reason.map(str::trim).filter(|value| !value.is_empty()) {
+                    object.insert("codexSyncReason".to_string(), json!(reason));
+                }
+            } else {
+                object.insert(
+                        "codexSyncUpdatedAt".to_string(),
+                    json!(runtime_env::system_time_rfc3339()),
+                );
+                object.insert("codexSyncReason".to_string(), serde_json::Value::Null);
+            }
+        }
+
+        metadata
+    }
+    pub(crate) fn is_codex_thread_sync_required(metadata: Option<&Value>) -> bool {
+        metadata
+            .and_then(|value| value.get("codexSyncRequired"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+    pub(crate) fn should_clone_local_branch_history(source_thread: &ThreadDto) -> bool {
+        !is_codex_thread_sync_required(source_thread.engine_metadata.as_ref())
+        && source_thread.message_count > 0
+    }
+    pub(crate) fn clone_codex_branch_metadata(
+        existing: Option<&Value>,
+        model_id: &str,
+        raw_status: Option<&str>,
+        active_flags: &[String],
+        preview: Option<&str>,
+        sync_required: bool,
+        sync_reason: Option<&str>,
+    ) -> Value {
+        let mut metadata = existing.cloned().unwrap_or_else(|| json!({}));
+        if !metadata.is_object() {
+            metadata = json!({});
+        }
+
+        if let Some(object) = metadata.as_object_mut() {
+            object.remove("manualTitle");
+            object.remove("manualTitleUpdatedAt");
+            object.insert("codexTranscriptImported".to_string(), json!(true));
+        }
+
+        merge_codex_runtime_metadata(
+            Some(metadata),
+            raw_status,
+            active_flags,
+            preview,
+            sync_required,
+            sync_reason,
+        )
+    }
+    pub(crate) fn codex_transcript_imported(metadata: Option<&Value>) -> bool {
+        metadata
+            .and_then(|value| value.get("codexTranscriptImported"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
+    pub(crate) fn thread_reasoning_effort(_metadata: Option<&Value>) -> Option<String> {
+    /*
+    // 旧实现从 engine_metadata_json 读取 reasoningEffort，已停用：
+    _metadata
+        .and_then(|value| value.get("reasoningEffort"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    */
+        None
+    }
+    pub(crate) fn thread_last_model_id(_metadata: Option<&Value>) -> Option<String> {
+        None
+    }
+    pub(crate) fn thread_service_tier(metadata: Option<&Value>) -> Option<String> {
+        metadata
+            .and_then(|value| value.get("serviceTier"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| matches!(*value, "fast" | "flex"))
+            .map(ToOwned::to_owned)
+    }
+    pub(crate) fn thread_personality(metadata: Option<&Value>) -> Option<String> {
+        metadata
+            .and_then(|value| value.get("personality"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| matches!(*value, "none" | "friendly" | "pragmatic"))
+            .map(ToOwned::to_owned)
+    }
+    pub(crate) fn thread_output_schema(metadata: Option<&Value>) -> Option<Value> {
+        metadata
+            .and_then(|value| value.get("outputSchema"))
+            .cloned()
+    }
+    pub(crate) fn thread_opencode_agent(metadata: Option<&Value>) -> Option<String> {
+        metadata
+            .and_then(|value| value.get("opencodeAgent"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+    pub(crate) fn map_codex_thread_status_to_local(
+        raw_status: Option<&str>,
+        active_flags: &[String],
+        has_local_turn: bool,
+    ) -> Option<ThreadStatusDto> {
+        if has_local_turn {
+            return None;
+        }
+
+        match raw_status.map(str::trim).filter(|value| !value.is_empty()) {
+            Some("systemError") => Some(ThreadStatusDto::Error),
+            Some("idle") | Some("notLoaded") => Some(ThreadStatusDto::Idle),
+            Some("active") => {
+                if active_flags
+                    .iter()
+                    .any(|flag| matches!(flag.as_str(), "waitingOnApproval" | "waitingOnUserInput"))
+                {
+                    Some(ThreadStatusDto::AwaitingApproval)
+                } else {
+                    Some(ThreadStatusDto::Streaming)
+                }
+            }
+            _ => None,
+        }
+    }
+    pub(crate) fn normalize_thread_personality(value: Option<String>) -> Result<Option<String>, String> {
+        let normalized = value
+            .as_deref()
+            .map(str::trim)
+            .filter(|candidate| !candidate.is_empty())
+            .map(str::to_lowercase);
+
+        let Some(normalized) = normalized else {
+            return Ok(None);
+        };
+
+        match normalized.as_str() {
+            "none" | "friendly" | "pragmatic" => Ok(Some(normalized)),
+            _ => Err(format!(
+            "invalid personality `{normalized}`. expected one of: none, friendly, pragmatic"
+            )),
+        }
+    }
+    pub(crate) fn normalize_thread_service_tier(value: Option<String>) -> Result<Option<String>, String> {
+        let normalized = value
+            .as_deref()
+            .map(str::trim)
+            .filter(|candidate| !candidate.is_empty())
+            .map(str::to_lowercase);
+
+        let Some(normalized) = normalized else {
+            return Ok(None);
+        };
+
+        match normalized.as_str() {
+            "fast" | "flex" => Ok(Some(normalized)),
+            _ => Err(format!(
+            "invalid service tier `{normalized}`. expected one of: fast, flex"
+            )),
+        }
+    }
+    pub(crate) fn normalize_thread_output_schema(value: Option<Value>) -> Result<Option<Value>, String> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+
+        match value {
+            Value::Object(_) | Value::Bool(_) => Ok(Some(value)),
+            _ => Err("invalid output schema. expected a JSON Schema object or boolean".to_string()),
+        }
+    }
+    pub(crate) fn err_to_string(error: impl std::fmt::Display) -> String {
+        format!("{error:#}")
+    }
+    pub(crate) async fn run_db<T, F>(db: crate::db::Database, operation: F) -> Result<T, String>
+    where
+    T: Send + 'static,
+    F: FnOnce(&crate::db::Database) -> anyhow::Result<T> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || operation(&db))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(err_to_string)
+    }
+    impl CodexCli {
+        pub(crate) async fn thread_list_records(&self, workspace_id: String, cursor: Option<String>, limit: Option<u32>, search_term: Option<String>, archived: Option<bool>) -> Result<CodexRemoteThreadPageDto, String> {
+            let state = &self.state;
+
+            let db = state.db.clone();
+            let workspace_root = run_db(db.clone(), {
+                    let workspace_id = workspace_id.clone();
+                    move |db| {
+                        let workspace = db::workspaces::find_workspace_by_id(db, &workspace_id)?
+                            .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
+                        Ok(workspace.root_path)
+                    }
+            })
+                .await?;
+
+            let normalized_search_term = normalize_remote_thread_search_term(search_term);
+            let workspace = run_db(db.clone(), {
+                    let workspace_id = workspace_id.clone();
+                    move |db| {
+                        db::workspaces::find_workspace_by_id(db, &workspace_id)?
+                            .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))
+                    }
+            })
+                .await?;
+            let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
+            let cli: &dyn CliTool = self;
+            let matching_threads = cli
+                .list_sessions(&context, normalized_search_term.as_deref(), archived)
+                .await
+                .map_err(err_to_string)?
+                .into_iter()
+                .filter(|thread| codex_remote_thread_belongs_to_workspace(&workspace_root, &thread.cwd))
+                .collect::<Vec<_>>();
+
+            let offset = parse_codex_remote_thread_cursor(cursor.as_deref())?;
+            let page_size = normalize_codex_remote_thread_limit(limit);
+            let page_end = offset.saturating_add(page_size).min(matching_threads.len());
+            let page_threads = if offset >= matching_threads.len() {
+                Vec::new()
+            } else {
+                matching_threads[offset..page_end].to_vec()
+            };
+            let next_cursor = (page_end < matching_threads.len()).then(|| page_end.to_string());
+
+            run_db(db, move |db| {
+                    let threads = page_threads
+                        .into_iter()
+                        .map(|thread| {
+                            let local_thread_id = db::threads::find_thread_by_engine_thread_id(
+                                db,
+                                "codex",
+                                &thread.engine_thread_id,
+                            )?
+                                .filter(|local| local.workspace_id == workspace_id)
+                                .map(|local| local.id);
+                            Ok(map_codex_remote_thread_dto(thread, local_thread_id))
+                    })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+
+                    Ok(CodexRemoteThreadPageDto {
+                            threads,
+                            next_cursor,
+                    })
+            })
+                .await
+
+        }
+        pub(crate) async fn thread_attach_record(&self, workspace_id: String, engine_thread_id: String) -> Result<ThreadDto, String> {
+            let state = &self.state;
+
+    // let normalized_model_id =
+    //     validate_model_for_engine(state, "codex", model_id.trim()).await?;
+            let db = state.db.clone();
+            let existing_local_thread = run_db(db.clone(), {
+                    let workspace_id = workspace_id.clone();
+                    let engine_thread_id = engine_thread_id.clone();
+                    move |db| {
+                        db::workspaces::find_workspace_by_id(db, &workspace_id)?
+                            .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
+                        let existing =
+                        db::threads::find_thread_by_engine_thread_id(db, "codex", &engine_thread_id)?
+                            .filter(|thread| thread.workspace_id == workspace_id);
+                        Ok(existing)
+                    }
+            })
+                .await?;
+
+            let workspace = run_db(db.clone(), {
+                    let workspace_id = workspace_id.clone();
+                    move |db| {
+                        db::workspaces::find_workspace_by_id(db, &workspace_id)?
+                            .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))
+                    }
+            })
+                .await?;
+            let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
+            let cli: &dyn CliTool = self;
+            let session = cli
+                .read_session(&context, &engine_thread_id)
+                .await
+                .map_err(err_to_string)?;
+            let validation_models = cli
+                .models_for_validation(&context, &session.model_id)
+                .await
+                .ok();
+    // Codex Desktop / vscode 创建的会话 model 为 null（映射后为 "unknown"），不在
+    // 模型目录中。目录校验失败不得中断导入：优先回退到目录默认模型，目录不可用
+    // 时保留会话原值，保证这类会话能正常发现并显示。
+    // 旧实现校验失败直接返回错误，导致无 model 的会话被整体丢弃、项目下"没有会话"：
+    // let normalized_model_id = validate_model_for_engine_from_catalog(
+    //     "codex",
+    //     session.model_id.trim(),
+    //     validation_models.as_deref(),
+    // )?;
+            let normalized_model_id = match validate_model_for_engine_from_catalog(
+                "codex",
+                session.model_id.trim(),
+                validation_models.as_deref(),
+            ) {
+                Ok(model_id) => model_id,
+                Err(error) => {
+                    let fallback = validation_models.as_deref().and_then(|models| {
+                            models
+                                .iter()
+                                .find(|model| model.is_default && !model.hidden)
+                                .or_else(|| models.iter().find(|model| !model.hidden))
+                                .or_else(|| models.first())
+                    });
+                    match fallback {
+                        Some(model) => {
+                            log::warn!(
+                                "Codex 会话模型不在模型目录中，导入回退到目录默认模型: engine_thread_id={} session_model={} fallback_model={} error={}",
+                                engine_thread_id,
+                                session.model_id.trim(),
+                                model.id,
+                                error,
+                            );
+                            model.id.clone()
+                        }
+                        None => {
+                            log::warn!(
+                                "Codex 会话模型校验失败且无模型目录可回退，导入保留会话原模型: engine_thread_id={} session_model={} error={}",
+                                engine_thread_id,
+                                session.model_id.trim(),
+                                error,
+                            );
+                            session.model_id.trim().to_string()
+                        }
+                    }
+                }
+            };
+            let normalized_reasoning_effort = session
+                .reasoning_effort
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_lowercase);
+    // reasoning_effort 校验失败同样不得中断导入：忽略该值、保留会话本体。
+    // 旧实现直接返回错误：
+    // let validated_reasoning_effort = normalized_reasoning_effort
+    //     .as_deref()
+    //     .map(|value| {
+    //         validate_reasoning_effort_from_catalog(
+    //             &normalized_model_id,
+    //             value,
+    //             validation_models.as_deref(),
+    //         )
+    //     })
+    //     .transpose()?;
+            let validated_reasoning_effort = normalized_reasoning_effort
+                .as_deref()
+                .map(|value| {
+                    validate_reasoning_effort_from_catalog(
+                        &normalized_model_id,
+                        value,
+                        validation_models.as_deref(),
+                    )
+            })
+                .transpose()
+                .unwrap_or_else(|error| {
+                    log::warn!(
+                        "Codex 会话 reasoning_effort 不受支持，导入时忽略该值: engine_thread_id={} error={}",
+                        engine_thread_id,
+                        error,
+                    );
+                    None
+            });
+            let model_provider = session
+                .metadata
+                .get("codexModelProvider")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let parse_timestamp = |value: Option<String>| {
+                value
+                    .as_deref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .map(|value| value.timestamp_millis())
+                    .unwrap_or_default()
+            };
+            let mut remote_thread = CodexRemoteThreadSummary {
+                engine_thread_id: session.engine_thread_id.clone(),
+                title: Some(session.title.clone()),
+                preview: session.preview.unwrap_or_default(),
+                cwd: session.cwd,
+                created_at: parse_timestamp(session.created_at),
+                updated_at: parse_timestamp(session.updated_at),
+                model_id: Some(normalized_model_id.clone()),
+                reasoning_effort: validated_reasoning_effort.clone(),
+                model_provider,
+                source_kind: session.source_kind.unwrap_or_default(),
+                status_type: session.raw_status.unwrap_or_default(),
+                active_flags: session.active_flags,
+                archived: session.archived,
+            };
+            if remote_thread.archived {
+                let operation_thread = existing_local_thread.clone().unwrap_or_else(|| ThreadDto {
+                        id: engine_thread_id.clone(),
+                        workspace_id: workspace.id.clone(),
+                        engine_id: "codex".to_string(),
+                        model_id: normalized_model_id.clone(),
+                        engine_thread_id: Some(engine_thread_id.clone()),
+                        engine_metadata: None,
+                        plan_mode: None,
+                        send_method: None,
+                        reasoning_effort: None,
+                        permission_mode: None,
+                        title: remote_thread
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| engine_thread_id.clone()),
+                        status: ThreadStatusDto::Idle,
+                        message_count: 0,
+                        total_tokens: 0,
+                        context_current_tokens: None,
+                        context_max_tokens: None,
+                        context_usage_updated_at: None,
+                        created_at: String::new(),
+                        last_activity_at: String::new(),
+                });
+                cli.unarchive_thread(&context, &operation_thread, &engine_thread_id)
+                    .await
+                    .map_err(err_to_string)?;
+                remote_thread.archived = false;
+            }
+            let title = build_codex_remote_thread_title(&remote_thread);
+            let metadata = build_codex_remote_thread_metadata(
+                &remote_thread,
+                &normalized_model_id,
+                validated_reasoning_effort.as_deref(),
+            );
+    // 只有远端返回并成功解析的更新时间才覆盖本地活动时间，避免写入 Unix epoch。
+            let remote_last_activity_at = (remote_thread.updated_at > 0)
+                .then(|| codex_remote_thread_timestamp_to_rfc3339(remote_thread.updated_at));
+
+            let existing_last_activity_at = remote_last_activity_at.clone();
+            if let Some(existing) = existing_local_thread {
+                return run_db(db, move |db| {
+                        let thread = match db::threads::restore_thread(db, &existing.id) {
+                            Ok(restored) => restored,
+                            Err(_) => existing,
+                        };
+                        let updated = db::threads::update_thread_runtime_snapshot(
+                            db,
+                            &thread.id,
+                            Some(&title),
+                            map_codex_thread_status_to_local(
+                                Some(remote_thread.status_type.as_str()),
+                                &remote_thread.active_flags,
+                                false,
+                            ),
+                            Some(&metadata),
+                        )?;
+            // 模型以用户在 AuraCoder 中的选择为准：本地已有具体模型时保留，仅本地模型未知
+            // （空或 "unknown"，如首次导入历史会话）时才接受 Codex 会话返回的模型，
+            // 与 SSH 快照路径的保护语义一致。旧行为无条件用 Codex 会话模型覆盖，
+            // 导致用户改模型后每次重启 attach 同步即被重置：
+            // db::threads::update_thread_runtime_selection(
+            //     db,
+            //     &updated.id,
+            //     "codex",
+            //     &normalized_model_id,
+            //     None,
+            //     None,
+            //     validated_reasoning_effort.as_deref(),
+            //     None,
+            // )?;
+                        let local_model_id = updated.model_id.trim();
+                        let effective_model_id = if local_model_id.is_empty() || local_model_id == "unknown" {
+                            normalized_model_id.as_str()
+                        } else {
+                            local_model_id
+                        };
+            // CLI 服务端不返回计划/发送方法/权限；模型按上方保护规则、思考强度按其真实返回落库。
+                        db::threads::update_thread_runtime_selection(
+                            db,
+                            &updated.id,
+                            "codex",
+                            effective_model_id,
+                            None,
+                            None,
+                            validated_reasoning_effort.as_deref(),
+                            None,
+                        )?;
+                        match existing_last_activity_at.as_deref() {
+                            Some(last_activity_at) => {
+                                db::threads::update_thread_last_activity(db, &updated.id, last_activity_at)
+                            }
+                            None => Ok(updated),
+                        }
+                })
+                    .await;
+            }
+
+            run_db(db, move |db| {
+                    let created =
+                    db::threads::create_thread(db, &workspace_id, "codex", &normalized_model_id, &title)?;
+                    db::threads::set_engine_thread_id(db, &created.id, &engine_thread_id)?;
+                    let updated = db::threads::update_thread_runtime_snapshot(
+                        db,
+                        &created.id,
+                        Some(&title),
+                        map_codex_thread_status_to_local(
+                            Some(remote_thread.status_type.as_str()),
+                            &remote_thread.active_flags,
+                            false,
+                        ),
+                        Some(&metadata),
+                    )?;
+        // CLI 服务端不返回计划/发送方法/权限，仅按其真实返回的模型与思考强度落库。
+                    db::threads::update_thread_runtime_selection(
+                        db,
+                        &updated.id,
+                        "codex",
+                        &normalized_model_id,
+                        None,
+                        None,
+                        validated_reasoning_effort.as_deref(),
+                        None,
+                    )?;
+                    match remote_last_activity_at.as_deref() {
+                        Some(last_activity_at) => {
+                            db::threads::update_thread_last_activity(db, &updated.id, last_activity_at)
+                        }
+                        None => Ok(updated),
+                    }
+            })
+                .await
+
+        }
+        pub(crate) async fn thread_sync_record(&self, thread_id: String) -> Result<ThreadDto, String> {
+            let state = &self.state;
+
+            let db = state.db.clone();
+            let thread = run_db(db.clone(), {
+                    let thread_id = thread_id.clone();
+                    move |db| db::threads::get_thread(db, &thread_id)
+            })
+                .await?
+                .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+            if thread.engine_id != "codex" { return Err("线程所属 CLI 与 Codex 实现不一致".to_owned()); }
+            let workspace = run_db(db.clone(), {
+                    let workspace_id = thread.workspace_id.clone();
+                    move |db| {
+                        db::workspaces::find_workspace_by_id(db, &workspace_id)?
+                            .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))
+                    }
+            })
+                .await?;
+            let Some(engine_thread_id) = thread.engine_thread_id.as_deref() else {
+                return Ok(thread);
+            };
+            let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
+            let cli: &dyn CliTool = self;
+            let Some(snapshot) = cli
+                .read_thread_sync_snapshot(&context, &thread, engine_thread_id)
+                .await
+                .map_err(err_to_string)?
+            else {
+                return Ok(thread);
+            };
+
+            let has_local_turn = state.turns.get(&thread_id).await.is_some();
+            let has_active_remote_turn =
+            !snapshot.active_flags.is_empty() || imported_messages_have_streaming_turn(&snapshot);
+            let imported_messages = snapshot
+                .imported_messages
+                .iter()
+                .map(|message| db::messages::ImportedMessageRecord {
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                    blocks: message.blocks.clone(),
+                    status: MessageStatusDto::from_str(message.status.as_str()),
+                    turn_engine_id: message.turn_engine_id.clone(),
+                    remote_turn_id: message.turn_engine_id.clone(),
+                    turn_model_id: message.turn_model_id.clone(),
+                    turn_reasoning_effort: message.turn_reasoning_effort.clone(),
+                    token_input: message.token_input,
+                    token_output: message.token_output,
+                    created_at: message.created_at.clone(),
+            })
+                .collect::<Vec<_>>();
+            let imported_any_messages = !imported_messages.is_empty();
+            run_db(db.clone(), {
+                    let thread_id = thread_id.clone();
+                    move |db| {
+                        db::messages::append_thread_messages(db, &thread_id, &imported_messages)?;
+                        db::threads::refresh_thread_message_stats(
+                            db,
+                            &thread_id,
+                            db::threads::ThreadMessageStatsActivityPolicy::PreserveExisting,
+                        )?;
+                        Ok::<_, anyhow::Error>(())
+                    }
+            })
+                .await?;
+
+            let sync_required = !has_local_turn && has_active_remote_turn;
+            let metadata = merge_codex_runtime_metadata(
+                thread.engine_metadata.clone(),
+                snapshot.raw_status.as_deref(),
+                &snapshot.active_flags,
+                snapshot.preview.as_deref(),
+                sync_required,
+                sync_required.then_some("remote thread has an active turn"),
+            );
+            let metadata = mark_codex_transcript_imported(metadata, imported_any_messages);
+            let next_status = map_codex_thread_status_to_local(
+                snapshot.raw_status.as_deref(),
+                &snapshot.active_flags,
+                has_local_turn,
+            );
+
+            run_db(db, {
+                    let thread_id = thread_id.clone();
+                    let title = snapshot.title.clone();
+                    let metadata = metadata.clone();
+                    let next_status = next_status.clone();
+                    move |db| {
+            // 旧调用把 next_status 传入 update_thread_runtime_snapshot，会经 update_thread_status 触碰活动时间；点击同步改为下方 status-only 局部更新。
+                        let updated = db::threads::update_thread_runtime_snapshot(
+                            db,
+                            &thread_id,
+                            title.as_deref(),
+                            None,
+                            Some(&metadata),
+                        )?;
+                        let Some(next_status) = next_status else {
+                            return Ok(updated);
+                        };
+                        if updated.status == next_status {
+                            return Ok(updated);
+                        }
+                        db::threads::update_thread(
+                            db,
+                            &ThreadUpdateDto {
+                    // 已完成标题和 metadata 同步后的线程标识。
+                                id: updated.id,
+                    // 只更新状态，避免状态同步路径改写活动时间。
+                                status: Some(next_status.as_str().to_owned()),
+                                    ..Default::default()
+                            },
+                        )
+                    }
+            })
+                .await
+
+        }
+        pub(crate) async fn thread_reject_local_only_action(&self, thread: &ThreadDto, action: &str) -> Result<(), String> {
+            let state = &self.state;
+
+            let db = state.db.clone();
+            let workspace_id = thread.workspace_id.clone();
+            let workspace = run_db(db, move |db| {
+                    db::workspaces::find_workspace_by_id(db, &workspace_id)
+            })
+                .await?;
+            if workspace.is_some_and(|workspace| workspace.location_kind == "ssh") {
+                return Err(format!(
+            "SSH 远端 Codex 暂未接入{action}，当前不会调用本机 Codex 执行"
+                ));
+            }
+            Ok(())
+
+        }
+        pub(crate) async fn thread_build_branch_context(&self, thread: &ThreadDto) -> Result<(String, String, SandboxPolicy), String> {
+            let state = &self.state;
+
+            let db = state.db.clone();
+            let workspace = run_db(db, {
+                    let workspace_id = thread.workspace_id.clone();
+                    let thread_id = thread.id.clone();
+                    move |db| {
+                        let workspace = db::workspaces::list_workspaces(db)?
+                            .into_iter()
+                            .find(|item| item.id == workspace_id)
+                            .ok_or_else(|| anyhow::anyhow!("workspace not found for thread {thread_id}"))?;
+                        Ok(workspace)
+                    }
+            })
+                .await?;
+
+            let workspace_root = workspace.root_path.clone();
+            let writable_roots = vec![workspace_root.clone()];
+
+            Ok((
+                    workspace_root,
+                    thread.model_id.clone(),
+                    SandboxPolicy {
+                        writable_roots,
+                        allow_network: false,
+                        auto_approve_mcp_elicitations: false,
+                        approval_policy: None,
+                        permission_profile: None,
+                        approvals_reviewer: None,
+                        reasoning_effort: thread.reasoning_effort.clone(),
+                        sandbox_mode: None,
+                        service_tier: thread_service_tier(thread.engine_metadata.as_ref()),
+                        personality: thread_personality(thread.engine_metadata.as_ref()),
+                        output_schema: thread_output_schema(thread.engine_metadata.as_ref()),
+                        opencode_agent: thread_opencode_agent(thread.engine_metadata.as_ref()),
+                    },
+            ))
+
+        }
+        pub(crate) async fn thread_create_branch(&self, source_thread: &ThreadDto, engine_thread_id: &str, model_id: &str, title: Option<&str>, preview: Option<&str>, raw_status: Option<&str>, active_flags: &[String], rollback_turns: Option<u32>) -> Result<ThreadDto, String> {
+            let state = &self.state;
+
+            if !codex_transcript_imported(source_thread.engine_metadata.as_ref()) {
+                return Err(
+            "native Codex history tools require a locally mirrored transcript. Attached remote threads without imported history cannot be forked or rolled back yet."
+                        .to_string(),
+                );
+            }
+
+            let db = state.db.clone();
+            let created = run_db(db.clone(), {
+                    let source_thread = source_thread.clone();
+                    let engine_thread_id = engine_thread_id.to_string();
+                    let model_id = model_id.to_string();
+                    let title = title.map(str::to_string);
+                    let preview = preview.map(str::to_string);
+                    let raw_status = raw_status.map(str::to_string);
+                    let active_flags = active_flags.to_vec();
+                    move |db| {
+                        let clone_local_history = should_clone_local_branch_history(&source_thread);
+                        let created = db::threads::create_thread(
+                            db,
+                            &source_thread.workspace_id,
+                            &source_thread.engine_id,
+                            &model_id,
+                            title.as_deref().unwrap_or(&source_thread.title),
+                        )?;
+                        db::threads::set_engine_thread_id(db, &created.id, &engine_thread_id)?;
+                        if clone_local_history {
+                            db::messages::clone_thread_messages(db, &source_thread.id, &created.id)?;
+                            if let Some(turns) = rollback_turns {
+                                db::messages::drop_last_turns(db, &created.id, turns)?;
+                            }
+                        }
+                        db::threads::refresh_thread_message_stats(
+                            db,
+                            &created.id,
+                            db::threads::ThreadMessageStatsActivityPolicy::FromMessages,
+                        )?;
+
+                        let metadata = clone_codex_branch_metadata(
+                            source_thread.engine_metadata.as_ref(),
+                            &model_id,
+                            raw_status.as_deref(),
+                            &active_flags,
+                            preview.as_deref(),
+                            !clone_local_history,
+                            (!clone_local_history).then_some("branch_thread_requires_sync"),
+                        );
+                        let next_status =
+                        map_codex_thread_status_to_local(raw_status.as_deref(), &active_flags, false);
+                        db::threads::update_thread_runtime_snapshot(
+                            db,
+                            &created.id,
+                            title.as_deref(),
+                            next_status,
+                            Some(&metadata),
+                        )
+                    }
+            })
+                .await?;
+            ThreadService::new(state.clone())
+                .save_permissions(
+                &created.id,
+                source_thread.permission_mode.clone().unwrap_or_default(),
+            )
+                .await
+                .map_err(err_to_string)
+
+        }
+        pub(crate) async fn thread_save_compaction_notice(&self, thread_id: &str, message_id: Option<&str>, status: &str, error: Option<&str>) -> Result<MessageDto, String> {
+            let state = &self.state;
+
+            let thread_id = thread_id.to_string();
+            let message_id = message_id.map(str::to_string);
+            let status = status.to_string();
+            let error = error.map(str::to_string);
+            run_db(state.db.clone(), move |db| {
+                    let message_id = match message_id {
+                        Some(message_id) => message_id,
+                        None => db::messages::insert_assistant_placeholder(
+                            db,
+                            &thread_id,
+                            Some("codex"),
+                            None,
+                            None,
+                        )?
+                            .id,
+                    };
+                    let level = match status.as_str() {
+                        "failed" => "error",
+                        "unconfirmed" => "warning",
+                        _ => "info",
+                    };
+                    let message = match status.as_str() {
+                        "in_progress" => "Compacting context...",
+                        "completed" => "Context compaction completed.",
+                        "failed" => "Context compaction failed.",
+                        _ => "Context compaction result is unconfirmed.",
+                    };
+                    let mut metadata = serde_json::json!({
+                            "type": "context_compaction",
+                            "status": status,
+                    });
+                    if let Some(error) = error {
+                        metadata["error"] = Value::String(error);
+                    }
+                    let blocks = serde_json::json!([{
+                                "type": "notice",
+                                "kind": "context_compaction",
+                                "level": level,
+                                "title": "Context compaction",
+                                "message": message,
+                                "metadata": metadata,
+                    }]);
+                    db::messages::update_assistant_blocks_json(
+                        db,
+                        &message_id,
+                        &serde_json::to_string(&blocks)?,
+                        MessageStatusDto::Completed,
+                        None,
+                    )?;
+                    db::messages::get_message(db, &message_id)?
+                        .ok_or_else(|| anyhow::anyhow!("压缩状态消息保存后无法读取: {message_id}"))
+            })
+                .await
+
+        }
+        pub(crate) async fn thread_fork_record(&self, thread_id: String) -> Result<ThreadDto, String> {
+            let state = &self.state;
+
+            if state.turns.get(&thread_id).await.is_some() {
+                return Err("cannot fork a thread while a turn is still active".to_string());
+            }
+
+            let db = state.db.clone();
+            let thread = run_db(db.clone(), {
+                    let thread_id = thread_id.clone();
+                    move |db| db::threads::get_thread(db, &thread_id)
+            })
+                .await?
+                .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+            if thread.engine_id != "codex" {
+                return Err("native fork is only available for Codex threads".to_string());
+            }
+            self.thread_reject_local_only_action( &thread, "会话分支").await?;
+            let engine_thread_id = thread
+                .engine_thread_id
+                .clone()
+                .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
+            let (cwd, model_id, sandbox) = self.thread_build_branch_context( &thread).await?;
+
+            let context = self
+                .execution_context(Some(thread.workspace_id.as_str()))
+                .await
+                .map_err(err_to_string)?;
+            let cli: &dyn CliTool = self;
+            let forked = cli
+                .fork_thread(&context, &thread, &engine_thread_id, &cwd, &model_id, sandbox)
+                .await
+                .map_err(err_to_string)?;
+
+            self.thread_create_branch(
+                &thread,
+                &forked.engine_thread_id,
+                &forked.model_id,
+                forked.title.as_deref(),
+                forked.preview.as_deref(),
+                forked.raw_status.as_deref(),
+                &forked.active_flags,
+                None,
+            )
+                .await
+
+        }
+        pub(crate) async fn thread_rollback_record(&self, thread_id: String, num_turns: u32) -> Result<ThreadDto, String> {
+            let state = &self.state;
+
+            if num_turns == 0 {
+                return Err("rollback requires at least one turn".to_string());
+            }
+            if state.turns.get(&thread_id).await.is_some() {
+                return Err("cannot rollback a thread while a turn is still active".to_string());
+            }
+
+            let db = state.db.clone();
+            let thread = run_db(db.clone(), {
+                    let thread_id = thread_id.clone();
+                    move |db| db::threads::get_thread(db, &thread_id)
+            })
+                .await?
+                .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+            if thread.engine_id != "codex" {
+                return Err("native rollback is only available for Codex threads".to_string());
+            }
+            self.thread_reject_local_only_action( &thread, "回滚").await?;
+            let engine_thread_id = thread
+                .engine_thread_id
+                .clone()
+                .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
+            let (cwd, model_id, sandbox) = self.thread_build_branch_context( &thread).await?;
+
+            let context = self
+                .execution_context(Some(thread.workspace_id.as_str()))
+                .await
+                .map_err(err_to_string)?;
+            let cli: &dyn CliTool = self;
+            let forked = cli
+                .fork_thread(&context, &thread, &engine_thread_id, &cwd, &model_id, sandbox)
+                .await
+                .map_err(err_to_string)?;
+            let rollback_snapshot = match cli
+                .rollback_thread(&context, &forked.engine_thread_id, num_turns)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(rollback_error) => {
+                    let mut cleanup_thread = thread.clone();
+                    cleanup_thread.engine_thread_id = Some(forked.engine_thread_id.clone());
+                    if let Err(cleanup_error) = cli
+                        .archive_thread(&context, &cleanup_thread, &forked.engine_thread_id)
+                        .await
+                    {
+                        log::warn!(
+                            "failed to clean up forked engine thread {} after rollback failure: {cleanup_error}",
+                            forked.engine_thread_id
+                        );
+                    }
+                    return Err(err_to_string(rollback_error));
+                }
+            };
+
+            self.thread_create_branch(
+                &thread,
+                &forked.engine_thread_id,
+                &forked.model_id,
+                rollback_snapshot
+                    .title
+                    .as_deref()
+                    .or(forked.title.as_deref()),
+                rollback_snapshot
+                    .preview
+                    .as_deref()
+                    .or(forked.preview.as_deref()),
+                rollback_snapshot
+                    .raw_status
+                    .as_deref()
+                    .or(forked.raw_status.as_deref()),
+                &rollback_snapshot.active_flags,
+                Some(num_turns),
+            )
+                .await
+
+        }
+        pub(crate) async fn thread_compact_record(&self, app: AppHandle, thread_id: String) -> Result<ThreadDto, String> {
+            let state = &self.state;
+
+            if state.turns.get(&thread_id).await.is_some() {
+                return Err("cannot compact a thread while a turn is still active".to_string());
+            }
+
+            let db = state.db.clone();
+            let thread = run_db(db.clone(), {
+                    let thread_id = thread_id.clone();
+                    move |db| db::threads::get_thread(db, &thread_id)
+            })
+                .await?
+                .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+            if thread.engine_id != "codex" {
+                return Err("native compact is only available for Codex threads".to_string());
+            }
+    // SSH 压缩由 CodexCli 按工作区位置分派到远端句柄，不再走仅本机限制。
+    // self.thread_reject_local_only_action( &thread, "压缩").await?;
+            let engine_thread_id = thread
+                .engine_thread_id
+                .clone()
+                .ok_or_else(|| "Codex thread has not been initialized yet".to_string())?;
+
+
+            let context = self
+                .execution_context(Some(thread.workspace_id.as_str()))
+                .await
+                .map_err(err_to_string)?;
+            let cli: &dyn CliTool = self;
+    // 旧业务直接调用路径保留迁移留痕，改由持久化消息承载手动压缩状态：
+    // cli.compact_thread(&context, &engine_thread_id).await.map_err(err_to_string)?;
+    // 手动压缩状态独立持久化为已完成消息，Notice 本身承载实际进行状态。
+            let in_progress_message = self.thread_save_compaction_notice(
+                &thread_id,
+                None,
+                "in_progress",
+                None,
+            )
+                .await
+                .map_err(|error| {
+                    log::error!("Failed to persist Codex compaction start message for thread {thread_id}: {error}");
+                    error
+            })?;
+            let event_name = format!("message-updated-{thread_id}");
+            if let Err(error) = app.emit(&event_name, &in_progress_message) {
+                log::error!("Failed to emit Codex compaction start message for thread {thread_id}: {error}");
+            }
+
+            let compaction_result = match cli.compact_thread(&context, &engine_thread_id).await {
+                Ok(result) => result,
+                Err(error) => {
+                    let status = if error.chain().any(|cause| cause.is::<tokio::time::error::Elapsed>()) {
+                "unconfirmed"
+                    } else {
+                "failed"
+                    };
+                    let compaction_error = err_to_string(error);
+                    match self.thread_save_compaction_notice(
+                        &thread_id,
+                        Some(&in_progress_message.id),
+                        status,
+                        Some(&compaction_error),
+                    )
+                        .await
+                    {
+                        Ok(message) => {
+                            if let Err(error) = app.emit(&event_name, &message) {
+                                log::error!("Failed to emit Codex compaction failure message for thread {thread_id}: {error}");
+                            }
+                        }
+                        Err(error) => {
+                            log::error!("Failed to persist Codex compaction failure for thread {thread_id}: {error}");
+                        }
+                    }
+                    return Err(compaction_error);
+                }
+            };
+
+    // 只绑定压缩状态助手消息，避免历史导入为手动压缩重新创建重复通知。
+            let binding_thread_id = thread_id.clone();
+            let binding_message_id = in_progress_message.id.clone();
+            let remote_turn_id = compaction_result.remote_turn_id.clone();
+            let binding_error = run_db(state.db.clone(), move |db| {
+                    db::messages::bind_message_to_remote_turn(
+                        db,
+                        &binding_thread_id,
+                        &binding_message_id,
+                        &remote_turn_id,
+                    )
+            })
+                .await
+                .err();
+            if let Some(error) = binding_error.as_deref() {
+                log::error!("Codex compaction completed but status message binding failed for thread {thread_id}: {error}");
+            }
+
+    // 压缩成功后将原消息更新为完成状态，并同步给当前对话视图。
+            let completed_message = self.thread_save_compaction_notice(
+                &thread_id,
+                Some(&in_progress_message.id),
+                "completed",
+                None,
+            )
+                .await
+                .map_err(|error| {
+                    log::error!("Codex compaction completed but state persistence failed for thread {thread_id}: {error}");
+                    format!("压缩已完成，状态保存失败：{error}")
+            })?;
+            if let Err(error) = app.emit(&event_name, &completed_message) {
+                log::error!("Failed to emit Codex compaction completion message for thread {thread_id}: {error}");
+            }
+            if let Some(error) = binding_error {
+                return Err(format!("压缩已完成，状态关联失败：{error}"));
+            }
+
+    // 返回压缩完成后持久化的上下文快照，前端不再复用压缩前的 token 数量。
+            run_db(db, move |db| db::threads::get_thread(db, &thread_id))
+                .await?
+                .ok_or_else(|| "压缩完成后会话不存在".to_string())
+
+        }
+        pub(crate) async fn thread_update_config(&self, thread_id: String, update_personality: bool, personality: Option<String>, update_service_tier: bool, service_tier: Option<String>, update_output_schema: bool, output_schema: Option<Value>) -> Result<ThreadDto, String> {
+            let state = &self.state;
+
+            let db = state.db.clone();
+            let thread = run_db(db.clone(), {
+                    let thread_id = thread_id.clone();
+                    move |db| db::threads::get_thread(db, &thread_id)
+            })
+                .await?
+                .ok_or_else(|| format!("thread not found: {thread_id}"))?;
+
+            if thread.engine_id != "codex" {
+                return Err("Codex thread config is only available for Codex threads".to_string());
+            }
+
+            let normalized_personality = if update_personality {
+                normalize_thread_personality(personality)?
+            } else {
+                None
+            };
+            let normalized_service_tier = if update_service_tier {
+                normalize_thread_service_tier(service_tier)?
+            } else {
+                None
+            };
+            let normalized_output_schema = if update_output_schema {
+                normalize_thread_output_schema(output_schema)?
+            } else {
+                None
+            };
+
+            let mut metadata = thread.engine_metadata.unwrap_or_else(|| json!({}));
+            if !metadata.is_object() {
+                metadata = json!({});
+            }
+
+            if let Some(object) = metadata.as_object_mut() {
+                if update_personality {
+                    match normalized_personality {
+                        Some(value) => {
+                            object.insert("personality".to_string(), json!(value));
+                        }
+                        None => {
+                            object.remove("personality");
+                        }
+                    }
+                }
+
+                if update_service_tier {
+                    match normalized_service_tier {
+                        Some(value) => {
+                            object.insert("serviceTier".to_string(), json!(value));
+                        }
+                        None => {
+                            object.remove("serviceTier");
+                        }
+                    }
+                }
+
+                if update_output_schema {
+                    match normalized_output_schema {
+                        Some(value) => {
+                            object.insert("outputSchema".to_string(), value);
+                        }
+                        None => {
+                            object.remove("outputSchema");
+                        }
+                    }
+                }
+            }
+
+            run_db(db.clone(), {
+                    let thread_id = thread_id.clone();
+                    let metadata = metadata.clone();
+                    move |db| db::threads::update_engine_metadata(db, &thread_id, &metadata)
+            })
+                .await?;
+
+            run_db(db, {
+                    let thread_id = thread_id.clone();
+                    move |db| db::threads::get_thread(db, &thread_id)
+            })
+                .await?
+                .ok_or_else(|| format!("thread not found after Codex config update: {thread_id}"))
+
+        }
     }
 }

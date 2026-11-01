@@ -4,7 +4,6 @@ use serde_json::Value;
 use tauri::{Emitter, State};
 
 use crate::{
-    commands::threads,
     db::{self, scheduled_tasks::ScheduledTaskWrite},
     models::{ScheduledTaskDto, ThreadDto},
     scheduled_tasks::schedule::initial_next_run_at,
@@ -292,8 +291,8 @@ async fn validate_runtime_config(
         return Err("scheduled task model is required".to_string());
     }
 
-    runtime.model_id =
-        threads::validate_model_for_engine(state, &runtime.engine_id, &runtime.model_id).await?;
+    let cli = crate::cli_tools::factory::CliToolFactory::new(state.clone()).create(&runtime.engine_id).map_err(|error| format!("{error:#}"))?;
+    runtime.model_id = cli.validate_thread_model(None, &runtime.model_id).await.map_err(|error| format!("{error:#}"))?;
     runtime.reasoning_effort = runtime
         .reasoning_effort
         .as_deref()
@@ -302,13 +301,7 @@ async fn validate_runtime_config(
         .map(str::to_lowercase);
     if let Some(reasoning_effort) = runtime.reasoning_effort.as_deref() {
         runtime.reasoning_effort = Some(
-            threads::validate_reasoning_effort(
-                state,
-                &runtime.engine_id,
-                &runtime.model_id,
-                reasoning_effort,
-            )
-            .await?,
+            cli.validate_thread_reasoning(&runtime.model_id, reasoning_effort).await.map_err(|error| format!("{error:#}"))?,
         );
     }
     runtime.service_tier = match runtime

@@ -923,6 +923,91 @@ impl ClaudeCodeCli {
 
 #[async_trait]
 impl CliTool for ClaudeCodeCli {
+    async fn list_codex_thread_records(&self, _workspace_id: String, _cursor: Option<String>, _limit: Option<u32>, _search_term: Option<String>, _archived: Option<bool>) -> Result<crate::models::CodexRemoteThreadPageDto> {
+        anyhow::bail!("claude 不支持此线程业务操作：list_codex_thread_records")
+    }
+
+    async fn list_opencode_thread_records(&self, _workspace_id: String, _cursor: Option<String>, _limit: Option<u32>, _search_term: Option<String>, _archived: Option<bool>) -> Result<crate::models::OpenCodeRemoteSessionPageDto> {
+        anyhow::bail!("claude 不支持此线程业务操作：list_opencode_thread_records")
+    }
+
+    async fn attach_thread_record(&self, _workspace_id: String, _engine_thread_id: String) -> Result<ThreadDto> {
+        anyhow::bail!("claude 不支持此线程业务操作：attach_thread_record")
+    }
+
+    async fn attach_opencode_thread_record(&self, _workspace_id: String, _engine_thread_id: String, _cwd: String, _model_id: String) -> Result<ThreadDto> {
+        anyhow::bail!("claude 不支持此线程业务操作：attach_opencode_thread_record")
+    }
+
+    async fn fork_thread_record(&self, _thread_id: String) -> Result<ThreadDto> {
+        anyhow::bail!("claude 不支持此线程业务操作：fork_thread_record")
+    }
+
+    async fn rollback_thread_record(&self, _thread_id: String, _num_turns: u32) -> Result<ThreadDto> {
+        anyhow::bail!("claude 不支持此线程业务操作：rollback_thread_record")
+    }
+
+    async fn compact_thread_record(&self, _app: tauri::AppHandle, _thread_id: String) -> Result<ThreadDto> {
+        anyhow::bail!("claude 不支持此线程业务操作：compact_thread_record")
+    }
+
+    async fn update_codex_thread_config(&self, _thread_id: String, _update_personality: bool, _personality: Option<String>, _update_service_tier: bool, _service_tier: Option<String>, _update_output_schema: bool, _output_schema: Option<Value>) -> Result<ThreadDto> {
+        anyhow::bail!("claude 不支持此线程业务操作：update_codex_thread_config")
+    }
+
+    async fn update_opencode_thread_config(&self, _thread_id: String, _update_agent: bool, _agent: Option<String>) -> Result<ThreadDto> {
+        anyhow::bail!("claude 不支持此线程业务操作：update_opencode_thread_config")
+    }
+
+    fn normalize_thread_service_tier(&self, value: Option<String>) -> Result<Option<String>> {
+        if value.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+            anyhow::bail!("service tier is only supported for Codex threads")
+        }
+        Ok(None)
+    }
+
+
+    async fn create_thread_record(&self, workspace_id: String, model_id: String, title: String, reasoning_effort: Option<String>, service_tier: Option<String>) -> Result<ThreadDto> {
+        self.mcp.create_thread_record(self, "claude", workspace_id, model_id, title, reasoning_effort, service_tier).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=claude operation=create_thread_record error={error:#}"))
+    }
+
+    async fn reconfigure_thread_record(&self, thread_id: String, model_id: String, reasoning_effort: Option<String>, service_tier: Option<String>) -> Result<ThreadDto> {
+        self.mcp.reconfigure_thread_record(self, "claude", thread_id, model_id, reasoning_effort, service_tier).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=claude operation=reconfigure_thread_record error={error:#}"))
+    }
+
+    async fn set_thread_reasoning(&self, thread_id: String, reasoning_effort: Option<String>, model_id: Option<String>) -> Result<()> {
+        self.mcp.set_thread_reasoning(self, "claude", thread_id, reasoning_effort, model_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=claude operation=set_thread_reasoning error={error:#}"))
+    }
+
+    async fn set_thread_selected_model(&self, thread_id: String, model_id: String) -> Result<ThreadDto> {
+        self.mcp.set_thread_selected_model(self, "claude", thread_id, model_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=claude operation=set_thread_selected_model error={error:#}"))
+    }
+
+    async fn delete_thread_record(&self, thread_id: String) -> Result<()> {
+        self.mcp.delete_thread_record(self, "claude", thread_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=claude operation=delete_thread_record error={error:#}"))
+    }
+
+    async fn archive_thread_record(&self, thread_id: String) -> Result<()> {
+        self.mcp.archive_thread_record(self, "claude", thread_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=claude operation=archive_thread_record error={error:#}"))
+    }
+
+    async fn restore_thread_record(&self, thread_id: String) -> Result<ThreadDto> {
+        self.mcp.restore_thread_record(self, "claude", thread_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=claude operation=restore_thread_record error={error:#}"))
+    }
+
+    async fn validate_thread_model(&self, workspace_id: Option<&str>, model_id: &str) -> Result<String> {
+        self.mcp.validate_thread_model(self, "claude", workspace_id, model_id).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=claude operation=validate_thread_model error={error:#}"))
+    }
+
+    async fn validate_thread_reasoning(&self, model_id: &str, reasoning_effort: &str) -> Result<String> {
+        self.mcp.validate_thread_reasoning(self, "claude", model_id, reasoning_effort).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=claude operation=validate_thread_reasoning error={error:#}"))
+    }
+
+    async fn sync_thread_record(&self, thread_id: String) -> Result<ThreadDto> {
+        self.thread_sync_record(thread_id).await.map_err(anyhow::Error::msg)
+    }
+
+
     fn id(&self) -> &str {
         "claude"
     }
@@ -2327,5 +2412,217 @@ mod tests {
         assert!(matches_claude_session_search(&session, Some("DEPLOY")));
         assert!(!matches_claude_session_search(&session, Some("staging")));
         assert!(matches_claude_session_search(&session, None));
+    }
+}
+
+pub(crate) mod thread_business {
+    use super::*;
+    use crate::models::MessageStatusDto;
+
+    async fn run_db<T, F>(db: crate::db::Database, operation: F) -> Result<T, String>
+    where
+    T: Send + 'static,
+    F: FnOnce(&crate::db::Database) -> anyhow::Result<T> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || operation(&db))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(err_to_string)
+    }
+    fn err_to_string(error: impl std::fmt::Display) -> String {
+        format!("{error:#}")
+    }
+    impl ClaudeCodeCli {
+        pub(crate) async fn thread_sync_record(&self, thread_id: String) -> Result<ThreadDto, String> {
+            let state = &self.state;
+            let thread = crate::services::thread_service::ThreadService::new(state.clone()).get_thread(&thread_id).await.map_err(err_to_string)?;
+            if thread.engine_id != "claude" { return Err("线程所属 CLI 与当前实现不一致".to_owned()); }
+            let thread = &thread;
+            let thread_id = thread_id.as_str();
+            let summary_synced_thread = thread.clone();
+
+            let sync_required = match run_db(state.db.clone(), {
+                    let thread_id = thread_id.to_string();
+                    move |db| db::threads::get_claude_sync_required(db, &thread_id)
+            })
+                .await
+            {
+                Ok(sync_required) => sync_required,
+                Err(error) => {
+                    log::error!(
+                        "Claude 历史同步标记读取失败: thread_id={} workspace_id={} engine_id=claude engine_thread_id={:?} error={}",
+                        thread_id,
+                        thread.workspace_id,
+                        thread.engine_thread_id,
+                        error
+                    );
+                    return Err(error);
+                }
+            };
+            log::info!(
+                "Claude 历史同步标记读取完成: thread_id={} workspace_id={} engine_id=claude engine_thread_id={:?} claude_sync_required={}",
+                thread_id,
+                thread.workspace_id,
+                thread.engine_thread_id,
+                sync_required
+            );
+            if !sync_required {
+                log::info!(
+                    "Claude 历史同步跳过: thread_id={} workspace_id={} engine_id=claude engine_thread_id={:?} skip_reason=sync_not_required",
+                    thread_id,
+                    thread.workspace_id,
+                    thread.engine_thread_id
+                );
+                return Ok(thread.clone());
+            }
+
+            let Some(engine_thread_id) = thread
+                .engine_thread_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                log::info!(
+                    "Claude 历史同步跳过: thread_id={} workspace_id={} engine_id=claude engine_thread_id=None skip_reason=missing_engine_thread_id",
+                    thread_id,
+                    thread.workspace_id
+                );
+                return Ok(thread.clone());
+            };
+
+            let workspace = run_db(state.db.clone(), {
+                    let workspace_id = thread.workspace_id.clone();
+                    move |db| {
+                        db::workspaces::find_workspace_by_id(db, &workspace_id)?
+                            .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))
+                    }
+            })
+                .await?;
+            let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
+            let cli: &dyn CliTool = self;
+            log::info!(
+                "读取 Claude 历史快照请求: thread_id={} engine_thread_id={} workspace_id={} cwd={}",
+                thread_id,
+                engine_thread_id,
+                thread.workspace_id,
+                context.root_path
+            );
+            let snapshot = match cli
+                .read_thread_sync_snapshot(&context, thread, engine_thread_id)
+                .await
+            {
+                Ok(Some(snapshot)) => {
+                    log::info!(
+                        "读取 Claude 历史快照成功: thread_id={} engine_thread_id={} workspace_id={} snapshot_cwd={} title_present={} imported_messages={}",
+                        thread_id,
+                        engine_thread_id,
+                        thread.workspace_id,
+                        context.root_path,
+                        snapshot.title.is_some(),
+                        snapshot.imported_messages.len()
+                    );
+                    snapshot
+                }
+                Ok(None) => {
+                    log::info!(
+                        "读取 Claude 历史快照完成但无快照: thread_id={} engine_thread_id={} workspace_id={} no_snapshot=true",
+                        thread_id,
+                        engine_thread_id,
+                        thread.workspace_id
+                    );
+                    return Ok(summary_synced_thread);
+                }
+                Err(error) => {
+            // 旧完整历史入口会把原始读取错误返回给点击层和 MCP；两者再回退到本地结果。
+                    let error_text = err_to_string(error);
+                    log::error!(
+                        "读取 Claude 历史快照失败: thread_id={} engine_thread_id={} workspace_id={} error={}",
+                        thread_id,
+                        engine_thread_id,
+                        thread.workspace_id,
+                        error_text
+                    );
+                    return Err(error_text);
+            // 旧实现曾在此处记录 debug 后返回本地线程，保留迁移留痕但不再吞掉原生错误：
+            // log::debug!("failed to sync {} thread {}: {error}", thread.engine_id, thread_id);
+            // return Ok(thread.clone());
+                }
+            };
+
+            let imported_messages = snapshot
+                .imported_messages
+                .iter()
+                .map(|message| db::messages::ImportedMessageRecord {
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                    blocks: message.blocks.clone(),
+                    status: MessageStatusDto::from_str(message.status.as_str()),
+                    turn_engine_id: message.turn_engine_id.clone(),
+                    remote_turn_id: message.turn_engine_id.clone(),
+                    turn_model_id: message.turn_model_id.clone(),
+                    turn_reasoning_effort: message.turn_reasoning_effort.clone(),
+                    token_input: message.token_input,
+                    token_output: message.token_output,
+                    created_at: message.created_at.clone(),
+            })
+                .collect::<Vec<_>>();
+            let imported_message_count = imported_messages.len();
+            run_db(state.db.clone(), {
+                    let thread_id = thread_id.to_string();
+                    move |db| {
+                        db::messages::append_thread_messages(db, &thread_id, &imported_messages)?;
+                        db::threads::refresh_thread_message_stats(
+                            db,
+                            &thread_id,
+                            db::threads::ThreadMessageStatsActivityPolicy::PreserveExisting,
+                        )?;
+                        Ok::<_, anyhow::Error>(())
+                    }
+            })
+                .await?;
+            log::info!(
+                "Claude 历史消息写入与统计刷新成功: thread_id={} engine_thread_id={} workspace_id={} imported_messages={}",
+                thread_id,
+                engine_thread_id,
+                thread.workspace_id,
+                imported_message_count
+            );
+
+            let title = snapshot
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let updated_thread = run_db(state.db.clone(), {
+                    let thread_id = thread_id.to_string();
+                    let title = title.map(str::to_string);
+                    move |db| {
+                        db::threads::update_thread_runtime_snapshot(
+                            db,
+                            &thread_id,
+                            title.as_deref(),
+                            None,
+                            None,
+                        )
+                    }
+            })
+                .await?;
+
+    // 完整历史、统计和现有运行时更新全部成功后，清除当前 Claude 线程的同步标记。
+            run_db(state.db.clone(), {
+                    let thread_id = thread_id.to_string();
+                    move |db| db::threads::set_claude_sync_required(db, &thread_id, false)
+            })
+                .await?;
+            log::info!(
+                "Claude 历史同步标记清除成功: thread_id={} engine_thread_id={} workspace_id={} flag_cleared=true",
+                thread_id,
+                engine_thread_id,
+                thread.workspace_id
+            );
+
+            Ok(updated_thread)
+
+        }
     }
 }

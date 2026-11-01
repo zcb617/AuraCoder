@@ -8,7 +8,6 @@ use tokio::{sync::Notify, time::sleep};
 use crate::{
     commands::{
         chat::{ChatMessageService, SendMessageRequest},
-        threads,
     },
     db,
     models::{ScheduledTaskDto, ScheduledTaskRunDto, ThreadDto},
@@ -302,8 +301,7 @@ async fn create_scheduled_thread(
     title.push_str(" · ");
     title.push_str(&scheduled_suffix);
 
-    threads::create_thread_with_defaults(
-        state,
+    crate::services::thread_service::ThreadService::new(state.clone()).create_thread(
         task.workspace_id.clone(),
         runtime.engine_id.clone(),
         runtime.model_id.clone(),
@@ -312,6 +310,7 @@ async fn create_scheduled_thread(
         runtime.service_tier.clone(),
     )
     .await
+    .map_err(|error| format!("{error:#}"))
 }
 
 fn runtime_config_for_task(

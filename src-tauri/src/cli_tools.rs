@@ -2,7 +2,7 @@ pub mod claude_code;
 mod claude_code_session_lifecycle;
 pub mod codex;
 pub mod factory;
-mod mcp;
+pub(crate) mod mcp;
 pub mod opencode;
 
 pub(crate) use mcp::{BaseCliMcp, CliMcpRuntime};
@@ -248,6 +248,41 @@ pub struct CliReviewStarted {
 /// CLI 取得对应实现，并且只通过本接口完成 CLI 业务操作。
 #[async_trait]
 pub trait CliTool: Send + Sync {
+
+    // 完整线程业务入口：Controller 和其他调用方不得拼接协议调用或直接访问 Mapper。
+    async fn create_thread_record(&self, workspace_id: String, model_id: String, title: String, reasoning_effort: Option<String>, service_tier: Option<String>) -> Result<ThreadDto>;
+
+    async fn reconfigure_thread_record(&self, thread_id: String, model_id: String, reasoning_effort: Option<String>, service_tier: Option<String>) -> Result<ThreadDto>;
+
+    async fn set_thread_reasoning(&self, thread_id: String, reasoning_effort: Option<String>, model_id: Option<String>) -> Result<()>;
+
+    async fn set_thread_selected_model(&self, thread_id: String, model_id: String) -> Result<ThreadDto>;
+
+    async fn delete_thread_record(&self, thread_id: String) -> Result<()>;
+
+    async fn archive_thread_record(&self, thread_id: String) -> Result<()>;
+
+    async fn restore_thread_record(&self, thread_id: String) -> Result<ThreadDto>;
+
+    async fn validate_thread_model(&self, workspace_id: Option<&str>, model_id: &str) -> Result<String>;
+
+    async fn validate_thread_reasoning(&self, model_id: &str, reasoning_effort: &str) -> Result<String>;
+
+    /// 同步当前 CLI 的会话历史、统计及状态，成功后返回落库结果。
+    async fn sync_thread_record(&self, thread_id: String) -> Result<ThreadDto>;
+
+    async fn list_codex_thread_records(&self, _workspace_id: String, _cursor: Option<String>, _limit: Option<u32>, _search_term: Option<String>, _archived: Option<bool>) -> Result<crate::models::CodexRemoteThreadPageDto>;
+    async fn list_opencode_thread_records(&self, _workspace_id: String, _cursor: Option<String>, _limit: Option<u32>, _search_term: Option<String>, _archived: Option<bool>) -> Result<crate::models::OpenCodeRemoteSessionPageDto>;
+    async fn attach_thread_record(&self, _workspace_id: String, _engine_thread_id: String) -> Result<ThreadDto>;
+    async fn attach_opencode_thread_record(&self, _workspace_id: String, _engine_thread_id: String, _cwd: String, _model_id: String) -> Result<ThreadDto>;
+    async fn fork_thread_record(&self, _thread_id: String) -> Result<ThreadDto>;
+    async fn rollback_thread_record(&self, _thread_id: String, _num_turns: u32) -> Result<ThreadDto>;
+    async fn compact_thread_record(&self, _app: tauri::AppHandle, _thread_id: String) -> Result<ThreadDto>;
+    async fn update_codex_thread_config(&self, _thread_id: String, _update_personality: bool, _personality: Option<String>, _update_service_tier: bool, _service_tier: Option<String>, _update_output_schema: bool, _output_schema: Option<Value>) -> Result<ThreadDto>;
+    async fn update_opencode_thread_config(&self, _thread_id: String, _update_agent: bool, _agent: Option<String>) -> Result<ThreadDto>;
+    /// 由实现类决定专属配置的校验规则；公共基础流程不判断 CLI 名称。
+    fn normalize_thread_service_tier(&self, value: Option<String>) -> Result<Option<String>>;
+
     /// 在模型选择器、会话和扩展页面中标识当前 CLI，保证用户选择的 CLI 不会被换成其他 CLI。
     fn id(&self) -> &str;
 

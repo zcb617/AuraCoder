@@ -29,7 +29,6 @@ use crate::{
             cancel_turn_inner, save_pasted_image_attachment, ChatAttachmentPayload,
             ChatMessageService, SendMessageRequest,
         },
-        threads::create_thread_with_defaults,
     },
     config::app_config::{AppConfig, RemoteAccessConfig, RemoteDeviceConfig},
     // 历史分页已恢复：MessageWindowCursorDto 用于 message.list 游标分页。
@@ -1470,8 +1469,7 @@ impl RemoteTunnelManager {
                                                 .filter(|value| !value.is_empty())
                                                 .map(str::to_string);
                                             match workspace_id {
-                                                Ok(workspace_id) => create_thread_with_defaults(
-                                                    &state,
+                                                Ok(workspace_id) => crate::services::thread_service::ThreadService::new(state.clone()).create_thread(
                                                     workspace_id,
                                                     engine_id,
                                                     model_id,
@@ -1480,6 +1478,7 @@ impl RemoteTunnelManager {
                                                     service_tier,
                                                 )
                                                 .await
+                                                .map_err(|error| format!("{error:#}"))
                                                 .and_then(|thread| serde_json::to_value(thread).map_err(|error| error.to_string())),
                                                 Err(error) => Err(error),
                                             }

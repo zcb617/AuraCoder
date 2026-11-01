@@ -149,6 +149,9 @@ function collectCodeFiles(sourceRoot, directory = sourceRoot, files = []) {
     }
 
     const entryPath = join(directory, entry.name);
+    if (entry.isDirectory() && normalizePath(relative(sourceRoot, entryPath)) === "src-tauri/tests") {
+      continue;
+    }
     if (entry.isDirectory()) {
       collectCodeFiles(sourceRoot, entryPath, files);
       continue;
@@ -570,7 +573,17 @@ function addMissingFinding(findings, file, rule, match, direction) {
  * @returns {ReturnType<typeof createFinding>[]} 文件命中的违规结果。
  */
 function sourceRuleMatchesToFindings(source, rule) {
-  return findMatches(source.clean, rule.pattern).map((match) => {
+  return findMatches(source.clean, rule.pattern).filter((match) => {
+    if (rule.rule !== "REF-10" || source.path !== "src-tauri/src/lib.rs") {
+      return true;
+    }
+    // 应用入口只允许声明 Controller 模块及注册 Tauri 命令，业务调用仍然报错。
+    if (/^(?:pub\s+)?mod\s+commands\b/.test(match.text)) {
+      return false;
+    }
+    return ![...source.clean.matchAll(/\b(?:tauri\s*::\s*)?generate_handler\s*!\s*\[[\s\S]*?\]/g)]
+      .some((registration) => match.index >= registration.index && match.index < registration.index + registration[0].length);
+  }).map((match) => {
     const line = getLineNumber(source.clean, match.index);
     return createFinding(
       source.path,
@@ -704,7 +717,21 @@ function databaseRulesForPath(filePath) {
  */
 function rulesForPath(filePath) {
   const normalized = normalizePath(filePath);
+  if (normalized.startsWith("src-tauri/tests/")) {
+    return [];
+  }
   const rules = [];
+
+  // Controller 只接收外部请求；所有业务层和其他 Controller 都不得反向复用。
+  if (normalized.startsWith("src-tauri/src/")) {
+    const direction = "禁止业务模块或 Controller 调用、引用其他 Controller；公共业务移入对应 Service，CLI 业务通过工厂和 CliTool 接口进入对应实现类。";
+    rules.push(defineRule("REF-10", moduleReferencePattern(["commands"]), direction));
+    rules.push(defineRule("REF-10", /(?<!::)\bcommands\s*::/g, direction));
+    if (normalized.startsWith("src-tauri/src/commands/")) {
+      rules.push(defineRule("REF-10", /\bsuper\s*::\s*(?:chat|threads|engines|scheduled_tasks|workspace|ssh_connections|terminal|files|git)\b/g, direction));
+      rules.push(defineRule("REF-10", /\buse\s+super\s*::\s*\{[^}]*\b(?:chat|threads|engines|scheduled_tasks|workspace|ssh_connections|terminal|files|git)\b/g, direction));
+    }
+  }
 
   if (isBusinessPath(normalized)) {
     const direction =
@@ -1111,6 +1138,32 @@ function findSampleFindings(filePath, snippet) {
  */
 function runSelfChecks() {
   assert.ok(
+    findSampleFindings("src-tauri/src/services/example.rs", "use crate::commands::threads::create_thread;")
+      .some((finding) => finding.rule === "REF-10"),
+    "REF-10 必须拒绝业务模块反向引用 Controller",
+  );
+  assert.ok(
+    findSampleFindings("src-tauri/src/commands/example.rs", "use super::{threads, chat};")
+      .some((finding) => finding.rule === "REF-10"),
+    "REF-10 必须拒绝 Controller 之间的业务复用",
+  );
+  assert.equal(
+    findSampleFindings("src-tauri/src/lib.rs", "mod commands; tauri::generate_handler![commands::threads::create_thread]")
+      .filter((finding) => finding.rule === "REF-10").length,
+    0,
+    "REF-10 必须允许应用入口注册 Tauri 命令",
+  );
+  assert.ok(
+    findSampleFindings("src-tauri/src/lib.rs", "fn business() { commands::threads::create_thread(); }")
+      .some((finding) => finding.rule === "REF-10"),
+    "REF-10 不得放行应用入口中的普通 Controller 调用",
+  );
+  assert.equal(
+    findSampleFindings("src-tauri/tests/unit/example.rs", "db::threads::get_thread(); crate::commands::threads::create_thread();").length,
+    0,
+    "统一测试目录不参与生产架构扫描",
+  );
+  assert.ok(
     findSampleFindings(
       "src-tauri/src/commands/example.rs",
       "use crate::local_cli_service_lifecycle::LocalCliServiceLifecycle;",
@@ -1339,7 +1392,7 @@ function main() {
       [
         "Tauri 后端架构引用检查通过。",
         `全量代码扫描: ${sources.size} 个仓库代码文件。`,
-        "引用方向规则: REF-01 至 REF-09。",
+        "引用方向规则: REF-01 至 REF-10。",
         "脚本自检: 既有架构引用、数据库访问越层、允许实现层和注释字符串过滤均通过。",
         "依赖检查: 仅使用 Node.js 内置模块，无新增依赖。",
       ].join("\n") + "\n",
