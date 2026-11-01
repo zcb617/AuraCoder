@@ -30,6 +30,7 @@ mod remote_project_opencode_runtime_service;
 mod remote_project_session_refresh_service;
 mod runtime_env;
 mod scheduled_tasks;
+pub mod services;
 mod ssh;
 mod state;
 mod terminal;
@@ -610,7 +611,6 @@ pub fn run() {
             commands::threads::rename_thread,
             commands::threads::set_thread_reasoning_effort,
             commands::threads::set_ssh_remote_thread_selected_model,
-            commands::threads::set_thread_execution_policy,
             commands::threads::get_thread_permissions,
             commands::threads::set_thread_permissions,
             commands::threads::set_thread_codex_config,

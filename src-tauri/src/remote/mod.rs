@@ -24,7 +24,6 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    cli_tools::{factory::CliToolFactory, CliTool},
     commands::{
         chat::{
             cancel_turn_inner, save_pasted_image_attachment, ChatAttachmentPayload,
@@ -35,6 +34,7 @@ use crate::{
     config::app_config::{AppConfig, RemoteAccessConfig, RemoteDeviceConfig},
     // 历史分页已恢复：MessageWindowCursorDto 用于 message.list 游标分页。
     models::{EngineInfoDto, MessageWindowCursorDto, ThreadDto},
+    services::thread_service::ThreadService,
     state::AppState,
 };
 
@@ -1567,121 +1567,26 @@ impl RemoteTunnelManager {
                                             match (thread_id, preset) {
                                                 (Ok(thread_id), Ok(preset)) => {
                                                     async {
-                                                    // 权限业务统一经过 CLI 工厂和 CLI 实现层；本地、SSH
-                                                    // 只由实现层内部决定具体的生命周期和数据来源。
-                                                    let db = state.db.clone();
-                                                    let query_thread_id = thread_id.clone();
-                                                    let thread = tokio::task::spawn_blocking(move || {
-                                                        crate::db::threads::get_thread(&db, &query_thread_id)
-                                                    })
-                                                    .await
-                                                    .map_err(|error| error.to_string())
-                                                    .and_then(|result| result.map_err(|error| error.to_string()))?
-                                                    .ok_or_else(|| "thread not found".to_string())?;
-                                                    let cli = CliToolFactory::new(state.clone())
-                                                        .create(&thread.engine_id)
-                                                        .map_err(|error| error.to_string())?;
-                                                    let context = cli
-                                                        .execution_context(Some(&thread.workspace_id))
+                                                    let thread_service = ThreadService::new(state.clone());
+                                                    let mut permissions = thread_service
+                                                        .get_permissions(&thread_id)
                                                         .await
                                                         .map_err(|error| error.to_string())?;
-                                                    let mut permissions = cli
-                                                        .get_permissions(&context, &thread)
-                                                        .await
-                                                        .map_err(|error| error.to_string())?;
-                                                    permissions.insert(
-                                                        "autonomyPreset".to_string(),
-                                                        if preset == "inherit" {
-                                                            json!([])
-                                                        } else {
-                                                            json!([preset])
-                                                        },
-                                                    );
-                                                    cli.set_permissions(&context, &thread, permissions)
-                                                        .await
-                                                        .map_err(|error| error.to_string())?;
-                                                    let db = state.db.clone();
-                                                    let result_thread_id = thread_id.clone();
-                                                    let saved_thread = tokio::task::spawn_blocking(move || {
-                                                        crate::db::threads::get_thread(&db, &result_thread_id)
-                                                    })
-                                                    .await
-                                                    .map_err(|error| error.to_string())
-                                                    .and_then(|result| result.map_err(|error| error.to_string()))?
-                                                    .ok_or_else(|| "thread not found after permission update".to_string())?;
-                                                    serde_json::to_value(saved_thread).map_err(|error| error.to_string())
-                                                    /*
-                                                    // 旧实现已停用：Controller 直接修改 engine_metadata_json，
-                                                    // 并根据 Codex 外部沙箱分支拼接三种 CLI 的原始字段。
-                                                    let db = state.db.clone();
-                                                    let codex = CliToolFactory::new(state.clone())
-                                                        .create("codex")
-                                                        .expect("Codex CLI factory mapping must exist");
-                                                    let codex_uses_external_sandbox = match codex.execution_context(None).await {
-                                                        Ok(context) => {
-                                                            let cli: &dyn CliTool = codex.as_ref();
-                                                            cli.uses_external_sandbox(&context).await.unwrap_or(false)
-                                                        }
-                                                        Err(_) => false,
+                                                    permissions.autonomy_preset = if preset == "inherit" {
+                                                        Vec::new()
+                                                    } else {
+                                                        vec![preset]
                                                     };
-                                                    tokio::task::spawn_blocking(move || {
-                                                        let thread = crate::db::threads::get_thread(&db, &thread_id)?
-                                                            .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
-                                                        let mut metadata = thread.engine_metadata.unwrap_or_else(|| json!({}));
-                                                        if !metadata.is_object() { metadata = json!({}); }
-                                                        let values = metadata.as_object_mut().expect("metadata must be an object");
-                                                        values.remove("permissionProfile");
-                                                        values.remove("sandboxApprovalPolicy");
-                                                        values.remove("sandboxMode");
-                                                        values.remove("sandboxAllowNetwork");
-                                                        values.remove("claudePermissionMode");
-                                                        values.remove("opencodePermissionMode");
-                                                        if preset != "inherit" {
-                                                            match thread.engine_id.as_str() {
-                                                                "codex" => {
-                                                                    let (approval, sandbox, allow_network) = match preset.as_str() {
-                                                                        "read-only" => ("untrusted", (!codex_uses_external_sandbox).then_some("read-only"), false),
-                                                                        "ask" => ("on-request", (!codex_uses_external_sandbox).then_some("workspace-write"), false),
-                                                                        "auto" => ("on-request", (!codex_uses_external_sandbox).then_some("workspace-write"), true),
-                                                                        "full" => ("never", Some("danger-full-access"), true),
-                                                                        _ => unreachable!(),
-                                                                    };
-                                                                    values.insert("sandboxApprovalPolicy".to_string(), json!(approval));
-                                                                    if let Some(sandbox) = sandbox { values.insert("sandboxMode".to_string(), json!(sandbox)); }
-                                                                    values.insert("sandboxAllowNetwork".to_string(), json!(allow_network));
-                                                                }
-                                                                "claude" => {
-                                                                    let (permission_mode, sandbox, allow_network) = match preset.as_str() {
-                                                                        "read-only" => ("default", "read-only", false),
-                                                                        "ask" => ("default", "workspace-write", false),
-                                                                        "auto" => ("acceptEdits", "workspace-write", true),
-                                                                        "full" => ("bypassPermissions", "danger-full-access", true),
-                                                                        _ => unreachable!(),
-                                                                    };
-                                                                    values.insert("claudePermissionMode".to_string(), json!(permission_mode));
-                                                                    values.insert("sandboxMode".to_string(), json!(sandbox));
-                                                                    values.insert("sandboxAllowNetwork".to_string(), json!(allow_network));
-                                                                }
-                                                                "opencode" => {
-                                                                    let permission_mode = match preset.as_str() {
-                                                                        "read-only" | "ask" => "default",
-                                                                        "auto" | "full" => "bypassPermissions",
-                                                                        _ => unreachable!(),
-                                                                    };
-                                                                    values.insert("opencodePermissionMode".to_string(), json!(permission_mode));
-                                                                }
-                                                                _ => return Err(anyhow::anyhow!("unsupported engine")),
-                                                            }
-                                                        }
-                                                        crate::db::threads::update_engine_metadata(&db, &thread_id, &metadata)?;
-                                                        crate::db::threads::get_thread(&db, &thread_id)?
-                                                            .ok_or_else(|| anyhow::anyhow!("thread not found after update"))
-                                                    })
-                                                    .await
-                                                    .map_err(|error| error.to_string())
-                                                    .and_then(|result| result.map_err(|error| error.to_string()))
-                                                    .and_then(|thread| serde_json::to_value(thread).map_err(|error| error.to_string()))
-                                                    */
+                                                    let saved_thread = thread_service
+                                                        .save_permissions(&thread_id, permissions)
+                                                        .await
+                                                        .map_err(|error| error.to_string())?;
+                                                    let _ = app.emit("thread-updated", json!({
+                                                        "threadId": saved_thread.id,
+                                                        "workspaceId": saved_thread.workspace_id,
+                                                        "thread": saved_thread.clone(),
+                                                    }));
+                                                    serde_json::to_value(saved_thread).map_err(|error| error.to_string())
                                                     }.await
                                                 }
                                                 (Err(error), _) | (_, Err(error)) => Err(error),
@@ -2227,7 +2132,6 @@ impl RemoteTunnelManager {
                                                                                             plan_mode: Some(false),
                                                                                             send_method: None,
                                                                                             reasoning_effort,
-                                                                                            permission_mode_json: None,
                                                                                             permission_values: None,
                                                                                             attachments: Some(attachments),
                                                                                             input_items: None,
@@ -2306,7 +2210,6 @@ impl RemoteTunnelManager {
                                                                                 plan_mode: Some(false),
                                                                                 send_method: None,
                                                                                 reasoning_effort,
-                                                                                permission_mode_json: None,
                                                                                 permission_values: None,
                                                                                 attachments,
                                                                                 input_items: None,

@@ -9,7 +9,6 @@ use crate::{
     },
     config::app_config::AppConfig,
     db,
-    engines::validate_engine_sandbox_mode,
     engines::CodexRemoteThreadSummary,
     engines::ModelInfo,
     engines::OpenCodeRemoteSessionSummary,
@@ -18,10 +17,11 @@ use crate::{
     models::{
         CodexRemoteThreadDto, CodexRemoteThreadPageDto, MessageDto, MessageStatusDto, OpenCodeRemoteSessionDto,
         OpenCodeRemoteSessionPageDto, PermissionComponentJson, ThreadDto, ThreadStatusDto,
-        ThreadUpdateDto, TrustLevelDto,
+        ThreadUpdateDto,
     },
     path_utils::paths_equal,
     runtime_env,
+    services::thread_service::ThreadService,
     state::AppState,
 };
 
@@ -38,52 +38,40 @@ where
         .map_err(err_to_string)
 }
 
-async fn codex_external_sandbox_for_workspace(
-    state: &AppState,
-    workspace: &crate::models::WorkspaceDto,
-) -> Result<bool, String> {
-    let context = CliExecutionContext::from_workspace(workspace).map_err(err_to_string)?;
-    let codex = CliToolFactory::new(state.clone())
-        .create("codex")
-        .expect("Codex CLI factory mapping must exist");
-    let cli: &dyn CliTool = codex.as_ref();
-    cli.uses_external_sandbox(&context)
-        .await
-        .map_err(err_to_string)
-}
-
+/// 通过线程 Service 读取工作区活动线程及其统一权限对象 A。
 #[tauri::command]
 pub async fn list_threads(
     state: State<'_, AppState>,
     workspace_id: String,
 ) -> Result<Vec<ThreadDto>, String> {
-    run_db(state.db.clone(), move |db| {
-        db::threads::list_threads_for_workspace(db, &workspace_id)
-    })
-    .await
+    ThreadService::new(state.inner().clone())
+        .list_threads(&workspace_id)
+        .await
+        .map_err(err_to_string)
 }
 
+/// 通过线程 Service 读取工作区归档线程及其统一权限对象 A。
 #[tauri::command]
 pub async fn list_archived_threads(
     state: State<'_, AppState>,
     workspace_id: String,
 ) -> Result<Vec<ThreadDto>, String> {
-    run_db(state.db.clone(), move |db| {
-        db::threads::list_archived_threads_for_workspace(db, &workspace_id)
-    })
-    .await
+    ThreadService::new(state.inner().clone())
+        .list_archived_threads(&workspace_id)
+        .await
+        .map_err(err_to_string)
 }
 
-/// 通过统一局部更新 DTO 保存线程运行时字段。
+/// 通过线程 Service 保存局部字段和统一权限对象 A。
 #[tauri::command]
 pub async fn update_thread(
     state: State<'_, AppState>,
     update: ThreadUpdateDto,
 ) -> Result<ThreadDto, String> {
-    run_db(state.db.clone(), move |db| {
-        db::threads::update_thread(db, &update)
-    })
-    .await
+    ThreadService::new(state.inner().clone())
+        .update_thread(update)
+        .await
+        .map_err(err_to_string)
 }
 
 /// 持久化会话底部 6 项运行时选择。
@@ -99,21 +87,21 @@ pub async fn update_thread_runtime_selection(
     plan_mode: Option<bool>,
     send_method: Option<String>,
     reasoning_effort: Option<String>,
-    permission_mode: Option<String>,
+    permission_mode: Option<PermissionComponentJson>,
 ) -> Result<ThreadDto, String> {
-    run_db(state.db.clone(), move |db| {
-        db::threads::update_thread_runtime_selection(
-            db,
-            &thread_id,
-            &engine_id,
-            &model_id,
+    ThreadService::new(state.inner().clone())
+        .update_thread(ThreadUpdateDto {
+            id: thread_id,
+            engine_id: Some(engine_id),
+            model_id: Some(model_id),
             plan_mode,
-            send_method.as_deref(),
-            reasoning_effort.as_deref(),
-            permission_mode.as_deref(),
-        )
-    })
-    .await
+            send_method,
+            reasoning_effort,
+            permission_mode,
+            ..Default::default()
+        })
+        .await
+        .map_err(err_to_string)
 }
 
 #[tauri::command]
@@ -1038,13 +1026,6 @@ fn build_opencode_remote_session_metadata(
         for key in [
             "lastModelId",
             "reasoningEffort",
-            "sandboxApprovalPolicy",
-            "sandboxMode",
-            "sandboxAllowNetwork",
-            "permissionProfile",
-            "approvalsReviewer",
-            "claudePermissionMode",
-            "opencodePermissionMode",
         ] {
             object.remove(key);
         }
@@ -1066,85 +1047,6 @@ fn build_opencode_remote_session_metadata(
     }
 
     metadata
-}
-
-#[derive(Debug, PartialEq)]
-struct AutonomyPresetPolicy {
-    approval_policy: Value,
-    sandbox_mode: Option<&'static str>,
-    allow_network: Option<bool>,
-}
-
-fn autonomy_policy_for_preset(
-    engine_id: &str,
-    preset: &str,
-    codex_external_sandbox: bool,
-) -> Result<AutonomyPresetPolicy, String> {
-    let policy = match engine_id {
-        "opencode" => AutonomyPresetPolicy {
-            approval_policy: json!(match preset {
-                "read-only" => "deny",
-                "ask" => "ask",
-                "auto" | "full" => "allow",
-                _ => return Err(format!("unknown autonomy preset: {preset}")),
-            }),
-            sandbox_mode: None,
-            allow_network: None,
-        },
-        "claude" => match preset {
-            "read-only" => AutonomyPresetPolicy {
-                approval_policy: json!("restricted"),
-                sandbox_mode: Some("read-only"),
-                allow_network: Some(false),
-            },
-            "ask" => AutonomyPresetPolicy {
-                approval_policy: json!("standard"),
-                sandbox_mode: Some("workspace-write"),
-                allow_network: Some(false),
-            },
-            "auto" => AutonomyPresetPolicy {
-                approval_policy: json!("trusted"),
-                sandbox_mode: Some("workspace-write"),
-                allow_network: None,
-            },
-            "full" => AutonomyPresetPolicy {
-                approval_policy: json!("trusted"),
-                sandbox_mode: Some("workspace-write"),
-                allow_network: Some(true),
-            },
-            _ => return Err(format!("unknown autonomy preset: {preset}")),
-        },
-        "codex" => match preset {
-            "read-only" => AutonomyPresetPolicy {
-                approval_policy: json!("untrusted"),
-                sandbox_mode: (!codex_external_sandbox).then_some("read-only"),
-                allow_network: Some(false),
-            },
-            "ask" => AutonomyPresetPolicy {
-                approval_policy: json!("on-request"),
-                sandbox_mode: (!codex_external_sandbox).then_some("workspace-write"),
-                allow_network: Some(false),
-            },
-            "auto" => AutonomyPresetPolicy {
-                approval_policy: json!("on-request"),
-                sandbox_mode: (!codex_external_sandbox).then_some("workspace-write"),
-                allow_network: Some(true),
-            },
-            "full" => AutonomyPresetPolicy {
-                approval_policy: json!("never"),
-                sandbox_mode: Some("danger-full-access"),
-                allow_network: Some(true),
-            },
-            _ => return Err(format!("unknown autonomy preset: {preset}")),
-        },
-        _ => {
-            return Err(format!(
-                "autonomy presets are unsupported for engine: {engine_id}"
-            ))
-        }
-    };
-
-    Ok(policy)
 }
 
 /// 创建会话并在失败时记录包含运行时参数的完整后端诊断日志。
@@ -1335,12 +1237,17 @@ async fn create_thread_inner(
         metadata.insert("serviceTier".to_string(), json!(value));
     }
 
-    // 初始权限预设由 CLI 权限接口处理，不再写入 engine_metadata_json 镜像。
-    // 旧实现忽略 initial_autonomy_preset 的语句已停用：let _ = initial_autonomy_preset;
+    // 根据项目统一信任设置和新线程默认预设构造初始权限对象 A。
+    let mut permission_mode = PermissionComponentJson::default();
+    permission_mode.trust = vec![target_workspace.trust_level.as_str().to_owned()];
+    if let Some(preset) = initial_autonomy_preset {
+        permission_mode.autonomy_preset = vec![preset.clone()];
+        permission_mode.default_for_new_threads = vec![preset];
+    }
 
     let metadata = (!metadata.is_empty()).then_some(Value::Object(metadata));
 
-    let mut created = run_db(state.db.clone(), move |db| {
+    let created = run_db(state.db.clone(), move |db| {
         let created =
             db::threads::create_thread(db, &workspace_id, &engine_id, &effective_model_id, &title)?;
         if let Some(metadata) = metadata.as_ref() {
@@ -1361,33 +1268,10 @@ async fn create_thread_inner(
     })
     .await?;
 
-    if let Some(preset) = initial_autonomy_preset {
-        let cli = CliToolFactory::new(state.clone())
-            .create(created.engine_id.as_str())
-            .map_err(err_to_string)?;
-        let context =
-            CliExecutionContext::from_workspace(&target_workspace).map_err(err_to_string)?;
-        let mut permissions = cli
-            .get_permissions(&context, &created)
-            .await
-            .map_err(err_to_string)?;
-        permissions.insert("autonomyPreset".to_string(), json!([preset]));
-        let _saved_permissions = cli
-            .set_permissions(&context, &created, permissions)
-            .await
-            .map_err(err_to_string)?;
-        let created_id = created.id.clone();
-        created = run_db(state.db.clone(), {
-            let thread_id = created_id.clone();
-            move |db| db::threads::get_thread(db, &thread_id)
-        })
-        .await?
-        .ok_or_else(|| {
-            format!("thread not found after initial autonomy preset update: {created_id}")
-        })?;
-    }
-
-    Ok(created)
+    ThreadService::new(state.clone())
+        .save_permissions(&created.id, permission_mode)
+        .await
+        .map_err(err_to_string)
 }
 
 /// 将尚未启动的会话改为用户首次发送时选择的 CLI 运行时。
@@ -1516,19 +1400,10 @@ pub async fn reconfigure_unstarted_thread_runtime(
             None
         };
 
-    let default_autonomy_preset = tokio::task::spawn_blocking(|| {
-        AppConfig::load_or_create()
-            .map(|config| config.default_autonomy_preset().map(ToOwned::to_owned))
-            .map_err(err_to_string)
-    })
-    .await
-    .map_err(err_to_string)??;
     let mut metadata = serde_json::Map::new();
     if let Some(value) = normalized_service_tier {
         metadata.insert("serviceTier".to_string(), json!(value));
     }
-    // 初始权限预设由 CLI 权限接口处理，不再写入 engine_metadata_json 镜像。
-    let _ = default_autonomy_preset;
 
     if let Some(existing_metadata) = thread.engine_metadata.as_ref().and_then(Value::as_object) {
         for key in ["manualTitle", "manualTitleUpdatedAt"] {
@@ -1566,33 +1441,6 @@ pub async fn reconfigure_unstarted_thread_runtime(
         )
     })
     .await
-    /*
-    // 误插入到 reconfigure_unstarted_thread_runtime 的初始预设处理，已停用；
-    // 初始预设处理属于 create_thread_inner。
-    if let Some(preset) = initial_autonomy_preset {
-        let cli = CliToolFactory::new(state.clone())
-            .create(created.engine_id.as_str())
-            .map_err(err_to_string)?;
-        let context = CliExecutionContext::from_workspace(&target_workspace)
-            .map_err(err_to_string)?;
-        let mut permissions = cli
-            .get_permissions(&context, &created)
-            .await
-            .map_err(err_to_string)?;
-        permissions.insert("autonomyPreset".to_string(), json!([preset]));
-        let _saved_permissions = cli
-            .set_permissions(&context, &created, permissions)
-            .await
-            .map_err(err_to_string)?;
-        let created_id = created.id.clone();
-        created = run_db(state.db.clone(), {
-            let thread_id = created_id.clone();
-            move |db| db::threads::get_thread(db, &thread_id)
-        })
-        .await?
-        .ok_or_else(|| format!("thread not found after initial autonomy preset update: {created_id}"))?;
-    }
-    */
 }
 
 #[tauri::command]
@@ -2745,7 +2593,7 @@ pub async fn fork_codex_thread(
     }
 
     let db = state.db.clone();
-    let mut thread = run_db(db.clone(), {
+    let thread = run_db(db.clone(), {
         let thread_id = thread_id.clone();
         move |db| db::threads::get_thread(db, &thread_id)
     })
@@ -2756,7 +2604,6 @@ pub async fn fork_codex_thread(
         return Err("native fork is only available for Codex threads".to_string());
     }
     reject_ssh_remote_codex_local_only_action(state.inner(), &thread, "会话分支").await?;
-    migrate_legacy_codex_on_failure_thread_metadata(state.inner(), &mut thread).await;
     let engine_thread_id = thread
         .engine_thread_id
         .clone()
@@ -2771,7 +2618,7 @@ pub async fn fork_codex_thread(
         .map_err(err_to_string)?;
     let cli: &dyn CliTool = codex.as_ref();
     let forked = cli
-        .fork_thread(&context, &engine_thread_id, &cwd, &model_id, sandbox)
+        .fork_thread(&context, &thread, &engine_thread_id, &cwd, &model_id, sandbox)
         .await
         .map_err(err_to_string)?;
 
@@ -2803,7 +2650,7 @@ pub async fn rollback_codex_thread(
     }
 
     let db = state.db.clone();
-    let mut thread = run_db(db.clone(), {
+    let thread = run_db(db.clone(), {
         let thread_id = thread_id.clone();
         move |db| db::threads::get_thread(db, &thread_id)
     })
@@ -2814,7 +2661,6 @@ pub async fn rollback_codex_thread(
         return Err("native rollback is only available for Codex threads".to_string());
     }
     reject_ssh_remote_codex_local_only_action(state.inner(), &thread, "回滚").await?;
-    migrate_legacy_codex_on_failure_thread_metadata(state.inner(), &mut thread).await;
     let engine_thread_id = thread
         .engine_thread_id
         .clone()
@@ -2829,7 +2675,7 @@ pub async fn rollback_codex_thread(
         .map_err(err_to_string)?;
     let cli: &dyn CliTool = codex.as_ref();
     let forked = cli
-        .fork_thread(&context, &engine_thread_id, &cwd, &model_id, sandbox)
+        .fork_thread(&context, &thread, &engine_thread_id, &cwd, &model_id, sandbox)
         .await
         .map_err(err_to_string)?;
     let rollback_snapshot = match cli
@@ -3121,213 +2967,32 @@ pub async fn set_ssh_remote_thread_selected_model(
     .await
 }
 
-#[tauri::command]
-pub async fn set_thread_execution_policy(
-    state: State<'_, AppState>,
-    thread_id: String,
-    update_approval_policy: bool,
-    approval_policy: Option<Value>,
-    update_sandbox_mode: bool,
-    sandbox_mode: Option<String>,
-    update_allow_network: bool,
-    allow_network: Option<bool>,
-    update_permission_profile: bool,
-    permission_profile: Option<Value>,
-    update_approvals_reviewer: bool,
-    approvals_reviewer: Option<String>,
-) -> Result<ThreadDto, String> {
-    set_thread_execution_policy_inner(
-        state.inner(),
-        thread_id,
-        update_approval_policy,
-        approval_policy,
-        update_sandbox_mode,
-        sandbox_mode,
-        update_allow_network,
-        allow_network,
-        update_permission_profile,
-        permission_profile,
-        update_approvals_reviewer,
-        approvals_reviewer,
-    )
-    .await
-}
-
-async fn set_thread_execution_policy_inner(
-    state: &AppState,
-    thread_id: String,
-    update_approval_policy: bool,
-    approval_policy: Option<Value>,
-    update_sandbox_mode: bool,
-    sandbox_mode: Option<String>,
-    update_allow_network: bool,
-    allow_network: Option<bool>,
-    update_permission_profile: bool,
-    permission_profile: Option<Value>,
-    update_approvals_reviewer: bool,
-    approvals_reviewer: Option<String>,
-) -> Result<ThreadDto, String> {
-    let db = state.db.clone();
-    let thread = run_db(db.clone(), {
-        let thread_id = thread_id.clone();
-        move |db| db::threads::get_thread(db, &thread_id)
-    })
-    .await?
-    .ok_or_else(|| format!("thread not found: {thread_id}"))?;
-
-    /*
-    // 旧 Controller 适配逻辑已停用：Controller 曾按 engine_id 识别并校验
-    // Codex、Claude Code、OpenCode 的 approvalPolicy、sandboxMode、permissionProfile
-    // 和 approvalsReviewer。原始字段和值现在由 CliTool 实现层负责转换。
-    let normalized_approval_policy = if update_approval_policy {
-        normalize_thread_approval_policy_for_engine(thread.engine_id.as_str(), approval_policy)?
-    } else { None };
-    let normalized_sandbox_mode = if update_sandbox_mode {
-        let normalized = normalize_thread_sandbox_mode(sandbox_mode)?;
-        validate_engine_sandbox_mode(thread.engine_id.as_str(), normalized.as_deref())?;
-        normalized
-    } else { None };
-    let normalized_permission_profile = if update_permission_profile {
-        normalize_thread_permission_profile(permission_profile)?
-    } else { None };
-    let normalized_approvals_reviewer = if update_approvals_reviewer {
-        normalize_thread_approvals_reviewer(approvals_reviewer)?
-    } else { None };
-    */
-    let workspace = run_db(db.clone(), {
-        let workspace_id = thread.workspace_id.clone();
-        move |db| {
-            db::workspaces::find_workspace_by_id(db, &workspace_id)?
-                .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))
-        }
-    })
-    .await?;
-    let original_permission_mode = thread.permission_mode.clone();
-    let cli = CliToolFactory::new(state.clone())
-        .create(thread.engine_id.as_str())
-        .map_err(err_to_string)?;
-    let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
-    let patch = crate::cli_tools::CliRuntimePermissionPatch {
-        approval_policy: update_approval_policy.then_some(approval_policy),
-        sandbox_mode: update_sandbox_mode.then_some(sandbox_mode),
-        allow_network: update_allow_network.then_some(allow_network),
-        permission_profile: update_permission_profile.then_some(permission_profile),
-        approvals_reviewer: update_approvals_reviewer.then_some(approvals_reviewer),
-    };
-    let updated_thread = cli
-        .patch_runtime_permissions(&context, &thread, patch)
-        .await
-        .map_err(err_to_string)?;
-
-    if update_approval_policy && updated_thread.engine_thread_id.is_some() {
-        let policy = cli
-            .runtime_permissions(&context, &updated_thread)
-            .await
-            .map_err(err_to_string)?
-            .approval_policy
-            .unwrap_or(Value::Null);
-        if let Err(sync_error) = cli
-            .sync_thread_execution_policy(&context, &updated_thread, &policy)
-            .await
-        {
-            let rollback_permission_mode =
-                if original_permission_mode.is_none() && thread.engine_id == "opencode" {
-                    Some("[]".to_string())
-                } else {
-                    original_permission_mode.clone()
-                };
-            let rollback_result = run_db(db.clone(), {
-                let thread_id = thread_id.clone();
-                move |db| {
-                    db::threads::update_thread_permissions(
-                        db,
-                        &thread_id,
-                        rollback_permission_mode.as_deref(),
-                    )
-                    .map(|_| ())
-                }
-            })
-            .await;
-            if let Err(rollback_error) = rollback_result {
-                return Err(format!(
-                    "同步 OpenCode session 执行权限失败: {sync_error:#}; 回滚线程权限配置也失败: {rollback_error}"
-                ));
-            }
-            return Err(format!(
-                "同步 OpenCode session 执行权限失败: {sync_error:#}"
-            ));
-        }
-    }
-
-    run_db(db, {
-        let thread_id = thread_id.clone();
-        move |db| db::threads::get_thread(db, &thread_id)
-    })
-    .await?
-    .ok_or_else(|| format!("thread not found after execution policy update: {thread_id}"))
-}
-
-/// 读取当前线程对应 CLI 转换后的统一权限组件数据。
+/// 按线程标识读取完整统一权限对象 A。
 #[tauri::command]
 pub async fn get_thread_permissions(
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<PermissionComponentJson, String> {
-    let db = state.db.clone();
-    let thread = run_db(db.clone(), {
-        let thread_id = thread_id.clone();
-        move |db| db::threads::get_thread(db, &thread_id)
-    })
-    .await?
-    .ok_or_else(|| format!("thread not found: {thread_id}"))?;
-    let workspace = run_db(db, {
-        let workspace_id = thread.workspace_id.clone();
-        move |db| {
-            db::workspaces::find_workspace_by_id(db, &workspace_id)?
-                .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))
-        }
-    })
-    .await?;
-    let tool = CliToolFactory::new(state.inner().clone())
-        .create(thread.engine_id.as_str())
-        .map_err(err_to_string)?;
-    let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
-    let cli: &dyn CliTool = tool.as_ref();
-    cli.get_permissions(&context, &thread)
+    ThreadService::new(state.inner().clone())
+        .get_permissions(&thread_id)
         .await
         .map_err(err_to_string)
 }
 
-/// 保存统一权限组件数据，由当前 CLI 实现转换并持久化其原始权限 JSON。
+/// 校验并按线程标识直接保存统一权限对象 A，不依赖线程使用的 CLI。
 #[tauri::command]
 pub async fn set_thread_permissions(
     state: State<'_, AppState>,
     thread_id: String,
     values: PermissionComponentJson,
 ) -> Result<PermissionComponentJson, String> {
-    let db = state.db.clone();
-    let thread = run_db(db.clone(), {
-        let thread_id = thread_id.clone();
-        move |db| db::threads::get_thread(db, &thread_id)
-    })
-    .await?
-    .ok_or_else(|| format!("thread not found: {thread_id}"))?;
-    let workspace = run_db(db, {
-        let workspace_id = thread.workspace_id.clone();
-        move |db| {
-            db::workspaces::find_workspace_by_id(db, &workspace_id)?
-                .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))
-        }
-    })
-    .await?;
-    let tool = CliToolFactory::new(state.inner().clone())
-        .create(thread.engine_id.as_str())
-        .map_err(err_to_string)?;
-    let context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
-    let cli: &dyn CliTool = tool.as_ref();
-    cli.set_permissions(&context, &thread, values)
+    let updated = ThreadService::new(state.inner().clone())
+        .save_permissions(&thread_id, values)
         .await
-        .map_err(err_to_string)
+        .map_err(err_to_string)?;
+    updated
+        .permission_mode
+        .ok_or_else(|| "thread permission object is unavailable after update".to_string())
 }
 
 #[tauri::command]
@@ -3659,13 +3324,6 @@ fn merge_codex_runtime_metadata(
         for key in [
             "lastModelId",
             "reasoningEffort",
-            "sandboxApprovalPolicy",
-            "sandboxMode",
-            "sandboxAllowNetwork",
-            "permissionProfile",
-            "approvalsReviewer",
-            "claudePermissionMode",
-            "opencodePermissionMode",
         ] {
             object.remove(key);
         }
@@ -3714,6 +3372,7 @@ fn merge_codex_runtime_metadata(
     metadata
 }
 
+/// 为 Codex 分支创建准备工作目录和非权限运行上下文。
 async fn build_codex_branch_context(
     state: &AppState,
     thread: &ThreadDto,
@@ -3733,70 +3392,20 @@ async fn build_codex_branch_context(
     .await?;
 
     let workspace_root = workspace.root_path.clone();
-    let codex = CliToolFactory::new(state.clone())
-        .create("codex")
-        .map_err(err_to_string)?;
-    let cli_context = CliExecutionContext::from_workspace(&workspace).map_err(err_to_string)?;
-    let runtime_permissions = codex
-        .runtime_permissions(&cli_context, thread)
-        .await
-        .map_err(err_to_string)?;
-    let auto_approve_mcp_elicitations = codex
-        .auto_approve_mcp_elicitations(&cli_context, thread)
-        .await
-        .map_err(err_to_string)?;
-    let sandbox_mode_override = runtime_permissions.sandbox_mode.clone();
-    let sandbox_mode = sandbox_mode_override
-        .clone()
-        .unwrap_or_else(|| "workspace-write".to_string());
-    let trust_level = workspace.trust_level.clone();
-    let codex_external_sandbox_active =
-        codex_external_sandbox_for_workspace(state, &workspace).await?;
-    let permission_profile = runtime_permissions.permission_profile.clone();
-
-    if permission_profile.is_none() {
-        if unsupported_thread_sandbox_override_for_external_sandbox(
-            sandbox_mode_override.as_deref(),
-            codex_external_sandbox_active,
-        ) {
-            return Err(
-                "Codex read-only and workspace-write sandbox overrides are unavailable while AuraCoder is using external sandbox mode. Clear the override or restore local Codex sandboxing first.".to_string(),
-            );
-        }
-
-        validate_engine_sandbox_mode(thread.engine_id.as_str(), Some(sandbox_mode.as_str()))?;
-    }
-
     let writable_roots = vec![workspace_root.clone()];
-    let allow_network = if sandbox_mode.eq_ignore_ascii_case("danger-full-access") {
-        true
-    } else {
-        runtime_permissions
-            .allow_network
-            .unwrap_or_else(|| allow_network_for_trust_level(&trust_level))
-    };
-    let approval_policy_override = runtime_permissions.approval_policy.clone();
 
     Ok((
         workspace_root,
         thread.model_id.clone(),
         SandboxPolicy {
             writable_roots,
-            allow_network,
-            auto_approve_mcp_elicitations,
-            approval_policy: Some(approval_policy_override.unwrap_or_else(|| {
-                Value::String(
-                    approval_policy_for_engine_and_trust_level(
-                        thread.engine_id.as_str(),
-                        &trust_level,
-                    )
-                    .to_string(),
-                )
-            })),
-            permission_profile,
-            approvals_reviewer: runtime_permissions.approvals_reviewer.clone(),
+            allow_network: false,
+            auto_approve_mcp_elicitations: false,
+            approval_policy: None,
+            permission_profile: None,
+            approvals_reviewer: None,
             reasoning_effort: thread.reasoning_effort.clone(),
-            sandbox_mode: Some(sandbox_mode),
+            sandbox_mode: None,
             service_tier: thread_service_tier(thread.engine_metadata.as_ref()),
             personality: thread_personality(thread.engine_metadata.as_ref()),
             output_schema: thread_output_schema(thread.engine_metadata.as_ref()),
@@ -3805,6 +3414,7 @@ async fn build_codex_branch_context(
     ))
 }
 
+/// 保存 Codex 分支线程、继承来源线程统一权限对象 A 并同步本地历史状态。
 async fn create_codex_branch_thread(
     state: &AppState,
     source_thread: &ThreadDto,
@@ -3824,7 +3434,7 @@ async fn create_codex_branch_thread(
     }
 
     let db = state.db.clone();
-    run_db(db.clone(), {
+    let created = run_db(db.clone(), {
         let source_thread = source_thread.clone();
         let engine_thread_id = engine_thread_id.to_string();
         let model_id = model_id.to_string();
@@ -3874,7 +3484,14 @@ async fn create_codex_branch_thread(
             )
         }
     })
-    .await
+    .await?;
+    ThreadService::new(state.clone())
+        .save_permissions(
+            &created.id,
+            source_thread.permission_mode.clone().unwrap_or_default(),
+        )
+        .await
+        .map_err(err_to_string)
 }
 
 fn is_codex_thread_sync_required(metadata: Option<&Value>) -> bool {
@@ -3926,135 +3543,6 @@ fn codex_transcript_imported(metadata: Option<&Value>) -> bool {
         .unwrap_or(true)
 }
 
-fn approval_policy_for_engine_and_trust_level(
-    engine_id: &str,
-    trust_level: &TrustLevelDto,
-) -> &'static str {
-    match engine_id {
-        "claude" => match trust_level {
-            TrustLevelDto::Trusted => "trusted",
-            TrustLevelDto::Standard => "standard",
-            TrustLevelDto::Restricted => "restricted",
-        },
-        "opencode" => match trust_level {
-            TrustLevelDto::Trusted | TrustLevelDto::Standard => "ask",
-            TrustLevelDto::Restricted => "deny",
-        },
-        _ => match trust_level {
-            TrustLevelDto::Trusted | TrustLevelDto::Standard => "on-request",
-            TrustLevelDto::Restricted => "untrusted",
-        },
-    }
-}
-
-fn allow_network_for_trust_level(trust_level: &TrustLevelDto) -> bool {
-    matches!(trust_level, TrustLevelDto::Trusted)
-}
-
-pub(crate) async fn migrate_legacy_codex_on_failure_thread_metadata(
-    state: &AppState,
-    thread: &mut ThreadDto,
-) {
-    let _ = (state, thread);
-    /*
-    // 旧 metadata 权限迁移执行体已停用，保留完整实现记录：
-    if thread.engine_id != "codex"
-        || thread
-            .engine_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("sshRemote"))
-            .and_then(Value::as_bool)
-            == Some(true)
-        || !is_legacy_codex_on_failure_metadata(thread.engine_metadata.as_ref())
-    {
-        return;
-    }
-
-    let db = state.db.clone();
-    let workspace_id = thread.workspace_id.clone();
-    let is_ssh_workspace = run_db(db.clone(), move |db| {
-        Ok(db::workspaces::find_workspace_by_id(db, &workspace_id)?
-            .is_some_and(|workspace| workspace.location_kind == "ssh"))
-    })
-    .await
-    .unwrap_or(false);
-    if is_ssh_workspace {
-        return;
-    }
-
-    let codex = CliToolFactory::new(state.clone())
-        .create("codex")
-        .expect("Codex CLI factory mapping must exist");
-    let Ok(context) = codex
-        .execution_context(Some(thread.workspace_id.as_str()))
-        .await
-    else {
-        return;
-    };
-    let cli: &dyn CliTool = codex.as_ref();
-    let Ok(codex_external_sandbox_active) = cli.uses_external_sandbox(&context).await else {
-        return;
-    };
-    let Some(metadata) = migrate_legacy_codex_on_failure_metadata(
-        thread.engine_metadata.as_ref(),
-        codex_external_sandbox_active,
-    ) else {
-        return;
-    };
-
-    let thread_id = thread.id.clone();
-    let metadata_for_db = metadata.clone();
-    if let Err(error) = run_db(db, move |db| {
-        db::threads::update_engine_metadata(db, &thread_id, &metadata_for_db)
-    })
-    .await
-    {
-        log::warn!(
-            "failed to persist legacy Codex on-failure policy migration for thread {}: {error}",
-            thread.id
-        );
-    }
-
-    thread.engine_metadata = Some(metadata);
-    */
-}
-
-fn is_legacy_codex_on_failure_metadata(metadata: Option<&Value>) -> bool {
-    metadata
-        .and_then(Value::as_object)
-        .and_then(|object| object.get("sandboxApprovalPolicy"))
-        .and_then(Value::as_str)
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("on-failure"))
-}
-
-fn migrate_legacy_codex_on_failure_metadata(
-    _metadata: Option<&Value>,
-    _codex_external_sandbox_active: bool,
-) -> Option<Value> {
-    None
-}
-fn thread_approval_policy_override_value(
-    _engine_id: &str,
-    _metadata: Option<&Value>,
-) -> Result<Option<Value>, String> {
-    Ok(None)
-}
-
-fn thread_allow_network_override(_metadata: Option<&Value>) -> Option<bool> {
-    None
-}
-
-fn thread_sandbox_mode(_metadata: Option<&Value>) -> Result<Option<String>, String> {
-    Ok(None)
-}
-
-fn unsupported_thread_sandbox_override_for_external_sandbox(
-    sandbox_mode: Option<&str>,
-    external_sandbox_active: bool,
-) -> bool {
-    external_sandbox_active && matches!(sandbox_mode, Some("read-only" | "workspace-write"))
-}
-
 fn thread_reasoning_effort(_metadata: Option<&Value>) -> Option<String> {
     /*
     // 旧实现从 engine_metadata_json 读取 reasoningEffort，已停用：
@@ -4092,21 +3580,6 @@ fn thread_output_schema(metadata: Option<&Value>) -> Option<Value> {
     metadata
         .and_then(|value| value.get("outputSchema"))
         .cloned()
-}
-
-fn thread_permission_profile(metadata: Option<&Value>) -> Option<Value> {
-    metadata
-        .and_then(|value| value.get("permissionProfile"))
-        .cloned()
-}
-
-fn thread_approvals_reviewer(metadata: Option<&Value>) -> Option<String> {
-    metadata
-        .and_then(|value| value.get("approvalsReviewer"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 fn thread_opencode_agent(metadata: Option<&Value>) -> Option<String> {
@@ -4189,114 +3662,6 @@ async fn codex_remote_thread_archive_state(
     }
 }
 
-fn approval_policy_metadata_key(engine_id: &str) -> &'static str {
-    match engine_id {
-        "claude" => "claudePermissionMode",
-        "opencode" => "opencodePermissionMode",
-        _ => "sandboxApprovalPolicy",
-    }
-}
-
-fn normalize_thread_approval_policy_for_engine(
-    engine_id: &str,
-    value: Option<Value>,
-) -> Result<Option<Value>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-
-    match engine_id {
-        "claude" => {
-            let normalized = value
-                .as_str()
-                .map(str::trim)
-                .filter(|candidate| !candidate.is_empty())
-                .map(str::to_lowercase)
-                .ok_or_else(|| {
-                    "invalid Claude permission mode. expected a string value".to_string()
-                })?;
-
-            match normalized.as_str() {
-                "restricted" | "standard" | "trusted" => {
-                    Ok(Some(Value::String(normalized)))
-                }
-                _ => Err(format!(
-                    "invalid Claude permission mode `{normalized}`. expected one of: restricted, standard, trusted"
-                )),
-            }
-        }
-        "opencode" => {
-            let normalized = value
-                .as_str()
-                .map(str::trim)
-                .filter(|candidate| !candidate.is_empty())
-                .map(str::to_lowercase)
-                .ok_or_else(|| {
-                    "invalid OpenCode permission mode. expected a string value".to_string()
-                })?;
-
-            match normalized.as_str() {
-                "ask" | "allow" | "deny" => Ok(Some(Value::String(normalized))),
-                _ => Err(format!(
-                    "invalid OpenCode permission mode `{normalized}`. expected one of: ask, allow, deny"
-                )),
-            }
-        }
-        _ => normalize_codex_approval_policy(value).map(Some),
-    }
-}
-
-fn normalize_codex_approval_policy(value: Value) -> Result<Value, String> {
-    match value {
-        Value::String(raw) => {
-            let normalized = raw.trim().to_lowercase();
-            match normalized.as_str() {
-                "on-failure" => Ok(Value::String("on-request".to_string())),
-                "untrusted" | "on-request" | "never" => {
-                    Ok(Value::String(normalized))
-                }
-                _ => Err(format!(
-                    "invalid approval policy `{normalized}`. expected one of: untrusted, on-request, never"
-                )),
-            }
-        }
-        Value::Object(object) => {
-            let reject = object
-                .get("reject")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    "invalid structured approval policy. expected a `reject` object".to_string()
-                })?;
-
-            for required_key in ["mcp_elicitations", "rules", "sandbox_approval"] {
-                if !reject.get(required_key).and_then(Value::as_bool).is_some() {
-                    return Err(format!(
-                        "invalid structured approval policy. missing boolean reject.{required_key}"
-                    ));
-                }
-            }
-
-            if reject.contains_key("request_permissions")
-                && reject
-                    .get("request_permissions")
-                    .and_then(Value::as_bool)
-                    .is_none()
-            {
-                return Err(
-                    "invalid structured approval policy. reject.request_permissions must be a boolean"
-                        .to_string(),
-                );
-            }
-
-            Ok(Value::Object(object))
-        }
-        _ => Err(
-            "invalid approval policy. expected a string mode or structured reject object"
-                .to_string(),
-        ),
-    }
-}
-
 fn normalize_thread_personality(value: Option<String>) -> Result<Option<String>, String> {
     let normalized = value
         .as_deref()
@@ -4346,123 +3711,6 @@ fn normalize_thread_output_schema(value: Option<Value>) -> Result<Option<Value>,
     }
 }
 
-fn normalize_thread_permission_profile(value: Option<Value>) -> Result<Option<Value>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let Some(object) = value.as_object() else {
-        return Err("invalid permission profile. expected a profile object".to_string());
-    };
-    let profile_type = object
-        .get("type")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .ok_or_else(|| "invalid permission profile. missing string `type`".to_string())?;
-    match profile_type {
-        "managed" => {
-            validate_permission_profile_file_system(object.get("fileSystem"))?;
-            validate_permission_profile_network(object.get("network"))?;
-        }
-        "external" => {
-            validate_permission_profile_network(object.get("network"))?;
-        }
-        "disabled" => {}
-        _ => {
-            return Err(format!(
-                "invalid permission profile type `{profile_type}`. expected one of: managed, external, disabled"
-            ));
-        }
-    }
-    Ok(Some(value))
-}
-
-fn validate_permission_profile_file_system(value: Option<&Value>) -> Result<(), String> {
-    let Some(file_system) = value.and_then(Value::as_object) else {
-        return Err("invalid permission profile. managed.fileSystem must be an object".to_string());
-    };
-    let fs_type = file_system
-        .get("type")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .ok_or_else(|| {
-            "invalid permission profile. managed.fileSystem.type must be a string".to_string()
-        })?;
-    match fs_type {
-        "unrestricted" => Ok(()),
-        "restricted" => {
-            let entries = file_system.get("entries").and_then(Value::as_array).ok_or_else(
-                || {
-                    "invalid permission profile. managed.fileSystem.entries must be an array"
-                        .to_string()
-                },
-            )?;
-            for entry in entries {
-                validate_permission_profile_file_system_entry(entry)?;
-            }
-            Ok(())
-        }
-        _ => Err(format!(
-            "invalid permission profile filesystem type `{fs_type}`. expected one of: restricted, unrestricted"
-        )),
-    }
-}
-
-fn validate_permission_profile_file_system_entry(value: &Value) -> Result<(), String> {
-    let Some(entry) = value.as_object() else {
-        return Err("invalid permission profile. fileSystem entry must be an object".to_string());
-    };
-    let access = entry
-        .get("access")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .ok_or_else(|| {
-            "invalid permission profile. fileSystem entry access must be a string".to_string()
-        })?;
-    if !matches!(access, "read" | "write" | "none") {
-        return Err(format!(
-            "invalid permission profile fileSystem entry access `{access}`. expected one of: read, write, none"
-        ));
-    }
-    let Some(path) = entry.get("path").and_then(Value::as_object) else {
-        return Err(
-            "invalid permission profile. fileSystem entry path must be an object".to_string(),
-        );
-    };
-    if path.get("type").and_then(Value::as_str).is_none() {
-        return Err(
-            "invalid permission profile. fileSystem entry path.type must be a string".to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn validate_permission_profile_network(value: Option<&Value>) -> Result<(), String> {
-    let Some(network) = value.and_then(Value::as_object) else {
-        return Err("invalid permission profile. network must be an object".to_string());
-    };
-    if network.get("enabled").and_then(Value::as_bool).is_none() {
-        return Err("invalid permission profile. network.enabled must be a boolean".to_string());
-    }
-    Ok(())
-}
-
-fn normalize_thread_approvals_reviewer(value: Option<String>) -> Result<Option<String>, String> {
-    let normalized = value
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    let Some(normalized) = normalized else {
-        return Ok(None);
-    };
-    match normalized.as_str() {
-        "user" | "auto_review" | "guardian_subagent" => Ok(Some(normalized)),
-        _ => Err(format!(
-            "invalid approvals reviewer `{normalized}`. expected one of: user, auto_review, guardian_subagent"
-        )),
-    }
-}
-
 fn normalize_thread_opencode_agent(value: Option<String>) -> Result<Option<String>, String> {
     let normalized = value
         .as_deref()
@@ -4492,41 +3740,6 @@ fn normalize_thread_opencode_agent(value: Option<String>) -> Result<Option<Strin
     }
 
     Ok(Some(normalized.to_string()))
-}
-
-fn normalize_thread_sandbox_mode(value: Option<String>) -> Result<Option<String>, String> {
-    let normalized = value
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_lowercase());
-
-    let Some(normalized) = normalized else {
-        return Ok(None);
-    };
-
-    let canonical = match normalized.as_str() {
-        "readonly" | "read-only" | "read_only" => "read-only",
-        "workspacewrite" | "workspace-write" | "workspace_write" => "workspace-write",
-        "dangerfullaccess" | "danger-full-access" | "danger_full_access" => {
-            "danger-full-access"
-        }
-        _ => {
-            return Err(format!(
-                "invalid sandbox mode `{normalized}`. expected one of: read-only, workspace-write, danger-full-access"
-            ))
-        }
-    };
-
-    Ok(Some(canonical.to_string()))
-}
-
-#[cfg(test)]
-fn thread_allow_network(metadata: Option<&serde_json::Value>) -> Option<bool> {
-    metadata
-        .and_then(serde_json::Value::as_object)
-        .and_then(|value| value.get("sandboxAllowNetwork"))
-        .and_then(serde_json::Value::as_bool)
 }
 
 fn normalize_thread_title(raw: &str) -> Result<String, String> {
@@ -4653,185 +3866,6 @@ mod tests {
             db::actions::find_pending_opencode_permission_approval_ids(&state.db, &thread.id)
                 .unwrap(),
             vec!["permission-approval".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn opencode_permission_update_failure_keeps_original_metadata() {
-        let state = test_app_state();
-        let thread = test_thread(&state, "opencode", "openai/gpt-5");
-        db::threads::set_engine_thread_id(&state.db, &thread.id, "session-1").unwrap();
-        db::threads::update_engine_metadata(
-            &state.db,
-            &thread.id,
-            &json!({ "opencodePermissionMode": "ask" }),
-        )
-        .unwrap();
-
-        let result = set_thread_execution_policy_inner(
-            &state,
-            thread.id.clone(),
-            true,
-            Some(json!("allow")),
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-        )
-        .await;
-        assert!(result.is_err());
-        let latest = db::threads::get_thread(&state.db, &thread.id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            latest.engine_metadata,
-            Some(json!({ "opencodePermissionMode": "ask" }))
-        );
-    }
-
-    #[test]
-    fn thread_allow_network_reads_explicit_override_in_full_access_mode() {
-        let metadata = json!({
-            "sandboxMode": "danger-full-access",
-            "sandboxAllowNetwork": false,
-        });
-
-        assert_eq!(thread_allow_network(Some(&metadata)), Some(false));
-    }
-
-    #[test]
-    fn normalize_thread_sandbox_mode_accepts_aliases() {
-        assert_eq!(
-            normalize_thread_sandbox_mode(Some("danger_full_access".to_string())).unwrap(),
-            Some("danger-full-access".to_string())
-        );
-        assert_eq!(
-            normalize_thread_sandbox_mode(Some("read_only".to_string())).unwrap(),
-            Some("read-only".to_string())
-        );
-    }
-
-    #[test]
-    fn normalize_thread_approval_policy_accepts_claude_modes() {
-        assert_eq!(
-            normalize_thread_approval_policy_for_engine("claude", Some(json!("trusted"))).unwrap(),
-            Some(json!("trusted"))
-        );
-        assert_eq!(
-            normalize_thread_approval_policy_for_engine("claude", Some(json!("STANDARD"))).unwrap(),
-            Some(json!("standard"))
-        );
-    }
-    #[test]
-    fn normalize_thread_approval_policy_migrates_legacy_codex_on_failure() {
-        assert_eq!(
-            normalize_thread_approval_policy_for_engine("codex", Some(json!("on-failure")))
-                .unwrap(),
-            Some(json!("on-request"))
-        );
-    }
-
-    #[test]
-    fn legacy_codex_on_failure_metadata_migration_is_disabled() {
-        let metadata = json!({
-            "sandboxApprovalPolicy": "on-failure",
-            "sandboxMode": "read-only",
-            "sandboxAllowNetwork": false,
-        });
-
-        assert_eq!(
-            migrate_legacy_codex_on_failure_metadata(Some(&metadata), false),
-            None
-        );
-        /*
-        // 旧 metadata 迁移已停用：
-        assert_eq!(
-            migrate_legacy_codex_on_failure_metadata(Some(&metadata), false),
-            Some(json!({
-                "sandboxApprovalPolicy": "on-request",
-                "sandboxMode": "workspace-write",
-                "sandboxAllowNetwork": false,
-            }))
-        );
-        */
-    }
-
-    #[test]
-    fn legacy_codex_on_failure_metadata_migration_is_disabled_for_external_sandbox() {
-        let metadata = json!({
-            "sandboxApprovalPolicy": "on-failure",
-            "sandboxMode": "workspace-write",
-        });
-
-        assert_eq!(
-            migrate_legacy_codex_on_failure_metadata(Some(&metadata), true),
-            None
-        );
-        /*
-        // 旧 metadata 迁移已停用：
-        let migrated = migrate_legacy_codex_on_failure_metadata(Some(&metadata), true)
-            .expect("legacy metadata should migrate");
-        assert_eq!(
-            migrated.get("sandboxApprovalPolicy"),
-            Some(&json!("on-request"))
-        );
-        assert!(migrated.get("sandboxMode").is_none());
-        */
-    }
-
-    #[test]
-    fn normalize_thread_approval_policy_rejects_codex_values_for_claude() {
-        assert!(
-            normalize_thread_approval_policy_for_engine("claude", Some(json!("on-request")))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn normalize_thread_approval_policy_accepts_opencode_modes() {
-        assert_eq!(
-            normalize_thread_approval_policy_for_engine("opencode", Some(json!("ALLOW"))).unwrap(),
-            Some(json!("allow"))
-        );
-        assert_eq!(
-            normalize_thread_approval_policy_for_engine("opencode", Some(json!("ask"))).unwrap(),
-            Some(json!("ask"))
-        );
-        assert!(
-            normalize_thread_approval_policy_for_engine("opencode", Some(json!("on-request")))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn normalize_thread_approval_policy_accepts_structured_codex_policy() {
-        let normalized = normalize_thread_approval_policy_for_engine(
-            "codex",
-            Some(json!({
-                "reject": {
-                    "mcp_elicitations": false,
-                    "request_permissions": true,
-                    "rules": true,
-                    "sandbox_approval": false
-                }
-            })),
-        )
-        .expect("expected structured policy to validate");
-
-        assert_eq!(
-            normalized,
-            Some(json!({
-                "reject": {
-                    "mcp_elicitations": false,
-                    "request_permissions": true,
-                    "rules": true,
-                    "sandbox_approval": false
-                }
-            }))
         );
     }
 
@@ -5214,43 +4248,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_thread_inner_persists_initial_autonomy_policy() {
-        let state = test_app_state();
-        let workspace = test_workspace(&state);
-
-        let created = create_thread_inner(
-            &state,
-            workspace.id.clone(),
-            "claude".to_string(),
-            "claude-sonnet-4-6".to_string(),
-            "Thread".to_string(),
-            None,
-            None,
-            Some("read-only".to_string()),
-        )
-        .await
-        .expect("expected thread creation to succeed");
-
-        let context = CliExecutionContext::from_workspace(&workspace)
-            .expect("expected Claude workspace context");
-        let claude = CliToolFactory::new(state.clone())
-            .create("claude")
-            .expect("expected Claude CLI implementation");
-        let permissions = claude
-            .get_permissions(&context, &created)
-            .await
-            .expect("expected Claude permissions");
-        assert_eq!(
-            permissions.get("autonomyPreset"),
-            Some(&json!(["read-only"]))
-        );
-        let metadata = created.engine_metadata.unwrap_or_else(|| json!({}));
-        assert_eq!(metadata.get("claudePermissionMode"), None);
-        assert_eq!(metadata.get("sandboxMode"), None);
-        assert_eq!(metadata.get("sandboxAllowNetwork"), None);
-    }
-
-    #[tokio::test]
     async fn create_thread_inner_rejects_invalid_reasoning_effort() {
         let state = test_app_state();
         let workspace = test_workspace(&state);
@@ -5290,264 +4287,6 @@ mod tests {
         .expect_err("expected non-codex service tier to be rejected");
 
         assert!(error.contains("service tier is only supported for Codex threads"));
-    }
-
-    #[test]
-    fn autonomy_policy_for_preset_matches_engine_contracts() {
-        assert_eq!(
-            autonomy_policy_for_preset("codex", "auto", false).unwrap(),
-            AutonomyPresetPolicy {
-                approval_policy: json!("on-request"),
-                sandbox_mode: Some("workspace-write"),
-                allow_network: Some(true),
-            }
-        );
-        assert_eq!(
-            autonomy_policy_for_preset("codex", "read-only", false).unwrap(),
-            AutonomyPresetPolicy {
-                approval_policy: json!("untrusted"),
-                sandbox_mode: Some("read-only"),
-                allow_network: Some(false),
-            }
-        );
-        assert_eq!(
-            autonomy_policy_for_preset("claude", "full", false).unwrap(),
-            AutonomyPresetPolicy {
-                approval_policy: json!("trusted"),
-                sandbox_mode: Some("workspace-write"),
-                allow_network: Some(true),
-            }
-        );
-        assert_eq!(
-            autonomy_policy_for_preset("opencode", "auto", false).unwrap(),
-            AutonomyPresetPolicy {
-                approval_policy: json!("allow"),
-                sandbox_mode: None,
-                allow_network: None,
-            }
-        );
-    }
-
-    #[test]
-    fn external_sandbox_omits_blocked_codex_overrides() {
-        for preset in ["read-only", "ask", "auto"] {
-            assert_eq!(
-                autonomy_policy_for_preset("codex", preset, true)
-                    .unwrap()
-                    .sandbox_mode,
-                None
-            );
-        }
-        assert_eq!(
-            autonomy_policy_for_preset("codex", "full", true)
-                .unwrap()
-                .sandbox_mode,
-            Some("danger-full-access")
-        );
-    }
-
-    #[tokio::test]
-    async fn set_thread_execution_policy_allows_claude_read_only() {
-        let state = test_app_state();
-        let thread = test_thread(&state, "claude", "claude-sonnet-4-6");
-
-        let updated = set_thread_execution_policy_inner(
-            &state,
-            thread.id.clone(),
-            false,
-            None,
-            true,
-            Some("read-only".to_string()),
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-        )
-        .await
-        .expect("expected read-only update to succeed");
-
-        let workspace =
-            crate::db::workspaces::find_workspace_by_id(&state.db, &thread.workspace_id)
-                .unwrap()
-                .expect("expected workspace");
-        let context = CliExecutionContext::from_workspace(&workspace).unwrap();
-        let claude = CliToolFactory::new(state.clone()).create("claude").unwrap();
-        let permissions = claude
-            .runtime_permissions(&context, &updated)
-            .await
-            .unwrap();
-        assert_eq!(permissions.sandbox_mode.as_deref(), Some("read-only"));
-        assert!(updated
-            .engine_metadata
-            .as_ref()
-            .is_none_or(|value| value.get("sandboxMode").is_none()));
-    }
-
-    #[tokio::test]
-    async fn set_thread_execution_policy_allows_claude_workspace_write() {
-        let state = test_app_state();
-        let thread = test_thread(&state, "claude", "claude-sonnet-4-6");
-
-        let updated = set_thread_execution_policy_inner(
-            &state,
-            thread.id.clone(),
-            false,
-            None,
-            true,
-            Some("workspace-write".to_string()),
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-        )
-        .await
-        .expect("expected workspace-write update to succeed");
-
-        let workspace =
-            crate::db::workspaces::find_workspace_by_id(&state.db, &thread.workspace_id)
-                .unwrap()
-                .expect("expected workspace");
-        let context = CliExecutionContext::from_workspace(&workspace).unwrap();
-        let claude = CliToolFactory::new(state.clone()).create("claude").unwrap();
-        let permissions = claude
-            .runtime_permissions(&context, &updated)
-            .await
-            .unwrap();
-        assert_eq!(permissions.sandbox_mode.as_deref(), Some("workspace-write"));
-        assert!(updated
-            .engine_metadata
-            .as_ref()
-            .is_none_or(|value| value.get("sandboxMode").is_none()));
-    }
-
-    #[tokio::test]
-    async fn set_thread_execution_policy_allows_claude_danger_full_access() {
-        let state = test_app_state();
-        let thread = test_thread(&state, "claude", "claude-sonnet-4-6");
-
-        let updated = set_thread_execution_policy_inner(
-            &state,
-            thread.id.clone(),
-            false,
-            None,
-            true,
-            Some("danger-full-access".to_string()),
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-        )
-        .await
-        .expect("expected danger-full-access to be accepted");
-
-        let workspace =
-            crate::db::workspaces::find_workspace_by_id(&state.db, &thread.workspace_id)
-                .unwrap()
-                .expect("expected workspace");
-        let context = CliExecutionContext::from_workspace(&workspace).unwrap();
-        let claude = CliToolFactory::new(state.clone()).create("claude").unwrap();
-        let permissions = claude
-            .runtime_permissions(&context, &updated)
-            .await
-            .unwrap();
-        assert_eq!(
-            permissions.sandbox_mode.as_deref(),
-            Some("danger-full-access")
-        );
-        assert!(updated
-            .engine_metadata
-            .as_ref()
-            .is_none_or(|value| value.get("sandboxMode").is_none()));
-    }
-
-    #[tokio::test]
-    async fn set_thread_execution_policy_clears_permission_profile_when_sandbox_changes() {
-        let state = test_app_state();
-        let thread = test_thread(&state, "codex", "gpt-5.4");
-
-        let profile = json!({
-            "type": "managed",
-            "fileSystem": {
-                "type": "unrestricted"
-            },
-            "network": {
-                "enabled": true
-            }
-        });
-        let updated = set_thread_execution_policy_inner(
-            &state,
-            thread.id.clone(),
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-            true,
-            Some(profile),
-            false,
-            None,
-        )
-        .await
-        .expect("expected permission profile update to succeed");
-        let workspace =
-            crate::db::workspaces::find_workspace_by_id(&state.db, &thread.workspace_id)
-                .unwrap()
-                .expect("expected workspace");
-        let context = CliExecutionContext::from_workspace(&workspace).unwrap();
-        let codex = CliToolFactory::new(state.clone()).create("codex").unwrap();
-        let permissions = codex.runtime_permissions(&context, &updated).await.unwrap();
-        assert!(permissions.permission_profile.is_some());
-
-        let updated = set_thread_execution_policy_inner(
-            &state,
-            thread.id.clone(),
-            false,
-            None,
-            true,
-            Some("danger-full-access".to_string()),
-            false,
-            None,
-            false,
-            None,
-            false,
-            None,
-        )
-        .await
-        .expect("expected sandbox update to succeed");
-        let permissions = codex.runtime_permissions(&context, &updated).await.unwrap();
-        assert_eq!(permissions.permission_profile, None);
-        assert_eq!(
-            permissions.sandbox_mode.as_deref(),
-            Some("danger-full-access")
-        );
-    }
-
-    #[test]
-    fn normalize_thread_permission_profile_rejects_incomplete_profiles() {
-        let error = normalize_thread_permission_profile(Some(json!({
-            "type": "managed",
-            "fileSystem": {
-                "type": "unrestricted"
-            }
-        })))
-        .expect_err("expected missing network to be rejected");
-
-        assert!(error.contains("network must be an object"));
-    }
-
-    #[test]
-    fn normalize_thread_approvals_reviewer_rejects_unknown_values() {
-        let error = normalize_thread_approvals_reviewer(Some("robot".to_string()))
-            .expect_err("expected unknown reviewer to be rejected");
-
-        assert!(error.contains("invalid approvals reviewer `robot`"));
     }
 
     #[tokio::test]

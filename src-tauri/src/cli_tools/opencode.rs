@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
-    CliReviewStarted, CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError,
-    CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult, map_context_usage,
+    CliReviewStarted, CliSessionNotFoundError, CliSessionSnapshot, CliTool, McpInvocationContext,
+    McpToolResult, map_context_usage,
 };
 use crate::{
     db,
@@ -34,123 +34,6 @@ use crate::{
     path_utils, remote_project_opencode_runtime_service, ssh,
     state::AppState,
 };
-
-fn default_permission_component() -> PermissionComponentJson {
-    let mut values = HashMap::new();
-    for key in ["autonomyPreset", "trust", "approval", "sandbox", "network"] {
-        values.insert(key.to_string(), json!(["automatic"]));
-    }
-    values.insert("defaultForNewThreads".to_string(), json!([]));
-    values
-}
-
-fn set_permission_array(values: &mut PermissionComponentJson, key: &str, items: &[&str]) {
-    values.insert(
-        key.to_string(),
-        Value::Array(items.iter().map(|item| json!(item)).collect()),
-    );
-}
-
-fn permission_choice<'a>(
-    values: &'a PermissionComponentJson,
-    key: &str,
-) -> Result<Option<&'a str>> {
-    let value = values.get(key).context(format!("缺少权限参数: {key}"))?;
-    let array = value
-        .as_array()
-        .context(format!("权限参数必须是数组: {key}"))?;
-    Ok(array.first().and_then(Value::as_str))
-}
-
-fn validate_permission_component(values: &PermissionComponentJson) -> Result<()> {
-    let allowed = [
-        (
-            "autonomyPreset",
-            ["automatic", "read-only", "ask", "auto", "full"].as_slice(),
-        ),
-        (
-            "trust",
-            ["automatic", "trusted", "standard", "restricted"].as_slice(),
-        ),
-        (
-            "approval",
-            ["automatic", "restricted", "ask", "autonomous"].as_slice(),
-        ),
-        (
-            "sandbox",
-            ["automatic", "read-only", "workspace-write", "full-access"].as_slice(),
-        ),
-        ("network", ["automatic", "enabled", "restricted"].as_slice()),
-        (
-            "defaultForNewThreads",
-            ["automatic", "read-only", "ask", "auto", "full"].as_slice(),
-        ),
-    ];
-    for key in values.keys() {
-        anyhow::ensure!(
-            allowed.iter().any(|(name, _)| name == key),
-            "未知权限参数: {key}"
-        );
-    }
-    for (key, choices) in allowed {
-        let value = values.get(key).context(format!("缺少权限参数: {key}"))?;
-        let array = value
-            .as_array()
-            .context(format!("权限参数必须是数组: {key}"))?;
-        anyhow::ensure!(array.len() <= 1, "权限参数数组最多只能有一个值: {key}");
-        for item in array {
-            let item = item
-                .as_str()
-                .context(format!("权限参数值必须是字符串: {key}"))?;
-            anyhow::ensure!(choices.contains(&item), "权限参数值不支持: {key}={item}");
-        }
-    }
-    Ok(())
-}
-
-fn raw_rules_from_thread(thread: &ThreadDto) -> Result<Value> {
-    let raw = thread.permission_mode.as_deref().unwrap_or("").trim();
-    if raw.is_empty() {
-        return Ok(json!([]));
-    }
-    let parsed: Value = serde_json::from_str(raw).context("OpenCode 权限 JSON 格式错误")?;
-    if parsed.is_null() || parsed == json!({}) || parsed == json!([]) {
-        return Ok(json!([]));
-    }
-    if let Some(rules) = parsed.get("permission") {
-        anyhow::ensure!(rules.is_array(), "OpenCode permission 必须是数组");
-        return Ok(rules.clone());
-    }
-    if let Some(policy) = parsed
-        .get("approvalPolicy")
-        .or_else(|| parsed.get("opencodePermissionMode"))
-        .and_then(Value::as_str)
-    {
-        return Ok(match policy {
-            "allow" => json!([{ "permission": "*", "pattern": "*", "action": "allow" }]),
-            "deny" => json!([{ "permission": "*", "pattern": "*", "action": "deny" }]),
-            "ask" => json!([
-                { "permission": "*", "pattern": "*", "action": "ask" },
-                { "permission": "question", "pattern": "*", "action": "allow" }
-            ]),
-            "inherit" => json!([]),
-            _ => anyhow::bail!("OpenCode approvalPolicy 值无效: {policy}"),
-        });
-    }
-    Ok(json!([]))
-}
-
-/// 从现有 OpenCode raw object 复制权限数组，保留 CLI 未知顶层字段。
-fn raw_permission_value(thread: &ThreadDto, rules: &Value) -> Value {
-    let mut raw_object = thread
-        .permission_mode
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    raw_object.insert("permission".to_string(), rules.clone());
-    Value::Object(raw_object)
-}
 
 /// OpenCode 对统一 CLI 操作接口的实现。
 ///
@@ -440,8 +323,83 @@ impl OpenCodeCli {
     fn unsupported(action: &str) -> anyhow::Error {
         anyhow::anyhow!("OpenCode 当前不支持{action}")
     }
-}
 
+    /// 根据线程当前保存的统一权限配置生成 OpenCode 本次执行使用的原生规则。
+    async fn parse_permissions(
+        &self,
+        context: &CliExecutionContext,
+        thread: &ThreadDto,
+    ) -> Result<Value> {
+        let workspace = self.load_workspace(context).await?;
+        Self::validate_thread(context, thread)?;
+        anyhow::ensure!(
+            thread.workspace_id == context.workspace_id,
+            "当前会话不属于该 workspace"
+        );
+        let permissions = thread.permission_mode.clone().unwrap_or_default();
+        permissions.validate()?;
+
+        // OpenCode 无法表达统一权限中的 sandbox 和 network 覆盖，发送前明确拒绝此类配置。
+        anyhow::ensure!(
+            permissions
+                .sandbox
+                .first()
+                .map_or(true, |value| value == "automatic"),
+            "OpenCode 不支持 sandbox 覆盖"
+        );
+        anyhow::ensure!(
+            permissions
+                .network
+                .first()
+                .map_or(true, |value| value == "automatic"),
+            "OpenCode 不支持 network 覆盖"
+        );
+
+        // 按当前统一权限配置和 workspace 信任级别生成完整 OpenCode 原生权限数组。
+        let trust = match permissions.trust.first().map(String::as_str) {
+            Some("automatic") | None => workspace.trust_level.as_str(),
+            Some(value) => value,
+        };
+        let trust_rules = match trust {
+            "restricted" => json!([{ "permission": "*", "pattern": "*", "action": "deny" }]),
+            "trusted" | "standard" => json!([
+                { "permission": "*", "pattern": "*", "action": "ask" },
+                { "permission": "question", "pattern": "*", "action": "allow" }
+            ]),
+            _ => anyhow::bail!("workspace 信任级别不支持 OpenCode 权限映射: {trust}"),
+        };
+        let rules = match permissions.autonomy_preset.first().map(String::as_str) {
+            Some("read-only") => {
+                json!([{ "permission": "*", "pattern": "*", "action": "deny" }])
+            }
+            Some("ask") => json!([
+                { "permission": "*", "pattern": "*", "action": "ask" },
+                { "permission": "question", "pattern": "*", "action": "allow" }
+            ]),
+            Some("auto") | Some("full") => {
+                json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
+            }
+            Some("automatic") => trust_rules,
+            None => match permissions.approval.first().map(String::as_str) {
+                Some("restricted") => {
+                    json!([{ "permission": "*", "pattern": "*", "action": "deny" }])
+                }
+                Some("ask") => json!([
+                    { "permission": "*", "pattern": "*", "action": "ask" },
+                    { "permission": "question", "pattern": "*", "action": "allow" }
+                ]),
+                Some("autonomous") => {
+                    json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
+                }
+                Some("automatic") | None => trust_rules,
+                Some(value) => anyhow::bail!("OpenCode approval 配置不支持: {value}"),
+            },
+            Some(value) => anyhow::bail!("OpenCode autonomy preset 不支持: {value}"),
+        };
+        Ok(json!({ "permission": rules }))
+    }
+
+}
 #[async_trait]
 impl CliTool for OpenCodeCli {
     fn id(&self) -> &str {
@@ -995,378 +953,7 @@ impl CliTool for OpenCodeCli {
         Ok(())
     }
 
-    async fn get_permissions(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-    ) -> Result<PermissionComponentJson> {
-        self.load_workspace(context).await?;
-        Self::validate_thread(context, thread)?;
-        anyhow::ensure!(
-            thread.workspace_id == context.workspace_id,
-            "当前会话不属于该 workspace"
-        );
-        let mut rules = raw_rules_from_thread(thread)?;
-        /*
-        // 旧实现曾用该标记判断是否回退到 engine_metadata_json 权限镜像；
-        // 统一权限来源改为 permission_mode 后，该分支已停用。
-        let has_explicit_permission = thread
-            .permission_mode
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-            .and_then(|raw| raw.get("permission").cloned())
-            .is_some();
-        */
-        // 权限为空时保持 CLI 默认行为，不再回退读取 engine_metadata_json。
-        let mut result = default_permission_component();
-        let action = rules.as_array().and_then(|rules| {
-            rules.iter().rev().find_map(|rule| {
-                (rule.get("permission").and_then(Value::as_str) == Some("*")
-                    && rule.get("pattern").and_then(Value::as_str) == Some("*"))
-                .then(|| rule.get("action").and_then(Value::as_str))
-                .flatten()
-            })
-        });
-        match action {
-            Some("allow") => {
-                set_permission_array(&mut result, "autonomyPreset", &["full"]);
-                set_permission_array(&mut result, "approval", &["autonomous"]);
-            }
-            Some("ask") => {
-                set_permission_array(&mut result, "autonomyPreset", &["ask"]);
-                set_permission_array(&mut result, "approval", &["ask"]);
-            }
-            Some("deny") => {
-                set_permission_array(&mut result, "autonomyPreset", &["read-only"]);
-                set_permission_array(&mut result, "approval", &["restricted"]);
-            }
-            Some(_) => {
-                set_permission_array(&mut result, "autonomyPreset", &[]);
-                set_permission_array(&mut result, "approval", &[]);
-            }
-            None => {}
-        }
-        Ok(result)
-    }
-
-    /// 发送前只把 OpenCode 权限规则保存到线程，不更新已经运行的 session。
-    async fn save_permissions_for_send(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-        values: PermissionComponentJson,
-    ) -> Result<ThreadDto> {
-        self.load_workspace(context).await?;
-        Self::validate_thread(context, thread)?;
-        anyhow::ensure!(
-            thread.workspace_id == context.workspace_id,
-            "当前会话不属于该 workspace"
-        );
-        validate_permission_component(&values)?;
-        let preset = permission_choice(&values, "autonomyPreset")?;
-        let approval = permission_choice(&values, "approval")?;
-        let autonomy_is_empty = values
-            .get("autonomyPreset")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty);
-        anyhow::ensure!(
-            permission_choice(&values, "sandbox")?.map_or(true, |v| v == "automatic"),
-            "OpenCode 不支持 sandbox 覆盖"
-        );
-        anyhow::ensure!(
-            permission_choice(&values, "network")?.map_or(true, |v| v == "automatic"),
-            "OpenCode 不支持 network 覆盖"
-        );
-        let rules = match preset {
-            Some("automatic") => json!([]),
-            None if autonomy_is_empty || approval == Some("automatic") => json!([]),
-            Some("read-only") => json!([{ "permission": "*", "pattern": "*", "action": "deny" }]),
-            Some("ask") => json!([
-                { "permission": "*", "pattern": "*", "action": "ask" },
-                { "permission": "question", "pattern": "*", "action": "allow" }
-            ]),
-            Some("auto") | Some("full") => {
-                json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
-            }
-            _ => match approval {
-                Some("restricted") => {
-                    json!([{ "permission": "*", "pattern": "*", "action": "deny" }])
-                }
-                Some("ask") => json!([
-                    { "permission": "*", "pattern": "*", "action": "ask" },
-                    { "permission": "question", "pattern": "*", "action": "allow" }
-                ]),
-                Some("autonomous") => {
-                    json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
-                }
-                _ => raw_rules_from_thread(thread)?,
-            },
-        };
-        // 只替换 OpenCode 的 permission 字段，保留原始 JSON 中其他顶层扩展字段。
-        let raw = if thread
-            .permission_mode
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok())
-            .is_some_and(|value| value.is_array())
-        {
-            rules.to_string()
-        } else {
-            raw_permission_value(thread, &rules).to_string()
-        };
-        db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw))
-            .map_err(Into::into)
-    }
-
-    async fn set_permissions(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-        values: PermissionComponentJson,
-    ) -> Result<PermissionComponentJson> {
-        let workspace = self.load_workspace(context).await?;
-        Self::validate_thread(context, thread)?;
-        anyhow::ensure!(
-            thread.workspace_id == context.workspace_id,
-            "当前会话不属于该 workspace"
-        );
-        validate_permission_component(&values)?;
-        let current = <Self as CliTool>::get_permissions(self, context, thread).await?;
-        if current.get("autonomyPreset") == values.get("autonomyPreset")
-            && current.get("approval") == values.get("approval")
-            && current.get("sandbox") == values.get("sandbox")
-            && current.get("network") == values.get("network")
-        {
-            let mut result = current;
-            if let Some(value) = values.get("trust") {
-                result.insert("trust".to_string(), value.clone());
-            }
-            if let Some(value) = values.get("defaultForNewThreads") {
-                result.insert("defaultForNewThreads".to_string(), value.clone());
-            }
-            return Ok(result);
-        }
-        let preset = permission_choice(&values, "autonomyPreset")?;
-        let approval = permission_choice(&values, "approval")?;
-        let autonomy_is_empty = values
-            .get("autonomyPreset")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty);
-        anyhow::ensure!(
-            permission_choice(&values, "sandbox")?.map_or(true, |v| v == "automatic"),
-            "OpenCode 不支持 sandbox 覆盖"
-        );
-        anyhow::ensure!(
-            permission_choice(&values, "network")?.map_or(true, |v| v == "automatic"),
-            "OpenCode 不支持 network 覆盖"
-        );
-        let rules = match preset {
-            Some("automatic") => json!([]),
-            None if autonomy_is_empty || approval == Some("automatic") => json!([]),
-            Some("read-only") => json!([{ "permission": "*", "pattern": "*", "action": "deny" }]),
-            Some("ask") => json!([
-                { "permission": "*", "pattern": "*", "action": "ask" },
-                { "permission": "question", "pattern": "*", "action": "allow" }
-            ]),
-            Some("auto") | Some("full") => {
-                json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
-            }
-            _ => match approval {
-                Some("restricted") => {
-                    json!([{ "permission": "*", "pattern": "*", "action": "deny" }])
-                }
-                Some("ask") => json!([
-                    { "permission": "*", "pattern": "*", "action": "ask" },
-                    { "permission": "question", "pattern": "*", "action": "allow" }
-                ]),
-                Some("autonomous") => {
-                    json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
-                }
-                _ => raw_rules_from_thread(thread)?,
-            },
-        };
-        // 只替换 OpenCode 的 permission 字段；原始 JSON 中其他顶层字段属于 CLI
-        // 自身扩展，必须随权限变更继续保留。
-        let raw = if thread
-            .permission_mode
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok())
-            .is_some_and(|value| value.is_array())
-        {
-            rules.to_string()
-        } else {
-            raw_permission_value(thread, &rules).to_string()
-        };
-        let engine_thread_id = thread.engine_thread_id.clone();
-        let saved = db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw))?;
-        if let Some(engine_thread_id) = engine_thread_id.as_deref() {
-            let cwd = self.thread_cwd(&workspace, thread).await?;
-            let result = if context.location_kind == CliLocationKind::Ssh {
-                remote_project_opencode_runtime_service::runtime(&workspace)
-                    .await?
-                    .set_session_permission_rules(&cwd, engine_thread_id, &rules)
-                    .await
-            } else {
-                self.local_engine(&cwd)
-                    .await?
-                    .set_session_permission_rules(&cwd, engine_thread_id, &rules)
-                    .await
-            };
-            if let Err(error) = result {
-                let rollback_value = thread
-                    .permission_mode
-                    .clone()
-                    .unwrap_or_else(|| "[]".to_string());
-                if let Err(rollback_error) = db::threads::update_thread_permissions(
-                    &self.state.db,
-                    &thread.id,
-                    Some(&rollback_value),
-                ) {
-                    return Err(anyhow::anyhow!(
-                        "同步 OpenCode session 权限失败: {error:#}; 回滚线程权限配置也失败: {rollback_error}"
-                    ));
-                }
-                return Err(error).context("同步 OpenCode session 权限失败");
-            }
-        }
-        let mut result = self.get_permissions(context, &saved).await?;
-        for key in ["trust", "defaultForNewThreads"] {
-            if let Some(value) = values.get(key) {
-                result.insert(key.to_string(), value.clone());
-            }
-        }
-        Ok(result)
-    }
-
-    /// 将 OpenCode 全局权限规则转换为统一运行时权限结构。
-    async fn runtime_permissions(
-        &self,
-        _context: &CliExecutionContext,
-        thread: &ThreadDto,
-    ) -> Result<CliRuntimePermissions> {
-        let rules = raw_rules_from_thread(thread)?;
-        let approval_policy = rules.as_array().and_then(|items| {
-            items.iter().rev().find_map(|rule| {
-                (rule.get("permission").and_then(Value::as_str) == Some("*")
-                    && rule.get("pattern").and_then(Value::as_str) == Some("*"))
-                .then(|| rule.get("action").cloned())
-                .flatten()
-            })
-        });
-        Ok(CliRuntimePermissions {
-            approval_policy,
-            sandbox_mode: None,
-            allow_network: None,
-            permission_profile: None,
-            approvals_reviewer: None,
-        })
-    }
-
-    /// 将统一权限补丁转换为 OpenCode permission 规则数组并持久化到线程。
-    async fn patch_runtime_permissions(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-        patch: CliRuntimePermissionPatch,
-    ) -> Result<ThreadDto> {
-        self.load_workspace(context).await?;
-        let parsed = thread
-            .permission_mode
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok())
-            .unwrap_or_else(|| json!([]));
-        anyhow::ensure!(
-            patch.sandbox_mode.is_none()
-                && patch.allow_network.is_none()
-                && patch.permission_profile.is_none()
-                && patch.approvals_reviewer.is_none(),
-            "OpenCode 仅支持更新 permission 规则"
-        );
-        let mut rules = raw_rules_from_thread(thread)?;
-        if let Some(value) = patch.approval_policy {
-            let action = value.as_ref().and_then(Value::as_str);
-            rules = match action {
-                Some("allow") => json!([{ "permission": "*", "pattern": "*", "action": "allow" }]),
-                Some("deny") => json!([{ "permission": "*", "pattern": "*", "action": "deny" }]),
-                Some("ask") => json!([{ "permission": "*", "pattern": "*", "action": "ask" }]),
-                None => json!([]),
-                Some(other) => anyhow::bail!("OpenCode 权限动作无效: {other}"),
-            };
-        }
-        let raw = if parsed.is_object() {
-            raw_permission_value(thread, &rules).to_string()
-        } else {
-            rules.to_string()
-        };
-        db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw))
-    }
-
-    async fn sync_thread_execution_policy(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-        approval_policy: &Value,
-    ) -> Result<()> {
-        let workspace = self.load_workspace(context).await?;
-        Self::validate_thread(context, thread)?;
-        let Some(engine_thread_id) = thread.engine_thread_id.as_deref() else {
-            // 尚未建立 OpenCode session 时只保留 AuraCoder 的权限配置，后续创建 session
-            // 会继续使用该配置生成权限规则。
-            return Ok(());
-        };
-        let cwd = self.thread_cwd(&workspace, thread).await?;
-        if context.location_kind == CliLocationKind::Ssh {
-            remote_project_opencode_runtime_service::runtime(&workspace)
-                .await?
-                .set_session_permission_mode(&cwd, engine_thread_id, approval_policy)
-                .await
-                .with_context(|| {
-                    format!(
-                        "同步 SSH OpenCode session 执行权限失败: thread_id={} engine_thread_id={}",
-                        thread.id, engine_thread_id
-                    )
-                })
-        } else {
-            self.local_engine(&cwd)
-                .await?
-                .set_session_permission_mode(&cwd, engine_thread_id, approval_policy)
-                .await
-                .with_context(|| {
-                    format!(
-                        "同步本机 OpenCode session 执行权限失败: thread_id={} engine_thread_id={}",
-                        thread.id, engine_thread_id
-                    )
-                })
-        }?;
-
-        // OpenCode 的 ask/allow/deny 规则由 OpenCode 实现层解释；切换到
-        // allow 或 deny 时，同时处理该线程已有的待处理权限请求。
-        if let Some(action) = approval_policy.as_str().filter(|value| *value != "ask") {
-            let db = self.state.db.clone();
-            let thread_id = thread.id.clone();
-            let approval_ids = tokio::task::spawn_blocking(move || {
-                db::actions::find_pending_opencode_permission_approval_ids(&db, &thread_id)
-            })
-            .await
-            .context("查询 OpenCode 待处理权限请求失败")??;
-            let decision = if action == "allow" {
-                "accept_for_session"
-            } else {
-                "decline"
-            };
-            for approval_id in approval_ids {
-                crate::commands::chat::respond_to_approval_inner(
-                    &self.state,
-                    thread.id.clone(),
-                    approval_id,
-                    json!({ "decision": decision }),
-                )
-                .await
-                .map_err(anyhow::Error::msg)?;
-            }
-        }
-        Ok(())
-    }
-
+    /// 解析当前线程权限并在本机或 SSH OpenCode 引擎中建立 session。
     async fn start_thread(
         &self,
         context: &CliExecutionContext,
@@ -1376,8 +963,17 @@ impl CliTool for OpenCodeCli {
         model: &str,
         sandbox: SandboxPolicy,
     ) -> Result<EngineThread> {
+        let permissions = self.parse_permissions(context, thread).await?;
         let workspace = self.load_workspace(context).await?;
         Self::validate_thread(context, thread)?;
+        // 将当前线程转换出的 OpenCode 原生规则传入 session 建立流程。
+        let permission_rules = permissions
+            .get("permission")
+            .cloned()
+            .context("OpenCode 原生权限规则缺失")?;
+        anyhow::ensure!(permission_rules.is_array(), "OpenCode 原生权限规则必须是数组");
+        let mut sandbox = sandbox;
+        sandbox.approval_policy = Some(permission_rules);
         let scope_cwd = match &scope {
             ThreadScope::Project { root_path, .. } => root_path.as_str(),
         };
@@ -1411,6 +1007,7 @@ impl CliTool for OpenCodeCli {
         .await
     }
 
+    /// 每次发送前解析当前线程权限，并将原生规则交给本机或 SSH OpenCode 引擎。
     async fn send_message(
         &self,
         context: &CliExecutionContext,
@@ -1422,6 +1019,9 @@ impl CliTool for OpenCodeCli {
     ) -> Result<()> {
         let workspace = self.load_workspace(context).await?;
         Self::validate_thread(context, thread)?;
+        let mut input = input;
+        // 每次发送都从线程当前 A 权限重新解析 OpenCode 原生规则并交给引擎。
+        input.permissions = Some(self.parse_permissions(context, thread).await?);
         if context.location_kind == CliLocationKind::Ssh {
             let engine = self.remote_turn_use.lock().await.take().ok_or_else(|| {
                 anyhow::anyhow!("当前 SSH 远端 OpenCode 会话尚未建立持续使用关系")
@@ -1955,9 +1555,11 @@ impl CliTool for OpenCodeCli {
         extensions::opencode::perform_action(&item, action, None).await
     }
 
+    /// 报告 OpenCode 当前不支持的会话分支业务。
     async fn fork_thread(
         &self,
         context: &CliExecutionContext,
+        _thread: &ThreadDto,
         _engine_thread_id: &str,
         _cwd: &str,
         _model: &str,
@@ -1999,82 +1601,5 @@ impl CliTool for OpenCodeCli {
     ) -> Result<()> {
         self.load_workspace(context).await?;
         Err(Self::unsupported("代码审查"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn thread(permission_mode: Option<&str>, metadata: Option<Value>) -> ThreadDto {
-        ThreadDto {
-            id: "thread".to_string(),
-            workspace_id: "workspace".to_string(),
-            engine_id: "opencode".to_string(),
-            model_id: "model".to_string(),
-            engine_thread_id: None,
-            engine_metadata: metadata,
-            plan_mode: None,
-            send_method: None,
-            reasoning_effort: None,
-            permission_mode: permission_mode.map(str::to_string),
-            title: "thread".to_string(),
-            status: ThreadStatusDto::Idle,
-            message_count: 0,
-            total_tokens: 0,
-            context_current_tokens: None,
-            context_max_tokens: None,
-            context_usage_updated_at: None,
-            created_at: String::new(),
-            last_activity_at: String::new(),
-        }
-    }
-
-    #[test]
-    fn permissions_read_empty_and_legacy_modes() {
-        assert_eq!(
-            raw_rules_from_thread(&thread(None, None)).unwrap(),
-            json!([])
-        );
-        let rules =
-            raw_rules_from_thread(&thread(Some(r#"{"approvalPolicy":"ask"}"#), None)).unwrap();
-        assert_eq!(rules.as_array().map(Vec::len), Some(2));
-        assert_eq!(rules[0]["action"], json!("ask"));
-    }
-
-    #[test]
-    fn permissions_last_global_rule_ignores_question_allow() {
-        let rules = json!([
-            { "permission": "*", "pattern": "*", "action": "ask" },
-            { "permission": "question", "pattern": "*", "action": "allow" }
-        ]);
-        let action = rules.as_array().unwrap().iter().rev().find_map(|rule| {
-            (rule.get("permission").and_then(Value::as_str) == Some("*")
-                && rule.get("pattern").and_then(Value::as_str) == Some("*"))
-            .then(|| rule.get("action").and_then(Value::as_str))
-            .flatten()
-        });
-        assert_eq!(action, Some("ask"));
-    }
-
-    #[test]
-    fn permissions_save_preserves_unknown_raw_fields() {
-        let thread = thread(
-            Some(r#"{"permission":[],"unknown":{"keep":true},"sessionMode":"build"}"#),
-            None,
-        );
-        let raw = raw_permission_value(
-            &thread,
-            &json!([{ "permission": "*", "pattern": "*", "action": "allow" }]),
-        );
-        assert_eq!(raw["permission"][0]["action"], json!("allow"));
-        assert_eq!(raw["unknown"], json!({"keep": true}));
-        assert_eq!(raw["sessionMode"], json!("build"));
-    }
-
-    #[test]
-    fn permissions_invalid_json_returns_error() {
-        let error = raw_rules_from_thread(&thread(Some("{bad"), None)).unwrap_err();
-        assert!(error.to_string().contains("格式错误"));
     }
 }

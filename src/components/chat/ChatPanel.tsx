@@ -62,19 +62,6 @@ import { useChatInputHeightStore } from "../../stores/chatInputHeightStore";
 // 斜杠菜单统一由 buildSlashCommandsFromExtensions 按 ExtensionItemDto 解析。
 import { buildSlashCommandsFromExtensions } from "../../cli-tools/build-slash-commands";
 import type { CliSlashCommand } from "../../cli-tools/contracts/slash-command";
-import {
-  // 旧 PermissionPicker 的 CLI 权限适配导入已停用，保留迁移记录：
-  // autonomyPresetExecutionPolicyRequest,
-  // autonomyPresetPatch,
-  // detectAutonomyPreset,
-  isAutonomyPresetId,
-} from "../../lib/autonomyPresets";
-import type { AutonomyPresetId } from "../../lib/autonomyPresets";
-import {
-  codexUsesExternalSandbox,
-  // 旧 PermissionPicker 保存分支使用，现已停用：
-  // isCodexExternalSandboxWarning,
-} from "../../lib/codexSandbox";
 import { resolvePreferredOnboardingChatSelection } from "../../lib/onboarding";
 import { recordPerfMetric } from "../../lib/perfTelemetry";
 import { isMacDesktop, usesCustomWindowFrame } from "../../lib/windowActions";
@@ -85,7 +72,6 @@ import {
   EMPTY_CHAT_TEXT_ANNOTATIONS,
   EMPTY_PENDING_FLEXIBLE_MESSAGES,
   EMPTY_PERMISSION_COMPONENT,
-  PERMISSION_COMPONENT_ENGINE_IDS,
 } from "./chatPanelConstants";
 import type {
   CodexReferenceCatalogState,
@@ -103,9 +89,7 @@ import {
   canBatchApproveApproval,
   canUseApprovalDecisionActions,
   filterPendingApprovalBannerRows,
-  permissionSaveWaitAction,
   resolvePendingToolInputApproval,
-  shouldUpdateWorkspaceTrustLevel,
   buildPermissionApprovalResponseForEngine,
   isOpenCodeQuestionApproval,
 } from "./approvalUtils";
@@ -113,9 +97,7 @@ export {
   canBatchApproveApproval,
   canUseApprovalDecisionActions,
   filterPendingApprovalBannerRows,
-  permissionSaveWaitAction,
   resolvePendingToolInputApproval,
-  shouldUpdateWorkspaceTrustLevel,
   buildPermissionApprovalResponseForEngine,
   isOpenCodeQuestionApproval,
 } from "./approvalUtils";
@@ -138,9 +120,6 @@ import {
   serializePrettyJson,
 } from "./formatters";
 import {
-  autonomyPresetToComponentValue,
-  componentValueToAutonomyPreset,
-  parseStoredApprovalPolicy,
   parseStoredOutputSchema,
   readThreadLastModelId,
   readThreadOpenCodeAgentValue,
@@ -148,7 +127,6 @@ import {
   readThreadPersonalityValue,
   readThreadServiceTierValue,
 } from "./threadExecutionPolicy";
-import type { ThreadSandboxModeValue } from "./threadExecutionPolicy";
 import { resolveEngineCapabilities } from "./engineCapabilities";
 import { buildCodexInputItems, buildSelectedInputItems } from "./codexInputItems";
 import {
@@ -194,8 +172,6 @@ import type {
   ChatInputItem,
   ChatInputReference,
   ChatTextAnnotation,
-  // 旧 PermissionPicker 请求适配使用，现已停用：
-  // CodexApprovalsReviewer,
   CodexApp,
   CodexPlugin,
   CodexSkill,
@@ -339,7 +315,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const [selectedPersonality, setSelectedPersonality] = useState<CodexPersonalityValue>("inherit");
   const [selectedServiceTier, setSelectedServiceTier] = useState<CodexServiceTierValue>("inherit");
   const [outputSchemaText, setOutputSchemaText] = useState("");
-  const [customApprovalPolicyText, setCustomApprovalPolicyText] = useState("");
   const [editingThreadTitle, setEditingThreadTitle] = useState(false);
   const [threadTitleDraft, setThreadTitleDraft] = useState("");
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(
@@ -411,28 +386,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const loadEngines = useEngineStore((s) => s.load);
   // 旧逻辑仅用于线程变化时额外检查 CLI；当前业务只调用后端 CLI 列表接口。
   // const ensureEngineHealth = useEngineStore((s) => s.ensureHealth);
-  const engineWorkspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
   const onboardingOpen = useOnboardingStore((s) => s.open);
   const onboardingSelectedChatEngines = useOnboardingStore((s) => s.selectedChatEngines);
-  // The health warning is only a heuristic; the backend answer is what
-  // set_thread_execution_policy actually validates against.
-  const [codexExternalSandboxActive, setCodexExternalSandboxActive] = useState(false);
-  useEffect(() => {
-    let disposed = false;
-    const heuristic = codexUsesExternalSandbox(health);
-    setCodexExternalSandboxActive((prev) => prev || heuristic);
-    void ipc
-      .codexUsesExternalSandbox(engineWorkspaceId)
-      .then((active) => {
-        if (!disposed) {
-          setCodexExternalSandboxActive(active);
-        }
-      })
-      .catch(() => {});
-    return () => {
-      disposed = true;
-    };
-  }, [engineWorkspaceId, health]);
   const codexProtocolDiagnostics = health.codex?.protocolDiagnostics;
   const preferredOnboardingChatSelection = useMemo(
     () => resolvePreferredOnboardingChatSelection(onboardingSelectedChatEngines, engines),
@@ -794,7 +749,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
    *   personality: prompt.personality,
    *   serviceTier: prompt.serviceTier,
    *   outputSchemaText: prompt.outputSchemaText,
-   *   customApprovalPolicyText: prompt.customApprovalPolicyText,
    * }))) {
    *   setInput(prompt.draftText);
    *   setAttachments(prompt.attachments);
@@ -889,10 +843,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const prependLoadInFlightRef = useRef(false);
   const threadActivatedAtRef = useRef(0);
   const initialScrollThreadRef = useRef<string | null>(null);
-  const threadExecutionPolicyRequestIdsRef = useRef<Record<string, number>>({});
-  // 保存每个线程正在执行的权限持久化任务，普通消息发送必须等待同线程任务完成。
-  const threadExecutionPolicyRequestsRef = useRef<Record<string, Promise<boolean> | undefined>>({});
-  // 保存每个线程正在执行的五项运行选择局部更新，保证同一线程按顺序落库。
+  // 保存每个线程正在执行的运行选择局部更新，保证同一线程按顺序落库。
   const threadRuntimeSelectionRequestsRef = useRef<Record<string, Promise<boolean> | undefined>>({});
   const viewportScrollTopRef = useRef(0);
   const [textAnnotationPopover, setTextAnnotationPopover] =
@@ -912,7 +863,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     personality: CodexPersonalityValue;
     serviceTier: CodexServiceTierValue;
     outputSchemaText: string;
-    customApprovalPolicyText: string;
     openCodeAgent: string;
   } | null>(null);
 
@@ -925,30 +875,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     });
     return () => cancelAnimationFrame(animationFrame);
   }, [textAnnotationPopover?.stage]);
-
-  /* 旧 PermissionPicker 的 CLI 选项计算已停用，保留迁移记录。
-  const trustLevelOptions = useMemo(() => getTrustLevelOptions(t), [t]);
-  const codexThreadApprovalPolicyOptions = useMemo(
-    () => getCodexThreadApprovalPolicyOptions(t),
-    [t],
-  );
-  const claudeThreadPermissionModeOptions = useMemo(
-    () => getClaudeThreadPermissionModeOptions(t),
-    [t],
-  );
-  const openCodeThreadPermissionModeOptions = useMemo(
-    () => getOpenCodeThreadPermissionModeOptions(t),
-    [t],
-  );
-  const threadSandboxModeOptionsAll = useMemo(
-    () => getThreadSandboxModeOptions(t),
-    [t],
-  );
-  const threadNetworkPolicyOptions = useMemo(
-    () => getThreadNetworkPolicyOptions(t),
-    [t],
-  );
-  */
 
   const selectedEngine = useMemo(
     () => engines.find((engine) => engine.id === selectedEngineId) ?? engines[0] ?? null,
@@ -1049,8 +975,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const codexConfigActiveCount =
     (selectedPersonality !== "inherit" ? 1 : 0) +
     (selectedServiceTier !== "inherit" ? 1 : 0) +
-    (outputSchemaText.trim().length > 0 ? 1 : 0) +
-    (customApprovalPolicyText.trim().length > 0 ? 1 : 0);
+    (outputSchemaText.trim().length > 0 ? 1 : 0);
   const selectedOutputSchemaValue = useMemo(() => {
     try {
       return parseStoredOutputSchema(outputSchemaText);
@@ -1058,13 +983,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       return null;
     }
   }, [outputSchemaText]);
-  const selectedCustomApprovalPolicyValue = useMemo(() => {
-    try {
-      return parseStoredApprovalPolicy(customApprovalPolicyText);
-    } catch {
-      return null;
-    }
-  }, [customApprovalPolicyText]);
   const activeThreadHasRemoteSession =
     activeWorkspace?.locationKind === "ssh" && Boolean(activeThread?.engineThreadId);
   /*
@@ -1416,175 +1334,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     };
   }, [activeThread?.engineId, activeThread?.modelId, engines, selectedEngine, selectedEngineId, selectedModel?.id, t]);
 
-  /* 旧 PermissionPicker 的信任选项提示已停用，保留迁移记录。
-  function trustLevelTooltip(level: TrustLevel): string {
-    return (
-      trustLevelOptions.find((option) => option.value === level)?.description ??
-      t("policy.permissionPolicyFallback")
-    );
-  }
-  */
-
-  const [permissionComponent, setPermissionComponent] = useState<PermissionComponentJson>(
-    EMPTY_PERMISSION_COMPONENT,
-  );
-  const permissionLoadRequestRef = useRef(0);
-  const permissionSaveRequestRef = useRef(0);
-  const permissionSavePromisesRef = useRef<Record<string, Promise<boolean>>>({});
-  const [defaultAutonomyPreset, setDefaultAutonomyPreset] =
-    useState<AutonomyPresetId | null>(null);
   const workspaceTrustLevel: TrustLevel = activeWorkspace?.trustLevel ?? "standard";
-  /*
-   * 旧实现把权限读写绑在 engines 环境注册状态上，已停用；按两条路架构，权限
-   * 取数据库只依赖 threads 表会话的引擎标识，与 CLI 环境加载无关。
-   * const activeThreadEngineRegistered = Boolean(
-   *   activeThread && engines.some((engine) => engine.id === activeThread.engineId),
-   * );
-   */
-  // 新建会话以 unknown 占位引擎；权限后端读写只要求引擎标识属于已接入的三个 CLI，
-  // unknown 占位的会话不调后端，首次发送写回真实引擎后恢复原路径。
-  const activeThreadHasPermissionBackend = Boolean(
-    activeThread && PERMISSION_COMPONENT_ENGINE_IDS.has(activeThread.engineId),
-  );
+  const permissionComponent = activeThread?.permissionMode ?? EMPTY_PERMISSION_COMPONENT;
 
-  // 权限组件只依赖 AuraCoder 线程 ID；新建线程在发送前也立即显示统一默认值。
-  useEffect(() => {
-    /** 在权限组件值上叠加本机覆盖项：工作区信任级别、新会话默认档位。 */
-    const mergeLocalPermissionOverrides = (
-      values: PermissionComponentJson,
-    ): PermissionComponentJson => ({
-      ...values,
-      trust: workspaceTrustLevel ? [workspaceTrustLevel] : values.trust,
-      defaultForNewThreads: autonomyPresetToComponentValue(defaultAutonomyPreset)
-        ? [autonomyPresetToComponentValue(defaultAutonomyPreset)!]
-        : values.defaultForNewThreads,
-    });
-    const threadId = activeThread?.id;
-    const requestId = permissionLoadRequestRef.current + 1;
-    permissionLoadRequestRef.current = requestId;
-    if (!threadId) {
-      setPermissionComponent(EMPTY_PERMISSION_COMPONENT);
-      return;
-    }
-    // 引擎为 unknown 占位的会话不调 getThreadPermissions（后端工厂无 unknown 实现
-    // 会报错），直接展示统一默认组件；已接入 CLI 的会话不等环境加载，直接取数据库。
-    if (!activeThreadHasPermissionBackend) {
-      setPermissionComponent(mergeLocalPermissionOverrides(EMPTY_PERMISSION_COMPONENT));
-      return;
-    }
-    let disposed = false;
-    setPermissionComponent(EMPTY_PERMISSION_COMPONENT);
-    void ipc
-      .getThreadPermissions(threadId)
-      .then((values) => {
-        if (!disposed && permissionLoadRequestRef.current === requestId) {
-          setPermissionComponent(mergeLocalPermissionOverrides(values));
-        }
-      })
-      .catch((error) => {
-        if (!disposed && permissionLoadRequestRef.current === requestId) {
-          // 旧逻辑把后端原始错误原文弹给用户（如"CLI 未在启动阶段登记"）；
-          // 原始错误记录日志，用户侧只展示业务语义文案。
-          console.error("Failed to load thread permissions:", error);
-          toast.error(t("panel.permissionLoadFailed"));
-        }
-      });
-    return () => {
-      disposed = true;
-    };
-  // 权限组件只允许在初始化阶段被重置：新建会话、点击已存在会话（即线程 ID 变化）。
-  // 引擎注册翻转（发送时 unknown 落库为真实 CLI）和用户自己修改信任级别/默认档位
-  // 都不是初始化阶段，不允许再触发重置，否则会覆盖用户已选择的权限。
-  /*
-   * 旧依赖声明会把发送时的引擎注册翻转当成重置触发源，保留迁移记录：
-   * }, [activeThread?.id, activeThreadEngineRegistered, defaultAutonomyPreset, workspaceTrustLevel]);
-   */
-  }, [activeThread?.id]);
-
-  function onPermissionComponentChange(next: PermissionComponentJson): Promise<boolean> {
-    const thread = activeThread;
-    if (!thread?.id) return Promise.resolve(false);
-    setPermissionComponent(next);
-    const requestId = permissionSaveRequestRef.current + 1;
-    permissionSaveRequestRef.current = requestId;
-    const threadId = thread.id;
-    const previous = permissionSavePromisesRef.current[threadId] ?? Promise.resolve(true);
-    let trackedPromise: Promise<boolean>;
-    trackedPromise = previous
-      .catch(() => true)
-      .then(async () => {
-      try {
-        const nextTrust = Array.isArray(next.trust) && typeof next.trust[0] === "string"
-          ? next.trust[0] as TrustLevel
-          : null;
-        const currentWorkspaceTrustLevel =
-          useWorkspaceStore.getState().workspaces.find(
-            (workspace) => workspace.id === thread.workspaceId,
-          )?.trustLevel ?? workspaceTrustLevel;
-        if (shouldUpdateWorkspaceTrustLevel(nextTrust, currentWorkspaceTrustLevel)) {
-          await onWorkspaceTrustLevelChange(nextTrust, false);
-        }
-        const nextDefaultValue = Array.isArray(next.defaultForNewThreads)
-          && typeof next.defaultForNewThreads[0] === "string"
-          ? next.defaultForNewThreads[0]
-          : null;
-        const nextDefault = componentValueToAutonomyPreset(nextDefaultValue);
-        const currentDefault = Array.isArray(permissionComponent.defaultForNewThreads)
-          && typeof permissionComponent.defaultForNewThreads[0] === "string"
-          ? permissionComponent.defaultForNewThreads[0]
-          : null;
-        const currentDefaultPreset = componentValueToAutonomyPreset(currentDefault);
-        if (nextDefault !== currentDefaultPreset) {
-          await onDefaultAutonomyPresetChange(nextDefault);
-        }
-        // 引擎为 unknown 占位的会话不调 setThreadPermissions（后端工厂无 unknown
-        // 实现会报错）；改动保留在本地组件状态，首次发送时随 permissionValues 一并提交。
-        if (!activeThreadHasPermissionBackend) {
-          return true;
-        }
-        const values = await ipc.setThreadPermissions(threadId, next);
-        if (
-          permissionSaveRequestRef.current === requestId
-          && useThreadStore.getState().activeThreadId === threadId
-          && permissionSavePromisesRef.current[threadId] === trackedPromise
-        ) {
-          setPermissionComponent(values);
-        }
-        return true;
-      } catch (error) {
-        if (
-          permissionSaveRequestRef.current === requestId
-          && useThreadStore.getState().activeThreadId === threadId
-          && permissionSavePromisesRef.current[threadId] === trackedPromise
-        ) {
-          toast.error(String(error));
-          try {
-            const values = await ipc.getThreadPermissions(threadId);
-            setPermissionComponent(values);
-          } catch {
-            setPermissionComponent(EMPTY_PERMISSION_COMPONENT);
-          }
-        }
-        return false;
-      }
-      });
-    permissionSavePromisesRef.current[threadId] = trackedPromise;
-    void trackedPromise.then(
-      () => {
-        if (permissionSavePromisesRef.current[threadId] === trackedPromise) {
-          delete permissionSavePromisesRef.current[threadId];
-        }
-      },
-      () => {
-        if (permissionSavePromisesRef.current[threadId] === trackedPromise) {
-          delete permissionSavePromisesRef.current[threadId];
-        }
-      },
-    );
-    return trackedPromise;
-  }
-
-  /** 串行保存线程五项运行时选择；不同线程之间互不阻塞。 */
+  /** 串行保存线程运行时选择和统一权限对象；不同线程之间互不阻塞。 */
   const saveThreadRuntimeSelectionPatch = useCallback(
     (
       threadId: string | null | undefined,
@@ -1593,6 +1346,17 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       if (!threadId || Object.keys(patch).length === 0) {
         return Promise.resolve(true);
       }
+      // 先将完整补丁合并到线程缓存，让所有运行时字段立即反映最新编辑。
+      const currentThread =
+        useThreadStore.getState().threads.find((thread) => thread.id === threadId) ?? null;
+      if (currentThread) {
+        applyThreadUpdateLocal({
+          ...currentThread,
+          ...patch,
+          engineId: (patch.engineId ?? currentThread.engineId) as Thread["engineId"],
+          modelId: patch.modelId ?? currentThread.modelId,
+        });
+      }
       const previous =
         threadRuntimeSelectionRequestsRef.current[threadId] ?? Promise.resolve(true);
       let trackedPromise: Promise<boolean>;
@@ -1600,11 +1364,23 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         .catch(() => true)
         .then(async () => {
           try {
+            // 按线程顺序提交通用更新，只允许队列中最新请求应用响应。
             const updatedThread = await ipc.updateThread({ id: threadId, ...patch });
-            applyThreadUpdateLocal(updatedThread);
+            if (threadRuntimeSelectionRequestsRef.current[threadId] === trackedPromise) {
+              applyThreadUpdateLocal(updatedThread);
+            }
             return true;
           } catch (error) {
-            toast.error(String(error));
+            if (threadRuntimeSelectionRequestsRef.current[threadId] === trackedPromise) {
+              toast.error(String(error));
+              if (currentThread) {
+                try {
+                  await refreshThreads(currentThread.workspaceId);
+                } catch {
+                  // 保存失败时刷新线程用于恢复服务端已存状态。
+                }
+              }
+            }
             return false;
           }
         });
@@ -1623,7 +1399,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       );
       return trackedPromise;
     },
-    [applyThreadUpdateLocal],
+    [applyThreadUpdateLocal, refreshThreads],
   );
 
   const activeThreadEngineInfo = useMemo(
@@ -1633,133 +1409,11 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         : null,
     [activeThread?.engineId, engines],
   );
-  const activeThreadSandboxMode: ThreadSandboxModeValue =
-    permissionComponent.sandbox[0] === "read-only"
-      ? "read-only"
-      : permissionComponent.sandbox[0] === "workspace-write"
-        ? "workspace-write"
-        : permissionComponent.sandbox[0] === "full-access"
-          ? "danger-full-access"
-          : "inherit";
-  /* 旧 PermissionPicker 的 CLI 权限状态计算已停用，保留完整迁移记录。
-  const activeThreadApprovalPolicy = readThreadApprovalPolicyValue(activeThread);
-  const activeThreadApprovalTitle =
-    activeThread?.engineId === "claude"
-      ? t("policy.approvalTitleClaude")
-      : activeThread?.engineId === "opencode"
-        ? t("policy.approvalTitleOpenCode")
-      : t("permissionPicker.approvalPolicy");
-  const activeThreadApprovalOptions =
-    activeThread?.engineId === "claude"
-      ? claudeThreadPermissionModeOptions
-      : activeThread?.engineId === "opencode"
-        ? openCodeThreadPermissionModeOptions
-      : codexThreadApprovalPolicyOptions;
-  const activeThreadApprovalSelectedLabel =
-    activeThread?.engineId === "codex" && activeThreadApprovalPolicy === "custom"
-      ? t("permissionPicker.custom")
-      : undefined;
-  const activeThreadNetworkPolicy = readThreadNetworkPolicyValue(activeThread);
-  const activeThreadAutonomyEngineId =
-    activeThread?.engineId === "codex" ||
-    activeThread?.engineId === "claude" ||
-    activeThread?.engineId === "opencode"
-      ? activeThread.engineId
-      : undefined;
-  const activeThreadAutonomyPreset = useMemo(
-    () =>
-      activeThreadAutonomyEngineId
-        ? detectAutonomyPreset(
-            activeThreadAutonomyEngineId,
-            {
-              approvalPolicy: activeThreadApprovalPolicy,
-              sandboxMode: activeThreadSandboxMode,
-              networkPolicy: readThreadStoredNetworkPolicyValue(activeThread),
-            },
-            { codexExternalSandbox: codexExternalSandboxActive },
-          )
-        : undefined,
-    [
-      activeThread,
-      activeThreadApprovalPolicy,
-      activeThreadAutonomyEngineId,
-      activeThreadSandboxMode,
-      codexExternalSandboxActive,
-    ],
-  );
-  */
-  useEffect(() => {
-    let disposed = false;
-    void ipc
-      .getDefaultAutonomyPreset()
-      .then((preset) => {
-        if (!disposed && isAutonomyPresetId(preset)) {
-          setDefaultAutonomyPreset(preset);
-        }
-      })
-      .catch(() => {});
-    return () => {
-      disposed = true;
-    };
-  }, []);
   const activeThreadCapabilities = useMemo(
     () => resolveEngineCapabilities(activeThread?.engineId, activeThreadEngineInfo?.capabilities),
     [activeThread?.engineId, activeThreadEngineInfo?.capabilities],
   );
   const activeThreadApprovalDecisionCapabilities = activeThreadCapabilities.approvalDecisions;
-  /* 旧 PermissionPicker 的 CLI 沙箱选项过滤和自定义计数已停用，保留完整迁移记录。
-  const activeThreadSandboxCapabilities = activeThreadCapabilities.sandboxModes;
-  const threadSandboxModeOptions = useMemo(
-    () => {
-      const supportedByEngine = threadSandboxModeOptionsAll.filter(
-        (option) =>
-          option.value === "inherit" ||
-          activeThreadSandboxCapabilities.includes(option.value),
-      );
-
-      if (activeThread?.engineId === "codex" && codexExternalSandboxActive) {
-        return supportedByEngine.filter(
-          (option) =>
-            option.value === "inherit" || option.value === "danger-full-access",
-        );
-      }
-
-      return supportedByEngine;
-    },
-    [
-      activeThread?.engineId,
-      activeThreadSandboxCapabilities,
-      codexExternalSandboxActive,
-      threadSandboxModeOptionsAll,
-    ],
-  );
-  const activeThreadSandboxModeOption = threadSandboxModeOptionsAll.find(
-    (option) => option.value === activeThreadSandboxMode,
-  );
-  const activeThreadSandboxModeSupported = threadSandboxModeOptions.some(
-    (option) => option.value === activeThreadSandboxMode,
-  );
-  const activeThreadSandboxNotice =
-    activeThread?.engineId === "claude" && !activeThreadSandboxModeSupported
-        ? t("policy.claudeSandboxNotice")
-        : null;
-  const activeThreadSandboxSelectedLabel =
-    !activeThreadSandboxModeSupported && activeThreadSandboxModeOption
-      ? `${activeThreadSandboxModeOption.label} ${t("panel.unsupportedSuffix")}`
-      : undefined;
-  const threadPolicyCustomCount =
-    activeThread?.engineId === "opencode"
-      ? activeThreadApprovalPolicy !== "inherit" ? 1 : 0
-      : activeThread?.engineId === "claude"
-      ? (activeThreadApprovalPolicy !== "inherit" ? 1 : 0) +
-        (activeThreadSandboxMode !== "inherit" ? 1 : 0) +
-        (activeThreadNetworkPolicy !== "inherit" ? 1 : 0)
-      : (activeThreadApprovalPolicy !== "inherit" ? 1 : 0) +
-        (activeThreadSandboxMode !== "inherit" ? 1 : 0) +
-        (activeThreadSandboxMode !== "danger-full-access" && activeThreadNetworkPolicy !== "inherit"
-          ? 1
-          : 0);
-  */
 
   const pendingApprovals = useMemo<ApprovalBlock[]>(() => {
     const approvals: ApprovalBlock[] = [];
@@ -1859,7 +1513,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         personality: selectedPersonality,
         serviceTier: selectedServiceTier,
         outputSchemaText,
-        customApprovalPolicyText,
         openCodeAgent: readThreadOpenCodeAgentValue(promptThread),
       });
       return;
@@ -1871,7 +1524,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   }, [
     activeThread,
     activeThreadReasoningEffort,
-    customApprovalPolicyText,
     messages,
     outputSchemaText,
     selectedPersonality,
@@ -2941,9 +2593,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     setSelectedPersonality(readThreadPersonalityValue(activeThread));
     setSelectedServiceTier(readThreadServiceTierValue(activeThread));
     setOutputSchemaText(readThreadOutputSchemaText(activeThread));
-    // 旧实现从 engineMetadata 读取自定义权限，已停用；统一权限组件不向这里回填 CLI 原始 JSON。
-    // setCustomApprovalPolicyText(readCodexThreadCustomApprovalPolicyText(activeThread));
-    setCustomApprovalPolicyText("");
   }, [activeThread?.engineId, activeThread?.id, activeThread?.engineMetadata]);
 
   useEffect(() => {
@@ -3360,6 +3009,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [cancel]);
 
+  /** 验证 Codex 输出结构草稿并返回可保存值。 */
   function parseOutputSchemaDraft(
     draftText: string = outputSchemaText,
   ): { ok: true; value: unknown | null } | { ok: false } {
@@ -3375,26 +3025,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
   }
 
-  function parseCustomApprovalPolicyDraft(
-    draftText: string = customApprovalPolicyText,
-  ):
-    | { ok: true; value: Record<string, unknown> | null }
-    | { ok: false } {
-    try {
-      return { ok: true, value: parseStoredApprovalPolicy(draftText) };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      toast.error(
-        message === "approval policy must be a JSON object"
-          ? t("panel.toasts.invalidCustomApprovalPolicy")
-          : t("panel.toasts.invalidCustomApprovalPolicyWithError", {
-              error: message,
-            }),
-      );
-      return { ok: false };
-    }
-  }
-
+  /** 保存 Codex 的人格、服务档位和输出结构配置。 */
   async function onCodexConfigSave(patch: CodexConfigPatch) {
     const nextPersonality =
       (patch.updatePersonality
@@ -3407,9 +3038,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     const nextOutputSchemaText = patch.updateOutputSchema
       ? serializePrettyJson(patch.outputSchema)
       : outputSchemaText;
-    const nextCustomApprovalPolicyText = patch.updateApprovalPolicy
-      ? serializePrettyJson(patch.approvalPolicy)
-      : customApprovalPolicyText;
     const applyLocalState = () => {
       if (patch.updateServiceTier) {
         setHasExplicitComposerRuntime(true);
@@ -3417,7 +3045,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       setSelectedPersonality(nextPersonality);
       setSelectedServiceTier(nextServiceTier);
       setOutputSchemaText(nextOutputSchemaText);
-      setCustomApprovalPolicyText(nextCustomApprovalPolicyText);
     };
 
     if (!activeThreadMatchesComposer || activeThread?.engineId !== "codex") {
@@ -3435,13 +3062,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         applyThreadUpdateLocal(updatedThread);
       }
 
-      if (patch.updateApprovalPolicy) {
-        const updatedThread = await ipc.setThreadExecutionPolicy(activeThread.id, {
-          approvalPolicy: patch.approvalPolicy,
-        });
-        applyThreadUpdateLocal(updatedThread);
-      }
-
       applyLocalState();
     } catch (error) {
       throw new Error(
@@ -3450,6 +3070,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
   }
 
+  /** 将当前 Codex 非权限配置应用到目标线程。 */
   async function applyCodexConfigToThread(
     targetThreadId: string,
     config?: {
@@ -3457,7 +3078,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       personality: CodexPersonalityValue;
       serviceTier: CodexServiceTierValue;
       outputSchemaText: string;
-      customApprovalPolicyText: string;
     },
   ): Promise<boolean> {
     const effectiveEngineId = config?.engineId ?? selectedEngineId;
@@ -3470,19 +3090,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       personality: selectedPersonality,
       serviceTier: selectedServiceTier,
       outputSchemaText,
-      customApprovalPolicyText,
     };
 
     const outputSchemaDraft = parseOutputSchemaDraft(effectiveConfig.outputSchemaText);
     if (!outputSchemaDraft.ok) {
       return false;
     }
-    const customApprovalDraft =
-      parseCustomApprovalPolicyDraft(effectiveConfig.customApprovalPolicyText);
-    if (!customApprovalDraft.ok) {
-      return false;
-    }
-
     try {
       const updatedConfigThread = await ipc.setThreadCodexConfig(targetThreadId, {
         personality:
@@ -3492,28 +3105,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         outputSchema: outputSchemaDraft.value,
       });
       applyThreadUpdateLocal(updatedConfigThread);
-
-      if (customApprovalDraft.value) {
-        const updatedThread = await ipc.setThreadExecutionPolicy(targetThreadId, {
-          approvalPolicy: customApprovalDraft.value,
-        });
-        applyThreadUpdateLocal(updatedThread);
-      }
-      /*
-      // 旧逻辑读取 latestThread.engineMetadata 判断 custom，并在空草稿时
-      // 自动清除数据库权限；该行为已停用，权限清除统一由 PermissionPicker
-      // 的 setThreadPermissions 路径处理。
-      const latestThread =
-        useThreadStore.getState().threads.find((thread) => thread.id === targetThreadId) ??
-        updatedConfigThread;
-      const approvalMode = readCodexThreadApprovalPolicyValue(latestThread);
-      if (!customApprovalDraft.value && approvalMode === "custom") {
-        const updatedThread = await ipc.setThreadExecutionPolicy(targetThreadId, {
-          approvalPolicy: null,
-        });
-        applyThreadUpdateLocal(updatedThread);
-      }
-      */
 
       return true;
     } catch (error) {
@@ -4239,8 +3830,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
               serviceTier: tier,
               updateOutputSchema: false,
               outputSchema: null,
-              updateApprovalPolicy: false,
-              approvalPolicy: null,
             });
             toast.success(
               t("panel.toasts.fastToggled", {
@@ -4261,8 +3850,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
               serviceTier: null,
               updateOutputSchema: false,
               outputSchema: null,
-              updateApprovalPolicy: false,
-              approvalPolicy: null,
             });
             toast.success(t("panel.toasts.personalityUpdated", { value: payload.personality }));
           }
@@ -4390,6 +3977,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         attachments: transportAttachments.length > 0 ? transportAttachments : undefined,
         inputItems,
         planMode: submittedPlanMode,
+        permissionValues: permissionComponent,
         referencedAuraCoderThreadId,
       });
       if (steered) {
@@ -4531,58 +4119,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       break;
     }
 
-    // 权限选择可能刚刚触发异步保存；发送必须等待同一线程最新任务完成。
-    while (true) {
-      const pendingPolicyRequest = threadExecutionPolicyRequestsRef.current[targetThreadId];
-      if (!pendingPolicyRequest) {
-        break;
-      }
-      let policySaved = false;
-      try {
-        policySaved = await pendingPolicyRequest;
-      } catch {
-        policySaved = false;
-      }
-
-      // 旧任务完成期间可能已经登记了新的权限保存任务；旧任务的失败不能阻止继续等待新任务。
-      const latestPendingPolicyRequest =
-        threadExecutionPolicyRequestsRef.current[targetThreadId];
-      if (latestPendingPolicyRequest && latestPendingPolicyRequest !== pendingPolicyRequest) {
-        continue;
-      }
-
-      // finally 可能已经清理当前任务的 ref：旧任务成功时结束等待，旧任务失败时阻止发送。
-      if (!policySaved) {
-        return false;
-      }
-      if (!latestPendingPolicyRequest || latestPendingPolicyRequest === pendingPolicyRequest) {
-        break;
-      }
-    }
-
-    while (true) {
-      const pendingPermissionRequest = permissionSavePromisesRef.current[targetThreadId];
-      if (!pendingPermissionRequest) break;
-      const permissionSaved = await pendingPermissionRequest;
-      const latestPendingPermissionRequest =
-        permissionSavePromisesRef.current[targetThreadId];
-      const permissionWaitAction = permissionSaveWaitAction(
-        permissionSaved,
-        pendingPermissionRequest,
-        latestPendingPermissionRequest,
-      );
-      if (permissionWaitAction === "continue") {
-        continue;
-      }
-      if (permissionWaitAction === "fail") return false;
-      break;
-    }
-
-    // 等待权限保存完成后重新读取线程，避免使用等待前仍为 ask 的旧快照。
-    const currentThread =
-      useThreadStore.getState().threads.find((thread) => thread.id === targetThreadId) ??
-      activeThread;
-
     setThreadMessageSendMode(targetThreadId, sessionMessageSendMode);
     clearPendingMessageSendMode(activeWorkspaceId);
 
@@ -4601,8 +4137,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     const needsNewThreadCodexConfig =
       submitEngineId === "codex" &&
       (selectedPersonality !== "inherit" ||
-        outputSchemaText.trim().length > 0 ||
-        customApprovalPolicyText.trim().length > 0);
+        outputSchemaText.trim().length > 0);
     if (!createdThread || needsNewThreadCodexConfig) {
       if (!(await applyCodexConfigToThread(targetThreadId))) {
         return false;
@@ -4635,17 +4170,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       planMode: submitPlanMode,
       sendMethod: sessionMessageSendMode,
       permissionValues: permissionComponent,
-      /*
-       * 旧实现的完整请求字段保留如下，不参与编译：
-       *
-       * permissionModeJson: JSON.stringify(
-       *   readThreadExecutionPolicyState(currentThread ?? activeThread ?? null),
-       * ),
-       *
-       * 旧值只包含 ChatPanel 的通用策略，不包含当前 CLI 的原始权限 JSON。
-       */
-      // 现由统一权限接口保存 CLI 原始 JSON，此处传 null 仅触发现有运行时选择持久化，后端忽略权限参数。
-      permissionModeJson: null,
       remoteAttachmentUpload:
         activeWorkspace?.locationKind === "ssh" && currentAttachments.length > 0,
       referencedAuraCoderThreadId,
@@ -4864,7 +4388,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         personality: prompt.personality,
         serviceTier: prompt.serviceTier,
         outputSchemaText: prompt.outputSchemaText,
-        customApprovalPolicyText: prompt.customApprovalPolicyText,
       }))) {
         restoreComposerContent(
           promptSessionKey,
@@ -4958,7 +4481,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
           personality: prompt.personality,
           serviceTier: prompt.serviceTier,
           outputSchemaText: prompt.outputSchemaText,
-          customApprovalPolicyText: prompt.customApprovalPolicyText,
         }))
       ) {
         setPlanMode(true);
@@ -5051,188 +4573,16 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     });
   }
 
-  async function onWorkspaceTrustLevelChange(
-    nextTrustLevel: TrustLevel,
-    enableWorkspaceAuto = true,
-  ) {
+  /** 更新工作区全局信任级别。 */
+  async function onWorkspaceTrustLevelChange(nextTrustLevel: TrustLevel) {
     if (activeWorkspaceId) {
       await useWorkspaceStore.getState().setWorkspaceTrustLevel(activeWorkspaceId, nextTrustLevel);
-    }
-    if (!enableWorkspaceAuto || !activeThread?.id) {
-      return;
-    }
-    const next = {
-      ...permissionComponent,
-      trust: [nextTrustLevel],
-      autonomyPreset: ["auto"],
-    } satisfies PermissionComponentJson;
-    await onPermissionComponentChange(next);
-  }
-
-  /* 旧 PermissionPicker 的 CLI 权限状态合并和保存回调已停用，保留完整迁移记录。
-  function onThreadExecutionPolicyChange(
-    patch: ThreadExecutionPolicyPatch,
-  ): Promise<boolean> {
-    if (
-      !activeThread ||
-      (activeThread.engineId !== "codex" &&
-        activeThread.engineId !== "claude" &&
-        activeThread.engineId !== "opencode")
-    ) {
-      return Promise.resolve(false);
-    }
-
-    const currentThread =
-      useThreadStore.getState().threads.find((thread) => thread.id === activeThread.id) ??
-      activeThread;
-    const isCodexThread = currentThread.engineId === "codex";
-    const isOpenCodeThread = currentThread.engineId === "opencode";
-    const nextState = {
-      ...readThreadExecutionPolicyState(currentThread),
-      ...patch,
-    };
-    const nextPatch: ThreadExecutionPolicyPatch = isOpenCodeThread
-      ? { approvalPolicy: patch.approvalPolicy }
-      : { ...patch };
-    const currentStoredNetworkPolicy = isCodexThread
-      ? readThreadStoredNetworkPolicyValue(currentThread)
-      : "inherit";
-
-    if (
-      isCodexThread &&
-      codexExternalSandboxActive &&
-      (patch.sandboxMode === "read-only" || patch.sandboxMode === "workspace-write")
-    ) {
-      toast.error(
-        t("panel.toasts.codexSandboxUnavailable"),
-      );
-      return Promise.resolve(false);
-    }
-
-    if (
-      currentThread.engineId === "claude" &&
-      patch.sandboxMode === "danger-full-access"
-    ) {
-      toast.error(t("panel.toasts.claudeSandboxUnsupported"));
-      return Promise.resolve(false);
-    }
-
-    if (
-      currentThread.engineId !== "codex" &&
-      currentThread.engineId !== "claude" &&
-      patch.sandboxMode !== undefined
-    ) {
-      toast.error(t("panel.toasts.codexOnlySandbox"));
-      return Promise.resolve(false);
-    }
-
-    if (isOpenCodeThread && (patch.sandboxMode !== undefined || patch.networkPolicy !== undefined)) {
-      return Promise.resolve(false);
-    }
-
-    if (isCodexThread && nextState.sandboxMode === "danger-full-access") {
-      if (patch.networkPolicy !== undefined) {
-        delete nextPatch.networkPolicy;
-      }
-
-      if (
-        patch.networkPolicy === "restricted" ||
-        (patch.sandboxMode === "danger-full-access" &&
-          currentStoredNetworkPolicy === "restricted")
-      ) {
-        toast.warning(t("panel.toasts.fullAccessNetworkWarning"));
-      }
-    }
-
-    applyThreadUpdateLocal(applyThreadExecutionPolicyPatch(currentThread, nextPatch));
-
-    const requestId =
-      (threadExecutionPolicyRequestIdsRef.current[currentThread.id] ?? 0) + 1;
-    threadExecutionPolicyRequestIdsRef.current[currentThread.id] = requestId;
-
-    const savePromise = (async (): Promise<boolean> => {
-      try {
-        const updatedThread = await ipc.setThreadExecutionPolicy(
-          currentThread.id,
-          toThreadExecutionPolicyRequest(nextPatch, isCodexThread),
-        );
-
-        if (threadExecutionPolicyRequestIdsRef.current[currentThread.id] !== requestId) {
-          try {
-            await refreshThreads(currentThread.workspaceId);
-          } catch {
-            // 最新权限任务仍会负责恢复真实状态；旧任务的刷新失败不能阻止它继续完成。
-          }
-          return true;
-        }
-
-        applyThreadUpdateLocal(updatedThread);
-        return true;
-      } catch (error) {
-        if (threadExecutionPolicyRequestIdsRef.current[currentThread.id] !== requestId) {
-          return false;
-        }
-
-        // If the backend rejects a sandbox override because Codex runs in
-        // external sandbox mode, remember that and retry without the override
-        // so presets keep working even when the health heuristic missed it.
-        if (
-          isCodexThread &&
-          isCodexExternalSandboxWarning(String(error)) &&
-          (nextPatch.sandboxMode === "read-only" || nextPatch.sandboxMode === "workspace-write")
-        ) {
-          setCodexExternalSandboxActive(true);
-          return onThreadExecutionPolicyChange({ ...nextPatch, sandboxMode: "inherit" });
-        }
-
-        toast.error(t("panel.toasts.updateExecutionPolicyFailed", { error: String(error) }));
-        try {
-          await refreshThreads(currentThread.workspaceId);
-        } catch {
-          // 后端保存已经失败，刷新失败不能把本次任务伪装成成功。
-        }
-        return false;
-      }
-    })();
-    let trackedPromise: Promise<boolean>;
-    trackedPromise = savePromise.finally(() => {
-      if (threadExecutionPolicyRequestsRef.current[currentThread.id] === trackedPromise) {
-        delete threadExecutionPolicyRequestsRef.current[currentThread.id];
-      }
-    });
-    threadExecutionPolicyRequestsRef.current[currentThread.id] = trackedPromise;
-    return trackedPromise;
-  }
-  */
-
-  /* 旧 PermissionPicker 的预设变更回调已停用，保留完整迁移记录。
-  function onAutonomyPresetChange(preset: AutonomyPresetId) {
-    if (!activeThreadAutonomyEngineId) {
-      return;
-    }
-    void onThreadExecutionPolicyChange(
-      autonomyPresetPatch(preset, activeThreadAutonomyEngineId, {
-        codexExternalSandbox: codexExternalSandboxActive,
-      }) as ThreadExecutionPolicyPatch,
-    );
-  }
-  */
-
-  async function onDefaultAutonomyPresetChange(preset: AutonomyPresetId | null) {
-    const previous = defaultAutonomyPreset;
-    setDefaultAutonomyPreset(preset);
-    try {
-      const saved = await ipc.setDefaultAutonomyPreset(preset);
-      setDefaultAutonomyPreset(isAutonomyPresetId(saved) ? saved : null);
-    } catch (error) {
-      setDefaultAutonomyPreset(previous);
-      toast.error(t("autonomy.defaultSaveFailed", { error: String(error) }));
     }
   }
 
   const batchApprovalInFlightRef = useRef(false);
 
-  /** 先同步完整权限，再批量结算当前已有的审批请求。 */
+  /** 按当前权限预设处理全部待审批请求。 */
   async function allowAllPendingApprovals(stopAsking: boolean) {
     if (batchApprovalInFlightRef.current) {
       return;
@@ -5249,40 +4599,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     batchApprovalInFlightRef.current = true;
     try {
       if (stopAsking) {
-        /*
-         * 旧实现通过 autonomyPresetExecutionPolicyRequest 按 CLI 生成
-         * ThreadExecutionPolicyPatch，再调用 setThreadExecutionPolicy；该调用链已停用，
-         * 旧代码保留如下作为迁移记录：
-         *
-         * const autonomyEngineId = activeThreadAutonomyEngineId;
-         * if (stopAsking && autonomyEngineId) {
-         *   const request = autonomyPresetExecutionPolicyRequest("full", autonomyEngineId, {
-         *     codexExternalSandbox: codexExternalSandboxActive,
-         *   });
-         *   if (request) {
-         *     const requestId =
-         *       (threadExecutionPolicyRequestIdsRef.current[targetThreadId] ?? 0) + 1;
-         *     threadExecutionPolicyRequestIdsRef.current[targetThreadId] = requestId;
-         *     try {
-         *       const updatedThread = await ipc.setThreadExecutionPolicy(targetThreadId, request);
-         *       if (threadExecutionPolicyRequestIdsRef.current[targetThreadId] === requestId) {
-         *         applyThreadUpdateLocal(updatedThread);
-         *       }
-         *     } catch (error) {
-         *       if (threadExecutionPolicyRequestIdsRef.current[targetThreadId] === requestId) {
-         *         toast.error(t("panel.toasts.updateExecutionPolicyFailed", { error: String(error) }));
-         *       }
-         *     }
-         *   }
-         * }
-         *
-         * 现在统一权限组件产生六键 JSON，由当前 CLI 实现类完成原始权限适配并保存。
-         */
         const next = {
           ...permissionComponent,
           autonomyPreset: ["full"],
         } satisfies PermissionComponentJson;
-        const permissionsSaved = await onPermissionComponentChange(next);
+        const permissionsSaved = await saveThreadRuntimeSelectionPatch(targetThreadId, {
+          permissionMode: next,
+        });
         if (!permissionsSaved) {
           return;
         }
@@ -5982,7 +5305,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
               onReasoningEffortChange={onReasoningEffortChange}
               onCodexConfigSave={onCodexConfigSave}
               loadEngines={loadEngines}
-              onPermissionComponentChange={onPermissionComponentChange}
               openUsageLimitsModal={openUsageLimitsModal}
               cancel={cancel}
             />

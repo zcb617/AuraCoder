@@ -1,9 +1,91 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 
-/// 前端权限组件与三个 CLI 实现之间的统一 JSON 契约。
-pub type PermissionComponentJson = HashMap<String, Value>;
+/// 表示前端展示、编辑并由数据库保存的统一线程权限对象，不包含 CLI 原生权限。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PermissionComponentJson {
+    /// 线程统一自主级别预设；空数组表示使用高级权限字段。
+    pub autonomy_preset: Vec<String>,
+    /// 线程执行时采用的统一信任等级选择。
+    pub trust: Vec<String>,
+    /// 线程操作审批的统一策略选择。
+    pub approval: Vec<String>,
+    /// 线程文件系统访问的统一沙箱选择。
+    pub sandbox: Vec<String>,
+    /// 线程联网能力的统一选择。
+    pub network: Vec<String>,
+    /// 新线程默认统一权限预设；空数组表示未设置。
+    pub default_for_new_threads: Vec<String>,
+}
+
+impl Default for PermissionComponentJson {
+    /// 构造固定六字段的统一默认权限对象。
+    fn default() -> Self {
+        Self {
+            autonomy_preset: vec!["automatic".to_owned()],
+            trust: vec!["automatic".to_owned()],
+            approval: vec!["automatic".to_owned()],
+            sandbox: vec!["automatic".to_owned()],
+            network: vec!["automatic".to_owned()],
+            default_for_new_threads: Vec::new(),
+        }
+    }
+}
+
+impl PermissionComponentJson {
+    /// 校验统一权限对象每个字段只有一个受支持选择，或按契约为空。
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let fields = [
+            (
+                "autonomyPreset",
+                &self.autonomy_preset,
+                &["automatic", "read-only", "ask", "auto", "full"][..],
+            ),
+            (
+                "trust",
+                &self.trust,
+                &["automatic", "trusted", "standard", "restricted"][..],
+            ),
+            (
+                "approval",
+                &self.approval,
+                &["automatic", "restricted", "ask", "autonomous"][..],
+            ),
+            (
+                "sandbox",
+                &self.sandbox,
+                &["automatic", "read-only", "workspace-write", "full-access"][..],
+            ),
+            (
+                "network",
+                &self.network,
+                &["automatic", "enabled", "restricted"][..],
+            ),
+        ];
+
+        // 校验固定组件字段的数量和值域，避免保存 CLI 无关契约之外的数据。
+        for (field_name, values, allowed) in fields {
+            if values.len() > 1 || values.iter().any(|value| !allowed.contains(&value.as_str())) {
+                anyhow::bail!("统一权限字段 {field_name} 值无效: {values:?}");
+            }
+        }
+
+        // 新线程默认值只允许不设置或保存一个已知统一预设。
+        if self.default_for_new_threads.len() > 1
+            || self
+                .default_for_new_threads
+                .iter()
+                .any(|value| !["automatic", "read-only", "ask", "auto", "full"].contains(&value.as_str()))
+        {
+            anyhow::bail!(
+                "统一权限字段 defaultForNewThreads 值无效: {:?}",
+                self.default_for_new_threads
+            );
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -164,7 +246,8 @@ pub struct ThreadDto {
     pub plan_mode: Option<bool>,
     pub send_method: Option<String>,
     pub reasoning_effort: Option<String>,
-    pub permission_mode: Option<String>,
+    /// 数据库中统一权限对象 A 的结构化内容。
+    pub permission_mode: Option<PermissionComponentJson>,
     pub title: String,
     pub status: ThreadStatusDto,
     pub message_count: i64,
@@ -217,8 +300,8 @@ pub struct ThreadUpdateDto {
     pub send_method: Option<String>,
     /// 推理强度。
     pub reasoning_effort: Option<String>,
-    /// CLI 原始权限 JSON 字符串。
-    pub permission_mode: Option<String>,
+    /// 待更新的统一线程权限对象 A。
+    pub permission_mode: Option<PermissionComponentJson>,
     /// 当前线程已经占用的上下文 token 数量快照。
     pub context_current_tokens: Option<i64>,
     /// 当前线程允许使用的最大上下文 token 数量快照。

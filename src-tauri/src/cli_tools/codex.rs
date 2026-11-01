@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
-    CliReviewStarted, CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError,
+    CliReviewStarted, CliSessionNotFoundError,
     CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult, map_context_usage,
 };
 use crate::{
@@ -16,7 +16,7 @@ use crate::{
     engines::{
         capabilities_for_engine,
         codex::{CodexEngine, CodexReviewStarted, CodexThreadNotFoundError},
-        map_engine_capabilities, map_model_info, map_provider_usage, validate_engine_sandbox_mode,
+        map_engine_capabilities, map_model_info, map_provider_usage,
         ApprovalRequestRoute, CodexRuntimeEvent, Engine, EngineCapabilities, EngineEvent,
         EngineSteerReceipt, EngineThread, ModelInfo, SandboxPolicy, ThreadScope,
         ThreadSyncSnapshot, TurnInput,
@@ -28,133 +28,11 @@ use crate::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
-        PermissionComponentJson, ThreadDto, ThreadStatusDto, WorkspaceDto,
+        ThreadDto, ThreadStatusDto, WorkspaceDto,
     },
     path_utils, remote_project_codex_runtime_service, remote_project_session_refresh_service, ssh,
     state::AppState,
 };
-
-fn default_permission_component() -> PermissionComponentJson {
-    let mut values = HashMap::new();
-    for key in ["autonomyPreset", "trust", "approval", "sandbox", "network"] {
-        values.insert(key.to_string(), json!(["automatic"]));
-    }
-    values.insert("defaultForNewThreads".to_string(), json!([]));
-    values
-}
-
-fn set_permission_array(values: &mut PermissionComponentJson, key: &str, items: &[&str]) {
-    values.insert(
-        key.to_string(),
-        Value::Array(items.iter().map(|item| json!(item)).collect()),
-    );
-}
-
-fn set_or_remove(object: &mut serde_json::Map<String, Value>, key: &str, value: Option<Value>) {
-    if let Some(value) = value {
-        object.insert(key.to_string(), value);
-    } else {
-        object.remove(key);
-    }
-}
-
-fn permission_choice<'a>(
-    values: &'a PermissionComponentJson,
-    key: &str,
-) -> Result<Option<&'a str>> {
-    let value = values.get(key).context(format!("缺少权限参数: {key}"))?;
-    let array = value
-        .as_array()
-        .context(format!("权限参数必须是数组: {key}"))?;
-    Ok(array.first().and_then(Value::as_str))
-}
-
-fn validate_permission_component(values: &PermissionComponentJson) -> Result<()> {
-    let allowed = [
-        (
-            "autonomyPreset",
-            ["automatic", "read-only", "ask", "auto", "full"].as_slice(),
-        ),
-        (
-            "trust",
-            ["automatic", "trusted", "standard", "restricted"].as_slice(),
-        ),
-        (
-            "approval",
-            ["automatic", "restricted", "ask", "autonomous"].as_slice(),
-        ),
-        (
-            "sandbox",
-            ["automatic", "read-only", "workspace-write", "full-access"].as_slice(),
-        ),
-        ("network", ["automatic", "enabled", "restricted"].as_slice()),
-        (
-            "defaultForNewThreads",
-            ["automatic", "read-only", "ask", "auto", "full"].as_slice(),
-        ),
-    ];
-    for key in values.keys() {
-        anyhow::ensure!(
-            allowed.iter().any(|(name, _)| name == key),
-            "未知权限参数: {key}"
-        );
-    }
-    for (key, choices) in allowed {
-        let value = values.get(key).context(format!("缺少权限参数: {key}"))?;
-        let array = value
-            .as_array()
-            .context(format!("权限参数必须是数组: {key}"))?;
-        anyhow::ensure!(array.len() <= 1, "权限参数数组最多只能有一个值: {key}");
-        for item in array {
-            let item = item
-                .as_str()
-                .context(format!("权限参数值必须是字符串: {key}"))?;
-            anyhow::ensure!(choices.contains(&item), "权限参数值不支持: {key}={item}");
-        }
-    }
-    Ok(())
-}
-
-/// 从现有 Codex raw object 复制权限字段，保留未知字段和 approvalsReviewer。
-fn raw_permissions_value(
-    thread: &ThreadDto,
-    approval_raw: Option<&str>,
-    sandbox_raw: Option<&str>,
-    network_raw: Option<bool>,
-    auto_approve_mcp_elicitations: Option<bool>,
-) -> Value {
-    let mut raw_object = thread
-        .permission_mode
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    set_or_remove(
-        &mut raw_object,
-        "approvalPolicy",
-        approval_raw.map(|value| json!(value)),
-    );
-    set_or_remove(
-        &mut raw_object,
-        "sandboxMode",
-        sandbox_raw.map(|value| json!(value)),
-    );
-    set_or_remove(
-        &mut raw_object,
-        "allowNetwork",
-        network_raw.map(|value| json!(value)),
-    );
-    set_or_remove(
-        &mut raw_object,
-        "autoApproveMcpElicitations",
-        auto_approve_mcp_elicitations.map(|value| json!(value)),
-    );
-    if approval_raw.is_some() || sandbox_raw.is_some() || network_raw.is_some() {
-        // permissionProfile 与显式三字段冲突时清理该旧聚合字段，其余未知字段原样保留。
-        raw_object.remove("permissionProfile");
-    }
-    Value::Object(raw_object)
-}
 
 /// Codex 对统一 CLI 操作接口的实现。
 ///
@@ -306,222 +184,128 @@ impl CodexCli {
         Ok(workspace)
     }
 
-    /// 将历史或当前 Codex 原始权限转换为统一组件 JSON。
-    ///
-    /// `external_sandbox` 为 true 时按外部沙箱契约识别预设：保存端在该模式下
-    /// 会抹掉 read-only/workspace-write 沙箱字段，识别端用同一前提把预设补回。
-    fn permissions_from_thread(
-        thread: &ThreadDto,
-        external_sandbox: bool,
-    ) -> Result<PermissionComponentJson> {
-        let mut result = default_permission_component();
-        let raw = thread.permission_mode.as_deref().unwrap_or("").trim();
-        let parsed = if raw.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str::<Value>(raw).context("Codex 权限 JSON 格式错误")?
-        };
-        anyhow::ensure!(
-            parsed.is_null()
-                || parsed.is_object()
-                || parsed.as_array().is_some_and(|items| items.is_empty()),
-            "Codex 权限 JSON 必须是对象、null 或空数组"
-        );
-        let mut object = parsed.as_object().cloned().unwrap_or_default();
-        let approval = object
-            .get("approvalPolicy")
-            .or_else(|| object.get("sandboxApprovalPolicy"));
-        let sandbox = object.get("sandboxMode");
-        let network = object
-            .get("allowNetwork")
-            .or_else(|| object.get("networkPolicy"))
-            .or_else(|| object.get("sandboxAllowNetwork"));
-        // 旧运行时把 inherit 作为“未覆盖”写入；读取时必须还原成统一契约的 automatic。
-        let approval_str = approval
-            .and_then(Value::as_str)
-            .filter(|value| *value != "inherit");
-        let sandbox_str = sandbox
-            .and_then(Value::as_str)
-            .filter(|value| *value != "inherit");
-        let network_bool = network.and_then(|value| {
-            value.as_bool().or_else(|| match value.as_str() {
-                Some("enabled") => Some(true),
-                Some("restricted") => Some(false),
-                Some("inherit") => None,
-                _ => None,
-            })
-        });
-        let preset = match (approval_str, sandbox_str, network_bool) {
-            (Some("untrusted"), Some("read-only"), Some(false)) => Some("read-only"),
-            (Some("on-request"), Some("workspace-write"), Some(false)) => Some("ask"),
-            (Some("on-request"), Some("workspace-write"), Some(true)) => Some("auto"),
-            (Some("never"), Some("danger-full-access"), Some(true)) => Some("full"),
-            (None, None, None) => Some("automatic"),
-            // 外部沙箱模式下保存端抹掉了沙箱字段，沙箱缺席 + 审批和网络匹配同样算对应预设。
-            (Some("untrusted"), None, Some(false)) if external_sandbox => Some("read-only"),
-            (Some("on-request"), None, Some(false)) if external_sandbox => Some("ask"),
-            (Some("on-request"), None, Some(true)) if external_sandbox => Some("auto"),
-            _ => None,
-        };
-        if let Some(preset) = preset {
-            set_permission_array(&mut result, "autonomyPreset", &[preset]);
-        } else {
-            set_permission_array(&mut result, "autonomyPreset", &[]);
-        }
-        if approval.is_some_and(Value::is_object)
-            || object
-                .get("permissionProfile")
-                .is_some_and(Value::is_object)
-        {
-            set_permission_array(&mut result, "approval", &[]);
-            set_permission_array(&mut result, "autonomyPreset", &[]);
-        }
-        let approval_value = match approval_str {
-            None => "automatic",
-            Some("untrusted") => "restricted",
-            Some("on-request") => "ask",
-            Some("never") => "autonomous",
-            Some(_) => "",
-        };
-        let approval_values: &[&str] = if approval_value.is_empty() {
-            &[]
-        } else {
-            std::slice::from_ref(&approval_value)
-        };
-        set_permission_array(&mut result, "approval", approval_values);
-        if approval.is_some_and(Value::is_object)
-            || object
-                .get("permissionProfile")
-                .is_some_and(Value::is_object)
-        {
-            set_permission_array(&mut result, "approval", &[]);
-        }
-        let sandbox_value = match sandbox_str {
-            None => "automatic",
-            Some("read-only") => "read-only",
-            Some("workspace-write") => "workspace-write",
-            Some("danger-full-access") => "full-access",
-            Some(_) => "",
-        };
-        let sandbox_values: &[&str] = if sandbox_value.is_empty() {
-            &[]
-        } else {
-            std::slice::from_ref(&sandbox_value)
-        };
-        set_permission_array(&mut result, "sandbox", sandbox_values);
-        let network_value = match network_bool {
-            None => "automatic",
-            Some(true) => "enabled",
-            Some(false) => "restricted",
-        };
-        set_permission_array(&mut result, "network", &[network_value]);
-        Ok(result)
-    }
-
-    /// 按统一组件契约生成 Codex 原始权限和兼容 metadata。
-    async fn save_permissions(
+    /// 将当前线程保存的统一权限对象解析为本次 Codex 原生权限请求。
+    async fn parse_permissions(
         &self,
         context: &CliExecutionContext,
         thread: &ThreadDto,
-        values: PermissionComponentJson,
-        force_persist: bool,
-    ) -> Result<PermissionComponentJson> {
-        self.load_workspace(context).await?;
+    ) -> Result<Value> {
+        // 确认工作区和会话属于本次 Codex 操作，再只从统一权限对象读取权限。
+        let workspace = self.load_workspace(context).await?;
         anyhow::ensure!(thread.engine_id == "codex", "当前会话不属于 Codex");
         anyhow::ensure!(
-            thread.workspace_id == context.workspace_id,
-            "当前会话不属于该 workspace"
+            thread.workspace_id == workspace.id,
+            "当前会话不属于本次 Codex 操作的 workspace"
         );
-        validate_permission_component(&values)?;
-        let preset = permission_choice(&values, "autonomyPreset")?;
-        let auto_approve_mcp_elicitations =
-            matches!(preset, Some("auto" | "full")).then_some(true);
-        let current = <Self as CliTool>::get_permissions(self, context, thread).await?;
-        let stored_auto_approve_mcp_elicitations = thread
-            .permission_mode
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-            .and_then(|value| value.as_object().cloned())
-            .and_then(|object| {
-                object
-                    .get("autoApproveMcpElicitations")
-                    .and_then(Value::as_bool)
-            });
-        // 发送路径每次都需要把权限写入 threads 表；参数变化入口仍保留相同权限短路。
-        if !force_persist
-            && current.get("autonomyPreset") == values.get("autonomyPreset")
-            && current.get("approval") == values.get("approval")
-            && current.get("sandbox") == values.get("sandbox")
-            && current.get("network") == values.get("network")
-            && stored_auto_approve_mcp_elicitations == auto_approve_mcp_elicitations
-        {
-            let mut result = current;
-            if let Some(value) = values.get("trust") {
-                result.insert("trust".to_string(), value.clone());
-            }
-            if let Some(value) = values.get("defaultForNewThreads") {
-                result.insert("defaultForNewThreads".to_string(), value.clone());
-            }
-            return Ok(result);
-        }
-        let approval = permission_choice(&values, "approval")?;
-        let sandbox = permission_choice(&values, "sandbox")?;
-        let network = permission_choice(&values, "network")?;
-        // autonomyPreset=[] 表示高级权限字段自定义，不能据此清除已选择的 approval、sandbox 或 network。
-        let (approval_raw, mut sandbox_raw, network_raw) = match preset {
-            Some("automatic") => (None, None, None),
-            // 旧守卫会把空 autonomyPreset 当作全部权限清空，导致自定义高级字段无法保存。
-            None if approval.is_none() && sandbox.is_none() && network.is_none() => {
-                (None, None, None)
-            }
-            Some("read-only") => (Some("untrusted"), Some("read-only"), Some(false)),
-            Some("ask") => (Some("on-request"), Some("workspace-write"), Some(false)),
-            Some("auto") => (Some("on-request"), Some("workspace-write"), Some(true)),
-            Some("full") => (Some("never"), Some("danger-full-access"), Some(true)),
-            _ => (
-                match approval {
-                    Some("restricted") => Some("untrusted"),
-                    Some("ask") => Some("on-request"),
-                    Some("autonomous") => Some("never"),
-                    _ => None,
-                },
-                match sandbox {
-                    Some("read-only") => Some("read-only"),
-                    Some("workspace-write") => Some("workspace-write"),
-                    Some("full-access") => Some("danger-full-access"),
-                    _ => None,
-                },
-                match network {
-                    Some("enabled") => Some(true),
-                    Some("restricted") => Some(false),
-                    _ => None,
-                },
-            ),
+        let permissions = thread.permission_mode.clone().unwrap_or_default();
+        permissions.validate()?;
+
+        // 将 workspace 信任状态归一化，供 automatic 权限选择和原生 reviewer 决策复用。
+        let workspace_trust = workspace.trust_level.as_str();
+        let requested_trust = permissions.trust.first().map(String::as_str);
+        let effective_trust = match requested_trust {
+            Some(value) if value != "automatic" => value,
+            _ => workspace_trust,
         };
-        let external_sandbox = if context.location_kind == CliLocationKind::Ssh {
-            false
+        let preset = permissions.autonomy_preset.first().map(String::as_str);
+        let approval = permissions.approval.first().map(String::as_str).unwrap_or("automatic");
+        let sandbox = permissions.sandbox.first().map(String::as_str).unwrap_or("automatic");
+        let network = permissions.network.first().map(String::as_str).unwrap_or("automatic");
+
+        // 将预设或自定义统一权限字段映射为 Codex 原生审批、沙箱和网络字段。
+        let (approval_policy, approval_is_automatic, mut sandbox_mode, mut allow_network, auto_mcp) =
+            match preset {
+                Some("read-only") => ("untrusted", false, Some("read-only"), false, false),
+                Some("ask") => ("on-request", false, Some("workspace-write"), false, false),
+                Some("auto") => ("on-request", true, Some("workspace-write"), true, true),
+                Some("full") => ("never", false, Some("danger-full-access"), true, true),
+                Some("automatic") | None => {
+                    let (approval_policy, allow_network) = if effective_trust == "restricted" {
+                        ("untrusted", false)
+                    } else {
+                        ("on-request", effective_trust == "trusted")
+                    };
+                    let sandbox_mode = if preset.is_some() {
+                        Some("workspace-write")
+                    } else {
+                        match sandbox {
+                            "read-only" => Some("read-only"),
+                            "workspace-write" => Some("workspace-write"),
+                            "full-access" => Some("danger-full-access"),
+                            "automatic" => Some("workspace-write"),
+                            _ => anyhow::bail!("Codex sandbox 权限值不支持: {sandbox}"),
+                        }
+                    };
+                    let approval_policy = if preset.is_some() {
+                        approval_policy
+                    } else {
+                        match approval {
+                            "restricted" => "untrusted",
+                            "ask" => "on-request",
+                            "autonomous" => "never",
+                            "automatic" => approval_policy,
+                            _ => anyhow::bail!("Codex approval 权限值不支持: {approval}"),
+                        }
+                    };
+                    let approval_is_automatic =
+                        preset.is_some() || approval == "automatic";
+                    let allow_network = if preset.is_some() {
+                        allow_network
+                    } else {
+                        match network {
+                            "enabled" => true,
+                            "restricted" => false,
+                            "automatic" => allow_network,
+                            _ => anyhow::bail!("Codex network 权限值不支持: {network}"),
+                        }
+                    };
+                    (approval_policy, approval_is_automatic, sandbox_mode, allow_network, false)
+                }
+                _ => anyhow::bail!("Codex autonomy preset 不支持: {}", preset.unwrap_or_default()),
+            };
+
+        // full-access 原生沙箱必须同时允许网络，避免生成互相矛盾的原生策略。
+        if sandbox_mode == Some("danger-full-access") {
+            allow_network = true;
+        }
+        let approvals_reviewer = if effective_trust == "trusted" && approval_is_automatic {
+            "auto_review"
         } else {
-            self.local_engine().await?.uses_external_sandbox().await
+            "user"
         };
-        if external_sandbox && matches!(sandbox_raw, Some("read-only" | "workspace-write")) {
-            sandbox_raw = None;
-        }
-        let raw_value = raw_permissions_value(
-            thread,
-            approval_raw,
-            sandbox_raw,
-            network_raw,
-            auto_approve_mcp_elicitations,
-        );
-        let raw = raw_value.to_string();
-        let saved = db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw))?;
-        let mut result = Self::permissions_from_thread(&saved, external_sandbox)?;
-        for key in ["trust", "defaultForNewThreads"] {
-            if let Some(value) = values.get(key) {
-                result.insert(key.to_string(), value.clone());
+
+        // 本地 external sandbox 继续使用其既有策略；自定义沙箱遇到不支持组合时明确失败。
+        if context.location_kind == CliLocationKind::Local
+            && self.local_engine().await?.uses_external_sandbox().await
+        {
+            if preset.is_some() && preset != Some("full") {
+                sandbox_mode = None;
+            } else if preset.is_none() && sandbox == "automatic" {
+                sandbox_mode = None;
+            } else if preset.is_none()
+                && matches!(sandbox_mode, Some("read-only" | "workspace-write"))
+            {
+                anyhow::bail!(
+                    "Codex 自定义 read-only/workspace-write 沙箱在本地 external sandbox 模式下不可用"
+                );
             }
         }
-        Ok(result)
+
+        // 记录当前权限解析结果，不记录任何凭据或敏感内容。
+        log::debug!(
+            "Codex 当前权限已解析: thread_id={} workspace_id={} approval_policy={} approvals_reviewer={}",
+            thread.id,
+            workspace.id,
+            approval_policy,
+            approvals_reviewer
+        );
+        Ok(json!({
+            "approvalPolicy": approval_policy,
+            "approvalsReviewer": approvals_reviewer,
+            "sandboxMode": sandbox_mode,
+            "allowNetwork": allow_network,
+            "autoApproveMcpElicitations": auto_mcp,
+        }))
     }
 
     fn map_session(
@@ -1176,259 +960,6 @@ impl CliTool for CodexCli {
         ))
     }
 
-    async fn get_permissions(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-    ) -> Result<PermissionComponentJson> {
-        self.load_workspace(context).await?;
-        anyhow::ensure!(thread.engine_id == "codex", "当前会话不属于 Codex");
-        anyhow::ensure!(
-            thread.workspace_id == context.workspace_id,
-            "当前会话不属于该 workspace"
-        );
-        let external_sandbox = if context.location_kind == CliLocationKind::Ssh {
-            false
-        } else {
-            self.local_engine().await?.uses_external_sandbox().await
-        };
-        let mut result = Self::permissions_from_thread(thread, external_sandbox)?;
-        let preset = result
-            .get("autonomyPreset")
-            .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .and_then(Value::as_str);
-        if matches!(preset, Some("read-only" | "ask" | "auto")) && external_sandbox {
-            result.insert("sandbox".to_string(), json!(["automatic"]));
-        }
-        Ok(result)
-    }
-
-    async fn set_permissions(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-        values: PermissionComponentJson,
-    ) -> Result<PermissionComponentJson> {
-        self.save_permissions(context, thread, values, false).await
-    }
-
-    /// 发送前只保存 Codex 线程权限，不更新已经运行的 CLI session。
-    async fn save_permissions_for_send(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-        values: PermissionComponentJson,
-    ) -> Result<ThreadDto> {
-        self.save_permissions(context, thread, values, true).await?;
-        db::threads::get_thread(&self.state.db, &thread.id)?
-            .ok_or_else(|| anyhow::anyhow!("thread not found after Codex permission update: {}", thread.id))
-    }
-
-    /// 将 Codex 的原始权限字段转换为统一运行时权限结构。
-    async fn runtime_permissions(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-    ) -> Result<CliRuntimePermissions> {
-        // 根据本次执行上下文读取真实 workspace，并确认线程与 Codex 工作区绑定一致。
-        let workspace = self.load_workspace(context).await?;
-        anyhow::ensure!(
-            thread.engine_id == "codex",
-            "当前线程不属于 Codex，不能读取 Codex 运行时权限"
-        );
-        anyhow::ensure!(
-            thread.workspace_id == workspace.id,
-            "当前线程不属于本次 Codex 操作的 workspace"
-        );
-
-        // 复用统一组件映射读取 approval 语义，避免另行解析原始权限字段。
-        let component = match Self::permissions_from_thread(thread, false) {
-            Ok(component) => component,
-            Err(error) => {
-                log::error!(
-                    "Codex 运行时权限组件解析失败: thread_id={} workspace_id={} error={error:#}",
-                    thread.id,
-                    workspace.id
-                );
-                return Err(error);
-            }
-        };
-        let automatic_approval =
-            permission_choice(&component, "approval")? == Some("automatic");
-        let use_auto_review = matches!(
-            &workspace.trust_level,
-            &crate::models::TrustLevelDto::Trusted
-        ) && automatic_approval;
-
-        let object = thread
-            .permission_mode
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok())
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-
-        // 保留原有策略字段读取方式，并将空白审核者视为未配置。
-        let approval_policy = object
-            .get("approvalPolicy")
-            .or_else(|| object.get("sandboxApprovalPolicy"))
-            .cloned();
-        let stored_reviewer = object
-            .get("approvalsReviewer")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|reviewer| !reviewer.is_empty())
-            .map(str::to_owned);
-        let final_reviewer = if use_auto_review {
-            "auto_review".to_string()
-        } else {
-            stored_reviewer.unwrap_or_else(|| "user".to_string())
-        };
-
-        // 记录实际工作区信任状态和最终审核者，便于追踪 auto_review 派生决策。
-        log::debug!(
-            "Codex 运行时审核决策: thread_id={} workspace_id={} trust_level={:?} automatic_approval={} approvals_reviewer={}",
-            thread.id,
-            workspace.id,
-            &workspace.trust_level,
-            automatic_approval,
-            final_reviewer
-        );
-
-        Ok(CliRuntimePermissions {
-            approval_policy: if use_auto_review {
-                Some(json!("on-request"))
-            } else {
-                approval_policy
-            },
-            sandbox_mode: object
-                .get("sandboxMode")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            allow_network: object
-                .get("allowNetwork")
-                .or_else(|| object.get("sandboxAllowNetwork"))
-                .and_then(Value::as_bool),
-            permission_profile: object.get("permissionProfile").cloned(),
-            approvals_reviewer: Some(final_reviewer),
-        })
-    }
-
-    /// 判断 Codex 当前线程是否处于工作区内自动模式，从而自动批准 MCP elicitation。
-    async fn auto_approve_mcp_elicitations(
-        &self,
-        _context: &CliExecutionContext,
-        thread: &ThreadDto,
-    ) -> Result<bool> {
-        let object = thread
-            .permission_mode
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok())
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        if let Some(marker) = object.get("autoApproveMcpElicitations") {
-            return Ok(marker.as_bool().unwrap_or(false));
-        }
-        Ok(matches!(
-            (
-                object.get("approvalPolicy").and_then(Value::as_str),
-                object.get("sandboxMode").and_then(Value::as_str),
-                object.get("allowNetwork").and_then(Value::as_bool),
-            ),
-            (Some("on-request"), Some("workspace-write"), Some(true))
-                | (Some("never"), Some("danger-full-access"), Some(true))
-        ))
-    }
-
-    /// 将统一权限补丁转换为 Codex 原始权限 JSON 并持久化到线程。
-    async fn patch_runtime_permissions(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-        patch: CliRuntimePermissionPatch,
-    ) -> Result<ThreadDto> {
-        self.load_workspace(context).await?;
-        let updates_approval = patch.approval_policy.is_some();
-        let updates_sandbox = patch.sandbox_mode.is_some();
-        let updates_network = patch.allow_network.is_some();
-        let updates_permission_profile = patch.permission_profile.is_some();
-        let mut raw = thread
-            .permission_mode
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok())
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        if updates_approval || updates_sandbox || updates_network || updates_permission_profile {
-            raw.remove("autoApproveMcpElicitations");
-        }
-        if let Some(value) = patch.approval_policy {
-            if let Some(value) = value.as_ref() {
-                anyhow::ensure!(
-                    value.is_string() || value.is_object(),
-                    "Codex approval policy 必须是字符串或结构化对象"
-                );
-            }
-            set_or_remove(&mut raw, "approvalPolicy", value);
-        }
-        if let Some(value) = patch.sandbox_mode {
-            let value = if let Some(value) = value {
-                let normalized = match value.trim().to_lowercase().as_str() {
-                    "readonly" | "read-only" | "read_only" => "read-only",
-                    "workspacewrite" | "workspace-write" | "workspace_write" => "workspace-write",
-                    "dangerfullaccess" | "danger-full-access" | "danger_full_access" => {
-                        "danger-full-access"
-                    }
-                    _ => value.as_str(),
-                };
-                validate_engine_sandbox_mode("codex", Some(normalized))
-                    .map_err(anyhow::Error::msg)?;
-                if matches!(normalized, "read-only" | "workspace-write")
-                    && context.location_kind == CliLocationKind::Local
-                    && self.local_engine().await?.uses_external_sandbox().await
-                {
-                    anyhow::bail!(
-                        "Codex read-only and workspace-write sandbox overrides are unavailable while AuraCoder is using external sandbox mode."
-                    );
-                }
-                Some(json!(normalized))
-            } else {
-                None
-            };
-            set_or_remove(&mut raw, "sandboxMode", value);
-        }
-        if let Some(value) = patch.allow_network {
-            set_or_remove(&mut raw, "allowNetwork", value.map(|value| json!(value)));
-        }
-        /*
-        // 旧实现仅按字段直接写入 permissionProfile，已由下方互斥规则接管：
-        if let Some(value) = patch.permission_profile {
-            set_or_remove(&mut raw, "permissionProfile", value);
-        }
-        */
-        if let Some(value) = patch.approvals_reviewer {
-            set_or_remove(
-                &mut raw,
-                "approvalsReviewer",
-                value.map(|value| json!(value)),
-            );
-        }
-        if (updates_sandbox || updates_network) && !updates_permission_profile {
-            raw.remove("permissionProfile");
-        }
-        if let Some(value) = patch.permission_profile {
-            if let Some(value) = value {
-                raw.insert("permissionProfile".to_string(), value);
-                raw.remove("sandboxMode");
-                raw.remove("allowNetwork");
-                raw.remove("sandboxAllowNetwork");
-            } else {
-                raw.remove("permissionProfile");
-            }
-        }
-        let raw = Value::Object(raw).to_string();
-        db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw))
-    }
-
     async fn acquire_turn(&self, context: &CliExecutionContext, thread: &ThreadDto) -> Result<()> {
         let workspace = self.load_workspace(context).await?;
         if context.location_kind == CliLocationKind::Ssh {
@@ -1447,7 +978,27 @@ impl CliTool for CodexCli {
         model: &str,
         sandbox: SandboxPolicy,
     ) -> Result<EngineThread> {
-        self.load_workspace(context).await?;
+        // 用当前统一权限填充本次启动参数，避免公共占位值覆盖线程实际权限。
+        let permissions = self.parse_permissions(context, thread).await?;
+        let mut sandbox = sandbox;
+        sandbox.approval_policy = Some(permissions["approvalPolicy"].clone());
+        sandbox.approvals_reviewer = Some(
+            permissions["approvalsReviewer"]
+                .as_str()
+                .context("Codex permissions 缺少 approvalsReviewer")?
+                .to_string(),
+        );
+        sandbox.sandbox_mode = permissions
+            .get("sandboxMode")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        sandbox.allow_network = permissions["allowNetwork"]
+            .as_bool()
+            .context("Codex permissions 缺少 allowNetwork")?;
+        sandbox.auto_approve_mcp_elicitations = permissions["autoApproveMcpElicitations"]
+            .as_bool()
+            .context("Codex permissions 缺少 autoApproveMcpElicitations")?;
+        sandbox.permission_profile = None;
         if context.location_kind == CliLocationKind::Ssh {
             let remote_turn_use = self.remote_turn_use.lock().await;
             let engine = remote_turn_use
@@ -1479,13 +1030,14 @@ impl CliTool for CodexCli {
     async fn send_message(
         &self,
         context: &CliExecutionContext,
-        _thread: &ThreadDto,
+        thread: &ThreadDto,
         engine_thread_id: &str,
-        input: TurnInput,
+        mut input: TurnInput,
         event_tx: mpsc::Sender<EngineEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        self.load_workspace(context).await?;
+        // 将当前统一权限随本次 TurnInput 发送到本机或 SSH Codex Engine。
+        input.permissions = Some(self.parse_permissions(context, thread).await?);
         if context.location_kind == CliLocationKind::Ssh {
             let engine =
                 self.remote_turn_use.lock().await.take().ok_or_else(|| {
@@ -1516,13 +1068,15 @@ impl CliTool for CodexCli {
     async fn steer_message(
         &self,
         context: &CliExecutionContext,
-        _thread: &ThreadDto,
+        thread: &ThreadDto,
         engine_thread_id: &str,
         client_steer_id: &str,
         content: &str,
-        input: TurnInput,
+        mut input: TurnInput,
     ) -> Result<EngineSteerReceipt> {
         let workspace = self.load_workspace(context).await?;
+        // 将当前统一权限随本次 steer 输入发送，并由 Engine 同步原生线程和轮次设置。
+        input.permissions = Some(self.parse_permissions(context, thread).await?);
         if context.location_kind == CliLocationKind::Ssh {
             let engine = remote_project_codex_runtime_service::runtime(&workspace).await?;
             Engine::steer_message(
@@ -2008,12 +1562,33 @@ impl CliTool for CodexCli {
     async fn fork_thread(
         &self,
         context: &CliExecutionContext,
+        thread: &ThreadDto,
         engine_thread_id: &str,
         cwd: &str,
         model: &str,
         sandbox: SandboxPolicy,
     ) -> Result<CliForkedThread> {
-        self.load_workspace(context).await?;
+        // 分支会话使用本次源线程权限创建，权限数据不落入原线程数据库字段。
+        let permissions = self.parse_permissions(context, thread).await?;
+        let mut sandbox = sandbox;
+        sandbox.approval_policy = Some(permissions["approvalPolicy"].clone());
+        sandbox.approvals_reviewer = Some(
+            permissions["approvalsReviewer"]
+                .as_str()
+                .context("Codex permissions 缺少 approvalsReviewer")?
+                .to_string(),
+        );
+        sandbox.sandbox_mode = permissions
+            .get("sandboxMode")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        sandbox.allow_network = permissions["allowNetwork"]
+            .as_bool()
+            .context("Codex permissions 缺少 allowNetwork")?;
+        sandbox.auto_approve_mcp_elicitations = permissions["autoApproveMcpElicitations"]
+            .as_bool()
+            .context("Codex permissions 缺少 autoApproveMcpElicitations")?;
+        sandbox.permission_profile = None;
         anyhow::ensure!(
             context.location_kind == CliLocationKind::Local,
             "SSH 远端 Codex 暂未接入会话分支，当前不会调用本机 Codex 执行"
@@ -2142,207 +1717,5 @@ impl CliTool for CodexCli {
             .await?;
         forward_started.await.context("等待代码审查会话失败")??;
         Ok(())
-    }
-}
-
-// 实测结论（最小复现验证）：#[path] 写在内联 mod tests 里时，rustc 的解析基址是
-// "src/cli_tools/codex/tests/"（文件 stem + 内联模块名拼成的目录），该目录在磁盘上不存在，
-// Linux 逐分量解析路径时遇到不存在的中间目录直接 ENOENT，任何数量的 "../" 都无法回退。
-// 因此与 factory.rs 同例，把 #[path] 声明放到文件顶层：基址变为真实存在的 src/cli_tools/，
-// 两级回退正好命中 src-tauri/tests/unit/。
-#[cfg(test)]
-#[path = "../../tests/unit/codex_cli_permissions_tests.rs"]
-mod codex_cli_permissions_tests;
-
-// thread() 原来定义在内联 mod tests 里；#[path] 测试模块移到文件顶层后，
-// 其 use super::* 指向本模块，thread() 需与本模块同级才能被两处测试同时解析到。
-#[cfg(test)]
-fn thread(permission_mode: Option<&str>, metadata: Option<Value>) -> ThreadDto {
-    ThreadDto {
-        id: "thread".to_string(),
-        workspace_id: "workspace".to_string(),
-        engine_id: "codex".to_string(),
-        model_id: "model".to_string(),
-        engine_thread_id: None,
-        engine_metadata: metadata,
-        plan_mode: None,
-        send_method: None,
-        reasoning_effort: None,
-        permission_mode: permission_mode.map(str::to_string),
-        title: "thread".to_string(),
-        status: ThreadStatusDto::Idle,
-        message_count: 0,
-        total_tokens: 0,
-        context_current_tokens: None,
-        context_max_tokens: None,
-        context_usage_updated_at: None,
-        created_at: String::new(),
-        last_activity_at: String::new(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // 旧声明在内联 mod tests 内部，解析基址 src/cli_tools/codex/tests/ 不存在，必然 ENOENT；
-    // 已按 factory.rs 同例移到文件顶层，见上方模块声明。
-    // #[path = "../../../../tests/unit/codex_cli_permissions_tests.rs"]
-    // mod codex_cli_permissions_tests;
-
-    // thread() 已上移到文件顶层（见上方），mod tests 通过 use super::* 继续解析到同一份定义。
-    // fn thread(permission_mode: Option<&str>, metadata: Option<Value>) -> ThreadDto {
-    //     ThreadDto {
-    //         id: "thread".to_string(),
-    //         workspace_id: "workspace".to_string(),
-    //         engine_id: "codex".to_string(),
-    //         model_id: "model".to_string(),
-    //         engine_thread_id: None,
-    //         engine_metadata: metadata,
-    //         plan_mode: None,
-    //         send_method: None,
-    //         reasoning_effort: None,
-    //         permission_mode: permission_mode.map(str::to_string),
-    //         title: "thread".to_string(),
-    //         status: ThreadStatusDto::Idle,
-    //         message_count: 0,
-    //         total_tokens: 0,
-    //         context_current_tokens: None,
-    //         context_max_tokens: None,
-    //         context_usage_updated_at: None,
-    //         created_at: String::new(),
-    //         last_activity_at: String::new(),
-    //     }
-    // }
-
-    #[test]
-    fn permissions_read_empty_as_automatic() {
-        let values = CodexCli::permissions_from_thread(&thread(None, None), false).unwrap();
-        assert_eq!(values.get("autonomyPreset"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("approval"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("sandbox"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("network"), Some(&json!(["automatic"])));
-    }
-
-    #[test]
-    fn permissions_read_legacy_network_policy_without_metadata_fallback() {
-        let values = CodexCli::permissions_from_thread(
-            &thread(
-                Some(r#"{"approvalPolicy":"on-request","sandboxMode":"workspace-write","networkPolicy":"enabled"}"#),
-                None,
-            ),
-            false,
-        )
-        .unwrap();
-        assert_eq!(values.get("autonomyPreset"), Some(&json!(["auto"])));
-        assert_eq!(values.get("network"), Some(&json!(["enabled"])));
-
-        let values = CodexCli::permissions_from_thread(
-            &thread(
-                Some(r#"{"approvalPolicy":"untrusted"}"#),
-                Some(json!({"sandboxMode":"read-only","sandboxAllowNetwork":false})),
-            ),
-            false,
-        )
-        .unwrap();
-        assert_eq!(values.get("autonomyPreset"), Some(&json!([])));
-        assert_eq!(values.get("approval"), Some(&json!(["restricted"])));
-        assert_eq!(values.get("sandbox"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("network"), Some(&json!(["automatic"])));
-        /*
-        // 旧 metadata 回退已停用：
-        assert_eq!(values.get("autonomyPreset"), Some(&json!(["read-only"])));
-        */
-    }
-
-    #[test]
-    fn permissions_read_all_legacy_inherit_values_as_automatic() {
-        let values = CodexCli::permissions_from_thread(&thread(
-            Some(r#"{"approvalPolicy":"inherit","sandboxMode":"inherit","networkPolicy":"inherit"}"#),
-            None,
-        ), false)
-        .unwrap();
-        assert_eq!(values.get("autonomyPreset"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("approval"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("sandbox"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("network"), Some(&json!(["automatic"])));
-    }
-
-    #[test]
-    fn permissions_save_preserves_unknown_raw_fields_and_reviewer() {
-        let thread = thread(
-            Some(
-                r#"{"approvalPolicy":"on-request","sandboxMode":"workspace-write","allowNetwork":false,"permissionProfile":{"old":true},"approvalsReviewer":"user","unknown":{"keep":true}}"#,
-            ),
-            None,
-        );
-        let raw = raw_permissions_value(
-            &thread,
-            Some("never"),
-            Some("danger-full-access"),
-            Some(true),
-            None,
-        );
-        assert_eq!(raw["approvalPolicy"], json!("never"));
-        assert_eq!(raw["sandboxMode"], json!("danger-full-access"));
-        assert_eq!(raw["allowNetwork"], json!(true));
-        assert_eq!(raw["approvalsReviewer"], json!("user"));
-        assert_eq!(raw["unknown"], json!({"keep": true}));
-        assert!(raw.get("permissionProfile").is_none());
-    }
-
-    #[test]
-    fn permissions_reject_invalid_non_empty_json() {
-        let error =
-            CodexCli::permissions_from_thread(&thread(Some("[1]"), None), false).unwrap_err();
-        assert!(error.to_string().contains("必须是对象"));
-    }
-
-    #[test]
-    fn permissions_read_external_sandbox_presets_without_sandbox_field() {
-        // 外部沙箱模式下保存端抹掉沙箱字段，识别端按同一契约补回预设。
-        let values = CodexCli::permissions_from_thread(
-            &thread(
-                Some(r#"{"approvalPolicy":"untrusted","allowNetwork":false}"#),
-                None,
-            ),
-            true,
-        )
-        .unwrap();
-        assert_eq!(values.get("autonomyPreset"), Some(&json!(["read-only"])));
-
-        let values = CodexCli::permissions_from_thread(
-            &thread(
-                Some(r#"{"approvalPolicy":"on-request","allowNetwork":false}"#),
-                None,
-            ),
-            true,
-        )
-        .unwrap();
-        assert_eq!(values.get("autonomyPreset"), Some(&json!(["ask"])));
-
-        let values = CodexCli::permissions_from_thread(
-            &thread(
-                Some(r#"{"approvalPolicy":"on-request","allowNetwork":true}"#),
-                None,
-            ),
-            true,
-        )
-        .unwrap();
-        assert_eq!(values.get("autonomyPreset"), Some(&json!(["auto"])));
-    }
-
-    #[test]
-    fn permissions_read_missing_sandbox_stays_custom_without_external_sandbox() {
-        // 同样的三元组在外部沙箱关闭时仍是用户手工组合，必须保持自定义。
-        let values = CodexCli::permissions_from_thread(
-            &thread(
-                Some(r#"{"approvalPolicy":"on-request","allowNetwork":false}"#),
-                None,
-            ),
-            false,
-        )
-        .unwrap();
-        assert_eq!(values.get("autonomyPreset"), Some(&json!([])));
     }
 }

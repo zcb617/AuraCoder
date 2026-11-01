@@ -23,7 +23,7 @@ use crate::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
-        PermissionComponentJson, ThreadDto, ThreadStatusDto, WorkspaceDto,
+        ThreadDto, ThreadStatusDto, WorkspaceDto,
     },
 };
 
@@ -175,36 +175,6 @@ pub struct CliSessionSnapshot {
     pub archived: bool,
     /// 保持现有会话恢复和同步所需的信息。
     pub metadata: Value,
-}
-
-/// 当前 CLI 原始权限字段；来源仅限 threads.permission_mode。
-#[derive(Debug, Clone, Default)]
-pub struct CliRuntimePermissions {
-    /// CLI 原生审批策略或策略对象。
-    pub approval_policy: Option<Value>,
-    /// CLI 原生沙箱模式。
-    pub sandbox_mode: Option<String>,
-    /// CLI 原生网络开关。
-    pub allow_network: Option<bool>,
-    /// CLI 原生权限配置对象。
-    pub permission_profile: Option<Value>,
-    /// CLI 原生审批审核人。
-    pub approvals_reviewer: Option<String>,
-}
-
-/// 统一执行权限局部更新补丁；CLI 实现负责转换为各自原始 JSON。
-#[derive(Debug, Clone, Default)]
-pub struct CliRuntimePermissionPatch {
-    /// 审批策略更新；外层 Some 表示更新，内层 None 表示清除。
-    pub approval_policy: Option<Option<Value>>,
-    /// 沙箱模式更新；外层 Some 表示更新，内层 None 表示清除。
-    pub sandbox_mode: Option<Option<String>>,
-    /// 网络开关更新；外层 Some 表示更新，内层 None 表示清除。
-    pub allow_network: Option<Option<bool>>,
-    /// 权限配置对象更新；外层 Some 表示更新，内层 None 表示清除。
-    pub permission_profile: Option<Option<Value>>,
-    /// 审批审核人更新；外层 Some 表示更新，内层 None 表示清除。
-    pub approvals_reviewer: Option<Option<String>>,
 }
 
 /// CLI 明确报告会话不存在时使用的公共错误类型。
@@ -385,73 +355,6 @@ pub trait CliTool: Send + Sync {
     /// SSH 连接测试成功后，由当前 CLI 生命周期建立 Tunnel 并登记、启动该 CLI 远端服务；本机不支持。
     async fn register_remote_service(&self, context: &CliExecutionContext) -> Result<()>;
 
-    /// 读取当前 CLI 原始权限并转换为前端统一权限组件 JSON。
-    async fn get_permissions(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-    ) -> Result<PermissionComponentJson>;
-
-    /// 将前端统一权限组件 JSON 转换为当前 CLI 原始权限并持久化。
-    async fn set_permissions(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-        values: PermissionComponentJson,
-    ) -> Result<PermissionComponentJson>;
-
-    /// 发送前只持久化当前线程权限，不更新已经运行的 CLI session。
-    async fn save_permissions_for_send(
-        &self,
-        _context: &CliExecutionContext,
-        _thread: &ThreadDto,
-        _values: PermissionComponentJson,
-    ) -> Result<ThreadDto> {
-        anyhow::bail!("当前 CLI 不支持发送前权限持久化")
-    }
-
-    /// 读取当前 CLI 原始权限字段，不读取 engine_metadata_json 权限镜像。
-    async fn runtime_permissions(
-        &self,
-        _context: &CliExecutionContext,
-        thread: &ThreadDto,
-    ) -> Result<CliRuntimePermissions>;
-
-    /// 判断当前线程是否由 AuraCoder 自动批准 Codex MCP elicitation 请求。
-    /// 非 Codex CLI 默认不启用该本地运行时能力。
-    async fn auto_approve_mcp_elicitations(
-        &self,
-        _context: &CliExecutionContext,
-        _thread: &ThreadDto,
-    ) -> Result<bool> {
-        Ok(false)
-    }
-
-    /// 将通用执行权限补丁交给当前 CLI 实现转换并持久化。
-    async fn patch_runtime_permissions(
-        &self,
-        _context: &CliExecutionContext,
-        _thread: &ThreadDto,
-        _patch: CliRuntimePermissionPatch,
-    ) -> Result<ThreadDto> {
-        anyhow::bail!("当前 CLI 不支持局部执行权限更新")
-    }
-
-    /// 将当前已存在的 CLI session 执行权限同步为用户选择的模式。
-    ///
-    /// 该操作只更新已有 session，不负责创建 CLI 服务或 session；不支持该能力的
-    /// CLI 保持默认错误，避免调用方绕过统一的 CLI 生命周期边界。
-    async fn sync_thread_execution_policy(
-        &self,
-        _context: &CliExecutionContext,
-        _thread: &ThreadDto,
-        _approval_policy: &Value,
-    ) -> Result<()> {
-        // Codex 和 Claude Code 没有 OpenCode session 权限同步动作；其线程权限
-        // 已由 patch_runtime_permissions 持久化，保持统一业务调用的无操作结果。
-        Ok(())
-    }
-
     /// 用户新建会话或继续已有会话时，在当前 CLI 和当前项目中建立正式会话；恢复失败时不得创建替代会话。
     /// 用户新建会话或继续已有会话时，在当前 CLI 和当前项目中建立正式会话；恢复失败时不得创建替代会话。
     async fn start_thread(
@@ -628,6 +531,7 @@ pub trait CliTool: Send + Sync {
     async fn fork_thread(
         &self,
         context: &CliExecutionContext,
+        thread: &ThreadDto,
         engine_thread_id: &str,
         cwd: &str,
         model: &str,

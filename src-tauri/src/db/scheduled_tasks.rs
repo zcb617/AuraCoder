@@ -464,6 +464,11 @@ pub fn active_thread_for_task(
         params![thread_id, task.workspace_id],
         |row| {
             let metadata: Option<String> = row.get(5)?;
+            let permission_mode_raw: Option<String> = row.get(18)?;
+            let permission_mode = crate::db::threads::decode_thread_permission_mode(
+                thread_id,
+                permission_mode_raw,
+            );
             Ok(ThreadDto {
                 id: row.get(0)?,
                 workspace_id: row.get(1)?,
@@ -474,7 +479,7 @@ pub fn active_thread_for_task(
                 plan_mode: row.get(15)?,
                 send_method: row.get(16)?,
                 reasoning_effort: row.get(17)?,
-                permission_mode: row.get(18)?,
+                permission_mode,
                 title: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 status: ThreadStatusDto::from_str(&row.get::<_, String>(7)?),
                 message_count: row.get(8)?,

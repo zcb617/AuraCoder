@@ -277,17 +277,17 @@ export type ChatEngineId = "codex" | "claude" | "opencode";
 
 /** 权限组件参数值；所有固定参数均使用字符串数组。 */
 export type PermissionComponentValue = string[];
-/** 前端权限组件与后端之间的六键统一 JSON 契约。 */
+/** 前端与后端共享的 CLI 无关六键权限对象。 */
 export interface PermissionComponentJson {
-  /** 当前统一权限预设；空数组表示自定义。 */
+  /** 当前统一权限预设；空数组表示自定义配置。 */
   autonomyPreset: string[];
   /** 当前项目或工作区信任级别。 */
   trust: string[];
-  /** 当前 CLI 审批策略。 */
+  /** 统一权限对象中的审批策略选项。 */
   approval: string[];
-  /** 当前 CLI 沙箱策略。 */
+  /** 统一权限对象中的沙箱策略选项。 */
   sandbox: string[];
-  /** 当前 CLI 网络策略。 */
+  /** 统一权限对象中的网络策略选项。 */
   network: string[];
   /** 是否将当前预设作为新会话默认值。 */
   defaultForNewThreads: string[];
@@ -304,8 +304,8 @@ export interface Thread {
   planMode?: boolean | null;
   sendMethod?: string | null;
   reasoningEffort?: string | null;
-  /** 当前 CLI 原始权限 JSON 字符串；前端不得解析，统一权限组件由 IPC 读取。 */
-  permissionMode?: string | null;
+  /** 当前线程完整统一权限对象；旧数据可为空，页面以统一默认值兜底。 */
+  permissionMode?: PermissionComponentJson | null;
   title: string;
   status: ThreadStatus;
   messageCount: number;

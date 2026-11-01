@@ -427,6 +427,8 @@ pub struct TurnInput {
     pub attachments: Vec<TurnAttachment>,
     pub plan_mode: bool,
     pub input_items: Vec<TurnInputItem>,
+    /// 当前发送动作对应 CLI 解析出的原生权限对象 B，不持久化或跨请求复用。
+    pub permissions: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

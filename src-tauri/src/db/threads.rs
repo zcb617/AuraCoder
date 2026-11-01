@@ -2,7 +2,7 @@ use anyhow::Context;
 use rusqlite::{params, OptionalExtension};
 use uuid::Uuid;
 
-use crate::models::{ThreadDto, ThreadStatusDto, ThreadUpdateDto};
+use crate::models::{PermissionComponentJson, ThreadDto, ThreadStatusDto, ThreadUpdateDto};
 use crate::runtime_env;
 
 use super::Database;
@@ -13,6 +13,7 @@ pub struct RuntimeRecoveryReport {
     pub thread_status_updates: usize,
 }
 
+/// 创建线程记录，并立即保存完整的统一默认权限对象 A。
 pub fn create_thread(
     db: &Database,
     workspace_id: &str,
@@ -22,12 +23,13 @@ pub fn create_thread(
 ) -> anyhow::Result<ThreadDto> {
     let id = Uuid::new_v4().to_string();
     let created_at = runtime_env::system_time_rfc3339();
+    let permission_mode = serde_json::to_string(&PermissionComponentJson::default())?;
     let conn = db.connect()?;
     conn.execute(
         "INSERT INTO threads (
-            id, workspace_id, engine_id, model_id, title, status, created_at, last_activity_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 'idle', ?6, ?6)",
-        params![id, workspace_id, engine_id, model_id, title, created_at],
+            id, workspace_id, engine_id, model_id, title, status, created_at, last_activity_at, permission_mode
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'idle', ?6, ?6, ?7)",
+        params![id, workspace_id, engine_id, model_id, title, created_at, permission_mode],
     )
     .context("failed to create thread")?;
 
@@ -578,39 +580,28 @@ pub fn update_engine_metadata(
     Ok(())
 }
 
-/// 持久化 CLI 原始权限；非权限 metadata 不由该接口改写。
+/// 校验并持久化统一权限对象 A；线程权限列不再保存 CLI 原生权限。
 pub fn update_thread_permissions(
     db: &Database,
     thread_id: &str,
-    permission_mode: Option<&str>,
+    permission_mode: Option<&PermissionComponentJson>,
 ) -> anyhow::Result<ThreadDto> {
+    if let Some(permission_mode) = permission_mode {
+        permission_mode.validate()?;
+    }
     let update = ThreadUpdateDto {
         id: thread_id.to_owned(),
-        permission_mode: permission_mode.map(str::to_owned),
+        permission_mode: permission_mode.cloned(),
         ..Default::default()
     };
-
-    /*
-     * 旧事务实现保留如下，实际执行路径已统一转入 update_thread：
-     *
-     * let mut conn = db.connect()?;
-     * let tx = conn.transaction()?;
-     * let affected = tx.execute(
-     *     "UPDATE threads
-     *      SET permission_mode = ?1
-     *      WHERE id = ?3",
-     *     params![permission_mode, thread_id],
-     * )?;
-     * if affected == 0 {
-     *     anyhow::bail!("thread not found: {thread_id}");
-     * }
-     * tx.commit()?;
-     */
     update_thread(db, &update)
 }
 
 /// 按局部更新 DTO 更新 threads 表；NULL 保留原值，空字符串照常持久化。
 pub fn update_thread(db: &Database, update: &ThreadUpdateDto) -> anyhow::Result<ThreadDto> {
+    if let Some(permission_mode) = update.permission_mode.as_ref() {
+        permission_mode.validate()?;
+    }
     let normalized_archived_at = update
         .archived_at
         .as_deref()
@@ -630,6 +621,11 @@ pub fn update_thread(db: &Database, update: &ThreadUpdateDto) -> anyhow::Result<
         .context_usage_updated_at
         .as_deref()
         .map(runtime_env::normalize_time_to_local)
+        .transpose()?;
+    let permission_mode_json = update
+        .permission_mode
+        .as_ref()
+        .map(serde_json::to_string)
         .transpose()?;
     let conn = db.connect()?;
     let affected = conn
@@ -673,7 +669,7 @@ pub fn update_thread(db: &Database, update: &ThreadUpdateDto) -> anyhow::Result<
                 update.plan_mode,
                 update.send_method,
                 update.reasoning_effort,
-                update.permission_mode,
+                permission_mode_json,
                 update.context_current_tokens,
                 update.context_max_tokens,
                 normalized_context_usage_updated_at,
@@ -719,7 +715,7 @@ pub fn get_context_usage_snapshot(
     Ok(Some((current_tokens, max_context_tokens)))
 }
 
-/// 持久化会话底部 6 项运行时选择。
+/// 持久化会话底部运行时选择，并接受统一权限对象 A 作为可选更新值。
 ///
 /// 调用方传入什么就写入什么，不做回退、不与 engine_metadata_json 合并，
 /// 保证底部状态以独立字段为唯一数据源。
@@ -732,21 +728,8 @@ pub fn update_thread_runtime_selection(
     plan_mode: Option<bool>,
     send_method: Option<&str>,
     reasoning_effort: Option<&str>,
-    permission_mode: Option<&str>,
+    permission_mode: Option<&PermissionComponentJson>,
 ) -> anyhow::Result<ThreadDto> {
-    // 旧参数保留兼容；权限现在由 update_thread_permissions 原子保存。
-    /*
-     * 旧运行时选择 SQL 曾包含以下权限列写入，保留迁移记录但不再执行：
-     *
-     * UPDATE threads
-     * SET engine_id = ?1, model_id = ?2, plan_mode = ?3, send_method = ?4,
-     *     reasoning_effort = ?5, permission_mode = ?6
-     * WHERE id = ?7
-     *
-     * 权限原始 JSON 和 engine_metadata_json 现在只能由
-     * update_thread_permissions 在同一事务中保存；本函数只负责底部运行时选择。
-     */
-    let _ = permission_mode;
     let update = ThreadUpdateDto {
         id: thread_id.to_owned(),
         engine_id: Some(engine_id.to_owned()),
@@ -754,6 +737,7 @@ pub fn update_thread_runtime_selection(
         plan_mode,
         send_method: send_method.map(str::to_owned),
         reasoning_effort: reasoning_effort.map(str::to_owned),
+        permission_mode: permission_mode.cloned(),
         ..Default::default()
     };
 
@@ -1057,12 +1041,47 @@ fn derive_thread_status_for_recovery(
     Ok(status)
 }
 
+/// 解码线程统一权限对象 A；空值或旧原生格式返回默认 A，并记录原始错误。
+pub(crate) fn decode_thread_permission_mode(
+    thread_id: &str,
+    raw_permission_mode: Option<String>,
+) -> Option<PermissionComponentJson> {
+    match raw_permission_mode {
+        Some(raw) => match serde_json::from_str::<PermissionComponentJson>(&raw) {
+            Ok(value) => match value.validate() {
+                Ok(()) => Some(value),
+                Err(error) => {
+                    log::warn!(
+                        "线程权限记录不符合统一权限契约，thread_id={} raw={} error={error:#}；展示默认权限且不改写记录",
+                        thread_id,
+                        raw
+                    );
+                    Some(PermissionComponentJson::default())
+                }
+            },
+            Err(error) => {
+                log::warn!(
+                    "线程权限记录无法解析为统一权限对象，thread_id={} raw={} error={error:#}；展示默认权限且不改写记录",
+                    thread_id,
+                    raw
+                );
+                Some(PermissionComponentJson::default())
+            }
+        },
+        None => Some(PermissionComponentJson::default()),
+    }
+}
+
+/// 将数据库线程行转换为 DTO，并把空值或旧原生格式权限显示为默认对象 A。
 fn map_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadDto> {
+    let thread_id: String = row.get(0)?;
     let metadata_raw: Option<String> = row.get(5)?;
     let metadata = metadata_raw.and_then(|raw| serde_json::from_str(&raw).ok());
+    let permission_mode_raw: Option<String> = row.get(18)?;
+    let permission_mode = decode_thread_permission_mode(&thread_id, permission_mode_raw);
 
     Ok(ThreadDto {
-        id: row.get(0)?,
+        id: thread_id,
         workspace_id: row.get(1)?,
         engine_id: row.get(2)?,
         model_id: row.get(3)?,
@@ -1071,7 +1090,7 @@ fn map_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadDto> {
         plan_mode: row.get(15)?,
         send_method: row.get(16)?,
         reasoning_effort: row.get(17)?,
-        permission_mode: row.get(18)?,
+        permission_mode,
         title: row.get(6)?,
         status: ThreadStatusDto::from_str(&row.get::<_, String>(7)?),
         message_count: row.get(8)?,
@@ -1322,40 +1341,31 @@ mod tests {
     }
 
     #[test]
-    fn update_thread_permissions_persists_raw_without_changing_metadata() {
+    fn update_thread_permissions_persists_component_without_changing_metadata() {
         let db = test_db();
         let thread = test_thread(&db, "Permissions");
-        let raw = r#"{"permissionMode":"standard","sandboxMode":"workspace-write"}"#;
+        let permission_values = PermissionComponentJson::default();
         let original_metadata = json!({"unrelated": true});
         update_engine_metadata(&db, &thread.id, &original_metadata).unwrap();
 
-        /*
-        // 旧权限 metadata 镜像写入已停用：
-        let metadata = json!({
-            "claudePermissionMode": "standard",
-            "sandboxMode": "workspace-write",
-        });
-        let updated = update_thread_permissions(&db, &thread.id, Some(raw), &metadata).unwrap();
-        assert_eq!(updated.engine_metadata, Some(metadata.clone()));
-        */
+        let updated =
+            update_thread_permissions(&db, &thread.id, Some(&permission_values)).unwrap();
 
-        let updated = update_thread_permissions(&db, &thread.id, Some(raw)).unwrap();
-
-        assert_eq!(updated.permission_mode.as_deref(), Some(raw));
+        assert_eq!(updated.permission_mode.as_ref(), Some(&permission_values));
         assert_eq!(updated.engine_metadata, Some(original_metadata.clone()));
         let persisted = get_thread(&db, &thread.id).unwrap().unwrap();
-        assert_eq!(persisted.permission_mode.as_deref(), Some(raw));
+        assert_eq!(persisted.permission_mode.as_ref(), Some(&permission_values));
         assert_eq!(persisted.engine_metadata, Some(original_metadata));
     }
 
     #[test]
     fn update_thread_permissions_rejects_missing_thread() {
         let db = test_db();
+        let permission_values = PermissionComponentJson::default();
         let error = update_thread_permissions(
             &db,
             "missing-thread",
-            Some("{}"),
-            /* 旧第四参数 metadata 已停用：&json!({"permission": "missing"}), */
+            Some(&permission_values),
         )
         .expect_err("missing thread must not update successfully");
 
@@ -1369,14 +1379,15 @@ mod tests {
     fn update_thread_permissions_does_not_change_another_thread_on_failure() {
         let db = test_db();
         let thread = test_thread(&db, "Permissions unchanged");
+        let mut attempted_permissions = PermissionComponentJson::default();
+        attempted_permissions.autonomy_preset = vec!["full".to_owned()];
         let original_metadata = json!({"original": true});
         update_engine_metadata(&db, &thread.id, &original_metadata).unwrap();
 
         let _ = update_thread_permissions(
             &db,
             "missing-thread",
-            Some(r#"{"changed":true}"#),
-            /* 旧第四参数 metadata 已停用：&json!({"changed": true}), */
+            Some(&attempted_permissions),
         )
         .expect_err("missing thread must roll back the failed transaction");
 

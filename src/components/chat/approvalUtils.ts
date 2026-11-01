@@ -1,8 +1,4 @@
-import type {
-  ApprovalBlock,
-  ApprovalResponse,
-  TrustLevel,
-} from "../../types";
+import type { ApprovalBlock, ApprovalResponse } from "../../types";
 import { shouldShowClaudeUnsupportedApproval } from "./MessageBlocks";
 import {
   buildPermissionsApprovalResponse,
@@ -12,40 +8,6 @@ import {
   parseToolInputQuestions,
   requiresCustomApprovalPayload,
 } from "./toolInputApproval";
-
-/**
- * 判断权限保存等待结果；先处理更新中的新请求，再处理当前请求失败，
- * 保证旧请求清理 ref 后的失败不会被发送流程忽略。
- */
-export function permissionSaveWaitAction(
-  permissionSaved: boolean,
-  pendingPermissionRequest: Promise<boolean>,
-  latestPendingPermissionRequest: Promise<boolean> | undefined,
-): "continue" | "fail" | "complete" {
-  if (
-    latestPendingPermissionRequest &&
-    latestPendingPermissionRequest !== pendingPermissionRequest
-  ) {
-    return "continue";
-  }
-  if (!permissionSaved) {
-    return "fail";
-  }
-  return "complete";
-}
-
-/**
- * 判断权限变更是否需要同步更新项目级信任等级，避免相同或非法等级触发无效写入。
- */
-export function shouldUpdateWorkspaceTrustLevel(
-  nextTrust: string | null,
-  currentTrust: TrustLevel | null | undefined,
-): nextTrust is TrustLevel {
-  return (
-    (nextTrust === "trusted" || nextTrust === "standard" || nextTrust === "restricted")
-    && nextTrust !== currentTrust
-  );
-}
 
 export function resolvePendingToolInputApproval(
   pendingApprovals: ApprovalBlock[],

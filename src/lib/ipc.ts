@@ -19,7 +19,6 @@ import type {
   CliContextUsage,
   ComputerControlStatus,
   ComputerControlApprovalRequest,
-  CodexApprovalsReviewer,
   CodexReviewDelivery,
   CodexReviewTarget,
   CodexRemoteThreadPage,
@@ -318,24 +317,38 @@ export const ipc = {
   listThreads: (workspaceId: string) => invoke<Thread[]>("list_threads", { workspaceId }),
   listArchivedThreads: (workspaceId: string) =>
     invoke<Thread[]>("list_archived_threads", { workspaceId }),
-  /** 保存线程运行时字段的局部更新；权限必须通过 setThreadPermissions 保存。 */
+  /** 通用保存线程运行时选择和完整统一权限对象。 */
   updateThread: (update: {
+    /** 要更新的线程标识。 */
     id: string;
+    /** 新的线程引擎标识。 */
     engineId?: string | null;
+    /** 新的线程模型标识。 */
     modelId?: string | null;
+    /** 新的线程计划模式。 */
     planMode?: boolean | null;
+    /** 新的线程发送方式。 */
     sendMethod?: string | null;
+    /** 新的线程推理强度。 */
     reasoningEffort?: string | null;
+    /** 新的完整统一权限对象。 */
+    permissionMode?: PermissionComponentJson | null;
   }) => invoke<Thread>("update_thread", { update }),
   updateThreadRuntimeSelection: (
     threadId: string,
     selection: {
+      /** 新的线程引擎标识。 */
       engineId: string;
+      /** 新的线程模型标识。 */
       modelId: string;
+      /** 新的线程计划模式。 */
       planMode?: boolean | null;
+      /** 新的线程发送方式。 */
       sendMethod?: string | null;
+      /** 新的线程推理强度。 */
       reasoningEffort?: string | null;
-      permissionMode?: string | null;
+      /** 新的完整统一权限对象。 */
+      permissionMode?: PermissionComponentJson | null;
     },
   ) =>
     invoke<Thread>("update_thread_runtime_selection", {
@@ -442,33 +455,10 @@ export const ipc = {
     invoke<void>("set_thread_reasoning_effort", { threadId, reasoningEffort, modelId: modelId ?? null }),
   setSshRemoteThreadSelectedModel: (threadId: string, modelId: string) =>
     invoke<Thread>("set_ssh_remote_thread_selected_model", { threadId, modelId }),
-  setThreadExecutionPolicy: (
-    threadId: string,
-    patch: {
-      approvalPolicy?: unknown;
-      sandboxMode?: string | null;
-      allowNetwork?: boolean | null;
-      permissionProfile?: Record<string, unknown> | null;
-      approvalsReviewer?: CodexApprovalsReviewer | null;
-    },
-  ) =>
-    invoke<Thread>("set_thread_execution_policy", {
-      threadId,
-      updateApprovalPolicy: Object.prototype.hasOwnProperty.call(patch, "approvalPolicy"),
-      approvalPolicy: patch.approvalPolicy ?? null,
-      updateSandboxMode: Object.prototype.hasOwnProperty.call(patch, "sandboxMode"),
-      sandboxMode: patch.sandboxMode ?? null,
-      updateAllowNetwork: Object.prototype.hasOwnProperty.call(patch, "allowNetwork"),
-      allowNetwork: patch.allowNetwork ?? null,
-      updatePermissionProfile: Object.prototype.hasOwnProperty.call(patch, "permissionProfile"),
-      permissionProfile: patch.permissionProfile ?? null,
-      updateApprovalsReviewer: Object.prototype.hasOwnProperty.call(patch, "approvalsReviewer"),
-      approvalsReviewer: patch.approvalsReviewer ?? null,
-    }),
-  /** 读取当前线程由后端适配后的统一权限组件数据。 */
+  /** 从数据库读取当前线程保存的统一权限对象。 */
   getThreadPermissions: (threadId: string) =>
     invoke<PermissionComponentJson>("get_thread_permissions", { threadId }),
-  /** 保存完整统一权限组件数据，由当前 CLI 实现负责转换为原始权限 JSON。 */
+  /** 将完整统一权限对象写入线程数据库字段。 */
   setThreadPermissions: (threadId: string, values: PermissionComponentJson) =>
     invoke<PermissionComponentJson>("set_thread_permissions", { threadId, values }),
   setThreadCodexConfig: (
@@ -702,7 +692,6 @@ export const ipc = {
     referencedThreadId?: string | null,
     engineId?: string | null,
     sendMethod?: string | null,
-    permissionModeJson?: string | null,
     permissionValues?: PermissionComponentJson | null,
   ) =>
     invoke<string>("send_message", {
@@ -714,7 +703,6 @@ export const ipc = {
         planMode: planMode ?? null,
         sendMethod: sendMethod ?? null,
         reasoningEffort: reasoningEffort ?? null,
-        permissionModeJson: permissionModeJson ?? null,
         permissionValues: permissionValues ?? null,
         attachments: attachments ?? null,
         inputItems: inputItems ?? null,
@@ -722,6 +710,7 @@ export const ipc = {
         referencedThreadId: referencedThreadId ?? null,
       },
     }),
+  /** 将当前统一权限对象随 steer 请求交给后端发送流程。 */
   steerMessage: (
     threadId: string,
     message: string,
@@ -730,6 +719,7 @@ export const ipc = {
     planMode?: boolean | null,
     clientSteerId?: string | null,
     referencedThreadId?: string | null,
+    permissionValues?: PermissionComponentJson | null,
   ) =>
     invoke<SteerReceipt>("steer_message", {
       threadId,
@@ -739,6 +729,7 @@ export const ipc = {
       planMode: planMode ?? null,
       clientSteerId: clientSteerId ?? null,
       referencedThreadId: referencedThreadId ?? null,
+      permissionValues: permissionValues ?? null,
     }),
   startCodexReview: (
     threadId: string,

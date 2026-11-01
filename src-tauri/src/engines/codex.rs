@@ -60,6 +60,7 @@ const THREAD_SET_NAME_METHODS: &[&str] = &["thread/name/set"];
 const THREAD_LIST_METHODS: &[&str] = &["thread/list"];
 const THREAD_FORK_METHODS: &[&str] = &["thread/fork"];
 const THREAD_ROLLBACK_METHODS: &[&str] = &["thread/rollback"];
+const THREAD_SETTINGS_UPDATE_METHODS: &[&str] = &["thread/settings/update"];
 const THREAD_COMPACT_START_METHODS: &[&str] = &["thread/compact/start"];
 const REVIEW_START_METHODS: &[&str] = &["review/start"];
 const EXPERIMENTAL_FEATURE_LIST_METHODS: &[&str] = &["experimentalFeature/list"];
@@ -72,6 +73,7 @@ const CONFIG_READ_METHODS: &[&str] = &["config/read"];
 const ACCOUNT_READ_METHODS: &[&str] = &["account/read"];
 const TURN_START_METHODS: &[&str] = &["turn/start"];
 const TURN_STEER_METHODS: &[&str] = &["turn/steer"];
+const TURN_SETTINGS_UPDATE_METHODS: &[&str] = &["turn/settings/update"];
 const TURN_INTERRUPT_METHODS: &[&str] = &["turn/interrupt"];
 #[cfg(target_os = "macos")]
 const COMMAND_EXEC_METHODS: &[&str] = &["command/exec"];
@@ -351,6 +353,8 @@ struct ThreadRuntime {
     /// 当前线程是否由 AuraCoder 自动批准 MCP elicitation 请求。
     auto_approve_mcp_elicitations: bool,
     sandbox_policy: serde_json::Value,
+    /// 当前 workspace 提供的可写目录，用于按本次权限重建原生沙箱策略。
+    writable_roots: Vec<String>,
     reasoning_effort: Option<String>,
     service_tier: Option<String>,
     personality: Option<String>,
@@ -675,6 +679,7 @@ impl Engine for CodexEngine {
             approvals_reviewer: sandbox.approvals_reviewer.clone(),
             auto_approve_mcp_elicitations: sandbox.auto_approve_mcp_elicitations,
             sandbox_policy: sandbox_policy.clone(),
+            writable_roots: sandbox.writable_roots.clone(),
             reasoning_effort: sandbox.reasoning_effort.clone(),
             service_tier: sandbox.service_tier.clone(),
             personality: sandbox.personality.clone(),
@@ -724,10 +729,17 @@ impl Engine for CodexEngine {
                 Ok(result) => {
                     let engine_thread_id = extract_thread_id(&result)
                         .unwrap_or_else(|| existing_thread_id.to_string());
-                    let runtime = preserve_live_thread_runtime_flags(
+                    let mut runtime = preserve_live_thread_runtime_flags(
                         thread_runtime_from_resume_response(&result, &requested_runtime),
                         self.thread_runtime(&engine_thread_id).await.as_ref(),
                     );
+                    // 运行时缓存仅保留非权限参数，后续轮次必须从本次统一对象取得权限。
+                    runtime.approval_policy = serde_json::Value::Null;
+                    runtime.permission_profile = None;
+                    runtime.approvals_reviewer = None;
+                    runtime.auto_approve_mcp_elicitations = false;
+                    runtime.sandbox_policy = serde_json::Value::Null;
+                    runtime.writable_roots = requested_runtime.writable_roots.clone();
                     self.store_thread_runtime(&engine_thread_id, runtime).await;
 
                     /*
@@ -807,6 +819,14 @@ impl Engine for CodexEngine {
             requested_runtime.output_schema.clone(),
             requested_runtime.auto_approve_mcp_elicitations,
         );
+        let mut runtime = runtime;
+        // 启动响应和本次请求权限只用于创建线程，不允许成为后续轮次的权限来源。
+        runtime.approval_policy = serde_json::Value::Null;
+        runtime.permission_profile = None;
+        runtime.approvals_reviewer = None;
+        runtime.auto_approve_mcp_elicitations = false;
+        runtime.sandbox_policy = serde_json::Value::Null;
+        runtime.writable_roots = requested_runtime.writable_roots.clone();
         self.store_thread_runtime(&engine_thread_id, runtime).await;
 
         /*
@@ -843,12 +863,16 @@ impl Engine for CodexEngine {
         let mut incoming_rx =
             spawn_codex_incoming_pump(transport.clone(), "turn", Some(thread_filter));
 
-        let runtime = self.thread_runtime(&thread_id).await;
-        let auto_approve_mcp_elicitations = runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.auto_approve_mcp_elicitations);
+        let runtime = self
+            .runtime_with_turn_permissions(
+                self.thread_runtime(&thread_id).await,
+                input.permissions.clone(),
+                &thread_id,
+            )
+            .await?;
+        let auto_approve_mcp_elicitations = runtime.auto_approve_mcp_elicitations;
         let plan_mode_activation = self
-            .resolve_turn_plan_mode_activation(runtime.as_ref(), &input)
+            .resolve_turn_plan_mode_activation(Some(&runtime), &input)
             .await;
         validate_turn_attachments(&input.attachments).await?;
 
@@ -865,7 +889,7 @@ impl Engine for CodexEngine {
 
         let transport_for_turn = transport.clone();
         let thread_id_for_turn = thread_id.clone();
-        let runtime_for_turn = runtime.clone();
+        let runtime_for_turn = Some(runtime.clone());
         let input_for_turn = input.clone();
         let plan_mode_activation_for_turn = plan_mode_activation;
         let turn_task = tokio::spawn(async move {
@@ -1620,12 +1644,86 @@ impl Engine for CodexEngine {
     ) -> Result<EngineSteerReceipt, anyhow::Error> {
         let transport = self.ensure_ready_transport().await?;
         validate_turn_attachments(&input.attachments).await?;
+        let runtime = self
+            .runtime_with_turn_permissions(
+                self.thread_runtime(engine_thread_id).await,
+                input.permissions.clone(),
+                engine_thread_id,
+            )
+            .await?;
 
         let expected_turn_id = self.active_turn_id(engine_thread_id).await.ok_or_else(|| {
             anyhow::anyhow!(
                 "Codex has not reported an active turn id for thread {engine_thread_id} yet"
             )
         })?;
+
+        // 先同步后续轮次设置，确保 thread/steer 与后续 send 均使用本次统一权限。
+        let thread_settings = request_with_fallback(
+            transport.as_ref(),
+            THREAD_SETTINGS_UPDATE_METHODS,
+            serde_json::json!({
+                "threadId": engine_thread_id,
+                "approvalPolicy": runtime.approval_policy,
+                "approvalsReviewer": runtime.approvals_reviewer,
+                "sandboxPolicy": runtime.sandbox_policy,
+            }),
+            TURN_REQUEST_TIMEOUT,
+        )
+        .await;
+        if let Err(error) = thread_settings {
+            log::error!(
+                "Codex thread/settings/update failed before steer: thread_id={} approval_policy={} approvals_reviewer={} error={error:#}",
+                engine_thread_id,
+                runtime.approval_policy,
+                runtime.approvals_reviewer.as_deref().unwrap_or("user")
+            );
+            return Err(error).context("Codex thread/settings/update failed before steer");
+        }
+
+        // 仅原生确认 active turn settings 已应用后，才允许发送 steer 内容。
+        let turn_settings = request_with_fallback(
+            transport.as_ref(),
+            TURN_SETTINGS_UPDATE_METHODS,
+            serde_json::json!({
+                "threadId": engine_thread_id,
+                "turnId": expected_turn_id,
+                "approvalsReviewer": runtime.approvals_reviewer,
+            }),
+            TURN_REQUEST_TIMEOUT,
+        )
+        .await;
+        let turn_settings = match turn_settings {
+            Ok(response) => response,
+            Err(error) => {
+                log::error!(
+                    "Codex turn/settings/update failed before steer: thread_id={} approval_policy={} approvals_reviewer={} error={error:#}",
+                    engine_thread_id,
+                    runtime.approval_policy,
+                    runtime.approvals_reviewer.as_deref().unwrap_or("user")
+                );
+                return Err(error).context("Codex turn/settings/update failed before steer");
+            }
+        };
+        let settings_status = turn_settings
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .context("Codex turn/settings/update response is missing status")?;
+        if settings_status == "targetUnavailable" {
+            log::error!(
+                "Codex turn/settings/update target unavailable: thread_id={} approval_policy={} approvals_reviewer={}",
+                engine_thread_id,
+                runtime.approval_policy,
+                runtime.approvals_reviewer.as_deref().unwrap_or("user")
+            );
+            anyhow::bail!(
+                "Codex turn/settings/update targetUnavailable for thread {engine_thread_id}"
+            );
+        }
+        anyhow::ensure!(
+            settings_status == "applied",
+            "Codex turn/settings/update returned unsupported status: {settings_status}"
+        );
 
         {
             let mut state = self.state.lock().await;
@@ -1952,6 +2050,7 @@ impl CodexEngine {
             approvals_reviewer: sandbox.approvals_reviewer.clone(),
             auto_approve_mcp_elicitations: sandbox.auto_approve_mcp_elicitations,
             sandbox_policy: sandbox_policy.clone(),
+            writable_roots: sandbox.writable_roots.clone(),
             reasoning_effort: sandbox.reasoning_effort.clone(),
             service_tier: sandbox.service_tier.clone(),
             personality: sandbox.personality.clone(),
@@ -1977,7 +2076,7 @@ impl CodexEngine {
 
         let new_engine_thread_id = extract_thread_id(&response)
             .ok_or_else(|| anyhow::anyhow!("missing thread id in thread/fork response"))?;
-        let runtime = thread_runtime_from_start_response(
+        let mut runtime = thread_runtime_from_start_response(
             &response,
             &requested_runtime.cwd,
             &requested_runtime.model_id,
@@ -1991,6 +2090,13 @@ impl CodexEngine {
             requested_runtime.output_schema.clone(),
             requested_runtime.auto_approve_mcp_elicitations,
         );
+        // fork 响应中的权限仅用于新分支创建，运行时缓存只保留非权限参数。
+        runtime.approval_policy = serde_json::Value::Null;
+        runtime.permission_profile = None;
+        runtime.approvals_reviewer = None;
+        runtime.auto_approve_mcp_elicitations = false;
+        runtime.sandbox_policy = serde_json::Value::Null;
+        runtime.writable_roots = requested_runtime.writable_roots.clone();
         self.store_thread_runtime(&new_engine_thread_id, runtime)
             .await;
 
@@ -2142,10 +2248,7 @@ impl CodexEngine {
             Some(review_thread_filter.clone()),
         );
         let mut active_thread_id = source_thread_id.clone();
-        let auto_approve_mcp_elicitations = self
-            .thread_runtime(&source_thread_id)
-            .await
-            .is_some_and(|runtime| runtime.auto_approve_mcp_elicitations);
+        let auto_approve_mcp_elicitations = false;
         let requested_delivery = delivery.map(str::to_string);
 
         let transport_for_rate_limits = transport.clone();
@@ -4238,15 +4341,9 @@ impl CodexEngine {
 
     async fn force_external_sandbox_for_thread(&self, engine_thread_id: &str) {
         self.set_force_external_sandbox(true).await;
-
-        let mut state = self.state.lock().await;
-        if let Some(runtime) = state.thread_runtimes.get_mut(engine_thread_id) {
-            let allow_network = sandbox_policy_network_enabled(&runtime.sandbox_policy);
-            runtime.sandbox_policy = serde_json::json!({
-              "type": "externalSandbox",
-              "networkAccess": if allow_network { "enabled" } else { "restricted" },
-            });
-        }
+        log::warn!(
+            "Codex workspaceWrite failed; future turns will rebuild external sandbox policy from current permissions: thread_id={engine_thread_id}"
+        );
     }
 
     async fn register_approval_request(
@@ -4320,6 +4417,100 @@ impl CodexEngine {
     async fn thread_runtime(&self, engine_thread_id: &str) -> Option<ThreadRuntime> {
         let state = self.state.lock().await;
         state.thread_runtimes.get(engine_thread_id).cloned()
+    }
+
+    /// 将本次 TurnInput 中的统一权限映射到临时运行时，不读取缓存权限。
+    async fn runtime_with_turn_permissions(
+        &self,
+        runtime: Option<ThreadRuntime>,
+        permissions: Option<serde_json::Value>,
+        thread_id: &str,
+    ) -> anyhow::Result<ThreadRuntime> {
+        // 运行时缓存只提供模型、工作目录和界面设置，权限必须由本次输入完整提供。
+        let mut runtime = runtime.ok_or_else(|| {
+            anyhow::anyhow!("Codex thread runtime is unavailable for thread {thread_id}")
+        })?;
+        let permissions = permissions
+            .context("Codex turn permissions are required for every message and steer")?;
+        let permissions = permissions
+            .as_object()
+            .context("Codex turn permissions must be an object")?;
+        anyhow::ensure!(
+            permissions.len() == 5,
+            "Codex turn permissions contain unsupported native fields"
+        );
+        let approval_policy = permissions
+            .get("approvalPolicy")
+            .and_then(serde_json::Value::as_str)
+            .context("Codex turn permissions are missing approvalPolicy")?;
+        let approvals_reviewer = permissions
+            .get("approvalsReviewer")
+            .and_then(serde_json::Value::as_str)
+            .context("Codex turn permissions are missing approvalsReviewer")?;
+        anyhow::ensure!(
+            matches!(approvals_reviewer, "user" | "auto_review"),
+            "Codex turn permissions contain an unsupported approvalsReviewer"
+        );
+        let sandbox_mode = match permissions
+            .get("sandboxMode")
+            .context("Codex turn permissions are missing sandboxMode")?
+        {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(value) => Some(value.as_str()),
+            _ => anyhow::bail!("Codex turn permissions sandboxMode must be a string or null"),
+        };
+        let allow_network = permissions
+            .get("allowNetwork")
+            .and_then(serde_json::Value::as_bool)
+            .context("Codex turn permissions are missing allowNetwork")?;
+        let auto_approve_mcp_elicitations = permissions
+            .get("autoApproveMcpElicitations")
+            .and_then(serde_json::Value::as_bool)
+            .context("Codex turn permissions are missing autoApproveMcpElicitations")?;
+
+        // 根据当前请求字段重建原生 sandboxPolicy，保留的可写目录来自 workspace 上下文。
+        let force_external_sandbox = matches!(
+            &self.transport_target,
+            CodexTransportTarget::Local
+        ) && self.resolve_external_sandbox_mode().await;
+        let sandbox_policy = if force_external_sandbox {
+            serde_json::json!({
+                "type": "externalSandbox",
+                "networkAccess": if allow_network { "enabled" } else { "restricted" },
+            })
+        } else {
+            match sandbox_mode.unwrap_or("workspace-write") {
+                "read-only" => serde_json::json!({
+                    "type": "readOnly",
+                    "networkAccess": allow_network,
+                }),
+                "workspace-write" => serde_json::json!({
+                    "type": "workspaceWrite",
+                    "writableRoots": runtime.writable_roots.clone(),
+                    "networkAccess": allow_network,
+                    "excludeTmpdirEnvVar": false,
+                    "excludeSlashTmp": false,
+                }),
+                "danger-full-access" => serde_json::json!({
+                    "type": "dangerFullAccess",
+                }),
+                value => anyhow::bail!("Codex turn permissions contain unsupported sandboxMode: {value}"),
+            }
+        };
+
+        // 用当前 B 字段覆盖临时副本；该副本只参与本次请求，不写回 thread_runtimes。
+        runtime.approval_policy = serde_json::json!(approval_policy);
+        runtime.permission_profile = None;
+        runtime.approvals_reviewer = Some(approvals_reviewer.to_string());
+        runtime.auto_approve_mcp_elicitations = auto_approve_mcp_elicitations;
+        runtime.sandbox_policy = sandbox_policy;
+        log::debug!(
+            "Codex 本次 turn 权限已应用: thread_id={} approval_policy={} approvals_reviewer={}",
+            thread_id,
+            approval_policy,
+            approvals_reviewer
+        );
+        Ok(runtime)
     }
 }
 
@@ -5760,14 +5951,6 @@ fn is_transport_or_protocol_error(value: &str) -> bool {
         || value.contains("invalid request")
 }
 
-fn sandbox_policy_network_enabled(policy: &serde_json::Value) -> bool {
-    match policy.get("networkAccess") {
-        Some(serde_json::Value::Bool(value)) => *value,
-        Some(serde_json::Value::String(value)) => value.eq_ignore_ascii_case("enabled"),
-        _ => false,
-    }
-}
-
 fn event_indicates_sandbox_denial(event: &EngineEvent) -> bool {
     match event {
         // Only an explicit sandbox signature may flip the session to
@@ -5966,6 +6149,7 @@ fn thread_runtime_from_start_response(
             .cloned()
             .filter(|value| !value.is_null())
             .unwrap_or_else(|| fallback_sandbox_policy.clone()),
+        writable_roots: Vec::new(),
         // Codex thread/start and thread/fork responses expose the model default effort.
         // The requested AuraCoder effort is authoritative for the subsequent turn/start.
         // reasoning_effort: extract_any_string(response, &["reasoningEffort", "reasoning_effort"]),
@@ -6019,6 +6203,7 @@ fn thread_runtime_from_resume_response(
     runtime.permission_profile = requested_runtime.permission_profile.clone();
     runtime.approvals_reviewer = requested_runtime.approvals_reviewer.clone();
     runtime.sandbox_policy = requested_runtime.sandbox_policy.clone();
+    runtime.writable_roots = requested_runtime.writable_roots.clone();
     runtime.reasoning_effort = requested_runtime.reasoning_effort.clone();
     runtime.service_tier = requested_runtime.service_tier.clone();
     runtime.personality = requested_runtime.personality.clone();
@@ -8641,6 +8826,7 @@ mod tests {
             attachments: vec![attachment],
             plan_mode: false,
             input_items: Vec::new(),
+            permissions: None,
         };
 
         let items = build_turn_input_items(&input, false)
@@ -8904,6 +9090,7 @@ mod tests {
             approval_policy: json!("on-request"),
             permission_profile: None,
             approvals_reviewer: None,
+            writable_roots: Vec::new(),
             sandbox_policy: json!({
                 "type": "workspaceWrite",
                 "writableRoots": ["/tmp/workspace"],
@@ -8923,6 +9110,7 @@ mod tests {
             input_items: vec![TurnInputItem::Text {
                 text: "Inspect the repo first".to_string(),
             }],
+            permissions: None,
         };
 
         let params = build_turn_start_params(
@@ -8968,6 +9156,7 @@ mod tests {
             approval_policy: json!("on-request"),
             permission_profile: None,
             approvals_reviewer: None,
+            writable_roots: Vec::new(),
             sandbox_policy: json!({
                 "type": "workspaceWrite",
                 "writableRoots": ["/tmp/workspace"],
@@ -8987,6 +9176,7 @@ mod tests {
             input_items: vec![TurnInputItem::Text {
                 text: handoff_message.to_string(),
             }],
+            permissions: None,
         };
 
         let params = build_turn_start_params(
@@ -9029,6 +9219,7 @@ mod tests {
             approval_policy: json!("on-request"),
             permission_profile: None,
             approvals_reviewer: None,
+            writable_roots: Vec::new(),
             sandbox_policy: json!({
                 "type": "workspaceWrite",
                 "writableRoots": ["/tmp/workspace"],
@@ -9048,6 +9239,7 @@ mod tests {
             input_items: vec![TurnInputItem::Text {
                 text: "Inspect the repo first".to_string(),
             }],
+            permissions: None,
         };
 
         let params = build_turn_start_params(
@@ -9084,6 +9276,7 @@ mod tests {
             input_items: vec![TurnInputItem::Text {
                 text: "Inspect the repo first".to_string(),
             }],
+            permissions: None,
         };
 
         let params =
@@ -9662,6 +9855,7 @@ mod tests {
             input_items: vec![TurnInputItem::Text {
                 text: "Inspect the repo".to_string(),
             }],
+            permissions: None,
         };
 
         let params = build_turn_start_params(
@@ -9712,6 +9906,7 @@ mod tests {
             approval_policy: json!("on-request"),
             permission_profile: None,
             approvals_reviewer: None,
+            writable_roots: Vec::new(),
             sandbox_policy: json!({
                 "type": "workspaceWrite",
                 "writableRoots": ["/tmp/requested"],
@@ -9747,6 +9942,7 @@ mod tests {
             approval_policy: json!("on-request"),
             permission_profile: None,
             approvals_reviewer: None,
+            writable_roots: Vec::new(),
             sandbox_policy: json!({
                 "type": "workspaceWrite",
                 "writableRoots": ["/tmp/original"],
@@ -9765,6 +9961,7 @@ mod tests {
             approval_policy: json!("never"),
             permission_profile: None,
             approvals_reviewer: None,
+            writable_roots: Vec::new(),
             sandbox_policy: json!({
                 "type": "workspaceWrite",
                 "writableRoots": ["/tmp/updated"],

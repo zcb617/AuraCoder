@@ -143,7 +143,7 @@ struct OpenCodeSession {
     reasoning_effort: Option<String>,
     /// 会话使用的 OpenCode agent。
     agent: Option<String>,
-    /// 会话权限模式。
+    /// 仅供当前活动 session 的权限事件自动回复使用，不作为后续请求的规则来源。
     permission_mode: OpenCodePermissionMode,
     /// 会话对应的协议连接。
     connection: Arc<OpenCodeConnection>,
@@ -819,6 +819,7 @@ impl Engine for OpenCodeEngine {
         !matches!(&self.target, OpenCodeTransportTarget::Local)
     }
 
+    /// 建立或恢复 OpenCode session，并按本次调用提供的原生权限数组设置 session 权限。
     async fn start_thread(
         &self,
         scope: ThreadScope,
@@ -831,65 +832,40 @@ impl Engine for OpenCodeEngine {
         let parsed_model = parse_model_slug(model)
             .with_context(|| format!("OpenCode model `{model}` must use provider/model format"))?;
         let _ = parsed_model;
+        // 使用当前调用提供的完整原生规则，避免只按最后动作重建并丢失 question 规则。
         let permission_mode = permission_mode_from_policy(sandbox.approval_policy.as_ref());
+        let requested_rules = sandbox
+            .approval_policy
+            .as_ref()
+            .filter(|value| value.is_array())
+            .cloned()
+            .unwrap_or_else(|| permission_rules(permission_mode));
         let reasoning_effort = self
             .resolve_session_reasoning_effort(&cwd, model, sandbox.reasoning_effort.as_deref())
             .await;
         let agent = normalize_opencode_agent(sandbox.opencode_agent.as_deref());
 
         if let Some(existing_id) = resume_engine_thread_id {
-            let mut state = self.state.lock().await;
-            if let Some(existing) = state.sessions.get(existing_id).cloned() {
-                if existing.cwd == cwd && existing.permission_mode == permission_mode {
+            let existing = {
+                let state = self.state.lock().await;
+                state.sessions.get(existing_id).cloned()
+            };
+            if let Some(existing) = existing {
+                if existing.cwd == cwd {
+                    // 已缓存的同一 session 直接接收本次完整规则，避免只按权限模式复用旧规则。
+                    self.set_session_permission_rules(&cwd, existing_id, &requested_rules)
+                        .await?;
+                    let mut state = self.state.lock().await;
                     if let Some(existing) = state.sessions.get_mut(existing_id) {
                         existing.model_id = model.to_string();
                         existing.reasoning_effort = reasoning_effort.clone();
                         existing.agent = agent.clone();
                     }
-                    /*
-                    // 旧单字段返回值保留迁移留痕，现返回内部运行键和外部原生 ID。
-                    return Ok(EngineThread {
-                        engine_thread_id: existing_id.to_string(),
-                    });
-                    */
                     return Ok(EngineThread {
                         runtime_thread_id: existing_id.to_string(),
                         external_engine_thread_id: Some(existing_id.to_string()),
                     });
                 }
-
-                if existing.cwd == cwd {
-                    if self.is_remote_target() {
-                        anyhow::bail!(
-                            "SSH 远端 OpenCode 会话权限模式与当前设置不一致；不会创建替代会话"
-                        );
-                    }
-                    state.sessions.remove(existing_id);
-                    drop(state);
-                    let engine_thread_id = self
-                        .create_session(existing.connection.as_ref(), permission_mode)
-                        .await?;
-                    self.state.lock().await.sessions.insert(
-                        engine_thread_id.clone(),
-                        OpenCodeSession {
-                            cwd,
-                            model_id: model.to_string(),
-                            reasoning_effort,
-                            agent,
-                            permission_mode,
-                            connection: existing.connection,
-                        },
-                    );
-                    /*
-                    // 旧单字段返回值保留迁移留痕，现返回内部运行键和外部原生 ID。
-                    return Ok(EngineThread { engine_thread_id });
-                    */
-                    return Ok(EngineThread {
-                        runtime_thread_id: engine_thread_id.clone(),
-                        external_engine_thread_id: Some(engine_thread_id),
-                    });
-                }
-
                 if self.is_remote_target() {
                     anyhow::bail!(
                         "SSH 远端 OpenCode 会话目录不匹配；不会在其他目录或本机创建替代会话"
@@ -903,11 +879,13 @@ impl Engine for OpenCodeEngine {
             Some(existing_id) => match self.get_session(connection.as_ref(), existing_id).await {
                 Ok(session)
                     if session.directory == cwd
-                        && (session_permission_matches(&session, permission_mode)
-                            || (self.is_remote_target()
-                                && session.permission.is_none()
-                                && permission_mode == OpenCodePermissionMode::Ask)) =>
+                        && (session_permission_matches(&session, &requested_rules)
+                            || self.is_remote_target()) =>
                 {
+                    if !session_permission_matches(&session, &requested_rules) {
+                        self.set_session_permission_rules(&cwd, existing_id, &requested_rules)
+                            .await?;
+                    }
                     existing_id.to_string()
                 }
                 Ok(session) => {
@@ -919,10 +897,8 @@ impl Engine for OpenCodeEngine {
                             session.directory
                         );
                     }
-                    log::warn!(
-                        "opencode session {existing_id} permission rules differ from requested mode; creating a new session"
-                    );
-                    self.create_session(connection.as_ref(), permission_mode)
+                    log::warn!("opencode session {existing_id} differs from requested scope or permission rules; creating a new session");
+                    self.create_session(connection.as_ref(), &requested_rules)
                         .await?
                 }
                 Err(error) => {
@@ -934,12 +910,12 @@ impl Engine for OpenCodeEngine {
                     log::warn!(
                         "opencode session resume failed for {existing_id}, creating a new session: {error}"
                     );
-                    self.create_session(connection.as_ref(), permission_mode)
+                    self.create_session(connection.as_ref(), &requested_rules)
                         .await?
                 }
             },
             None => {
-                self.create_session(connection.as_ref(), permission_mode)
+                self.create_session(connection.as_ref(), &requested_rules)
                     .await?
             }
         };
@@ -969,6 +945,7 @@ impl Engine for OpenCodeEngine {
         })
     }
 
+    /// 使用本次请求携带的 OpenCode 原生规则更新 session 后提交 prompt。
     async fn send_message(
         &self,
         engine_thread_id: &str,
@@ -985,6 +962,19 @@ impl Engine for OpenCodeEngine {
                 .cloned()
                 .context("no OpenCode session found; was start_thread called?")?
         };
+
+        let mut input = input;
+        // 本次权限必须由调用方提供；缺失或提交失败时不继续发送 prompt。
+        let permissions = input
+            .permissions
+            .take()
+            .context("OpenCode 当前请求缺少本次权限规则")?;
+        let rules = permissions
+            .get("permission")
+            .cloned()
+            .context("OpenCode 当前请求缺少原生 permission 数组")?;
+        self.set_session_permission_rules(&session.cwd, engine_thread_id, &rules)
+            .await?;
 
         // Subscribe to the persistent event bus BEFORE firing the prompt.
         // broadcast::Receiver does not replay history; it only delivers events
@@ -2149,15 +2139,17 @@ impl OpenCodeEngine {
         Ok(models)
     }
 
+    /// 使用调用方本次解析得到的原生规则创建 OpenCode session。
     async fn create_session(
         &self,
         connection: &OpenCodeConnection,
-        permission_mode: OpenCodePermissionMode,
+        rules: &Value,
     ) -> Result<String> {
+        let rules_array = rules.as_array().context("OpenCode 权限规则必须是数组")?;
         let session = self
             .request(connection, reqwest::Method::POST, "/session")
             .json(&json!({
-                "permission": permission_rules(permission_mode),
+                "permission": rules_array,
             }))
             .send()
             .await?
@@ -3801,8 +3793,13 @@ fn scope_cwd(scope: &ThreadScope) -> String {
     }
 }
 
+/// 从本次原生规则或兼容的单值策略中提取活动权限事件使用的响应模式。
 fn permission_mode_from_policy(policy: Option<&Value>) -> OpenCodePermissionMode {
-    let Some(raw) = policy.and_then(Value::as_str) else {
+    let Some(raw) = policy.and_then(|value| {
+        value
+            .as_str()
+            .or_else(|| session_wildcard_permission_action(Some(value)))
+    }) else {
         return OpenCodePermissionMode::Ask;
     };
     match raw.trim().to_lowercase().as_str() {
@@ -3812,6 +3809,7 @@ fn permission_mode_from_policy(policy: Option<&Value>) -> OpenCodePermissionMode
     }
 }
 
+/// 为引擎内部缺少完整规则数组的调用生成对应的 OpenCode 原生权限数组。
 fn permission_rules(mode: OpenCodePermissionMode) -> Value {
     match mode {
         OpenCodePermissionMode::Allow => {
@@ -3827,18 +3825,12 @@ fn permission_rules(mode: OpenCodePermissionMode) -> Value {
     }
 }
 
-fn session_permission_matches(
-    session: &OpenCodeSessionRecord,
-    mode: OpenCodePermissionMode,
-) -> bool {
-    let expected_action = match mode {
-        OpenCodePermissionMode::Ask => "ask",
-        OpenCodePermissionMode::Allow => "allow",
-        OpenCodePermissionMode::Deny => "deny",
-    };
-    session_wildcard_permission_action(session.permission.as_ref()) == Some(expected_action)
+/// 判断已存在 session 是否保存了本次完整原生权限规则。
+fn session_permission_matches(session: &OpenCodeSessionRecord, rules: &Value) -> bool {
+    session.permission.as_ref() == Some(rules)
 }
 
+/// 读取最后一条匹配全局权限规则的动作，供活动 session 事件映射响应模式。
 fn session_wildcard_permission_action(permission: Option<&Value>) -> Option<&str> {
     let rules = permission?.as_array()?;
     // OpenCode 使用 findLast 评估权限，后出现的全局规则覆盖前面的规则。
@@ -3850,16 +3842,6 @@ fn session_wildcard_permission_action(permission: Option<&Value>) -> Option<&str
         }
         None
     })
-
-    // 旧实现按正序查找首条全局规则，不能与 OpenCode findLast 语义保持一致：
-    // rules.iter().find_map(|rule| {
-    //     let permission = rule.get("permission").and_then(Value::as_str)?;
-    //     let pattern = rule.get("pattern").and_then(Value::as_str)?;
-    //     if permission == "*" && pattern == "*" {
-    //         return rule.get("action").and_then(Value::as_str);
-    //     }
-    //     None
-    // })
 }
 
 /// 将 OpenCode 工具的 object schema 转为插件要求的 Zod raw shape 源码。
@@ -6093,6 +6075,7 @@ opencode/gpt-5-nano
                 message: "hello".to_string(),
                 attachments: Vec::new(),
                 plan_mode: false,
+                permissions: None,
                 input_items: Vec::new(),
             },
         )
@@ -6125,6 +6108,7 @@ opencode/gpt-5-nano
                     remote_text_content: Some("附件正文".to_string()),
                 }],
                 plan_mode: false,
+                permissions: None,
                 input_items: Vec::new(),
             },
         )
@@ -6148,6 +6132,7 @@ opencode/gpt-5-nano
                 message: "hello".to_string(),
                 attachments: Vec::new(),
                 plan_mode: false,
+                permissions: None,
                 input_items: Vec::new(),
             },
         )
@@ -6167,6 +6152,7 @@ opencode/gpt-5-nano
                 message: "hello".to_string(),
                 attachments: Vec::new(),
                 plan_mode: true,
+                permissions: None,
                 input_items: Vec::new(),
             },
         )
@@ -6187,6 +6173,7 @@ opencode/gpt-5-nano
                 message: "hello".to_string(),
                 attachments: Vec::new(),
                 plan_mode: false,
+                permissions: None,
                 input_items: Vec::new(),
             },
         )
@@ -6461,11 +6448,14 @@ opencode/gpt-5-nano
 
         assert!(session_permission_matches(
             &session,
-            OpenCodePermissionMode::Ask
+            &json!([
+                { "permission": "question", "pattern": "*", "action": "allow" },
+                { "permission": "*", "pattern": "*", "action": "ask" }
+            ])
         ));
         assert!(!session_permission_matches(
             &session,
-            OpenCodePermissionMode::Allow
+            &json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
         ));
     }
 

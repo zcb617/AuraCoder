@@ -289,7 +289,6 @@ describe("chatStore send", () => {
         modelId: "openai/gpt-5",
         reasoningEffort: "high",
         sendMethod: "prompt",
-        permissionModeJson: "allow",
         permissionValues: {
           autonomyPreset: ["automatic"],
           trust: ["automatic"],
@@ -316,7 +315,6 @@ describe("chatStore send", () => {
       null,
       "opencode",
       "prompt",
-      "allow",
       {
         autonomyPreset: ["automatic"],
         trust: ["automatic"],
@@ -364,7 +362,14 @@ describe("chatStore send", () => {
         modelId: "openai/gpt-5",
         reasoningEffort: "high",
         sendMethod: "prompt",
-        permissionModeJson: "allow",
+        permissionValues: {
+          autonomyPreset: ["automatic"],
+          trust: ["automatic"],
+          approval: ["automatic"],
+          sandbox: ["automatic"],
+          network: ["automatic"],
+          defaultForNewThreads: [],
+        },
       }),
     ).resolves.toBe(false);
 

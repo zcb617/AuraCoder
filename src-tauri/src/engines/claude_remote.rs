@@ -377,6 +377,7 @@ impl ClaudeRemoteEngine {
         &self.base_url
     }
 
+    /// 用当次消息和权限构建 SSH 远端复用会话的查询参数。
     pub(crate) async fn prepare_persistent_turn(
         &self,
         engine_thread_id: &str,
@@ -400,7 +401,23 @@ impl ClaudeRemoteEngine {
             attachments,
             plan_mode,
             input_items,
+            permissions,
         } = input;
+        // 持久会话每轮都消费完整 B，确保请求参数来自本轮权限而非缓存配置。
+        let permissions = permissions.context("SSH 远端 Claude 请求缺少当次权限配置")?;
+        anyhow::ensure!(permissions.is_object(), "SSH 远端 Claude 当次权限配置必须是对象");
+        let permission_mode = permissions
+            .get("permissionMode")
+            .and_then(serde_json::Value::as_str)
+            .context("SSH 远端 Claude 当次权限配置缺少 permissionMode")?;
+        let sandbox_mode = permissions
+            .get("sandboxMode")
+            .and_then(serde_json::Value::as_str)
+            .context("SSH 远端 Claude 当次权限配置缺少 sandboxMode")?;
+        let allow_network = permissions
+            .get("allowNetwork")
+            .and_then(serde_json::Value::as_bool)
+            .context("SSH 远端 Claude 当次权限配置缺少 allowNetwork")?;
         let prompt = build_claude_prompt(&message, &input_items);
         anyhow::ensure!(
             attachments.iter().all(|attachment| attachment.is_remote),
@@ -422,10 +439,10 @@ impl ClaudeRemoteEngine {
             "attachments": attachments,
             "cwd": cwd,
             "model": thread_config.model_id,
-            "approvalPolicy": thread_config.sandbox.approval_policy.as_ref().and_then(serde_json::Value::as_str),
-            "allowNetwork": thread_config.sandbox.allow_network,
+            "approvalPolicy": permission_mode,
+            "allowNetwork": allow_network,
             "writableRoots": thread_config.sandbox.writable_roots,
-            "sandboxMode": thread_config.sandbox.sandbox_mode,
+            "sandboxMode": sandbox_mode,
             "reasoningEffort": thread_config.sandbox.reasoning_effort,
             "planMode": plan_mode,
             "settingSources": ["user", "project"],
@@ -1043,6 +1060,7 @@ impl Engine for ClaudeRemoteEngine {
         self.prewarm().await.is_ok()
     }
 
+    /// 创建 SSH 远端 Claude 会话配置，并仅缓存非权限运行参数。
     async fn start_thread(
         &self,
         scope: ThreadScope,
@@ -1073,6 +1091,22 @@ impl Engine for ClaudeRemoteEngine {
                 .threads
                 .get(runtime_thread_id)
                 .and_then(|config| config.agent_session_id.clone())
+        };
+        // 远端线程缓存只保留非权限参数，每轮权限由 TurnInput 单独传入。
+        let sandbox = SandboxPolicy {
+            // 审批模式仅在当次 SSH 请求中传递。
+            approval_policy: None,
+            // Claude 不缓存通用权限画像。
+            permission_profile: None,
+            // Claude 不缓存通用审批 reviewer。
+            approvals_reviewer: None,
+            // 网络权限仅从当次 SSH 请求读取。
+            allow_network: false,
+            // Claude 不缓存通用 MCP 自动批准配置。
+            auto_approve_mcp_elicitations: false,
+            // 沙箱模式仅在当次 SSH 请求中传递。
+            sandbox_mode: None,
+            ..sandbox
         };
         self.state.lock().await.threads.insert(
             runtime_thread_id.to_string(),
@@ -1107,6 +1141,7 @@ impl Engine for ClaudeRemoteEngine {
             .filter(|session_id| !session_id.trim().is_empty()))
     }
 
+    /// 将当次消息和权限发送到 SSH 远端 Claude 查询。
     async fn send_message(
         &self,
         engine_thread_id: &str,
@@ -1135,7 +1170,23 @@ impl Engine for ClaudeRemoteEngine {
             attachments,
             plan_mode,
             input_items,
+            permissions,
         } = input;
+        // 普通 SSH 请求同样只接受本轮 B，不回退到线程配置中的旧权限。
+        let permissions = permissions.context("SSH 远端 Claude 请求缺少当次权限配置")?;
+        anyhow::ensure!(permissions.is_object(), "SSH 远端 Claude 当次权限配置必须是对象");
+        let permission_mode = permissions
+            .get("permissionMode")
+            .and_then(serde_json::Value::as_str)
+            .context("SSH 远端 Claude 当次权限配置缺少 permissionMode")?;
+        let sandbox_mode = permissions
+            .get("sandboxMode")
+            .and_then(serde_json::Value::as_str)
+            .context("SSH 远端 Claude 当次权限配置缺少 sandboxMode")?;
+        let allow_network = permissions
+            .get("allowNetwork")
+            .and_then(serde_json::Value::as_bool)
+            .context("SSH 远端 Claude 当次权限配置缺少 allowNetwork")?;
         let prompt = build_claude_prompt(&message, &input_items);
         // 阶段计划 3 明确拒绝远端附件；阶段计划 4 已在发送前把本机文件上传并
         // 转换为远端绝对路径，因此这里只接受标记为远端缓存的附件。
@@ -1163,10 +1214,10 @@ impl Engine for ClaudeRemoteEngine {
             "attachments": attachments,
             "cwd": cwd,
             "model": thread_config.model_id,
-            "approvalPolicy": thread_config.sandbox.approval_policy.as_ref().and_then(serde_json::Value::as_str),
-            "allowNetwork": thread_config.sandbox.allow_network,
+            "approvalPolicy": permission_mode,
+            "allowNetwork": allow_network,
             "writableRoots": thread_config.sandbox.writable_roots,
-            "sandboxMode": thread_config.sandbox.sandbox_mode,
+            "sandboxMode": sandbox_mode,
             "reasoningEffort": thread_config.sandbox.reasoning_effort,
             "planMode": plan_mode,
             "settingSources": ["user", "project"],

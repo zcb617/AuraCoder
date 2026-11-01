@@ -532,34 +532,32 @@ function resolveClaudeSdkPermissionOptions(approvalPolicy, planMode) {
     return {
       sdkPermissionMode: "bypassPermissions",
       decisionMode: "full",
-      allowDangerouslySkipPermissions: true,
     };
   }
   if (planMode) {
     return {
       sdkPermissionMode: "plan",
       decisionMode: "ask",
-      allowDangerouslySkipPermissions: false,
     };
   }
   switch (approvalPolicy) {
     case "dontAsk":
     case "restricted":
-      return { sdkPermissionMode: "dontAsk", decisionMode: "read-only", allowDangerouslySkipPermissions: false };
+      return { sdkPermissionMode: "dontAsk", decisionMode: "read-only" };
     case "default":
     case "standard":
-      return { sdkPermissionMode: "default", decisionMode: "ask", allowDangerouslySkipPermissions: false };
+      return { sdkPermissionMode: "default", decisionMode: "ask" };
     case "acceptEdits":
     case "trusted":
-      return { sdkPermissionMode: "acceptEdits", decisionMode: "workspace-auto", allowDangerouslySkipPermissions: false };
+      return { sdkPermissionMode: "acceptEdits", decisionMode: "workspace-auto" };
     case "bypassPermissions":
     case "never":
-      return { sdkPermissionMode: "bypassPermissions", decisionMode: "full", allowDangerouslySkipPermissions: true };
+      return { sdkPermissionMode: "bypassPermissions", decisionMode: "full" };
     case "untrusted":
     case "on-failure":
     case "on-request":
     default:
-      return { sdkPermissionMode: "default", decisionMode: "ask", allowDangerouslySkipPermissions: false };
+      return { sdkPermissionMode: "default", decisionMode: "ask" };
   }
 }
 
@@ -836,6 +834,8 @@ function createQueryContext(id, approvalPolicy = null, planMode = false) {
     approvalPolicy: normalizedApprovalPolicy,
     // 当前查询是否处于计划模式，影响非完全自主策略的 SDK 权限模式。
     planMode: normalizedPlanMode,
+    // 当前查询的工作目录、写入根、沙箱与网络权限，供每次工具回调读取。
+    permissionRuntime: null,
     // 当前查询每次工具调用读取的可变权限决策状态。
     permissionOptions: resolveClaudeSdkPermissionOptions(
       normalizedApprovalPolicy,
@@ -1544,16 +1544,14 @@ function emitToolOutputChunks(id, actionId, output) {
 }
 
 /** 为 Claude SDK 构建权限回调，每次工具调用读取查询当前权限状态。 */
-function buildPermissionHandler({
-  context,
-  cwd,
-  writableRoots,
-  sandboxMode,
-  allowNetwork,
-}) {
-  const normalizedRoots = writableRoots.map((root) => path.resolve(root));
-
+function buildPermissionHandler({ context }) {
   return async (toolName, input, options) => {
+    // 每个工具调用都读取当前轮写入的权限状态，不闭包捕获初始轮次的访问范围。
+    const permissionRuntime = context.permissionRuntime;
+    if (!permissionRuntime) {
+      throw new Error("Claude permission runtime state is unavailable.");
+    }
+    const { cwd, writableRoots, sandboxMode, allowNetwork } = permissionRuntime;
     const toolInput = input ?? {};
     const toolUseId = options?.toolUseID;
     const agentId = options?.agentID;
@@ -1620,7 +1618,7 @@ function buildPermissionHandler({
         return permission;
       }
 
-      if (!candidatePaths.every((candidate) => isWithinAnyRoot(normalizedRoots, candidate))) {
+      if (!candidatePaths.every((candidate) => isWithinAnyRoot(writableRoots, candidate))) {
         const permission = {
           behavior: "deny",
           message: "This file path is outside the approved writable roots for the thread.",
@@ -2764,6 +2762,17 @@ async function handleQuery(req, persistentSession = null) {
   try {
     const normalizedSandboxMode = normalizeSandboxMode(sandboxMode);
     const normalizedWritableRoots = normalizeWritableRoots(sessionCwd, writableRoots);
+    // 初始化当前轮权限运行状态，后续复用轮次会在 SDK 更新成功后整体替换此值。
+    context.permissionRuntime = {
+      // 当前 Claude 查询的工作目录，用于解析相对写入路径。
+      cwd: sessionCwd,
+      // 当前查询允许写入的标准化根目录。
+      writableRoots: normalizedWritableRoots,
+      // 当前查询的 Claude 沙箱模式。
+      sandboxMode: normalizedSandboxMode,
+      // 当前查询是否允许网络工具访问。
+      allowNetwork: Boolean(allowNetwork),
+    };
     // 旧实现保留迁移留痕：统一 Gateway 接替进程内自定义工具服务器。
     // const auracoderComputerControlServer = createAuraCoderComputerControlServer(
     //   context,
@@ -2829,18 +2838,11 @@ async function handleQuery(req, persistentSession = null) {
         normalizedWritableRoots,
       ),
       permissionMode: permissionOptions.sdkPermissionMode,
-      ...(permissionOptions.allowDangerouslySkipPermissions
-        ? { allowDangerouslySkipPermissions: true }
-        : {}),
+      // 允许后续复用轮次切换原生权限模式，当前 permissionMode 仍由本轮 B 决定。
+      allowDangerouslySkipPermissions: true,
       allowedTools: automaticallyAllowedTools,
       ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
-      canUseTool: buildPermissionHandler({
-        context,
-        cwd: sessionCwd,
-        writableRoots: normalizedWritableRoots,
-        sandboxMode: normalizedSandboxMode,
-        allowNetwork: Boolean(allowNetwork),
-      }),
+      canUseTool: buildPermissionHandler({ context }),
       settingSources: Array.isArray(settingSources)
         ? settingSources.filter((source) => ["user", "project", "local"].includes(source))
         : ["user", "project"],
@@ -2861,8 +2863,11 @@ async function handleQuery(req, persistentSession = null) {
           ? {}
           : {
               network: {
+                // 空白名单禁止沙箱中的网络域名访问。
                 allowedDomains: [],
+                // 限制沙箱进程创建本地网络绑定。
                 allowLocalBinding: false,
+                // 限制沙箱进程访问 Unix socket。
                 allowUnixSockets: [],
               },
             }),
@@ -4023,6 +4028,7 @@ async function createPersistentSessionHandle(req) {
   }
 }
 
+/** 更新持久 Claude 查询的当次权限设置，再将新消息送入复用输入流。 */
 async function sendPersistentSessionMessage(req) {
   const { id, params = {} } = req;
   const threadId = typeof params.threadId === "string" ? params.threadId.trim() : "";
@@ -4048,6 +4054,32 @@ async function sendPersistentSessionMessage(req) {
 
   try {
     const sessionCwd = params.cwd || process.cwd();
+    // 复用请求必须携带完整 Claude 原生权限，所有字段只取当前 params。
+    if (!["dontAsk", "default", "acceptEdits", "bypassPermissions"].includes(params.approvalPolicy)) {
+      throw new Error("Claude persistent session approvalPolicy must be a native permission mode.");
+    }
+    if (typeof params.sandboxMode !== "string" || !params.sandboxMode.trim()) {
+      throw new Error("Claude persistent session sandboxMode must be provided.");
+    }
+    if (typeof params.allowNetwork !== "boolean") {
+      throw new Error("Claude persistent session allowNetwork must be a boolean.");
+    }
+    const nextSandboxMode = normalizeSandboxMode(params.sandboxMode);
+    const nextWritableRoots = normalizeWritableRoots(sessionCwd, params.writableRoots);
+    const nextPermissionOptions = resolveClaudeSdkPermissionOptions(
+      params.approvalPolicy,
+      params.planMode,
+    );
+    const nextRuntime = {
+      // 当前轮请求的工作目录，用于解析相对写入路径。
+      cwd: sessionCwd,
+      // 当前轮请求的标准化写入根目录。
+      writableRoots: nextWritableRoots,
+      // 当前轮请求的 Claude 沙箱模式。
+      sandboxMode: nextSandboxMode,
+      // 当前轮请求是否允许网络访问。
+      allowNetwork: params.allowNetwork,
+    };
     const input = buildPromptInput(
       params.prompt,
       params.attachments || [],
@@ -4064,7 +4096,50 @@ async function sendPersistentSessionMessage(req) {
     const nextReasoningEffort = typeof params.reasoningEffort === "string" && params.reasoningEffort.trim()
       ? params.reasoningEffort.trim()
       : null;
-    await entry.query.applyFlagSettings({ effortLevel: nextReasoningEffort });
+    await entry.query.applyFlagSettings({
+      // 同步当前模型对应的思考强度设置。
+      effortLevel: nextReasoningEffort,
+      // 同步 SDK 当前轮的原生默认权限模式和非 full 的 bypass 限制。
+      permissions: {
+        // 当前轮 B 转换得到的 SDK 原生权限模式。
+        defaultMode: nextPermissionOptions.sdkPermissionMode,
+        // 非 full 权限时禁止会话切换到 bypass 模式。
+        ...(nextPermissionOptions.decisionMode === "full"
+          ? {}
+          : { disableBypassPermissionsMode: "disable" }),
+      },
+      // 应用完整 sandbox 对象；允许网络时省略旧 allowlist，清除上一轮网络限制。
+      sandbox: {
+        // 完全访问模式关闭 Claude 沙箱，其余模式启用沙箱。
+        enabled: nextSandboxMode !== "danger-full-access",
+        // 仅非 Windows 平台在沙箱不可用时使查询失败。
+        failIfUnavailable: process.platform !== "win32",
+        // 沙箱启用时自动允许 Bash 命令。
+        autoAllowBashIfSandboxed: true,
+        // 禁止命令请求绕过沙箱运行。
+        allowUnsandboxedCommands: false,
+        filesystem: {
+          // 仅 workspace-write 模式开放当前轮指定的写入目录。
+          allowWrite: allowWriteRootsForSandbox(nextSandboxMode, nextWritableRoots),
+        },
+        ...(params.allowNetwork
+          ? {}
+          : {
+              network: {
+                allowedDomains: [],
+                allowLocalBinding: false,
+                allowUnixSockets: [],
+              },
+            }),
+      },
+    });
+    await entry.query.setPermissionMode(nextPermissionOptions.sdkPermissionMode);
+
+    // 只有 SDK 原生权限切换成功后才让回调读取新轮次状态。
+    entry.context.approvalPolicy = params.approvalPolicy;
+    entry.context.planMode = params.planMode === true;
+    entry.context.permissionOptions = nextPermissionOptions;
+    entry.context.permissionRuntime = nextRuntime;
 
     // 新逻辑轮次重新开始展示，清除上一轮保留的终态任务行。
     entry.context.backgroundTaskDisplay.clear();

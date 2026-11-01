@@ -2364,6 +2364,7 @@ impl Engine for ClaudeSidecarEngine {
         }
     }
 
+    /// 创建本机 Claude 会话配置，并仅缓存非权限运行参数。
     async fn start_thread(
         &self,
         scope: ThreadScope,
@@ -2381,6 +2382,22 @@ impl Engine for ClaudeSidecarEngine {
                 .or_else(|| resume_engine_thread_id.map(ToOwned::to_owned))
         };
 
+        // 线程运行配置只保留非权限参数，权限值由每轮请求的 TurnInput 提供。
+        let sandbox = SandboxPolicy {
+            // 审批模式仅在当次查询请求中传递。
+            approval_policy: None,
+            // Claude 不缓存通用权限画像。
+            permission_profile: None,
+            // Claude 不缓存通用审批 reviewer。
+            approvals_reviewer: None,
+            // 网络权限仅从当次查询请求读取。
+            allow_network: false,
+            // Claude 不缓存通用 MCP 自动批准配置。
+            auto_approve_mcp_elicitations: false,
+            // 沙箱模式仅在当次查询请求中传递。
+            sandbox_mode: None,
+            ..sandbox
+        };
         let config = ThreadConfig {
             scope,
             model_id: model.to_string(),
@@ -2415,6 +2432,7 @@ impl Engine for ClaudeSidecarEngine {
             .filter(|session_id| !session_id.trim().is_empty()))
     }
 
+    /// 将当次消息和权限发送到本机 Claude sidecar 查询。
     async fn send_message(
         &self,
         engine_thread_id: &str,
@@ -2498,7 +2516,23 @@ impl Engine for ClaudeSidecarEngine {
             attachments,
             plan_mode,
             input_items,
+            permissions,
         } = input;
+        // 每次查询都要求调用方提供完整 B，避免从已清空的线程配置回退读取权限。
+        let permissions = permissions.context("Claude 请求缺少当次权限配置")?;
+        anyhow::ensure!(permissions.is_object(), "Claude 当次权限配置必须是对象");
+        let permission_mode = permissions
+            .get("permissionMode")
+            .and_then(serde_json::Value::as_str)
+            .context("Claude 当次权限配置缺少 permissionMode")?;
+        let sandbox_mode = permissions
+            .get("sandboxMode")
+            .and_then(serde_json::Value::as_str)
+            .context("Claude 当次权限配置缺少 sandboxMode")?;
+        let allow_network = permissions
+            .get("allowNetwork")
+            .and_then(serde_json::Value::as_bool)
+            .context("Claude 当次权限配置缺少 allowNetwork")?;
         let prompt = build_claude_prompt(&message, &input_items);
         let manual_stop = MANUAL_STOP.load(Ordering::SeqCst);
 
@@ -2517,15 +2551,10 @@ impl Engine for ClaudeSidecarEngine {
                 .collect::<Vec<_>>(),
             "cwd": cwd,
             "model": thread_config.model_id,
-            "approvalPolicy": thread_config
-                .sandbox
-                .approval_policy
-                .as_ref()
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            "allowNetwork": thread_config.sandbox.allow_network,
+            "approvalPolicy": permission_mode,
+            "allowNetwork": allow_network,
             "writableRoots": thread_config.sandbox.writable_roots.clone(),
-            "sandboxMode": thread_config.sandbox.sandbox_mode.clone(),
+            "sandboxMode": sandbox_mode,
             "reasoningEffort": thread_config.sandbox.reasoning_effort.clone(),
             "planMode": plan_mode,
             "manualStop": manual_stop,

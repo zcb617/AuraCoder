@@ -21,16 +21,13 @@ use uuid::Uuid;
 use crate::common::MANUAL_STOP;
 use crate::{
     cli_tools::{
-        factory::CliToolFactory, CliExecutionContext, CliLocationKind, CliRuntimePermissions,
-        CliTool,
+        factory::CliToolFactory, CliExecutionContext, CliLocationKind, CliTool,
     },
-    commands::threads::migrate_legacy_codex_on_failure_thread_metadata,
     db,
     engines::{
         approval_response_route_for_engine,
         normalize_approval_response_for_engine,
         trim_action_output_delta_content,
-        validate_engine_sandbox_mode,
         ActionResult,
         ApprovalRequestRoute,
         BrowserAnnotationMetadata,
@@ -50,9 +47,10 @@ use crate::{
     models::{
         ActionOutputDto, EngineInfoDto, EngineModelDto, MessageDto, MessageStatusDto,
         MessageWindowCursorDto, MessageWindowDto, PermissionComponentJson, SearchResultDto,
-        SteerReceiptDto, ThreadDto, ThreadStatusDto, ThreadUpdateDto, TrustLevelDto,
+        SteerReceiptDto, ThreadDto, ThreadStatusDto, ThreadUpdateDto,
     },
     runtime_env,
+    services::thread_service::ThreadService,
     ssh::remote_attachments::{self, RemoteAttachmentBatch},
     state::AppState,
 };
@@ -952,9 +950,7 @@ pub(crate) struct SendMessageRequest {
     pub send_method: Option<String>,
     /// 本轮选中的思考强度，并持久化到线程运行配置。
     pub reasoning_effort: Option<String>,
-    /// 前端传入的 CLI 原始权限 JSON；没有统一权限组件时作为持久化兜底。
-    pub permission_mode_json: Option<String>,
-    /// 前端本轮选中的统一权限组件，发送前由当前 CLI 转换并持久化。
+    /// 本轮选中的统一权限对象 A；发送前由数据库保存，并由当前 CLI 在内部解析。
     pub permission_values: Option<PermissionComponentJson>,
     /// 本轮需要交给 CLI 的文件附件。
     pub attachments: Option<Vec<ChatAttachmentPayload>>,
@@ -974,6 +970,7 @@ pub(crate) struct ChatMessageService<'a> {
     state: &'a AppState,
 }
 
+/// 提交用户消息、保存当前统一权限对象 A，并启动对应 CLI 的一轮发送。
 #[tauri::command]
 pub async fn send_message(
     app: tauri::AppHandle,
@@ -991,7 +988,7 @@ impl<'a> ChatMessageService<'a> {
         Self { state }
     }
 
-    /// 执行一次消息发送：先保存本轮线程配置和权限，再使用本次请求继续当前 CLI 会话。
+    /// 执行一次消息发送：保存本轮线程配置和统一权限对象 A，再继续当前 CLI 会话。
     pub(crate) async fn send_message(
         &self,
         app: tauri::AppHandle,
@@ -1006,7 +1003,6 @@ impl<'a> ChatMessageService<'a> {
         plan_mode,
         send_method,
         reasoning_effort,
-        permission_mode_json,
         permission_values,
         attachments,
         input_items,
@@ -1029,7 +1025,6 @@ impl<'a> ChatMessageService<'a> {
     })
     .await?
     .ok_or_else(|| format!("thread not found: {thread_id}"))?;
-    migrate_legacy_codex_on_failure_thread_metadata(state, &mut thread).await;
 
     // 保存前保留原模型，用于后续判断本轮是否发生模型切换；发送始终使用本次请求确定的配置。
     let original_thread_model_id = thread.model_id.clone();
@@ -1048,7 +1043,14 @@ impl<'a> ChatMessageService<'a> {
     let selected_plan_mode = plan_mode.unwrap_or(false);
     let selection_send_method = send_method.clone();
     let selection_reasoning_effort = reasoning_effort.clone();
-    let selection_permission_mode_json = permission_mode_json.clone();
+    // 保存本次发送携带的统一权限对象 A，未传时继续使用线程当前对象。
+    if let Some(values) = permission_values {
+        let permission_thread_id = thread.id.clone();
+        thread = ThreadService::new(state.clone())
+            .save_permissions(&permission_thread_id, values)
+            .await
+            .map_err(err_to_string)?;
+    }
     thread = run_db(db.clone(), {
         let thread_id = thread.id.clone();
         let engine_id = selected_engine_id.clone();
@@ -1062,7 +1064,7 @@ impl<'a> ChatMessageService<'a> {
                 Some(selected_plan_mode),
                 selection_send_method.as_deref(),
                 selection_reasoning_effort.as_deref(),
-                selection_permission_mode_json.as_deref(),
+                None,
             )
         }
     })
@@ -1107,12 +1109,6 @@ impl<'a> ChatMessageService<'a> {
         });
     }
     // SSH 附件必须在模型校验和远端线程准备完成后上传，再使用远端路径构造 TurnInput。
-    // let turn_input = TurnInput {
-    //     message: engine_message,
-    //     attachments: attachments.clone(),
-    //     plan_mode,
-    //     input_items: engine_input_items,
-    // };
     let current_turn_model_id = original_thread_model_id.clone();
     let model_switch_requested = requested_model_id
         .map(|value| value != current_turn_model_id.as_str())
@@ -1183,50 +1179,6 @@ impl<'a> ChatMessageService<'a> {
     } else {
         None
     };
-
-    // 发送路径只保存线程权限，不向已经运行的 CLI session 发送权限更新协议。
-    if let Some(values) = permission_values.clone() {
-        thread = if let (Some(codex), Some(context)) =
-            (codex_cli.as_ref(), codex_context.as_ref())
-        {
-            let cli: &dyn CliTool = codex.as_ref();
-            cli.save_permissions_for_send(context, &thread, values)
-                .await
-                .map_err(err_to_string)?
-        } else if let (Some(opencode), Some(context)) =
-            (opencode_cli.as_ref(), opencode_context.as_ref())
-        {
-            let cli: &dyn CliTool = opencode.as_ref();
-            cli.save_permissions_for_send(context, &thread, values)
-                .await
-                .map_err(err_to_string)?
-        } else if let (Some(claude), Some(context)) =
-            (claude_cli.as_ref(), claude_context.as_ref())
-        {
-            let cli: &dyn CliTool = claude.as_ref();
-            cli.save_permissions_for_send(context, &thread, values)
-                .await
-                .map_err(err_to_string)?
-        } else {
-            return Err(format!("当前 CLI {} 不支持发送前权限持久化", thread.engine_id));
-        };
-    } else if let Some(raw_permission_mode) = permission_mode_json
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        // 没有统一权限组件时，保留调用方传入的原始权限 JSON。
-        let thread_id_for_permission = thread.id.clone();
-        let raw_permission_mode = raw_permission_mode.to_string();
-        thread = run_db(db.clone(), move |db| {
-            db::threads::update_thread_permissions(
-                db,
-                &thread_id_for_permission,
-                Some(&raw_permission_mode),
-            )
-        })
-        .await?;
-    }
 
     let remote_engine_catalog = if execution_workspace.location_kind == "ssh" {
         // 阶段计划 3 在这里拒绝所有本机附件；阶段计划 4 改为模型校验后统一上传。
@@ -1372,98 +1324,10 @@ impl<'a> ChatMessageService<'a> {
     } else {
         configured_reasoning_effort.clone()
     };
-    let (cli_permissions, auto_approve_mcp_elicitations) = if let (Some(codex), Some(context)) =
-        (codex_cli.as_ref(), codex_context.as_ref())
-    {
-        let cli: &dyn CliTool = codex.as_ref();
-        let permissions = cli
-            .runtime_permissions(context, &thread)
-            .await
-            .map_err(err_to_string)?;
-        let auto_approve_mcp_elicitations = cli
-            .auto_approve_mcp_elicitations(context, &thread)
-            .await
-            .map_err(err_to_string)?;
-        (permissions, auto_approve_mcp_elicitations)
-    } else if let (Some(opencode), Some(context)) =
-        (opencode_cli.as_ref(), opencode_context.as_ref())
-    {
-        let cli: &dyn CliTool = opencode.as_ref();
-        let permissions = cli
-            .runtime_permissions(context, &thread)
-            .await
-            .map_err(err_to_string)?;
-        let auto_approve_mcp_elicitations = cli
-            .auto_approve_mcp_elicitations(context, &thread)
-            .await
-            .map_err(err_to_string)?;
-        (permissions, auto_approve_mcp_elicitations)
-    } else if let (Some(claude), Some(context)) = (claude_cli.as_ref(), claude_context.as_ref()) {
-        let cli: &dyn CliTool = claude.as_ref();
-        let permissions = cli
-            .runtime_permissions(context, &thread)
-            .await
-            .map_err(err_to_string)?;
-        let auto_approve_mcp_elicitations = cli
-            .auto_approve_mcp_elicitations(context, &thread)
-            .await
-            .map_err(err_to_string)?;
-        (permissions, auto_approve_mcp_elicitations)
-    } else {
-        (CliRuntimePermissions::default(), false)
-    };
-    let sandbox_mode_override = cli_permissions.sandbox_mode.clone();
-    let supports_auracoder_sandbox = thread.engine_id != "opencode";
-    let sandbox_mode = if supports_auracoder_sandbox {
-        Some(
-            sandbox_mode_override
-                .clone()
-                .unwrap_or_else(|| "workspace-write".to_string()),
-        )
-    } else {
-        if sandbox_mode_override.is_some() {
-            log::warn!(
-                "ignoring sandbox mode override on OpenCode thread {}",
-                thread.id
-            );
-        }
-        None
-    };
     let scope = ThreadScope::Project {
         root_path: workspace_root.clone(),
         writable_roots: vec![workspace_root.clone()],
     };
-
-    let trust_level = workspace.trust_level.clone();
-    let codex_external_sandbox_active =
-        if let (Some(codex), Some(context)) = (codex_cli.as_ref(), codex_context.as_ref()) {
-            let cli: &dyn CliTool = codex.as_ref();
-            cli.uses_external_sandbox(context)
-                .await
-                .map_err(err_to_string)?
-        } else {
-            false
-        };
-    let permission_profile = if thread.engine_id == "codex" {
-        cli_permissions.permission_profile.clone()
-    } else {
-        None
-    };
-
-    if permission_profile.is_none() {
-        if let Some(sandbox_mode) = sandbox_mode.as_deref() {
-            if unsupported_thread_sandbox_override_for_external_sandbox(
-                sandbox_mode_override.as_deref(),
-                codex_external_sandbox_active,
-            ) {
-                return Err(
-                "Codex read-only and workspace-write sandbox overrides are unavailable while AuraCoder is using external sandbox mode. Clear the override or restore local Codex sandboxing first.".to_string(),
-            );
-            }
-
-            validate_engine_sandbox_mode(thread.engine_id.as_str(), Some(sandbox_mode))?;
-        }
-    }
 
     if requested_model_id.is_some() || reasoning_effort != stored_reasoning_effort {
         let update = ThreadUpdateDto {
@@ -1491,15 +1355,6 @@ impl<'a> ChatMessageService<'a> {
         }
     };
 
-    let allow_network = if (thread.engine_id == "codex" || thread.engine_id == "claude")
-        && sandbox_mode.as_deref() == Some("danger-full-access")
-    {
-        true
-    } else {
-        cli_permissions
-            .allow_network
-            .unwrap_or_else(|| allow_network_for_trust_level(&trust_level))
-    };
     let model_supports_selected_personality = if execution_workspace.location_kind == "ssh" {
         validation_catalog
             .as_deref()
@@ -1522,26 +1377,16 @@ impl<'a> ChatMessageService<'a> {
         None
     };
 
-    let approval_policy_override = cli_permissions.approval_policy.clone();
-
+    // 公共层只传工作区和非权限上下文，权限字段由具体 CLI 根据线程 A 处理。
     let sandbox = SandboxPolicy {
         writable_roots,
-        allow_network,
-        auto_approve_mcp_elicitations,
-        approval_policy: Some(approval_policy_override.unwrap_or_else(|| {
-            Value::String(
-                approval_policy_for_engine_and_trust_level(thread.engine_id.as_str(), &trust_level)
-                    .to_string(),
-            )
-        })),
-        permission_profile,
-        approvals_reviewer: if thread.engine_id == "codex" {
-            cli_permissions.approvals_reviewer.clone()
-        } else {
-            None
-        },
+        allow_network: false,
+        auto_approve_mcp_elicitations: false,
+        approval_policy: None,
+        permission_profile: None,
+        approvals_reviewer: None,
         reasoning_effort: reasoning_effort.clone(),
-        sandbox_mode,
+        sandbox_mode: None,
         service_tier: thread_service_tier(thread.engine_metadata.as_ref()),
         personality,
         output_schema: thread_output_schema(thread.engine_metadata.as_ref()),
@@ -1590,11 +1435,7 @@ impl<'a> ChatMessageService<'a> {
         .await
         .map_err(err_to_string)?
     } else {
-        state
-            .engines
-            .ensure_engine_thread(&thread, Some(effective_model_id.as_str()), scope, sandbox)
-            .await
-            .map_err(err_to_string)?
+        return Err(format!("当前 CLI {} 未接入统一发送实现", thread.engine_id));
     };
     let runtime_thread_id = engine_thread.runtime_thread_id.clone();
 
@@ -1661,6 +1502,7 @@ impl<'a> ChatMessageService<'a> {
         attachments: attachments.clone(),
         plan_mode,
         input_items: engine_input_items,
+        permissions: None,
     };
 
     let cancellation = CancellationToken::new();
@@ -1941,6 +1783,7 @@ pub async fn start_codex_review(
     Ok(review_thread)
 }
 
+/// 向活动中的 Codex 线程追加消息，并保存本次携带的统一权限对象 A。
 #[tauri::command]
 pub async fn steer_message(
     state: State<'_, AppState>,
@@ -1949,6 +1792,7 @@ pub async fn steer_message(
     attachments: Option<Vec<ChatAttachmentPayload>>,
     input_items: Option<Vec<ChatInputItemPayload>>,
     plan_mode: Option<bool>,
+    permission_values: Option<PermissionComponentJson>,
     client_steer_id: String,
     referenced_thread_id: Option<String>,
 ) -> Result<SteerReceiptDto, String> {
@@ -1973,7 +1817,7 @@ pub async fn steer_message(
     }
 
     let db = state.db.clone();
-    let thread = run_db(db.clone(), {
+    let mut thread = run_db(db.clone(), {
         let thread_id = thread_id.clone();
         move |db| db::threads::get_thread(db, &thread_id)
     })
@@ -1982,6 +1826,15 @@ pub async fn steer_message(
 
     if thread.engine_id != "codex" {
         return Err("Mid-turn steering is only available for Codex threads.".to_string());
+    }
+
+    // 保存 steer 请求中的统一权限对象 A；未传时沿用数据库当前对象。
+    if let Some(values) = permission_values {
+        let permission_thread_id = thread.id.clone();
+        thread = ThreadService::new(state.inner().clone())
+            .save_permissions(&permission_thread_id, values)
+            .await
+            .map_err(err_to_string)?;
     }
     let workspace = run_db(db.clone(), {
         let workspace_id = thread.workspace_id.clone();
@@ -2050,6 +1903,7 @@ pub async fn steer_message(
         attachments: attachments.clone(),
         plan_mode,
         input_items: engine_input_items,
+        permissions: None,
     };
     let effective_model_id = thread.model_id.clone();
     let reasoning_effort = thread.reasoning_effort.clone();
@@ -3168,7 +3022,6 @@ async fn run_turn(
     let (event_tx, mut event_rx) = mpsc::channel::<EngineEvent>(ENGINE_EVENT_QUEUE_CAPACITY);
 
     let db = state.db.clone();
-    let engines = state.engines.clone();
     let thread_for_engine = thread.clone();
     let input_for_engine = turn_input.clone();
     let engine_thread_for_engine = engine_thread_id.clone();
@@ -3176,7 +3029,6 @@ async fn run_turn(
     let cancellation_for_engine = engine_cancellation.clone();
     let cli_turn = codex_cli.or(opencode_cli).or(claude_cli);
     let cli_turn_for_engine = cli_turn.clone();
-    // let engines_for_engine = engines.clone();
     let assistant_message_id_for_engine = assistant_message_id.clone();
 
     let mut engine_task = tokio::spawn(async move {
@@ -3236,46 +3088,6 @@ async fn run_turn(
         } else {
             anyhow::bail!("当前 CLI 发送实例未准备完成")
         }
-        /*else {
-            let send_result = engines_for_engine
-                .send_message(
-                    &thread_for_engine,
-                    &engine_thread_for_engine,
-                    input_for_engine,
-                    event_tx,
-                    cancellation_for_engine,
-                )
-                .await;
-
-             * 旧 Engine 兼容入口的异常收尾同样移到 run_turn，发送任务只返回 Result。
-            if let Err(send_error) = send_result {
-                log::error!(
-                    "chat turn failed: engine_id={}, thread_id={}, engine_thread_id={}, error={send_error:#}",
-                    thread_for_engine.engine_id,
-                    thread_for_engine.id,
-                    engine_thread_for_engine,
-                );
-                return match engines_for_engine.interrupt(&thread_for_engine).await {
-                    Ok(()) => Err(anyhow::anyhow!(
-                        "本轮对话执行失败，远端执行已取消：{send_error:#}"
-                    )),
-                    Err(interrupt_error) => {
-                        log::error!(
-                            "failed to interrupt chat turn after execution error: engine_id={}, thread_id={}, engine_thread_id={}, error={interrupt_error:#}",
-                            thread_for_engine.engine_id,
-                            thread_for_engine.id,
-                            engine_thread_for_engine,
-                        );
-                        Err(anyhow::anyhow!(
-                            "本轮对话执行失败，并且取消远端执行失败。执行错误：{send_error:#}；取消错误：{interrupt_error:#}"
-                        ))
-                    }
-                };
-            }
-            Ok(())
-
-            send_result
-        }*/
     });
 
     let mut blocks: Vec<ContentBlock> = Vec::new();
@@ -4485,7 +4297,7 @@ async fn run_turn(
                 if let Some((cli, context)) = cli_turn.as_ref() {
                     cli.interrupt(context, &thread, &engine_thread_id).await
                 } else {
-                    engines.interrupt(&thread).await
+                    Err(anyhow::anyhow!("当前线程未关联 CLI 执行上下文"))
                 }
             })
             .await
@@ -4776,7 +4588,7 @@ async fn run_turn(
                 if let Some((cli, context)) = cli_turn.as_ref() {
                     cli.interrupt(context, &thread, &engine_thread_id).await
                 } else {
-                    engines.interrupt(&thread).await
+                    Err(anyhow::anyhow!("当前线程未关联 CLI 执行上下文"))
                 }
             })
             .await
@@ -4969,9 +4781,7 @@ async fn run_turn(
         cli.current_external_engine_thread_id(context, &thread, &engine_thread_id)
             .await
     } else {
-        engines
-            .current_external_engine_thread_id(&thread, &engine_thread_id)
-            .await
+        Err(anyhow::anyhow!("当前线程未关联 CLI 执行上下文"))
     };
     match external_engine_thread_id_result {
         Ok(Some(external_engine_thread_id)) if !external_engine_thread_id.trim().is_empty() => {
@@ -8367,56 +8177,6 @@ fn truncate_action_result_output(
     }
 }
 
-fn approval_policy_for_engine_and_trust_level(
-    engine_id: &str,
-    trust_level: &TrustLevelDto,
-) -> &'static str {
-    match engine_id {
-        "claude" => match trust_level {
-            TrustLevelDto::Trusted => "trusted",
-            TrustLevelDto::Standard => "standard",
-            TrustLevelDto::Restricted => "restricted",
-        },
-        "opencode" => match trust_level {
-            TrustLevelDto::Trusted | TrustLevelDto::Standard => "ask",
-            TrustLevelDto::Restricted => "deny",
-        },
-        _ => match trust_level {
-            TrustLevelDto::Trusted => "on-request",
-            TrustLevelDto::Standard => "on-request",
-            TrustLevelDto::Restricted => "untrusted",
-        },
-    }
-}
-
-fn allow_network_for_trust_level(trust_level: &TrustLevelDto) -> bool {
-    matches!(trust_level, TrustLevelDto::Trusted)
-}
-
-fn thread_approval_policy_override_value(
-    _engine_id: &str,
-    _metadata: Option<&Value>,
-) -> Result<Option<Value>, String> {
-    // 旧 metadata 适配入口保留；运行代码改由 CliTool::runtime_permissions 提供。
-    Ok(None)
-}
-
-fn thread_allow_network_override(_metadata: Option<&Value>) -> Option<bool> {
-    None
-}
-
-fn thread_sandbox_mode(_metadata: Option<&Value>) -> Result<Option<String>, String> {
-    // 旧 metadata 适配入口保留；运行代码改由 CliTool::runtime_permissions 提供。
-    Ok(None)
-}
-
-fn unsupported_thread_sandbox_override_for_external_sandbox(
-    sandbox_mode: Option<&str>,
-    external_sandbox_active: bool,
-) -> bool {
-    external_sandbox_active && matches!(sandbox_mode, Some("read-only" | "workspace-write"))
-}
-
 fn thread_reasoning_effort(_metadata: Option<&Value>) -> Option<String> {
     // 旧 metadata 读取入口保留，运行代码改由 ThreadDto.reasoning_effort 提供。
     None
@@ -8449,14 +8209,6 @@ fn thread_output_schema(metadata: Option<&Value>) -> Option<Value> {
     metadata
         .and_then(|value| value.get("outputSchema"))
         .cloned()
-}
-
-fn thread_permission_profile(_metadata: Option<&Value>) -> Option<Value> {
-    None
-}
-
-fn thread_approvals_reviewer(_metadata: Option<&Value>) -> Option<String> {
-    None
 }
 
 fn thread_opencode_agent(metadata: Option<&Value>) -> Option<String> {
@@ -8532,58 +8284,6 @@ fn resolve_reasoning_effort_from_catalog(
     };
 
     resolve_reasoning_effort_for_model(model, normalized_requested.as_deref())
-}
-
-fn normalize_codex_approval_policy_value(value: &Value) -> Result<Value, String> {
-    match value {
-        Value::String(raw) => {
-            let normalized = raw.trim().to_lowercase();
-            let normalized = normalized.as_str();
-            if matches!(normalized, "untrusted" | "on-request" | "never") {
-                Ok(Value::String(normalized.to_string()))
-            } else if normalized == "on-failure" {
-                Ok(Value::String("on-request".to_string()))
-            } else {
-                Err(format!(
-                    "invalid approval policy `{normalized}`. expected one of: untrusted, on-request, never"
-                ))
-            }
-        }
-        Value::Object(object) => {
-            let reject = object
-                .get("reject")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    "invalid structured approval policy. expected a `reject` object".to_string()
-                })?;
-
-            for required_key in ["mcp_elicitations", "rules", "sandbox_approval"] {
-                if !reject.get(required_key).and_then(Value::as_bool).is_some() {
-                    return Err(format!(
-                        "invalid structured approval policy. missing boolean reject.{required_key}"
-                    ));
-                }
-            }
-
-            if reject.contains_key("request_permissions")
-                && reject
-                    .get("request_permissions")
-                    .and_then(Value::as_bool)
-                    .is_none()
-            {
-                return Err(
-                    "invalid structured approval policy. reject.request_permissions must be a boolean"
-                        .to_string(),
-                );
-            }
-
-            Ok(Value::Object(object.clone()))
-        }
-        _ => Err(
-            "invalid approval policy. expected a string mode or structured reject object"
-                .to_string(),
-        ),
-    }
 }
 
 #[cfg(test)]
@@ -8908,13 +8608,6 @@ mod tests {
     }
 
     #[test]
-    fn external_sandbox_allows_default_workspace_write_mode() {
-        assert!(!unsupported_thread_sandbox_override_for_external_sandbox(
-            None, true,
-        ));
-    }
-
-    #[test]
     fn normalize_input_items_merges_adjacent_text_and_preserves_typed_items() {
         let normalized = normalize_input_items(
             "fallback",
@@ -9070,117 +8763,6 @@ mod tests {
         .expect_err("non-empty message text requires a text segment");
 
         assert!(error.contains("input items must include at least one text segment"));
-    }
-
-    #[test]
-    fn external_sandbox_blocks_explicit_workspace_write_override() {
-        assert!(unsupported_thread_sandbox_override_for_external_sandbox(
-            Some("workspace-write"),
-            true,
-        ));
-        assert!(unsupported_thread_sandbox_override_for_external_sandbox(
-            Some("read-only"),
-            true,
-        ));
-        assert!(!unsupported_thread_sandbox_override_for_external_sandbox(
-            Some("danger-full-access"),
-            true,
-        ));
-    }
-
-    #[test]
-    fn claude_defaults_follow_trust_level_directly() {
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Trusted),
-            "trusted"
-        );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Standard),
-            "standard"
-        );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("claude", &TrustLevelDto::Restricted),
-            "restricted"
-        );
-    }
-
-    #[test]
-    fn opencode_defaults_use_permission_modes_not_codex_sandbox_policies() {
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Trusted),
-            "ask"
-        );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Standard),
-            "ask"
-        );
-        assert_eq!(
-            approval_policy_for_engine_and_trust_level("opencode", &TrustLevelDto::Restricted),
-            "deny"
-        );
-    }
-
-    #[test]
-    fn claude_permission_mode_override_uses_claude_key() {
-        let metadata = serde_json::json!({
-            "claudePermissionMode": "restricted",
-            "sandboxApprovalPolicy": "never",
-        });
-
-        assert_eq!(
-            thread_approval_policy_override_value("claude", Some(&metadata)).unwrap(),
-            Some(Value::String("restricted".to_string()))
-        );
-        assert_eq!(
-            thread_approval_policy_override_value("codex", Some(&metadata)).unwrap(),
-            Some(Value::String("never".to_string()))
-        );
-    }
-
-    #[test]
-    fn opencode_permission_mode_override_uses_opencode_key() {
-        let metadata = serde_json::json!({
-            "opencodePermissionMode": "allow",
-            "sandboxApprovalPolicy": "never",
-        });
-
-        assert_eq!(
-            thread_approval_policy_override_value("opencode", Some(&metadata)).unwrap(),
-            Some(Value::String("allow".to_string()))
-        );
-        assert_eq!(
-            thread_approval_policy_override_value("codex", Some(&metadata)).unwrap(),
-            Some(Value::String("never".to_string()))
-        );
-    }
-
-    #[test]
-    fn legacy_codex_on_failure_override_is_migrated_before_thread_start() {
-        let metadata = serde_json::json!({
-            "sandboxApprovalPolicy": "on-failure",
-        });
-
-        assert_eq!(
-            thread_approval_policy_override_value("codex", Some(&metadata)).unwrap(),
-            Some(Value::String("on-request".to_string()))
-        );
-    }
-
-    #[test]
-    fn invalid_structured_codex_approval_policy_is_rejected() {
-        let metadata = serde_json::json!({
-            "sandboxApprovalPolicy": {
-                "reject": {
-                    "rules": true,
-                    "sandbox_approval": false
-                }
-            }
-        });
-
-        let error = thread_approval_policy_override_value("codex", Some(&metadata))
-            .expect_err("expected malformed structured approval policy to fail");
-
-        assert!(error.contains("reject.mcp_elicitations"));
     }
 
     #[test]

@@ -68,9 +68,7 @@ interface ChatState {
       remoteAttachmentUpload?: boolean;
       /** 发送方法（messageSendMode），发送时持久化到会话。 */
       sendMethod?: string | null;
-      /** 权限状态的整包 JSON，前端给什么写什么、读时整个取回。 */
-      permissionModeJson?: string | null;
-      /** 发送前保存的当前 CLI 统一权限组件数据。 */
+      /** 本轮发送使用的当前统一权限对象。 */
       permissionValues?: PermissionComponentJson;
       /** 发送时临时引用的 AuraCoder 会话 ID，不进入可见消息。 */
       referencedAuraCoderThreadId?: string | null;
@@ -83,6 +81,8 @@ interface ChatState {
       attachments?: ChatAttachment[];
       inputItems?: ChatInputItem[];
       planMode?: boolean;
+      /** steer 时携带当前统一权限对象。 */
+      permissionValues?: PermissionComponentJson;
       /** steer 时临时引用的 AuraCoder 会话 ID，不进入可见消息。 */
       referencedAuraCoderThreadId?: string | null;
     },
@@ -3000,7 +3000,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
         options?.referencedAuraCoderThreadId ?? null,
         options?.engineId ?? null,
         options?.sendMethod ?? null,
-        options?.permissionModeJson ?? null,
         options?.permissionValues ?? null,
       );
       set({ preparingEngineId: null, preparingAttachments: false });
@@ -3067,6 +3066,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         planMode,
         steerBlock.steerId,
         options?.referencedAuraCoderThreadId ?? null,
+        options?.permissionValues ?? null,
       );
       if (receipt.clientSteerId !== steerBlock.steerId) {
         throw new Error(

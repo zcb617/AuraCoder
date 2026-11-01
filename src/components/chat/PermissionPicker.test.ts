@@ -5,10 +5,6 @@ import {
   updatePermissionComponentValue,
   type PermissionPickerProps,
 } from "./PermissionPicker";
-import {
-  permissionSaveWaitAction,
-  shouldUpdateWorkspaceTrustLevel,
-} from "./ChatPanel";
 
 describe("PermissionPicker 统一 JSON 契约", () => {
   it("空权限数据补齐为六个数组参数并默认自动", () => {
@@ -66,23 +62,4 @@ describe("PermissionPicker 统一 JSON 契约", () => {
     void invalidProps;
   });
 
-  it("相同信任等级不更新，不同有效等级更新，automatic 和非法值不更新", () => {
-    expect(shouldUpdateWorkspaceTrustLevel("standard", "standard")).toBe(false);
-    expect(shouldUpdateWorkspaceTrustLevel("trusted", "standard")).toBe(true);
-    expect(shouldUpdateWorkspaceTrustLevel("restricted", "standard")).toBe(true);
-    expect(shouldUpdateWorkspaceTrustLevel("automatic", "standard")).toBe(false);
-    expect(shouldUpdateWorkspaceTrustLevel(null, "standard")).toBe(false);
-  });
-
-  it("权限保存失败且旧请求已清理时阻止发送", () => {
-    const pending = Promise.resolve(false);
-    expect(permissionSaveWaitAction(false, pending, undefined)).toBe("fail");
-  });
-
-  it("权限保存期间登记新请求时继续等待新请求", () => {
-    const pending = Promise.resolve(false);
-    const latest = Promise.resolve(true);
-    expect(permissionSaveWaitAction(false, pending, latest)).toBe("continue");
-    expect(permissionSaveWaitAction(true, latest, latest)).toBe("complete");
-  });
 });

@@ -11,8 +11,8 @@ use super::{
         shared_claude_code_session_handles, ClaudeCodeSessionHandleRegistry,
     },
     BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
-    CliReviewStarted, CliRuntimePermissionPatch, CliRuntimePermissions, CliSessionNotFoundError,
-    CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult, map_context_usage,
+    CliReviewStarted, CliSessionNotFoundError, CliSessionSnapshot, CliTool,
+    McpInvocationContext, McpToolResult, map_context_usage,
 };
 use crate::{
     config::app_config::ClaudeCodeSessionMode,
@@ -41,259 +41,11 @@ use crate::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionCatalogRefreshErrorDto, ExtensionItemDto,
-        OpenCodeRuntimeCatalogDto, PermissionComponentJson, ThreadDto, ThreadStatusDto,
-        WorkspaceDto,
+        OpenCodeRuntimeCatalogDto, ThreadDto, ThreadStatusDto, WorkspaceDto,
     },
     path_utils, remote_project_claude_runtime_service, ssh,
     state::AppState,
 };
-
-fn default_permission_component() -> PermissionComponentJson {
-    let mut values = HashMap::new();
-    for key in ["autonomyPreset", "trust", "approval", "sandbox", "network"] {
-        values.insert(key.to_string(), json!(["automatic"]));
-    }
-    values.insert("defaultForNewThreads".to_string(), json!([]));
-    values
-}
-
-fn set_permission_array(values: &mut PermissionComponentJson, key: &str, items: &[&str]) {
-    values.insert(
-        key.to_string(),
-        Value::Array(items.iter().map(|item| json!(item)).collect()),
-    );
-}
-
-fn set_or_remove(object: &mut serde_json::Map<String, Value>, key: &str, value: Option<Value>) {
-    if let Some(value) = value {
-        object.insert(key.to_string(), value);
-    } else {
-        object.remove(key);
-    }
-}
-
-fn permission_choice<'a>(
-    values: &'a PermissionComponentJson,
-    key: &str,
-) -> Result<Option<&'a str>> {
-    let value = values.get(key).context(format!("缺少权限参数: {key}"))?;
-    let array = value
-        .as_array()
-        .context(format!("权限参数必须是数组: {key}"))?;
-    Ok(array.first().and_then(Value::as_str))
-}
-
-fn validate_permission_component(values: &PermissionComponentJson) -> Result<()> {
-    let allowed = [
-        (
-            "autonomyPreset",
-            ["automatic", "read-only", "ask", "auto", "full"].as_slice(),
-        ),
-        (
-            "trust",
-            ["automatic", "trusted", "standard", "restricted"].as_slice(),
-        ),
-        (
-            "approval",
-            ["automatic", "restricted", "ask", "autonomous"].as_slice(),
-        ),
-        (
-            "sandbox",
-            ["automatic", "read-only", "workspace-write", "full-access"].as_slice(),
-        ),
-        ("network", ["automatic", "enabled", "restricted"].as_slice()),
-        (
-            "defaultForNewThreads",
-            ["automatic", "read-only", "ask", "auto", "full"].as_slice(),
-        ),
-    ];
-    for key in values.keys() {
-        anyhow::ensure!(
-            allowed.iter().any(|(name, _)| name == key),
-            "未知权限参数: {key}"
-        );
-    }
-    for (key, choices) in allowed {
-        let value = values.get(key).context(format!("缺少权限参数: {key}"))?;
-        let array = value
-            .as_array()
-            .context(format!("权限参数必须是数组: {key}"))?;
-        anyhow::ensure!(array.len() <= 1, "权限参数数组最多只能有一个值: {key}");
-        for item in array {
-            let item = item
-                .as_str()
-                .context(format!("权限参数值必须是字符串: {key}"))?;
-            anyhow::ensure!(choices.contains(&item), "权限参数值不支持: {key}={item}");
-        }
-    }
-    Ok(())
-}
-
-/// 将 Claude Code 的原始权限字段和兼容 metadata 转换为前端统一权限 JSON。
-///
-/// 该函数只负责数据适配，不访问 CLI 生命周期；本地和 SSH 读取路径都通过
-/// `get_permissions` 调用同一套转换逻辑。
-fn permissions_from_thread(thread: &ThreadDto) -> Result<PermissionComponentJson> {
-    let raw = thread.permission_mode.as_deref().unwrap_or("").trim();
-    let parsed = if raw.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_str::<Value>(raw).context("Claude 权限 JSON 格式错误")?
-    };
-    anyhow::ensure!(
-        parsed.is_null()
-            || parsed.is_object()
-            || parsed.as_array().is_some_and(|items| items.is_empty()),
-        "Claude 权限 JSON 必须是对象、null 或空数组"
-    );
-
-    let mut object = parsed.as_object().cloned().unwrap_or_default();
-    let mode = object
-        .get("permissionMode")
-        .or_else(|| object.get("approvalPolicy"))
-        .or_else(|| object.get("claudePermissionMode"))
-        .and_then(Value::as_str)
-        .filter(|value| *value != "inherit");
-    let sandbox = object
-        .get("sandboxMode")
-        .and_then(Value::as_str)
-        .filter(|value| *value != "inherit");
-    let network = object
-        .get("allowNetwork")
-        .or_else(|| object.get("networkPolicy"))
-        .or_else(|| object.get("sandboxAllowNetwork"))
-        .and_then(|value| {
-            value.as_bool().or_else(|| match value.as_str() {
-                Some("enabled") => Some(true),
-                Some("restricted") => Some(false),
-                Some("inherit") => None,
-                _ => None,
-            })
-        });
-
-    let mut result = default_permission_component();
-    let preset = match (mode, sandbox, network) {
-        (Some("dontAsk"), Some("read-only"), Some(false)) => Some("read-only"),
-        (Some("default"), Some("workspace-write"), Some(false)) => Some("ask"),
-        (Some("acceptEdits"), Some("workspace-write"), None) => Some("auto"),
-        (Some("bypassPermissions"), Some("workspace-write"), Some(true)) => Some("full"),
-        // 完全访问=关闭沙箱：存储值 danger-full-access 读回预设 full，与 Codex 语义一致。
-        (Some("bypassPermissions"), Some("danger-full-access"), Some(true)) => Some("full"),
-        (Some("restricted"), Some("read-only"), Some(false)) => Some("read-only"),
-        (Some("standard"), Some("workspace-write"), Some(false)) => Some("ask"),
-        (Some("trusted"), Some("workspace-write"), Some(true)) => Some("full"),
-        (Some("trusted"), Some("workspace-write"), None) => Some("auto"),
-        (None, None, None) => Some("automatic"),
-        _ => None,
-    };
-    if let Some(preset) = preset {
-        set_permission_array(&mut result, "autonomyPreset", &[preset]);
-    } else {
-        set_permission_array(&mut result, "autonomyPreset", &[]);
-    }
-
-    let approval_value = match mode {
-        None => "automatic",
-        Some("dontAsk") => "restricted",
-        Some("default") => "ask",
-        Some("acceptEdits") => "autonomous",
-        Some("bypassPermissions") => "autonomous",
-        Some("restricted") => "restricted",
-        Some("standard") => "ask",
-        Some("trusted") => "autonomous",
-        Some(_) => "",
-    };
-    let approval_values: &[&str] = if approval_value.is_empty() {
-        &[]
-    } else {
-        std::slice::from_ref(&approval_value)
-    };
-    set_permission_array(&mut result, "approval", approval_values);
-
-    /*
-    // 原先按 permissionMode 强制推导 sandbox 的实现保留如下，现由实际保存字段读取接替：
-    let sandbox_value = match (mode, sandbox) {
-        (Some("dontAsk"), _) => "read-only",
-        (Some("default") | Some("acceptEdits") | Some("bypassPermissions"), _) => "workspace-write",
-        (_, Some("read-only")) => "read-only",
-        (_, Some("workspace-write")) => "workspace-write",
-        (_, None) => "automatic",
-        _ => "",
-    };
-    */
-    let sandbox_value = match sandbox {
-        None => "automatic",
-        Some("read-only") => "read-only",
-        Some("workspace-write") => "workspace-write",
-        // 存储值 danger-full-access 读回组件值 full-access；完全访问 = 关闭沙箱。
-        Some("danger-full-access") => "full-access",
-        Some(_) => "",
-    };
-    let sandbox_values: &[&str] = if sandbox_value.is_empty() {
-        &[]
-    } else {
-        std::slice::from_ref(&sandbox_value)
-    };
-    set_permission_array(&mut result, "sandbox", sandbox_values);
-
-    /*
-    // 原先按 permissionMode 强制推导 network 的实现保留如下，现由实际保存字段读取接替：
-    let network_value = match (mode, network) {
-        (Some("dontAsk"), _) => "restricted",
-        (Some("default"), _) => "restricted",
-        (Some("bypassPermissions"), _) => "enabled",
-        (_, Some(true)) => "enabled",
-        (_, Some(false)) => "restricted",
-        (_, None) => "automatic",
-        _ => "automatic",
-    };
-    */
-    let network_value = match network {
-        None => "automatic",
-        Some(true) => "enabled",
-        Some(false) => "restricted",
-    };
-    set_permission_array(&mut result, "network", &[network_value]);
-    Ok(result)
-}
-
-/// 从现有 Claude raw object 复制新权限字段，清理被替代的旧字段并保留未知字段。
-fn raw_permissions_value(
-    thread: &ThreadDto,
-    mode: Option<&str>,
-    sandbox_mode: Option<&str>,
-    allow_network: Option<bool>,
-) -> Value {
-    let mut raw = thread
-        .permission_mode
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    raw.entry("permissionMode".to_string())
-        .or_insert(Value::Null);
-    raw.entry("sandboxMode".to_string()).or_insert(Value::Null);
-    raw.entry("allowNetwork".to_string()).or_insert(Value::Null);
-    raw.entry("allow".to_string()).or_insert_with(|| json!([]));
-    raw.entry("ask".to_string()).or_insert_with(|| json!([]));
-    raw.entry("deny".to_string()).or_insert_with(|| json!([]));
-    set_or_remove(&mut raw, "permissionMode", mode.map(|value| json!(value)));
-    set_or_remove(
-        &mut raw,
-        "sandboxMode",
-        sandbox_mode.map(|value| json!(value)),
-    );
-    set_or_remove(
-        &mut raw,
-        "allowNetwork",
-        allow_network.map(|value| json!(value)),
-    );
-    // 保存新字段时清理旧字段，避免读取时旧 approvalPolicy/networkPolicy
-    // 与新 permissionMode/allowNetwork 产生两套来源；其他字段继续保留。
-    raw.remove("approvalPolicy");
-    raw.remove("networkPolicy");
-    Value::Object(raw)
-}
 
 /// Claude Code 对统一 CLI 操作接口的实现。
 pub struct ClaudeCodeCli {
@@ -868,6 +620,88 @@ impl ClaudeCodeCli {
         Ok(workspace)
     }
 
+    /// 将线程保存的统一权限设置按 workspace 信任级别解析为 Claude 当次请求参数。
+    async fn parse_permissions(
+        &self,
+        context: &CliExecutionContext,
+        thread: &ThreadDto,
+    ) -> Result<Value> {
+        // 先确认线程与当前 workspace 一致，再读取本机或 SSH workspace 信任级别。
+        let workspace = self.load_workspace(context).await?;
+        anyhow::ensure!(thread.engine_id == "claude", "当前会话不属于 Claude Code");
+        anyhow::ensure!(
+            thread.workspace_id == context.workspace_id,
+            "当前会话不属于该 workspace"
+        );
+
+        // 统一设置只在 Claude 适配层转换为 Claude 原生权限字段，不读取历史原生权限值。
+        let permissions = thread.permission_mode.clone().unwrap_or_default();
+        permissions.validate()?;
+        let configured_trust = permissions.trust.first().map(String::as_str);
+        let trust = match configured_trust {
+            Some("automatic") | None => workspace.trust_level.as_str(),
+            Some(value) => value,
+        };
+        let preset = permissions.autonomy_preset.first().map(String::as_str);
+
+        // 统一 preset 转为 Claude 支持的原生 permissionMode、sandboxMode 与 allowNetwork。
+        let (permission_mode, sandbox_mode, allow_network) = match preset {
+            Some("read-only") => ("dontAsk", "read-only", false),
+            Some("ask") => ("default", "workspace-write", false),
+            Some("auto") => (
+                "acceptEdits",
+                "workspace-write",
+                trust == "trusted",
+            ),
+            Some("full") => ("bypassPermissions", "danger-full-access", true),
+            Some("automatic") => (
+                match trust {
+                    "restricted" => "dontAsk",
+                    "trusted" => "acceptEdits",
+                    _ => "default",
+                },
+                "workspace-write",
+                trust == "trusted",
+            ),
+            None | Some(_) => {
+                let permission_mode = match permissions.approval.first().map(String::as_str) {
+                    Some("restricted") => "dontAsk",
+                    Some("ask") => "default",
+                    Some("autonomous") => "bypassPermissions",
+                    _ => match trust {
+                        "restricted" => "dontAsk",
+                        "trusted" => "acceptEdits",
+                        _ => "default",
+                    },
+                };
+                let sandbox_mode = match permissions.sandbox.first().map(String::as_str) {
+                    Some("read-only") => "read-only",
+                    Some("full-access") => "danger-full-access",
+                    _ => "workspace-write",
+                };
+                let allow_network = if sandbox_mode == "danger-full-access" {
+                    true
+                } else {
+                    match permissions.network.first().map(String::as_str) {
+                        Some("enabled") => true,
+                        Some("restricted") => false,
+                        _ => trust == "trusted",
+                    }
+                };
+                (permission_mode, sandbox_mode, allow_network)
+            }
+        };
+
+        Ok(json!({
+            // Claude SDK 用此字段决定命令审批方式。
+            "permissionMode": permission_mode,
+            // Claude SDK 用此字段限制文件系统操作范围。
+            "sandboxMode": sandbox_mode,
+            // Claude SDK 用此字段决定是否允许网络访问。
+            "allowNetwork": allow_network,
+        }))
+    }
+
     async fn remote_connection(
         &self,
         workspace: &WorkspaceDto,
@@ -1076,24 +910,6 @@ impl ClaudeCodeCli {
     //         metadata: session.metadata,
     //     }
     // }
-
-    /// 从线程当前持久化权限读取运行时策略，并同步本机 Claude 活动查询。
-    async fn sync_thread_execution_policy_from_runtime(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-    ) -> Result<()> {
-        if thread.engine_thread_id.is_none() {
-            return Ok(());
-        }
-        let approval_policy = self
-            .runtime_permissions(context, thread)
-            .await?
-            .approval_policy
-            .unwrap_or(Value::Null);
-        self.sync_thread_execution_policy(context, thread, &approval_policy)
-            .await
-    }
 
     fn uses_reuse_session(&self, context: &CliExecutionContext) -> bool {
         context.location_kind == CliLocationKind::Ssh
@@ -1704,367 +1520,6 @@ impl CliTool for ClaudeCodeCli {
         })
     }
 
-    async fn get_permissions(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-    ) -> Result<PermissionComponentJson> {
-        self.load_workspace(context).await?;
-        anyhow::ensure!(thread.engine_id == "claude", "当前会话不属于 Claude Code");
-        anyhow::ensure!(
-            thread.workspace_id == context.workspace_id,
-            "当前会话不属于该 workspace"
-        );
-        permissions_from_thread(thread)
-    }
-
-    /// 发送前只把 Claude 权限转换并保存到线程，不触发活动 session 权限同步。
-    async fn save_permissions_for_send(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-        values: PermissionComponentJson,
-    ) -> Result<ThreadDto> {
-        self.load_workspace(context).await?;
-        anyhow::ensure!(thread.engine_id == "claude", "当前会话不属于 Claude Code");
-        anyhow::ensure!(
-            thread.workspace_id == context.workspace_id,
-            "当前会话不属于该 workspace"
-        );
-        validate_permission_component(&values)?;
-        let preset = permission_choice(&values, "autonomyPreset")?;
-        let approval = permission_choice(&values, "approval")?;
-        let sandbox = permission_choice(&values, "sandbox")?;
-        let network = permission_choice(&values, "network")?;
-        let autonomy_is_empty = values
-            .get("autonomyPreset")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty);
-        /* 旧行为：拒绝 full-access。完全访问档位语义已改为关闭沙箱（与 Codex 对齐），不再拒绝。
-        anyhow::ensure!(
-            sandbox != Some("full-access"),
-            "Claude Code 不支持 full-access sandbox"
-        );
-        */
-        let (mode, sandbox_mode, allow_network) = match preset {
-            Some("automatic") => (None, None, None),
-            None if autonomy_is_empty
-                || (approval.is_none() && sandbox.is_none() && network.is_none()) =>
-            {
-                (None, None, None)
-            }
-            Some("read-only") => (Some("dontAsk"), Some("read-only"), Some(false)),
-            Some("ask") => (Some("default"), Some("workspace-write"), Some(false)),
-            Some("auto") => (Some("acceptEdits"), Some("workspace-write"), None),
-            Some("full") => (
-                Some("bypassPermissions"),
-                Some("danger-full-access"),
-                Some(true),
-            ),
-            _ => (
-                match approval {
-                    Some("restricted") => Some("dontAsk"),
-                    Some("ask") => Some("default"),
-                    Some("autonomous") => Some("bypassPermissions"),
-                    _ => None,
-                },
-                match sandbox {
-                    Some("read-only") => Some("read-only"),
-                    Some("workspace-write") => Some("workspace-write"),
-                    Some("full-access") => Some("danger-full-access"),
-                    _ => None,
-                },
-                match network {
-                    Some("enabled") => Some(true),
-                    Some("restricted") => Some(false),
-                    _ => None,
-                },
-            ),
-        };
-        let raw_value = raw_permissions_value(thread, mode, sandbox_mode, allow_network);
-        let raw_string = raw_value.to_string();
-        db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw_string))
-            .map_err(Into::into)
-    }
-
-    async fn set_permissions(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-        values: PermissionComponentJson,
-    ) -> Result<PermissionComponentJson> {
-        self.load_workspace(context).await?;
-        anyhow::ensure!(thread.engine_id == "claude", "当前会话不属于 Claude Code");
-        anyhow::ensure!(
-            thread.workspace_id == context.workspace_id,
-            "当前会话不属于该 workspace"
-        );
-        validate_permission_component(&values)?;
-        let current = <Self as CliTool>::get_permissions(self, context, thread).await?;
-        if current.get("autonomyPreset") == values.get("autonomyPreset")
-            && current.get("approval") == values.get("approval")
-            && current.get("sandbox") == values.get("sandbox")
-            && current.get("network") == values.get("network") {
-
-                let mut result = current;
-            if let Some(value) = values.get("trust") {
-                result.insert("trust".to_string(), value.clone());
-            }
-            if let Some(value) = values.get("defaultForNewThreads") {
-                result.insert("defaultForNewThreads".to_string(), value.clone());
-            }
-            self.sync_thread_execution_policy_from_runtime(context, thread).await?;
-            return Ok(result);
-        }
-        let preset = permission_choice(&values, "autonomyPreset")?;
-        let approval = permission_choice(&values, "approval")?;
-        let sandbox = permission_choice(&values, "sandbox")?;
-        let network = permission_choice(&values, "network")?;
-        let autonomy_is_empty = values
-            .get("autonomyPreset")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty);
-        /* 旧行为：拒绝 full-access。完全访问档位语义已改为关闭沙箱（与 Codex 对齐），不再拒绝。
-        anyhow::ensure!(
-            sandbox != Some("full-access"),
-            "Claude Code 不支持 full-access sandbox"
-        );
-        */
-        let (mode, sandbox_mode, allow_network) = match preset {
-            Some("automatic") => (None, None, None),
-            None if autonomy_is_empty
-                || (approval.is_none() && sandbox.is_none() && network.is_none()) =>
-            {
-                (None, None, None)
-            }
-            Some("read-only") => (Some("dontAsk"), Some("read-only"), Some(false)),
-            Some("ask") => (Some("default"), Some("workspace-write"), Some(false)),
-            Some("auto") => (Some("acceptEdits"), Some("workspace-write"), None),
-            Some("full") => (
-                Some("bypassPermissions"),
-                Some("danger-full-access"),
-                Some(true),
-            ),
-            _ => (
-                /*
-                // 旧权限 preset 映射已由 SDK 原生 permissionMode 接替：
-                match approval { Some("restricted") => Some("restricted"), Some("ask") => Some("standard"), Some("autonomous") => Some("trusted"), _ => None },
-                */
-                match approval {
-                    Some("restricted") => Some("dontAsk"),
-                    Some("ask") => Some("default"),
-                    Some("autonomous") => Some("bypassPermissions"),
-                    _ => None,
-                },
-                match sandbox {
-                    Some("read-only") => Some("read-only"),
-                    Some("workspace-write") => Some("workspace-write"),
-                    Some("full-access") => Some("danger-full-access"),
-                    _ => None,
-                },
-                match network {
-                    Some("enabled") => Some(true),
-                    Some("restricted") => Some(false),
-                    _ => None,
-                },
-            ),
-        };
-        let raw_value = raw_permissions_value(thread, mode, sandbox_mode, allow_network);
-        let raw_string = raw_value.to_string();
-        let original_permission_mode = thread.permission_mode.clone();
-        let saved =
-            db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw_string))?;
-
-        if let Err(sync_error) = self.sync_thread_execution_policy_from_runtime(context, &saved).await
-        {
-            if let Err(rollback_error) = db::threads::update_thread_permissions(
-                &self.state.db,
-                &thread.id,
-                original_permission_mode.as_deref(),
-            ) {
-                log::error!(
-                    "Claude 权限同步失败且数据库回滚失败: thread_id={} sync_error={sync_error:#} rollback_error={rollback_error:#}",
-                    thread.id
-                );
-                return Err(anyhow::anyhow!(
-                    "Claude 权限同步失败，数据库回滚也失败: thread_id={} sync_error={sync_error:#} rollback_error={rollback_error:#}",
-                    thread.id
-                ));
-            }
-            return Err(sync_error.context(format!(
-                "Claude 活动会话权限同步失败，已回滚线程权限: thread_id={}",
-                thread.id
-            )));
-        }
-        let mut result = self.get_permissions(context, &saved).await?;
-        for key in ["trust", "defaultForNewThreads"] {
-            if let Some(value) = values.get(key) {
-                result.insert(key.to_string(), value.clone());
-            }
-        }
-        Ok(result)
-    }
-
-    /// 将本机 Claude 活动会话的权限策略同步到 sidecar，SSH 和未启动线程不发送同步命令。
-    async fn sync_thread_execution_policy(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-        approval_policy: &Value,
-    ) -> Result<()> {
-        if context.location_kind == CliLocationKind::Ssh {
-            return Ok(());
-        }
-        anyhow::ensure!(thread.engine_id == "claude", "当前会话不属于 Claude Code");
-        anyhow::ensure!(
-            thread.workspace_id == context.workspace_id,
-            "当前会话不属于该 workspace"
-        );
-        let Some(engine_thread_id) = thread.engine_thread_id.as_deref() else {
-            return Ok(());
-        };
-        let engine = self.local_engine().await?;
-        engine
-            .sync_thread_execution_policy(engine_thread_id, approval_policy)
-            .await
-            .with_context(|| {
-                format!(
-                    "同步本机 Claude 活动会话权限失败: thread_id={} engine_thread_id={}",
-                    thread.id, engine_thread_id
-                )
-            })
-    }
-
-    /// 将 Claude Code 的原始权限字段转换为统一运行时权限结构。
-    async fn runtime_permissions(
-        &self,
-        _context: &CliExecutionContext,
-        thread: &ThreadDto,
-    ) -> Result<CliRuntimePermissions> {
-        let object = thread
-            .permission_mode
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok())
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        let approval_policy = object
-            .get("permissionMode")
-            .or_else(|| object.get("approvalPolicy"))
-            .or_else(|| object.get("claudePermissionMode"))
-            .and_then(Value::as_str)
-            .map(|mode| match mode {
-                "restricted" => "dontAsk",
-                "standard" => "default",
-                "trusted" => {
-                    if object.get("allowNetwork").and_then(Value::as_bool) == Some(true) {
-                        "bypassPermissions"
-                    } else {
-                        "acceptEdits"
-                    }
-                }
-                _ => mode,
-            })
-            .map(|mode| json!(mode));
-        /*
-        // 旧 runtime 权限直接透传逻辑已由上面的历史值归一化接替：
-        let approval_policy = object
-            .get("permissionMode")
-            .or_else(|| object.get("approvalPolicy"))
-            .or_else(|| object.get("claudePermissionMode"))
-            .cloned();
-        */
-        Ok(CliRuntimePermissions {
-            approval_policy,
-            sandbox_mode: object
-                .get("sandboxMode")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            allow_network: object
-                .get("allowNetwork")
-                .or_else(|| object.get("networkPolicy"))
-                .or_else(|| object.get("sandboxAllowNetwork"))
-                .and_then(|value| {
-                    value.as_bool().or_else(|| match value.as_str() {
-                        Some("enabled") => Some(true),
-                        Some("restricted") => Some(false),
-                        _ => None,
-                    })
-                }),
-            permission_profile: object.get("permissionProfile").cloned(),
-            approvals_reviewer: object
-                .get("approvalsReviewer")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        })
-    }
-
-    /// 将统一权限补丁转换为 Claude Code 原始权限 JSON 并持久化到线程。
-    async fn patch_runtime_permissions(
-        &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
-        patch: CliRuntimePermissionPatch,
-    ) -> Result<ThreadDto> {
-        self.load_workspace(context).await?;
-        let mut raw = thread
-            .permission_mode
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok())
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        if let Some(value) = patch.approval_policy {
-            let value = if let Some(value) = value {
-                let normalized = value
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_lowercase)
-                    .ok_or_else(|| anyhow::anyhow!("Claude permission mode must be a string"))?;
-                anyhow::ensure!(matches!(normalized.as_str(), "dontask" | "default" | "acceptedits" | "bypasspermissions" | "restricted" | "standard" | "trusted"), "invalid Claude permission mode `{normalized}`. expected one of: dontAsk, default, acceptEdits, bypassPermissions");
-                let normalized = match normalized.as_str() {
-                    "dontask" | "restricted" => "dontAsk",
-                    "default" | "standard" => "default",
-                    "acceptedits" => "acceptEdits",
-                    "bypasspermissions" | "trusted" => "bypassPermissions",
-                    _ => unreachable!(),
-                };
-                Some(json!(normalized))
-            } else {
-                None
-            };
-            set_or_remove(&mut raw, "permissionMode", value);
-        }
-        if let Some(value) = patch.sandbox_mode {
-            let value = if let Some(value) = value {
-                let normalized = match value.trim().to_lowercase().as_str() {
-                    "read-only" | "read_only" | "readonly" => "read-only",
-                    "workspace-write" | "workspace_write" | "workspacewrite" => "workspace-write",
-                    "danger-full-access" | "danger_full_access" | "dangerfullaccess" => {
-                        "danger-full-access"
-                    }
-                    _ => {
-                        anyhow::bail!("Claude sandbox mode `{value}` is not supported")
-                    }
-                };
-                Some(json!(normalized))
-            } else {
-                None
-            };
-            set_or_remove(&mut raw, "sandboxMode", value);
-        }
-        if let Some(value) = patch.allow_network {
-            set_or_remove(&mut raw, "allowNetwork", value.map(|value| json!(value)));
-        }
-        if patch.permission_profile.is_some() {
-            anyhow::bail!("Claude Code 不支持 permission profile");
-        }
-        if patch.approvals_reviewer.is_some() {
-            anyhow::bail!("Claude Code 不支持 approvals reviewer");
-        }
-        let raw = Value::Object(raw).to_string();
-        db::threads::update_thread_permissions(&self.state.db, &thread.id, Some(&raw))
-    }
-
     async fn acquire_turn(&self, context: &CliExecutionContext, thread: &ThreadDto) -> Result<()> {
         let workspace = self.load_workspace(context).await?;
         if context.location_kind == CliLocationKind::Ssh {
@@ -2085,6 +1540,7 @@ impl CliTool for ClaudeCodeCli {
         Ok(())
     }
 
+    /// 按线程当前统一权限解析 Claude 参数，并使用其创建本机或 SSH 运行会话。
     async fn start_thread(
         &self,
         context: &CliExecutionContext,
@@ -2092,9 +1548,22 @@ impl CliTool for ClaudeCodeCli {
         scope: ThreadScope,
         resume_engine_thread_id: Option<&str>,
         model: &str,
-        sandbox: SandboxPolicy,
+        mut sandbox: SandboxPolicy,
     ) -> Result<EngineThread> {
-        self.load_workspace(context).await?;
+        // 启动时从当前 A 配置解析 Claude 原生权限，并覆盖调用层传入的公共占位值。
+        let permissions = self.parse_permissions(context, thread).await?;
+        // 当前审批策略只在本次启动参数中提供，不保存在引擎线程配置。
+        sandbox.approval_policy = Some(permissions["permissionMode"].clone());
+        // 通用权限画像不属于 Claude 的统一权限到原生参数映射。
+        sandbox.permission_profile = None;
+        // Claude 当前请求不使用统一审批 reviewer 配置。
+        sandbox.approvals_reviewer = None;
+        // 当前网络权限来自当次 A 解析结果。
+        sandbox.allow_network = permissions["allowNetwork"].as_bool().unwrap();
+        // Claude 当前请求不继承统一 MCP 自动批准设置。
+        sandbox.auto_approve_mcp_elicitations = false;
+        // 当前沙箱模式来自当次 A 解析结果。
+        sandbox.sandbox_mode = permissions["sandboxMode"].as_str().map(str::to_string);
         if context.location_kind == CliLocationKind::Ssh {
             if self.uses_reuse_session(context) && self.session_handles.contains(&thread.id).await {
                 let (engine, _) = self.session_handles.session_runtime(&thread.id).await?;
@@ -2171,6 +1640,7 @@ impl CliTool for ClaudeCodeCli {
         Engine::current_external_engine_thread_id(engine.as_ref(), runtime_thread_id).await
     }
 
+    /// 每次发送前从线程当前统一权限生成 B，并交给本机或 SSH Claude 请求。
     async fn send_message(
         &self,
         context: &CliExecutionContext,
@@ -2180,7 +1650,9 @@ impl CliTool for ClaudeCodeCli {
         event_tx: mpsc::Sender<EngineEvent>,
         cancellation: CancellationToken,
     ) -> Result<()> {
-        self.load_workspace(context).await?;
+        // 每轮发送都重新解析当前 A，使普通、SSH 与复用会话使用相同的当次权限。
+        let mut input = input;
+        input.permissions = Some(self.parse_permissions(context, thread).await?);
         if context.location_kind == CliLocationKind::Ssh {
             if self.uses_reuse_session(context) {
                 let session_exists = self.session_handles.contains(&thread.id).await;
@@ -2684,9 +2156,11 @@ impl CliTool for ClaudeCodeCli {
         extensions::claude::perform_action(&item, action, scope, None).await
     }
 
+    /// 拒绝 Claude 会话分支请求，避免将会话转交给其他引擎执行。
     async fn fork_thread(
         &self,
         context: &CliExecutionContext,
+        _thread: &ThreadDto,
         _engine_thread_id: &str,
         _cwd: &str,
         _model: &str,
@@ -2835,220 +2309,6 @@ mod tests {
         cli.archive_thread(&context, &thread, "remote-claude-thread")
             .await
             .expect("SSH Claude archive hook should not require remote service");
-    }
-
-    fn permission_thread(permission_mode: Option<&str>, metadata: Option<Value>) -> ThreadDto {
-        ThreadDto {
-            id: "thread".to_string(),
-            workspace_id: "workspace".to_string(),
-            engine_id: "claude".to_string(),
-            model_id: "model".to_string(),
-            engine_thread_id: None,
-            engine_metadata: metadata,
-            plan_mode: None,
-            send_method: None,
-            reasoning_effort: None,
-            permission_mode: permission_mode.map(str::to_string),
-            title: "thread".to_string(),
-            status: ThreadStatusDto::Idle,
-            message_count: 0,
-            total_tokens: 0,
-            context_current_tokens: None,
-            context_max_tokens: None,
-            context_usage_updated_at: None,
-            created_at: String::new(),
-            last_activity_at: String::new(),
-        }
-    }
-
-    #[test]
-    fn permissions_read_empty_as_automatic() {
-        let values = permissions_from_thread(&permission_thread(None, None)).unwrap();
-        assert_eq!(values.get("autonomyPreset"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("approval"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("sandbox"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("network"), Some(&json!(["automatic"])));
-    }
-
-    #[test]
-    fn permissions_read_legacy_fields() {
-        let values = permissions_from_thread(&permission_thread(
-            Some(r#"{"approvalPolicy":"restricted","sandboxMode":"read-only","networkPolicy":"restricted"}"#),
-            None,
-        ))
-        .unwrap();
-        assert_eq!(values.get("autonomyPreset"), Some(&json!(["read-only"])));
-        assert_eq!(values.get("approval"), Some(&json!(["restricted"])));
-        assert_eq!(values.get("sandbox"), Some(&json!(["read-only"])));
-        assert_eq!(values.get("network"), Some(&json!(["restricted"])));
-    }
-
-    #[test]
-    fn permissions_read_all_legacy_inherit_values_as_automatic() {
-        let values = permissions_from_thread(&permission_thread(
-            Some(
-                r#"{"approvalPolicy":"inherit","sandboxMode":"inherit","networkPolicy":"inherit"}"#,
-            ),
-            None,
-        ))
-        .unwrap();
-        assert_eq!(values.get("autonomyPreset"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("approval"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("sandbox"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("network"), Some(&json!(["automatic"])));
-    }
-
-    #[test]
-    fn permissions_read_current_fields() {
-        let values = permissions_from_thread(&permission_thread(
-            Some(r#"{"permissionMode":"standard","sandboxMode":"workspace-write","allowNetwork":false}"#),
-            None,
-        ))
-        .unwrap();
-        assert_eq!(values.get("autonomyPreset"), Some(&json!(["ask"])));
-        assert_eq!(values.get("approval"), Some(&json!(["ask"])));
-        assert_eq!(values.get("sandbox"), Some(&json!(["workspace-write"])));
-        assert_eq!(values.get("network"), Some(&json!(["restricted"])));
-    }
-
-    #[test]
-    fn permissions_read_native_permission_modes() {
-        let expected = [
-            (
-                "dontAsk",
-                "read-only",
-                "restricted",
-                "read-only",
-                "restricted",
-            ),
-            ("default", "ask", "ask", "workspace-write", "restricted"),
-            (
-                "acceptEdits",
-                "auto",
-                "autonomous",
-                "workspace-write",
-                "automatic",
-            ),
-            (
-                "bypassPermissions",
-                "full",
-                "autonomous",
-                "full-access",
-                "enabled",
-            ),
-        ];
-        for (mode, preset, approval, sandbox, network) in expected {
-            let stored_sandbox = if mode == "bypassPermissions" {
-                "danger-full-access"
-            } else {
-                sandbox
-            };
-            let network_field = if mode == "acceptEdits" {
-                ""
-            } else {
-                ",\"allowNetwork\":false"
-            };
-            let network_field = if mode == "dontAsk" {
-                ",\"allowNetwork\":false"
-            } else {
-                network_field
-            };
-            let network_field = if mode == "bypassPermissions" {
-                ",\"allowNetwork\":true"
-            } else {
-                network_field
-            };
-            let values = permissions_from_thread(&permission_thread(
-                Some(&format!(
-                    r#"{{"permissionMode":"{mode}","sandboxMode":"{stored_sandbox}"{network_field}}}"#
-                )),
-                None,
-            ))
-            .unwrap();
-            assert_eq!(values.get("autonomyPreset"), Some(&json!([preset])));
-            assert_eq!(values.get("approval"), Some(&json!([approval])));
-            assert_eq!(values.get("sandbox"), Some(&json!([sandbox])));
-            assert_eq!(values.get("network"), Some(&json!([network])));
-        }
-    }
-
-    #[test]
-    fn permissions_save_native_permission_modes() {
-        let cases = [
-            ("dontAsk", "read-only", false),
-            ("default", "workspace-write", false),
-            ("acceptEdits", "workspace-write", false),
-            ("bypassPermissions", "workspace-write", true),
-        ];
-        for (mode, sandbox, network) in cases {
-            let raw = raw_permissions_value(
-                &permission_thread(None, None),
-                Some(mode),
-                Some(sandbox),
-                Some(network),
-            );
-            assert_eq!(raw["permissionMode"], json!(mode));
-            assert_eq!(raw["sandboxMode"], json!(sandbox));
-            assert_eq!(raw["allowNetwork"], json!(network));
-        }
-    }
-
-    #[test]
-    fn permissions_save_preserves_unknown_fields_and_clears_legacy_fields() {
-        let thread = permission_thread(
-            Some(
-                r#"{"approvalPolicy":"standard","networkPolicy":"enabled","allow":["Read"],"ask":["Write"],"deny":[],"unknown":{"keep":true}}"#,
-            ),
-            None,
-        );
-        let raw = raw_permissions_value(
-            &thread,
-            Some("bypassPermissions"),
-            Some("workspace-write"),
-            Some(true),
-        );
-        assert_eq!(raw["permissionMode"], json!("bypassPermissions"));
-        /*
-        // 旧 trusted 保存值已由 SDK 原生 bypassPermissions 接替：
-        assert_eq!(raw["permissionMode"], json!("trusted"));
-        */
-        assert_eq!(raw["sandboxMode"], json!("workspace-write"));
-        assert_eq!(raw["allowNetwork"], json!(true));
-        assert_eq!(raw["allow"], json!(["Read"]));
-        assert_eq!(raw["ask"], json!(["Write"]));
-        assert_eq!(raw["unknown"], json!({"keep": true}));
-        assert!(raw.get("approvalPolicy").is_none());
-        assert!(raw.get("networkPolicy").is_none());
-    }
-
-    #[test]
-    fn permissions_ignore_metadata_when_raw_is_empty() {
-        let values = permissions_from_thread(&permission_thread(
-            Some("{}"),
-            Some(json!({
-                "claudePermissionMode": "trusted",
-                "sandboxMode": "workspace-write",
-                "sandboxAllowNetwork": true,
-            })),
-        ))
-        .unwrap();
-        assert_eq!(values.get("autonomyPreset"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("approval"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("sandbox"), Some(&json!(["automatic"])));
-        assert_eq!(values.get("network"), Some(&json!(["automatic"])));
-        /*
-        // 旧 metadata 回退已停用：
-        assert_eq!(values.get("autonomyPreset"), Some(&json!(["full"])));
-        assert_eq!(values.get("approval"), Some(&json!(["autonomous"])));
-        assert_eq!(values.get("sandbox"), Some(&json!(["workspace-write"])));
-        assert_eq!(values.get("network"), Some(&json!(["enabled"])));
-        */
-    }
-
-    #[test]
-    fn permissions_reject_invalid_non_empty_json() {
-        let error = permissions_from_thread(&permission_thread(Some("[1]"), None)).unwrap_err();
-        assert!(error.to_string().contains("必须是对象"));
     }
 
     #[test]

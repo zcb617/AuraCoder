@@ -257,7 +257,6 @@ async fn execute_claimed_task_inner(
             plan_mode: Some(false),
             send_method: thread.send_method.clone(),
             reasoning_effort: runtime.reasoning_effort,
-            permission_mode_json: None,
             permission_values: None,
             attachments: None,
             input_items: None,

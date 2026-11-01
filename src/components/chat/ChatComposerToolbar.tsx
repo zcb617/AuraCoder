@@ -151,8 +151,6 @@ export interface ChatComposerToolbarProps {
   onCodexConfigSave: (patch: CodexConfigPatch) => Promise<void>;
   /** 加载当前工作区的运行时引擎。 */
   loadEngines: (workspaceId?: string | null) => Promise<void>;
-  /** 保存权限组件配置变更。 */
-  onPermissionComponentChange: (next: PermissionComponentJson) => Promise<boolean>;
   /** 打开上下文用量详情。 */
   openUsageLimitsModal: () => void;
   /** 取消当前流式处理。 */
@@ -220,7 +218,6 @@ export function ChatComposerToolbar({
   onReasoningEffortChange,
   onCodexConfigSave,
   loadEngines,
-  onPermissionComponentChange,
   openUsageLimitsModal,
   cancel,
 }: ChatComposerToolbarProps) {
@@ -461,8 +458,6 @@ export function ChatComposerToolbar({
                           serviceTier: serviceTier === "inherit" ? null : serviceTier,
                           updateOutputSchema: false,
                           outputSchema: null,
-                          updateApprovalPolicy: false,
-                          approvalPolicy: null,
                         }).catch((error) => {
                           toast.error(String(error), {
                             title: t("panel.toasts.speedChangeFailed"),
@@ -485,155 +480,10 @@ export function ChatComposerToolbar({
               {!showSpecialInputComposer && Boolean(activeThread?.id) && (
                 <>
                   <div className="chat-toolbar-divider" />
-                  {/*
-                   * 旧实现的完整 PermissionPicker 调用保留如下，不参与编译：
-                   *
-                   * {!showSpecialInputComposer &&
-                   *   (activeRepo ||
-                   *     repos.length > 0 ||
-                   *     activeThread?.engineId === "codex" ||
-                   *     activeThread?.engineId === "claude" ||
-                   *     activeThread?.engineId === "opencode") && (
-                   *     <>
-                   *       <div className="chat-toolbar-divider" />
-                   *       <PermissionPicker
-                   *         engineId={activeThreadAutonomyEngineId}
-                   *         presetValue={activeThreadAutonomyPreset}
-                   *         codexExternalSandbox={codexExternalSandboxActive}
-                   *         onPresetChange={
-                   *           activeThreadAutonomyEngineId ? onAutonomyPresetChange : undefined
-                   *         }
-                   *         defaultPreset={defaultAutonomyPreset}
-                   *         onDefaultPresetChange={(preset) =>
-                   *           void onDefaultAutonomyPresetChange(preset)
-                   *         }
-                   *         trustScopeLabel={
-                   *           activeRepo
-                   *             ? t("panel.repoAccess")
-                   *             : repos.length > 0
-                   *               ? t("panel.workspaceAccess")
-                   *               : undefined
-                   *         }
-                   *         trustValue={
-                   *           activeRepo?.trustLevel ??
-                   *           (repos.length > 0 ? workspaceTrustLevel : undefined)
-                   *         }
-                   *         trustOptions={trustLevelOptions}
-                   *         onTrustChange={
-                   *           activeRepo
-                   *             ? (value) => void onRepoTrustLevelChange(value)
-                   *             : repos.length > 0
-                   *               ? (value) => void onWorkspaceTrustLevelChange(value)
-                   *               : undefined
-                   *         }
-                   *         customPolicyCount={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude" ||
-                   *           activeThread?.engineId === "opencode"
-                   *             ? threadPolicyCustomCount
-                   *             : 0
-                   *         }
-                   *         approvalTitle={
-                   *           activeThread?.engineId ? activeThreadApprovalTitle : undefined
-                   *         }
-                   *         approvalValue={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude" ||
-                   *           activeThread?.engineId === "opencode"
-                   *             ? activeThreadApprovalPolicy
-                   *             : undefined
-                   *         }
-                   *         approvalSelectedLabel={
-                   *           activeThread?.engineId === "codex"
-                   *             ? activeThreadApprovalSelectedLabel
-                   *             : undefined
-                   *         }
-                   *         approvalOptions={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude" ||
-                   *           activeThread?.engineId === "opencode"
-                   *             ? activeThreadApprovalOptions
-                   *             : undefined
-                   *         }
-                   *         onApprovalChange={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude" ||
-                   *           activeThread?.engineId === "opencode"
-                   *             ? (value) => {
-                   *                 if (activeThread?.engineId === "codex") {
-                   *                   setCustomApprovalPolicyText("");
-                   *                 }
-                   *                 void onThreadExecutionPolicyChange({
-                   *                   approvalPolicy: value as ThreadApprovalPolicyValue,
-                   *                 });
-                   *               }
-                   *             : undefined
-                   *         }
-                   *         sandboxValue={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude"
-                   *             ? activeThreadSandboxMode
-                   *             : undefined
-                   *         }
-                   *         sandboxOptions={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude"
-                   *             ? threadSandboxModeOptions
-                   *             : undefined
-                   *         }
-                   *         onSandboxChange={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude"
-                   *             ? (value) =>
-                   *                 void onThreadExecutionPolicyChange({
-                   *                   sandboxMode: value as ThreadSandboxModeValue,
-                   *                 })
-                   *             : undefined
-                   *         }
-                   *         sandboxSelectedLabel={activeThreadSandboxSelectedLabel}
-                   *         sandboxNotice={activeThreadSandboxNotice}
-                   *         networkValue={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude"
-                   *             ? activeThreadNetworkPolicy
-                   *             : undefined
-                   *         }
-                   *         networkOptions={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude"
-                   *             ? threadNetworkPolicyOptions
-                   *             : undefined
-                   *         }
-                   *         onNetworkChange={
-                   *           activeThread?.engineId === "codex" ||
-                   *           activeThread?.engineId === "claude"
-                   *             ? (value) =>
-                   *                 void onThreadExecutionPolicyChange({
-                   *                   networkPolicy: value as ThreadNetworkPolicyValue,
-                   *                 })
-                   *             : undefined
-                   *         }
-                   *         networkDisabled={
-                   *           activeThread?.engineId === "codex" &&
-                   *           activeThreadSandboxMode === "danger-full-access"
-                   *         }
-                   *         networkNotice={
-                   *           activeThread?.engineId === "codex" &&
-                   *           activeThreadSandboxMode === "danger-full-access"
-                   *             ? t("policy.fullAccessNotice")
-                   *             : null
-                   *         }
-                   *       />
-                   *     </>
-                   *   )}
-                   *
-                   * 现在组件只接收完整 PermissionComponentJson 和 onChange，前端不参与 CLI 适配，
-                   * 且仅在存在 AuraCoder 线程 ID 时展示。
-                   */}
                   <PermissionPicker
                     disabled={!activeThread?.id}
                     value={permissionComponent}
-                    onChange={(next) => void onPermissionComponentChange(next)}
+                    onChange={(next) => void saveThreadRuntimeSelectionPatch(activeChatSessionId, { permissionMode: next })}
                   />
                 </>
               )}
