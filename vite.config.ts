@@ -12,6 +12,10 @@ export default defineConfig({
     strictPort: true,
     hmr: {
       port: 42515
+    },
+    watch: {
+      // Rust 源码和编译产物由 Tauri 管理，前端开发服务不监听。
+      ignored: ["**/src-tauri/**"]
     }
   },
   clearScreen: false,
