@@ -99,7 +99,24 @@ fn expand_home(value: &str) -> String {
     value.to_string()
 }
 
+/// 按已保存的手动 SSH 连接参数生成严格校验使用的 known_hosts 文件。
+fn prepare_known_hosts(record: &SshConnectionRecord) -> anyhow::Result<()> {
+    if record.dto.source_kind == "manual" {
+        known_hosts::write(
+            &record.dto.id,
+            &record.dto.host_name,
+            record.dto.port,
+            &record.dto.host_key_type,
+            &record.host_key_base64,
+        )
+        .context("写入 SSH Host Key 文件失败")?;
+    }
+    Ok(())
+}
+
 fn build_session_command(record: &SshConnectionRecord) -> anyhow::Result<Command> {
+    // 为手动连接在构造 SSH 命令前准备数据库中的 Host Key。
+    prepare_known_hosts(record).context("为 SSH 会话准备 Host Key 文件失败")?;
     let Some(ssh) = runtime_env::resolve_executable("ssh") else {
         anyhow::bail!("未找到本机 ssh 命令")
     };
@@ -150,6 +167,8 @@ pub fn build_pty_command(
     record: &SshConnectionRecord,
     cwd: &str,
 ) -> anyhow::Result<(String, Vec<String>)> {
+    // 为手动连接在构造终端命令前准备数据库中的 Host Key。
+    prepare_known_hosts(record).context("为 SSH 终端准备 Host Key 文件失败")?;
     let Some(ssh) = runtime_env::resolve_executable("ssh") else {
         anyhow::bail!("未找到本机 ssh 命令");
     };
@@ -251,6 +270,8 @@ pub async fn test(record: &SshConnectionRecord) -> SshConnectionTestDto {
 }
 
 fn build_exec_command(record: &SshConnectionRecord) -> anyhow::Result<Command> {
+    // 为手动连接在构造远端命令前准备数据库中的 Host Key。
+    prepare_known_hosts(record).context("为 SSH 远端命令准备 Host Key 文件失败")?;
     let Some(ssh) = runtime_env::resolve_executable("ssh") else {
         anyhow::bail!("未找到本机 ssh 命令");
     };

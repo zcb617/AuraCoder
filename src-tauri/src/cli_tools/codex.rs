@@ -3084,6 +3084,21 @@ impl CliTool for CodexCli {
         ssh::cli_service_lifecycle::register_service(&record, self.id()).await
     }
 
+    /// 通过 SSH CLI 生命周期注销当前连接的 Codex 服务，不直接管理隧道资源。
+    async fn unregister_remote_service(&self, context: &CliExecutionContext) -> Result<()> {
+        // 仅 SSH 项目允许显式注销远端 CLI 服务，并要求调用方提供对应连接标识。
+        anyhow::ensure!(
+            context.location_kind == CliLocationKind::Ssh,
+            "本机 Codex CLI 不支持注销远端服务"
+        );
+        let connection_id = context
+            .ssh_connection_id
+            .as_deref()
+            .context("SSH 远端 Codex 注销服务未绑定连接")?;
+
+        ssh::cli_service_lifecycle::unregister_service(connection_id, self.id()).await
+    }
+
     async fn execution_context(&self, workspace_id: Option<&str>) -> Result<CliExecutionContext> {
         CodexCli::execution_context(self, workspace_id).await
     }

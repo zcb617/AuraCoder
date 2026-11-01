@@ -465,6 +465,13 @@ pub async fn remove(connection_id: &str, cli_id: &str) -> bool {
     SSH_CLI_TUNNELS.remove(connection_id, cli_id).await
 }
 
+/// 在 CLI 生命周期完成远端停止尝试后，仅释放指定 CLI 的本地隧道资源。
+pub(crate) async fn remove_after_unregister(connection_id: &str, cli_id: &str) -> bool {
+    SSH_CLI_TUNNELS
+        .remove_after_unregister(connection_id, cli_id)
+        .await
+}
+
 pub async fn start_remote_cli_service(
     connection_id: &str,
     cli_id: &str,
@@ -621,6 +628,36 @@ impl SshCliTunnelRegistry {
                     tunnel.cli_id()
                 );
             }
+            drop(lifecycle);
+            tunnel.close().await;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 释放已由 CLI 生命周期尝试停止的目标隧道，避免重复执行远端停止。
+    async fn remove_after_unregister(&self, connection_id: &str, cli_id: &str) -> bool {
+        // 从隧道注册表只取出目标连接和 CLI 的隧道，并清理空连接分组。
+        let removed = {
+            let mut tunnels = self.tunnels.write().await;
+            let Some(host_tunnels) = tunnels.get_mut(connection_id) else {
+                return false;
+            };
+            let removed = host_tunnels.remove(cli_id);
+            if host_tunnels.is_empty() {
+                tunnels.remove(connection_id);
+            }
+            removed
+        };
+
+        // 清空目标隧道上的本地使用登记并关闭进程，不再尝试远端 stop。
+        if let Some(tunnel) = removed {
+            let mut lifecycle = tunnel.service_lifecycle.lock().await;
+            lifecycle.resident_use_count = 0;
+            lifecycle.temporary_use_count = 0;
+            lifecycle.persistent_session_uses.clear();
+            lifecycle.service_state = RemoteCliServiceState::Stopped;
             drop(lifecycle);
             tunnel.close().await;
             true
@@ -1562,3 +1599,7 @@ mod tests {
         )));
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/ssh_cli_unregister_tests.rs"]
+mod unregister_tests;

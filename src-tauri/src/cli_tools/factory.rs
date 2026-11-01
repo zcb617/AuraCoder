@@ -18,6 +18,11 @@ impl CliToolFactory {
         Self { state }
     }
 
+    /// 返回工厂当前能够创建的 CLI 标识，供调用方统一遍历已支持的 CLI。
+    pub fn supported_cli_ids() -> &'static [&'static str] {
+        &["codex", "opencode", "claude"]
+    }
+
     /// 按 CLI 标识创建普通业务调用使用的统一 CLI 接口实现。
     pub fn create(&self, cli_id: &str) -> Result<Arc<dyn CliTool>> {
         match cli_id {

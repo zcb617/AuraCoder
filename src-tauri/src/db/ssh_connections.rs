@@ -211,6 +211,36 @@ pub fn record_test(
     Ok(())
 }
 
+/// 仅在检测期间连接配置未变化且仍未删除时，保存本次检测结果。
+pub fn record_test_if_current(
+    db: &Database,
+    id: &str,
+    expected_updated_at: &str,
+    ok: bool,
+    error: Option<&str>,
+) -> anyhow::Result<bool> {
+    let now = runtime_env::system_time_rfc3339();
+    let conn = db.connect()?;
+    let changed = conn.execute(
+        "UPDATE ssh_connections SET
+           connection_status=CASE WHEN enabled=0 THEN ?5 WHEN ?3=1 THEN ?6 ELSE ?7 END,
+           last_connected_at=CASE WHEN ?3=1 THEN ?4 ELSE last_connected_at END,
+           last_error=CASE WHEN ?3=1 THEN NULL ELSE ?8 END
+         WHERE id=?1 AND updated_at=?2 AND deleted_at IS NULL",
+        params![
+            id,
+            expected_updated_at,
+            ok,
+            now,
+            STATUS_DISABLED,
+            STATUS_OK,
+            STATUS_FAILED,
+            error,
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
 pub fn set_status_if_current(
     db: &Database,
     id: &str,
@@ -279,6 +309,49 @@ pub fn restore(db: &Database, id: &str) -> anyhow::Result<SshConnectionDto> {
         .context("restored ssh connection not found")
 }
 
+/// 在同一 SQLite 事务中恢复已删除连接并更新其 SSH 配置，保留原连接身份与启用状态。
+pub fn restore_with_input(
+    db: &Database,
+    id: &str,
+    input: &SshConnectionInput,
+    key_type: &str,
+    key_base64: &str,
+) -> anyhow::Result<SshConnectionDto> {
+    let now = runtime_env::system_time_rfc3339();
+    let mut conn = db.connect()?;
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
+        "UPDATE ssh_connections SET
+           config_alias=?2, host_name=?3, user_name=?4, port=?5, identity_file=?6,
+           host_key_type=?7, host_key_base64=?8,
+           deleted_at=NULL,
+           connection_status=CASE WHEN enabled=1 THEN ?9 ELSE ?10 END,
+           last_connected_at=NULL, last_error=NULL, updated_at=?11
+         WHERE id=?1 AND deleted_at IS NOT NULL",
+        params![
+            id,
+            input.config_alias,
+            input.host_name.trim(),
+            input.user.trim(),
+            input.port as i64,
+            input.identity_file,
+            key_type,
+            key_base64,
+            STATUS_UNKNOWN,
+            STATUS_DISABLED,
+            now,
+        ],
+    )?;
+    if changed == 0 {
+        anyhow::bail!("deleted ssh connection not found: {id}");
+    }
+    let dto = find_with_conn(&tx, id)?
+        .map(|record| record.dto)
+        .context("restored ssh connection not found")?;
+    tx.commit()?;
+    Ok(dto)
+}
+
 fn find_with_conn(conn: &Connection, id: &str) -> anyhow::Result<Option<SshConnectionRecord>> {
     let query = format!("SELECT {SELECT_COLUMNS} FROM ssh_connections WHERE id=?1");
     let mut stmt = conn.prepare(&query)?;
@@ -316,82 +389,5 @@ fn map_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SshConnectionRecord> 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use uuid::Uuid;
-
-    #[test]
-    fn monitored_status_is_versioned_and_lifecycle_states_are_persisted() {
-        let path = std::env::temp_dir().join(format!("auracoder-ssh-status-{}.db", Uuid::new_v4()));
-        let db = Database::open(path.clone()).expect("failed to initialize test database");
-        let input = SshConnectionInput {
-            display_name: "Test SSH".to_string(),
-            host_name: "192.0.2.10".to_string(),
-            user: "tester".to_string(),
-            port: 22,
-            identity_file: None,
-            host_key: String::new(),
-            config_alias: None,
-        };
-        let dto = insert(
-            &db,
-            "ssh-status-test",
-            "manual",
-            &input,
-            "ssh-ed25519",
-            "test-key",
-        )
-        .expect("failed to insert test connection");
-        assert_eq!(dto.connection_status, STATUS_UNKNOWN);
-        assert!(
-            !set_status_if_current(&db, &dto.id, "stale-version", STATUS_OK, None,)
-                .expect("stale status update should not fail")
-        );
-
-        let record = find(&db, &dto.id)
-            .expect("failed to load test connection")
-            .expect("test connection should exist");
-        assert!(set_status_if_current(
-            &db,
-            &dto.id,
-            &record.dto.updated_at,
-            STATUS_CONNECTING,
-            None,
-        )
-        .expect("failed to persist connecting status"));
-        assert_eq!(
-            find(&db, &dto.id)
-                .expect("failed to reload test connection")
-                .expect("test connection should exist")
-                .dto
-                .connection_status,
-            STATUS_CONNECTING
-        );
-
-        let version = find(&db, &dto.id)
-            .expect("failed to reload test connection")
-            .expect("test connection should exist")
-            .dto
-            .updated_at;
-        assert!(
-            set_status_if_current(&db, &dto.id, &version, STATUS_OK, None,)
-                .expect("failed to persist connected status")
-        );
-        assert_eq!(
-            find(&db, &dto.id)
-                .expect("failed to reload test connection")
-                .expect("test connection should exist")
-                .dto
-                .connection_status,
-            STATUS_OK
-        );
-
-        let disabled = set_enabled(&db, &dto.id, false).expect("failed to disable test connection");
-        assert_eq!(disabled.connection_status, STATUS_DISABLED);
-        soft_delete(&db, &dto.id).expect("failed to delete test connection");
-        let restored = restore(&db, &dto.id).expect("failed to restore test connection");
-        assert_eq!(restored.connection_status, STATUS_DISABLED);
-
-        let _ = std::fs::remove_file(path);
-    }
-}
+#[path = "../../tests/unit/ssh_connection_mapper_tests.rs"]
+mod tests;

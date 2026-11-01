@@ -241,6 +241,13 @@ pub async fn clear_mcp_context(connection_id: &str, cli_id: &str) -> anyhow::Res
         .await
 }
 
+/// 注销指定 SSH 连接的 CLI 服务，并释放该服务对应的隧道资源。
+pub async fn unregister_service(connection_id: &str, cli_id: &str) -> anyhow::Result<()> {
+    SSH_CLI_SERVICES
+        .unregister_service(connection_id, cli_id)
+        .await
+}
+
 /// 终止一个远端 CLI 服务并移除其运行时登记。
 pub async fn terminate(connection_id: &str, cli_id: &str) -> anyhow::Result<bool> {
     SSH_CLI_SERVICES.terminate(connection_id, cli_id).await
@@ -551,6 +558,76 @@ impl SshCliServiceLifecycleRegistry {
             );
         }
         Ok(registered)
+    }
+
+    /// 按连接和 CLI 注销生命周期登记，失败时仍完成本地资源释放并返回远端异常。
+    async fn unregister_service(&self, connection_id: &str, cli_id: &str) -> anyhow::Result<()> {
+        // 串行化注销与注册、状态更新和普通终止，避免同一项服务被并发重建。
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let service = self
+            .services
+            .read()
+            .await
+            .get(connection_id)
+            .and_then(|host_services| host_services.get(cli_id))
+            .cloned();
+
+        // 先将已登记服务标记为终止，避免注销期间继续作为 Ready 服务使用。
+        if let Some(service) = &service {
+            *service.state.lock().await = SshCliServiceEntryState::Terminating;
+        }
+
+        // 优先使用服务登记持有的 Tunnel；登记缺失时仍查找残留 Tunnel 并尝试远端停止。
+        let tunnel = match service.as_ref().map(|service| service.tunnel.clone()) {
+            Some(tunnel) => Some(tunnel),
+            None => cli_tunnel_registry::get(connection_id, cli_id).await,
+        };
+        let remote_stop_result = if let Some(tunnel) = tunnel {
+            Some(cli_tunnel_registry::stop_remote_cli_service_for_tunnel(tunnel.as_ref()).await)
+        } else {
+            None
+        };
+
+        // 无论远端停止是否成功，都只移除当前连接和 CLI 的原服务登记。
+        if let Some(service) = &service {
+            let mut services = self.services.write().await;
+            let remove_connection = if let Some(host_services) = services.get_mut(connection_id) {
+                if host_services
+                    .get(cli_id)
+                    .map(|registered| Arc::ptr_eq(registered, service))
+                    .unwrap_or(false)
+                {
+                    host_services.remove(cli_id);
+                }
+                host_services.is_empty()
+            } else {
+                false
+            };
+            if remove_connection {
+                services.remove(connection_id);
+            }
+            drop(services);
+
+            // 撤销当前服务持有的 Gateway 租约，避免本地注销后旧 Token 仍可使用。
+            if let Some(gateway) = self.mcp_gateway.read().await.clone() {
+                gateway.revoke_client(&service.mcp_token).await;
+            }
+        }
+
+        // 移除并关闭当前 CLI 的本地 Tunnel，即使远端 stop 返回错误也必须完成。
+        cli_tunnel_registry::remove_after_unregister(connection_id, cli_id).await;
+
+        // 将远端停止异常连同连接和 CLI 上下文返回调用方，且不恢复 Ready 状态。
+        if let Some(Err(error)) = remote_stop_result {
+            log::error!(
+                "注销 SSH CLI 服务时远端停止失败: connection_id={connection_id} cli_id={cli_id} error={error:#}"
+            );
+            return Err(error).with_context(|| {
+                format!("注销 SSH CLI 服务失败: connection_id={connection_id} cli_id={cli_id}")
+            });
+        }
+
+        Ok(())
     }
 
     async fn terminate(&self, connection_id: &str, cli_id: &str) -> anyhow::Result<bool> {

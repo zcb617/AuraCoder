@@ -398,6 +398,9 @@ pub trait CliTool: Send + Sync {
     /// SSH 连接测试成功后，由当前 CLI 生命周期建立 Tunnel 并登记、启动该 CLI 远端服务；本机不支持。
     async fn register_remote_service(&self, context: &CliExecutionContext) -> Result<()>;
 
+    /// 明确注销当前 SSH 连接上的 CLI 服务，不触发重启，也不影响其他连接或 CLI 服务。
+    async fn unregister_remote_service(&self, context: &CliExecutionContext) -> Result<()>;
+
     /// 用户新建会话或继续已有会话时，在当前 CLI 和当前项目中建立正式会话；恢复失败时不得创建替代会话。
     /// 用户新建会话或继续已有会话时，在当前 CLI 和当前项目中建立正式会话；恢复失败时不得创建替代会话。
     async fn start_thread(
