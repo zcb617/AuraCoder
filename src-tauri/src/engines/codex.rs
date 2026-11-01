@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, LazyLock, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -340,6 +340,8 @@ enum CodexTransportTarget {
 }
 
 #[derive(Debug, Clone)]
+// 已退出生产审批路径，仅供既有单元测试使用。
+#[cfg(test)]
 struct PendingApproval {
     raw_request_id: serde_json::Value,
     method: String,
@@ -388,6 +390,8 @@ struct PendingSteer {
 struct CodexState {
     transport: Option<Arc<CodexTransport>>,
     initialized: bool,
+    // 已退出生产审批路径，仅供既有单元测试使用。
+    #[cfg(test)]
     approval_requests: HashMap<String, PendingApproval>,
     active_turn_ids: HashMap<String, String>,
     pending_steers: HashMap<String, VecDeque<PendingSteer>>,
@@ -444,7 +448,12 @@ pub enum CodexRuntimeEvent {
         toast: Option<RuntimeToastDto>,
     },
     ApprovalResolved {
-        approval_id: String,
+        /// Codex 服务端通知中携带的原始引擎线程标识。
+        engine_thread_id: String,
+        /// Codex 服务端通知中携带的原始 JSON-RPC 请求 ID。
+        request_id: serde_json::Value,
+        /// 收到原始通知时所属 Codex Transport 的连接身份。
+        source_connection_id: String,
     },
     ThreadStatusChanged {
         engine_thread_id: String,
@@ -471,6 +480,15 @@ pub enum CodexRuntimeEvent {
     ThreadUnarchived {
         engine_thread_id: String,
     },
+}
+
+/// 转发各本机和 SSH Codex Service 收到的原始审批解析通知，不持有审批业务记录。
+static CODEX_APPROVAL_EVENTS: LazyLock<broadcast::Sender<CodexRuntimeEvent>> =
+    LazyLock::new(|| broadcast::channel(256).0);
+
+/// 订阅全应用 Codex 审批解析通知。
+pub(crate) fn subscribe_codex_approval_events() -> broadcast::Receiver<CodexRuntimeEvent> {
+    CODEX_APPROVAL_EVENTS.subscribe()
 }
 
 #[derive(Debug, Clone)]
@@ -1440,9 +1458,17 @@ impl Engine for CodexEngine {
                         continue;
                     }
 
-                    if let Some(approval) =
+                    if let Some(mut approval) =
                         mapper.map_server_request(&id, &raw_id, &method, &params)
                     {
+                      if let EngineEvent::ApprovalRequested { details, .. } = &mut approval.event {
+                        if let Some(details) = details.as_object_mut() {
+                          details.insert(
+                            super::codex_event_mapper::APPROVAL_DETAIL_CONNECTION_ID_KEY.to_string(),
+                            serde_json::Value::String(transport.connection_id().to_string()),
+                          );
+                        }
+                      }
                       log::info!(
                         "codex approval request mapped: approval_id={}, method={method}",
                         approval.approval_id
@@ -1450,13 +1476,7 @@ impl Engine for CodexEngine {
                       if turn_request_done && !completion_seen {
                         completion_last_progress_at = Some(Instant::now());
                       }
-                      self
-                        .register_approval_request(
-                          &approval.approval_id,
-                          &raw_id,
-                          &approval.server_method,
-                        )
-                        .await;
+                      // 已退出生产审批路径：self.register_approval_request(&approval.approval_id, &raw_id, &approval.server_method).await;
                       send_engine_event_with_diagnostics(
                         &event_tx,
                         approval.event,
@@ -1804,27 +1824,44 @@ impl Engine for CodexEngine {
         response: serde_json::Value,
         route: Option<ApprovalRequestRoute>,
     ) -> Result<(), anyhow::Error> {
-        let pending = self.approval_request(approval_id).await;
-        let (raw_request_id, method) =
-            resolve_approval_response_target(pending.as_ref(), route.as_ref()).map_err(
-                |reason| {
-                    anyhow::Error::new(reason)
-                        .context(approval_response_target_error_message(reason, approval_id))
-                },
-            )?;
-        let normalized_response = normalize_approval_response(Some(method), response);
-        let transport = self.ensure_ready_transport().await?;
+        // 仅使用 Service 从数据库传入的原始路由；缺失请求元数据时明确拒绝答复。
+        let route = route.ok_or_else(|| {
+            let reason = ApprovalResponseTargetError::MissingRequestMetadata;
+            anyhow::Error::new(reason)
+                .context(approval_response_target_error_message(reason, approval_id))
+        })?;
+        let source_connection_id = route.source_connection_id.as_deref().ok_or_else(|| {
+            let reason = ApprovalResponseTargetError::MissingRequestMetadata;
+            anyhow::Error::new(reason)
+                .context(approval_response_target_error_message(reason, approval_id))
+        })?;
+
+        // 只能将答复发给已经存在且与原审批相同的 Codex 连接。
+        let transport = self.live_transport().await.ok_or_else(|| {
+            let reason = ApprovalResponseTargetError::RuntimeReset;
+            anyhow::Error::new(reason)
+                .context(approval_response_target_error_message(reason, approval_id))
+        })?;
+        if source_connection_id != transport.connection_id() {
+            let reason = ApprovalResponseTargetError::RuntimeReset;
+            return Err(anyhow::Error::new(reason)
+                .context(approval_response_target_error_message(reason, approval_id)));
+        }
+
+        // 按数据库保留的服务端方法规范化响应，并保留原始 JSON-RPC ID 类型。
+        let normalized_response =
+            normalize_approval_response(Some(&route.server_method), response);
+        let raw_request_id = route.raw_request_id;
 
         log::info!(
             "sending approval response to codex: approval_id={approval_id}, raw_request_id={raw_request_id}"
         );
 
         transport
-            .respond_success(raw_request_id, normalized_response)
+            .respond_success(&raw_request_id, normalized_response)
             .await
             .context("failed to send approval response to codex")?;
 
-        self.take_approval_request(approval_id).await;
         Ok(())
     }
 
@@ -2642,9 +2679,17 @@ impl CodexEngine {
                       continue;
                     }
 
-                    if let Some(approval) =
+                    if let Some(mut approval) =
                         mapper.map_server_request(&id, &raw_id, &method, &params)
                     {
+                      if let EngineEvent::ApprovalRequested { details, .. } = &mut approval.event {
+                        if let Some(details) = details.as_object_mut() {
+                          details.insert(
+                            super::codex_event_mapper::APPROVAL_DETAIL_CONNECTION_ID_KEY.to_string(),
+                            serde_json::Value::String(transport.connection_id().to_string()),
+                          );
+                        }
+                      }
                       log::info!(
                         "codex review approval request mapped: approval_id={}, method={method}",
                         approval.approval_id
@@ -2652,13 +2697,7 @@ impl CodexEngine {
                       if turn_request_done && !completion_seen {
                         completion_last_progress_at = Some(Instant::now());
                       }
-                      self
-                        .register_approval_request(
-                          &approval.approval_id,
-                          &raw_id,
-                          &approval.server_method,
-                        )
-                        .await;
+                      // 已退出生产审批路径：self.register_approval_request(&approval.approval_id, &raw_id, &approval.server_method).await;
                       send_engine_event_with_diagnostics(
                         &event_tx,
                         approval.event,
@@ -3681,6 +3720,7 @@ impl CodexEngine {
                 })
                 .collect::<Vec<_>>();
             state.initialized = false;
+            #[cfg(test)]
             state.approval_requests.clear();
             state.active_turn_ids.clear();
             state.pending_steers.clear();
@@ -3908,6 +3948,7 @@ impl CodexEngine {
         let transport = transport.clone();
         let state = self.state.clone();
         let runtime_events = self.runtime_events.clone();
+        let source_connection_id = transport.connection_id().to_string();
         tokio::spawn(async move {
             let mut incoming_rx =
                 spawn_codex_incoming_pump(transport.clone(), "runtime_monitor", None);
@@ -4218,29 +4259,25 @@ impl CodexEngine {
                                 }
                             }
                             "serverrequest/resolved" => {
+                                let engine_thread_id =
+                                    extract_any_string(&params, &["threadId", "thread_id"]);
                                 let request_id = params
                                     .get("requestId")
                                     .or_else(|| params.get("request_id"))
                                     .cloned();
-                                if let Some(request_id) = request_id {
-                                    if let Some(approval_id) =
-                                        resolve_pending_approval_request(state.clone(), &request_id)
-                                            .await
-                                    {
-                                        log::debug!(
-                                            "codex server request resolved approval: approval_id={approval_id}"
-                                        );
-                                        let _ = runtime_events.send(
-                                            CodexRuntimeEvent::ApprovalResolved { approval_id },
-                                        );
-                                    } else {
-                                        log::debug!(
-                                            "codex server request resolved without approval match: request_id={request_id}"
-                                        );
-                                    }
+                                if let (Some(engine_thread_id), Some(request_id)) =
+                                    (engine_thread_id, request_id)
+                                {
+                                    let _ = CODEX_APPROVAL_EVENTS.send(
+                                        CodexRuntimeEvent::ApprovalResolved {
+                                            engine_thread_id,
+                                            request_id,
+                                            source_connection_id: source_connection_id.clone(),
+                                        },
+                                    );
                                 } else {
-                                    log::debug!(
-                                        "codex server request resolved without request id: params={params}"
+                                    log::error!(
+                                        "Codex server request resolved notification is missing thread or request id: params={params}"
                                     );
                                 }
                             }
@@ -4400,6 +4437,8 @@ impl CodexEngine {
         );
     }
 
+    // 已退出生产审批路径，仅供既有单元测试使用。
+    #[cfg(test)]
     async fn register_approval_request(
         &self,
         approval_id: &str,
@@ -4416,11 +4455,15 @@ impl CodexEngine {
         );
     }
 
+    // 已退出生产审批路径，仅供既有单元测试使用。
+    #[cfg(test)]
     async fn approval_request(&self, approval_id: &str) -> Option<PendingApproval> {
         let state = self.state.lock().await;
         state.approval_requests.get(approval_id).cloned()
     }
 
+    // 已退出生产审批路径，仅供既有单元测试使用。
+    #[cfg(test)]
     async fn take_approval_request(&self, approval_id: &str) -> Option<PendingApproval> {
         let mut state = self.state.lock().await;
         state.approval_requests.remove(approval_id)
@@ -8125,6 +8168,8 @@ fn build_windows_world_writable_warning_toast(
     })
 }
 
+// 已退出生产审批路径，仅供既有单元测试使用。
+#[cfg(test)]
 async fn resolve_pending_approval_request(
     state: Arc<Mutex<CodexState>>,
     request_id: &serde_json::Value,
@@ -8147,6 +8192,8 @@ pub(crate) enum ApprovalResponseTargetError {
     MissingRequestMetadata,
 }
 
+// 已退出生产审批路径，仅供既有单元测试使用。
+#[cfg(test)]
 fn resolve_approval_response_target<'a>(
     pending: Option<&'a PendingApproval>,
     route: Option<&'a ApprovalRequestRoute>,

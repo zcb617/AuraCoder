@@ -5161,6 +5161,7 @@ pub fn extract_persisted_approval_route(details: &Value) -> Option<ApprovalReque
     Some(ApprovalRequestRoute {
         server_method: server_method.to_string(),
         raw_request_id,
+        source_connection_id: None,
     })
 }
 

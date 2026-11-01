@@ -61,6 +61,8 @@ impl EngineCheckAction {
 pub struct ApprovalRequestRoute {
     pub server_method: String,
     pub raw_request_id: Value,
+    /// 原始审批请求所属连接，用于避免连接重建后重复请求 ID 串线。
+    pub source_connection_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -894,6 +894,7 @@ fn resolve_approval_response_target_prefers_pending_request_metadata() {
     let persisted = ApprovalRequestRoute {
         server_method: "item/commandExecution/requestApproval".to_string(),
         raw_request_id: json!("req-2"),
+        source_connection_id: None,
     };
 
     let resolved = resolve_approval_response_target(Some(&pending), Some(&persisted))
@@ -920,6 +921,7 @@ fn resolve_approval_response_target_rejects_persisted_route_after_transport_rese
     let persisted = ApprovalRequestRoute {
         server_method: "item/commandExecution/requestApproval".to_string(),
         raw_request_id: json!("req-2"),
+        source_connection_id: None,
     };
 
     assert_eq!(

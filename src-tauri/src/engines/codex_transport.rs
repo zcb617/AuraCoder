@@ -20,6 +20,7 @@ use tokio::{
     sync::{broadcast, oneshot, Mutex},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use uuid::Uuid;
 
 use crate::{process_utils, runtime_env};
 
@@ -79,6 +80,8 @@ type CodexWebSocketWriter =
     futures::stream::SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 pub struct CodexTransport {
+    /// 当前 Codex app-server 连接的唯一身份，用于核对审批请求所属连接。
+    connection_id: String,
     child: Mutex<Option<Child>>,
     stdin: Mutex<Option<ChildStdin>>,
     websocket_writer: Mutex<Option<CodexWebSocketWriter>>,
@@ -534,6 +537,7 @@ impl CodexTransport {
         }
 
         Ok(Self {
+            connection_id: Uuid::new_v4().to_string(),
             child: Mutex::new(Some(child)),
             stdin: Mutex::new(Some(stdin)),
             websocket_writer: Mutex::new(None),
@@ -711,6 +715,7 @@ impl CodexTransport {
         }
 
         Ok(Self {
+            connection_id: Uuid::new_v4().to_string(),
             child: Mutex::new(None),
             stdin: Mutex::new(None),
             websocket_writer: Mutex::new(Some(writer)),
@@ -726,6 +731,11 @@ impl CodexTransport {
 
     pub fn subscribe(&self) -> broadcast::Receiver<CodexTransportMessage> {
         self.incoming_tx.subscribe()
+    }
+
+    /// 返回当前 Codex app-server 连接的稳定身份。
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
     }
 
     pub async fn request(

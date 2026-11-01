@@ -2226,8 +2226,13 @@ impl CodexCli {
     /// 持续处理 Codex 自身的运行时事件，单个事件失败时记录原始错误后继续监听。
     async fn listen_runtime_events(&self, app: tauri::AppHandle) -> Result<()> {
         let mut events = self.state.engines.subscribe_codex_runtime_events();
+        let mut approval_events = crate::engines::codex::subscribe_codex_approval_events();
         loop {
-            match events.recv().await {
+            let received_event = tokio::select! {
+                event = events.recv() => event,
+                event = approval_events.recv() => event,
+            };
+            match received_event {
                 Ok(event) => {
                     let event_context = format!("{event:?}");
                     if let Err(error) = self.handle_runtime_event(&app, event).await {
@@ -2260,17 +2265,99 @@ impl CodexCli {
                 )
                 .context("通知 Codex 运行诊断更新失败")?;
             }
-            CodexRuntimeEvent::ApprovalResolved { approval_id } => {
-                if let Some(resolution) = self.resolve_runtime_approval(&approval_id).await? {
-                    let topic = format!("stream-event-{}", resolution.thread_id);
-                    app.emit(
-                        &topic,
-                        approval_resolved_payload(&approval_id),
+            CodexRuntimeEvent::ApprovalResolved {
+                engine_thread_id,
+                request_id,
+                source_connection_id,
+            } => {
+                // 按通知中的原始路由信息从数据库定位本地 UUID，不依赖引擎内存审批表。
+                let database = self.state.db.clone();
+                let lookup_engine_thread_id = engine_thread_id.clone();
+                let lookup_request_id = request_id.clone();
+                let lookup_connection_id = source_connection_id.clone();
+                let record = tokio::task::spawn_blocking(move || {
+                    db::actions::find_codex_approval_by_request(
+                        &database,
+                        &lookup_engine_thread_id,
+                        &lookup_request_id,
+                        &lookup_connection_id,
                     )
-                    .context("通知 Codex 审批卡片完成失败")?;
-                    if let Some(thread) = resolution.updated_thread {
-                        Self::emit_thread_updated(app, thread)?;
+                })
+                .await
+                .context("按 Codex 原始审批请求查找数据库记录失败")??;
+                let Some(record) = record else {
+                    log::debug!(
+                        "Codex resolved request has no saved approval: engine_thread_id={}, request_id={}, source_connection_id={}",
+                        engine_thread_id,
+                        request_id,
+                        source_connection_id
+                    );
+                    return Ok(());
+                };
+                let approval_id = record.approval_id.clone();
+                let Some(thread_id) = record.thread_id.clone() else {
+                    log::error!(
+                        "Codex resolved approval has no saved thread: approval_id={}, engine_thread_id={}, request_id={}, source_connection_id={}",
+                        approval_id,
+                        engine_thread_id,
+                        request_id,
+                        source_connection_id
+                    );
+                    return Ok(());
+                };
+
+                // pending 记录沿用既有原子结算；已经 answered 或 expired 的记录不再覆盖。
+                let mut updated_thread = None;
+                if record.status == "pending" {
+                    if let Some(resolution) = self.resolve_runtime_approval(&approval_id).await? {
+                        anyhow::ensure!(
+                            resolution.thread_id == thread_id,
+                            "Codex runtime approval thread does not match saved request: {approval_id}"
+                        );
+                        updated_thread = resolution.updated_thread;
                     }
+                }
+
+                // 以本地 UUID 重读真实数据库终态，兼容原生通知早于正常 Service 答复。
+                let database = self.state.db.clone();
+                let query_approval_id = approval_id.clone();
+                let record = tokio::task::spawn_blocking(move || {
+                    db::actions::read_runtime_approval_record(&database, &query_approval_id)
+                })
+                .await
+                .context("重读 Codex 审批数据库终态失败")??;
+                let Some(record) = record else {
+                    log::debug!(
+                        "Codex resolved approval disappeared before notification: approval_id={}, thread_id={}",
+                        approval_id,
+                        thread_id
+                    );
+                    return Ok(());
+                };
+                let payload = match record.status.as_str() {
+                    "answered" => approval_resolved_payload(&approval_id),
+                    "expired" => serde_json::json!({
+                        "type": "ApprovalExpired",
+                        "approval_id": approval_id,
+                        "reason": "审批已失效",
+                    }),
+                    status => {
+                        log::debug!(
+                            "Codex resolved approval remains non-terminal: approval_id={}, thread_id={}, status={status}",
+                            approval_id,
+                            thread_id
+                        );
+                        return Ok(());
+                    }
+                };
+                let topic = format!("stream-event-{thread_id}");
+                app.emit(&topic, payload).with_context(|| {
+                    format!(
+                        "通知 Codex 审批状态失败: thread_id={thread_id}, approval_id={approval_id}"
+                    )
+                })?;
+                if let Some(thread) = updated_thread {
+                    Self::emit_thread_updated(app, thread)?;
                 }
             }
             CodexRuntimeEvent::ThreadStatusChanged {

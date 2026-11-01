@@ -5749,6 +5749,7 @@ pub(crate) fn resolve_turn_model_id(
         let approval_id_owned = approval_id.to_string();
         let status_owned = status.to_string();
         let decision_owned = decision.map(str::to_string);
+        let allow_resolved_without_decision = status == "answered" && decision.is_some();
         match run_db(db, move |db| {
             db::actions::settle_chat_approval(
                 db,
@@ -5758,6 +5759,7 @@ pub(crate) fn resolve_turn_model_id(
                 decision_owned.as_deref(),
                 thread_status,
                 message_status,
+                allow_resolved_without_decision,
             )
         })
         .await
@@ -5773,6 +5775,12 @@ pub(crate) fn resolve_turn_model_id(
             Err(error) => {
                 log::error!("保存聊天审批结果失败: {error:#}");
                 match read_settled_chat_approval_outcome(state, thread_id, approval_id).await {
+                    Ok(Some(outcome))
+                        if outcome.status == status
+                            && outcome.decision.as_deref() == decision =>
+                    {
+                        Ok(outcome)
+                    }
                     Ok(Some(outcome)) => Err(ChatBusinessError::new(
                         "APPROVAL_NOT_PENDING",
                         "该审批已由其他处理完成，请刷新后查看实际结果",

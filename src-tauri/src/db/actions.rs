@@ -95,6 +95,7 @@ pub fn settle_chat_approval(
     decision: Option<&str>,
     thread_status: ThreadStatusDto,
     message_status: Option<MessageStatusDto>,
+    allow_resolved_without_decision: bool,
 ) -> anyhow::Result<(ThreadDto, MessageDto)> {
     // 只接受 Service 契约规定的两种结算状态，不在 Mapper 推导业务状态。
     if status != "answered" && status != "expired" {
@@ -107,7 +108,7 @@ pub fn settle_chat_approval(
     // 先读取审批并校验归属和 pending 状态，所有校验均发生在任何写入之前。
     let approval = tx
         .query_row(
-            "SELECT thread_id, message_id, status
+            "SELECT thread_id, message_id, status, decision
              FROM approvals
              WHERE id = ?1",
             params![approval_id],
@@ -116,18 +117,24 @@ pub fn settle_chat_approval(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             },
         )
         .optional()
         .context("failed to load approval for settlement")?;
-    let Some((approval_thread_id, message_id, current_status)) = approval else {
+    let Some((approval_thread_id, message_id, current_status, current_decision)) = approval else {
         anyhow::bail!("chat approval not found: {approval_id}");
     };
     if approval_thread_id != thread_id {
         anyhow::bail!("chat approval does not belong to thread: {thread_id}");
     }
-    if current_status != "pending" {
+    let can_complete_resolved_without_decision = allow_resolved_without_decision
+        && status == "answered"
+        && decision.is_some()
+        && current_status == "answered"
+        && current_decision.is_none();
+    if current_status != "pending" && !can_complete_resolved_without_decision {
         anyhow::bail!("chat approval is not pending: {approval_id}");
     }
 
@@ -209,8 +216,18 @@ pub fn settle_chat_approval(
                  answered_at = CASE WHEN ?1 = 'answered' THEN ?3 ELSE answered_at END
              WHERE id = ?4
                AND thread_id = ?5
-               AND status = 'pending'",
-            params![status, decision, answered_at, approval_id, thread_id],
+               AND (
+                   status = 'pending'
+                   OR (?6 AND status = 'answered' AND decision IS NULL)
+               )",
+            params![
+                status,
+                decision,
+                answered_at,
+                approval_id,
+                thread_id,
+                allow_resolved_without_decision
+            ],
         )
         .context("failed to settle chat approval")?;
     if approval_rows != 1 {
@@ -660,6 +677,58 @@ pub fn read_runtime_approval_record(
 ) -> anyhow::Result<Option<RuntimeApprovalRecord>> {
     let connection = db.connect()?;
     get_runtime_approval_record(&connection, approval_id)
+}
+
+/// 按 Codex 原始请求、引擎线程和连接身份定位唯一的数据库审批记录。
+pub fn find_codex_approval_by_request(
+    db: &Database,
+    engine_thread_id: &str,
+    request_id: &Value,
+    source_connection_id: &str,
+) -> anyhow::Result<Option<RuntimeApprovalRecord>> {
+    // 仅从 Codex 线程读取包含原线程与连接身份的审批详情。
+    let conn = db.connect().context("failed to connect for Codex approval lookup")?;
+    let mut statement = conn
+        .prepare(
+            "SELECT a.id, a.details_json
+             FROM approvals a
+             JOIN threads t ON t.id = a.thread_id
+             WHERE t.engine_id = 'codex'
+               AND json_valid(a.details_json)
+               AND COALESCE(
+                   json_extract(a.details_json, '$.threadId'),
+                   json_extract(a.details_json, '$.thread_id'),
+                   t.engine_thread_id
+               ) = ?1
+               AND json_extract(a.details_json, '$._codexConnectionId') = ?2",
+        )
+        .context("failed to prepare Codex approval request lookup")?;
+    let rows = statement
+        .query_map(params![engine_thread_id, source_connection_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .context("failed to query Codex approval requests")?;
+
+    // 通过 serde_json::Value 严格比较原始 ID，区分数字与字符串等不同 JSON 类型。
+    let mut matching_ids = Vec::new();
+    for row in rows {
+        let (approval_id, details_json) = row.context("failed to read Codex approval request row")?;
+        let details = serde_json::from_str::<Value>(&details_json)
+            .context("failed to parse Codex approval details_json")?;
+        if details.get("_rawRequestId") == Some(request_id) {
+            matching_ids.push(approval_id);
+        }
+    }
+
+    // 仅唯一匹配时读取完整审批事实，歧义请求不任意挑选记录。
+    match matching_ids.len() {
+        0 => Ok(None),
+        1 => get_runtime_approval_record(&conn, &matching_ids[0])
+            .context("failed to load matching Codex runtime approval record"),
+        count => anyhow::bail!(
+            "ambiguous Codex approval request match: engine_thread_id={engine_thread_id}, source_connection_id={source_connection_id}, matches={count}"
+        ),
+    }
 }
 
 /// 在审批事务内读取目标线程 DTO，供提交后通知页面使用。

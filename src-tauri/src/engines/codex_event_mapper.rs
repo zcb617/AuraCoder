@@ -10,6 +10,7 @@ use super::{
 
 pub const APPROVAL_DETAIL_SERVER_METHOD_KEY: &str = "_serverMethod";
 pub const APPROVAL_DETAIL_RAW_REQUEST_ID_KEY: &str = "_rawRequestId";
+pub const APPROVAL_DETAIL_CONNECTION_ID_KEY: &str = "_codexConnectionId";
 
 #[derive(Default)]
 pub struct TurnEventMapper {
@@ -1042,10 +1043,15 @@ pub fn extract_persisted_approval_route(details: &Value) -> Option<ApprovalReque
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
     let raw_request_id = object.get(APPROVAL_DETAIL_RAW_REQUEST_ID_KEY)?.clone();
+    let source_connection_id = object
+        .get(APPROVAL_DETAIL_CONNECTION_ID_KEY)
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     Some(ApprovalRequestRoute {
         server_method: server_method.to_string(),
         raw_request_id,
+        source_connection_id,
     })
 }
 
@@ -2252,6 +2258,7 @@ mod tests {
             Some(ApprovalRequestRoute {
                 server_method: "item/fileChange/requestApproval".to_string(),
                 raw_request_id: json!(42),
+                source_connection_id: None,
             })
         );
     }

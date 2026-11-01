@@ -1365,6 +1365,7 @@ const ATTACHMENT_PREVIEW_MAX_BYTES: usize = 700 * 1024;
             Some(ApprovalRequestRoute {
                 server_method: "item/fileChange/requestApproval".to_string(),
                 raw_request_id: serde_json::json!(42),
+                source_connection_id: None,
             })
         );
     }
