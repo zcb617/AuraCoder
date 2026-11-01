@@ -1749,7 +1749,17 @@ pub(crate) async fn process_stream_event(
         _ => {}
     }
 
-    // CLI 专属事件已由上方回调处理，公共层只持久化统一事件字段。    let _ = app.emit(stream_event_topic, &normalized_event);
+    // CLI 专属事件已由上方回调处理，公共层转发并持久化统一事件字段。
+    if let Err(error) = app.emit(stream_event_topic, &normalized_event) {
+        log::error!(
+            "聊天流式事件发送失败: thread_id={}, engine_id={}, assistant_message_id={}, topic={}, event_kind={}, error={error:#}",
+            thread.id,
+            thread.engine_id,
+            assistant_message_id,
+            stream_event_topic,
+            chat_engine_event_kind(&normalized_event),
+        );
+    }
     if let EngineEvent::ApprovalRequested { summary, .. } = &normalized_event {
         let _ = app.emit(approval_event_topic, &normalized_event);
         // Unscoped companion event so background threads can surface pending
