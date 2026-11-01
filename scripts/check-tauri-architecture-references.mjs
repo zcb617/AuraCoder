@@ -590,6 +590,29 @@ function isAllowedRefreshDatabaseImportMatch(source, match) {
     }),
   );
 }
+
+/**
+ * 判断应用入口的 REF-09 命中是否完整位于数据库初始化所需的两个精确类型导入中。
+ * @param {ReturnType<typeof readCodeSource>} source 文件快照。
+ * @param {{text: string, index: number}} match REF-09 的单次命中。
+ * @returns {boolean} 命中完全处于独立类型导入语句时返回 true。
+ */
+function isAllowedLibDatabaseTypeImportMatch(source, match) {
+  if (source.path !== "src-tauri/src/lib.rs") {
+    return false;
+  }
+  const allowedPatterns = [
+    /^\s*use\s+db\s*::\s*Database\s*;/gm,
+    /^\s*use\s+db\s*::\s*UnsupportedDatabaseVersion\s*;/gm,
+  ];
+  return allowedPatterns.some((pattern) =>
+    findMatches(source.clean, pattern).some((statement) => {
+      const statementEnd = statement.index + statement.text.length;
+      const matchEnd = match.index + match.text.length;
+      return match.index >= statement.index && matchEnd <= statementEnd;
+    }),
+  );
+}
 /**
  * 将文件中的规则匹配转换为带原始行内容的违规结果。
  * @param {ReturnType<typeof readCodeSource>} source 文件快照。
@@ -598,7 +621,11 @@ function isAllowedRefreshDatabaseImportMatch(source, match) {
  */
 function sourceRuleMatchesToFindings(source, rule) {
   return findMatches(source.clean, rule.pattern).filter((match) => {
-    if (rule.rule === "REF-09" && isAllowedRefreshDatabaseImportMatch(source, match)) {
+    if (
+      rule.rule === "REF-09" &&
+      (isAllowedRefreshDatabaseImportMatch(source, match) ||
+        isAllowedLibDatabaseTypeImportMatch(source, match))
+    ) {
       return false;
     }
     if (rule.rule !== "REF-10" || source.path !== "src-tauri/src/lib.rs") {
@@ -1409,6 +1436,38 @@ function runSelfChecks() {
       "公共刷新服务仍须报告 REF-09 引用: " + snippet,
     );
   }
+  const libPath = "src-tauri/src/lib.rs";
+  const allowedLibImports = "use db::Database;\nuse db::UnsupportedDatabaseVersion;";
+  assert.equal(
+    findSampleFindings(libPath, allowedLibImports).some((finding) => finding.rule === "REF-09"),
+    false,
+    "REF-09 必须允许应用入口的两个独立数据库初始化类型导入",
+  );
+  for (const snippet of [
+    "db::threads::get_thread();",
+    "db.connect();",
+    "rusqlite::Connection;",
+    "use db::{Database, threads};",
+    "db::UnsupportedDatabaseVersion;",
+  ]) {
+    assert.ok(
+      findSampleFindings(libPath, snippet).some((finding) => finding.rule === "REF-09"),
+      "应用入口仍须拒绝非精确数据库类型导入: " + snippet,
+    );
+  }
+  assert.ok(
+    findSampleFindings("src-tauri/src/services/other.rs", "use db::Database;").some(
+      (finding) => finding.rule === "REF-09",
+    ),
+    "普通 Service 不得继承应用入口的数据库类型导入例外",
+  );
+  assert.equal(
+    findSampleFindings(libPath, "tauri::generate_handler![commands::threads::create_thread]").some(
+      (finding) => finding.rule === "REF-10",
+    ),
+    false,
+    "应用入口仍须允许 Tauri 命令注册",
+  );
   assert.ok(
     findSampleFindings(refreshServicePath, "commands::chat::send_message();").some(
       (finding) => finding.rule === "REF-10",

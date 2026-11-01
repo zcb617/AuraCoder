@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -19,7 +19,7 @@ use crate::{
     engines::{
         approval_response_route_for_engine, capabilities_for_engine, map_engine_capabilities,
         map_model_info, normalize_approval_response_for_engine, opencode::OpenCodeEngine,
-        ApprovalRequestRoute, CodexRuntimeEvent, Engine, EngineCapabilities, EngineEvent,
+        ApprovalRequestRoute, Engine, EngineCapabilities, EngineEvent,
         EngineSteerReceipt, EngineThread, ModelInfo, OpenCodeRemoteSessionSummary, SandboxPolicy,
         ThreadScope, ThreadSyncSnapshot, TurnInput,
     },
@@ -1049,9 +1049,9 @@ impl CliTool for OpenCodeCli {
         })
     }
 
-    fn subscribe_codex_runtime_events(&self) -> broadcast::Receiver<CodexRuntimeEvent> {
-        let (_event_tx, event_rx) = broadcast::channel(1);
-        event_rx
+    /// OpenCode 当前没有独立的桌面运行时事件流，完成统一监听入口。
+    async fn run_runtime_event_bridge(&self, _app: tauri::AppHandle) -> Result<()> {
+        Ok(())
     }
 
     async fn prewarm_engine(&self, context: &CliExecutionContext) -> Result<()> {

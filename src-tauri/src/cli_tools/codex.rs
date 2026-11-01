@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tauri::Emitter;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -33,7 +33,8 @@ use crate::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
-        MessageStatusDto, ThreadDto, ThreadStatusDto, ThreadUpdateDto, WorkspaceDto,
+        EngineRuntimeUpdatedDto, MessageStatusDto, ThreadDto, ThreadStatusDto, ThreadUpdateDto,
+        WorkspaceDto,
     },
     models::chat::{
         ApprovalResponseOutcomeDto, ApprovalResponseRequest, ChatBusinessError, ChatReviewRequest,
@@ -2063,6 +2064,526 @@ impl CodexCli {
     }
 }
 
+/// 前端线程更新事件沿用原有字段名和可选快照载荷。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadUpdatedEvent {
+    /// 本地线程标识。
+    thread_id: String,
+    /// 线程所属工作区标识。
+    workspace_id: String,
+    /// 当前线程快照；部分事件只需要通知前端重新读取时可以省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thread: Option<ThreadDto>,
+}
+
+/// Codex 远端线程归档或删除通知沿用原有数据契约。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRemoteThreadRemovedEvent {
+    /// 被远端归档或删除的本地线程快照。
+    thread: ThreadDto,
+    /// 远端本次执行的动作名称。
+    remote_action: &'static str,
+}
+
+/// 审批完成后用于事件通知的已提交业务结果。
+#[derive(Debug, Clone)]
+struct CodexRuntimeApprovalResolution {
+    /// 审批所属本地线程标识。
+    thread_id: String,
+    /// 需要通知页面更新的线程快照；无活动本地轮次时为空。
+    updated_thread: Option<ThreadDto>,
+}
+
+impl CodexCli {
+    /// 持续处理 Codex 自身的运行时事件，单个事件失败时记录原始错误后继续监听。
+    async fn listen_runtime_events(&self, app: tauri::AppHandle) -> Result<()> {
+        let mut events = self.state.engines.subscribe_codex_runtime_events();
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    let event_context = format!("{event:?}");
+                    if let Err(error) = self.handle_runtime_event(&app, event).await {
+                        log::error!("处理 Codex 运行时事件失败: event={event_context} error={error:#}");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    log::warn!("Codex 运行时事件监听落后，跳过事件数: {skipped}");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+            }
+        }
+    }
+
+    /// 将 Codex 运行时事件按既有前端事件契约更新本地状态并通知页面。
+    async fn handle_runtime_event(
+        &self,
+        app: &tauri::AppHandle,
+        event: CodexRuntimeEvent,
+    ) -> Result<()> {
+        match event {
+            CodexRuntimeEvent::DiagnosticsUpdated { diagnostics, toast } => {
+                app.emit(
+                    "engine-runtime-updated",
+                    EngineRuntimeUpdatedDto {
+                        engine_id: "codex".to_string(),
+                        protocol_diagnostics: Some(diagnostics),
+                        toast,
+                    },
+                )
+                .context("通知 Codex 运行诊断更新失败")?;
+            }
+            CodexRuntimeEvent::ApprovalResolved { approval_id } => {
+                if let Some(resolution) = self.resolve_runtime_approval(&approval_id).await? {
+                    let topic = format!("stream-event-{}", resolution.thread_id);
+                    app.emit(
+                        &topic,
+                        approval_resolved_payload(&approval_id),
+                    )
+                    .context("通知 Codex 审批卡片完成失败")?;
+                    if let Some(thread) = resolution.updated_thread {
+                        Self::emit_thread_updated(app, thread)?;
+                    }
+                }
+            }
+            CodexRuntimeEvent::ThreadStatusChanged {
+                engine_thread_id,
+                status_type,
+                active_flags,
+            } => {
+                if let Some(thread) = self
+                    .apply_runtime_thread_update(
+                        &engine_thread_id,
+                        None,
+                        Some(&status_type),
+                        &active_flags,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?
+                {
+                    Self::emit_thread_updated(app, thread)?;
+                }
+            }
+            CodexRuntimeEvent::ThreadNameUpdated {
+                engine_thread_id,
+                thread_name,
+            } => {
+                let normalized_thread_name = thread_name.and_then(|name| {
+                    let trimmed = name.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                });
+                let sync_required = Some(normalized_thread_name.is_none());
+                let sync_reason = if normalized_thread_name.is_none() {
+                    Some("thread_name_updated")
+                } else {
+                    None
+                };
+                if let Some(thread) = self
+                    .apply_runtime_thread_update(
+                        &engine_thread_id,
+                        normalized_thread_name.as_deref(),
+                        None,
+                        &[],
+                        None,
+                        sync_required,
+                        sync_reason,
+                    )
+                    .await?
+                {
+                    Self::emit_thread_updated(app, thread)?;
+                }
+            }
+            CodexRuntimeEvent::ThreadSnapshotUpdated {
+                engine_thread_id,
+                thread_name,
+                status_type,
+                active_flags,
+                preview,
+            } => {
+                if let Some(thread) = self
+                    .apply_runtime_thread_update(
+                        &engine_thread_id,
+                        thread_name.as_deref(),
+                        status_type.as_deref(),
+                        &active_flags,
+                        preview.as_deref(),
+                        Some(false),
+                        None,
+                    )
+                    .await?
+                {
+                    Self::emit_thread_updated(app, thread)?;
+                }
+            }
+            CodexRuntimeEvent::ThreadArchived { engine_thread_id } => {
+                self.emit_remote_thread_removed(app, &engine_thread_id, "archived")
+                    .await?;
+            }
+            CodexRuntimeEvent::ThreadDeleted { engine_thread_id } => {
+                self.emit_remote_thread_removed(app, &engine_thread_id, "deleted")
+                    .await?;
+            }
+            CodexRuntimeEvent::ThreadUnarchived { engine_thread_id } => {
+                if let Some(thread) = self.restore_runtime_thread(&engine_thread_id).await? {
+                    Self::emit_thread_updated(app, thread)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 使用既有 thread-updated 事件通知前端完整线程快照。
+    fn emit_thread_updated(app: &tauri::AppHandle, thread: ThreadDto) -> Result<()> {
+        app.emit(
+            "thread-updated",
+            ThreadUpdatedEvent {
+                thread_id: thread.id.clone(),
+                workspace_id: thread.workspace_id.clone(),
+                thread: Some(thread),
+            },
+        )
+        .context("通知线程状态更新失败")
+    }
+
+    /// 按 Codex 远端线程 ID 合并状态、metadata 和标题的部分更新。
+    async fn apply_runtime_thread_update(
+        &self,
+        engine_thread_id: &str,
+        title: Option<&str>,
+        raw_status: Option<&str>,
+        active_flags: &[String],
+        preview: Option<&str>,
+        sync_required: Option<bool>,
+        sync_reason: Option<&str>,
+    ) -> Result<Option<ThreadDto>> {
+        let database = self.state.db.clone();
+        let lookup_engine_thread_id = engine_thread_id.to_string();
+        let thread = tokio::task::spawn_blocking(move || {
+            db::threads::find_thread_by_engine_thread_id(
+                &database,
+                "codex",
+                &lookup_engine_thread_id,
+            )
+        })
+        .await
+        .context("查询 Codex 运行时线程的数据库任务失败")??;
+        let Some(thread) = thread else {
+            return Ok(None);
+        };
+
+        let has_local_turn = self.state.turns.get(&thread.id).await.is_some();
+        let next_status = thread_business::map_codex_thread_status_to_local(
+            raw_status,
+            active_flags,
+            has_local_turn,
+        );
+        let metadata = merge_codex_runtime_event_metadata(
+            thread.engine_metadata.clone(),
+            raw_status,
+            active_flags,
+            preview,
+            sync_required,
+            sync_reason,
+        );
+        let database = self.state.db.clone();
+        let thread_id = thread.id.clone();
+        let title = title.map(str::to_string);
+        let result = tokio::task::spawn_blocking(move || {
+            db::threads::update_thread_runtime_snapshot(
+                &database,
+                &thread_id,
+                title.as_deref(),
+                next_status,
+                Some(&metadata),
+            )
+        })
+        .await
+        .context("保存 Codex 运行时线程更新的数据库任务失败")??;
+        Ok(Some(result))
+    }
+
+    /// 查找仍处于当前工作区活动列表中的 Codex 本地线程。
+    async fn find_active_runtime_thread(
+        &self,
+        engine_thread_id: &str,
+    ) -> Result<Option<ThreadDto>> {
+        let database = self.state.db.clone();
+        let engine_thread_id = engine_thread_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let Some(thread) = db::threads::find_thread_by_engine_thread_id(
+                &database,
+                "codex",
+                &engine_thread_id,
+            )? else {
+                return Ok(None);
+            };
+            let is_active = db::threads::list_threads_for_workspace(
+                &database,
+                &thread.workspace_id,
+            )?
+            .into_iter()
+            .any(|candidate| candidate.id == thread.id);
+            Ok(is_active.then_some(thread))
+        })
+        .await
+        .context("查询活动 Codex 线程的数据库任务失败")?
+    }
+
+    /// 将远端归档或删除事件通知给仍然活动的本地线程。
+    async fn emit_remote_thread_removed(
+        &self,
+        app: &tauri::AppHandle,
+        engine_thread_id: &str,
+        remote_action: &'static str,
+    ) -> Result<()> {
+        let Some(thread) = self.find_active_runtime_thread(engine_thread_id).await? else {
+            return Ok(());
+        };
+        app.emit(
+            "codex-remote-thread-removed",
+            CodexRemoteThreadRemovedEvent {
+                thread,
+                remote_action,
+            },
+        )
+        .context("通知 Codex 远端线程归档或删除失败")
+    }
+
+    /// 按 Mapper 结构化结果恢复远端取消归档的本地 Codex 线程。
+    async fn restore_runtime_thread(
+        &self,
+        engine_thread_id: &str,
+    ) -> Result<Option<ThreadDto>> {
+        let database = self.state.db.clone();
+        let engine_thread_id = engine_thread_id.to_string();
+        let restored = tokio::task::spawn_blocking(move || {
+            db::threads::restore_runtime_thread(&database, "codex", &engine_thread_id)
+        })
+        .await
+        .context("恢复 Codex 运行时线程的数据库任务失败")??;
+        match restored {
+            db::threads::RuntimeThreadRestoreResult::Updated(thread)
+            | db::threads::RuntimeThreadRestoreResult::AlreadyActive(thread) => Ok(Some(thread)),
+            db::threads::RuntimeThreadRestoreResult::NotFound => Ok(None),
+        }
+    }
+
+    /// 在审批和消息块仍匹配当前 pending 事实时原子保存 Codex 审批完成结果。
+    async fn resolve_runtime_approval(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<CodexRuntimeApprovalResolution>> {
+        let database = self.state.db.clone();
+        let query_approval_id = approval_id.to_string();
+        let initial = tokio::task::spawn_blocking(move || {
+            db::actions::read_runtime_approval_record(&database, &query_approval_id)
+        })
+        .await
+        .context("读取 Codex 审批上下文的数据库任务失败")??;
+        let Some(initial) = initial else {
+            return Ok(None);
+        };
+        if initial.status != "pending" || initial.engine_id.as_deref() != Some("codex") {
+            return Ok(None);
+        }
+        let thread_id = initial
+            .thread_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Codex runtime approval has no thread id: {approval_id}"))?;
+        let has_local_turn = self.state.turns.get(&thread_id).await.is_some();
+        let database = self.state.db.clone();
+        let query_approval_id = approval_id.to_string();
+        let transaction_result = tokio::task::spawn_blocking(move || {
+            db::actions::with_runtime_approval_transaction(&database, |tx| {
+                let Some(current) =
+                    db::actions::get_runtime_approval_record(tx, &query_approval_id)?
+                else {
+                    return Ok(None);
+                };
+                if current.status != "pending" || current.engine_id.as_deref() != Some("codex") {
+                    return Ok(None);
+                }
+                let thread_id = current.thread_id.ok_or_else(|| {
+                    anyhow::anyhow!("Codex runtime approval has no thread id: {query_approval_id}")
+                })?;
+                let message_id = current.message_id.ok_or_else(|| {
+                    anyhow::anyhow!("Codex runtime approval has no message id: {query_approval_id}")
+                })?;
+                if current.message_thread_id.as_deref() != Some(thread_id.as_str()) {
+                    anyhow::bail!("Codex runtime approval message belongs to another thread: {query_approval_id}");
+                }
+                let raw_blocks = current.blocks_json.ok_or_else(|| {
+                    anyhow::anyhow!("Codex runtime approval message has no blocks JSON: {message_id}")
+                })?;
+                let mut blocks: serde_json::Value = serde_json::from_str(&raw_blocks)
+                    .with_context(|| format!("failed to parse Codex runtime approval blocks: {message_id}"))?;
+                let items = blocks.as_array_mut().ok_or_else(|| {
+                    anyhow::anyhow!("Codex runtime approval blocks are not an array: {message_id}")
+                })?;
+                let mut matched_block = false;
+                for block in items {
+                    let Some(object) = block.as_object_mut() else {
+                        continue;
+                    };
+                    if object.get("type").and_then(serde_json::Value::as_str) != Some("approval") {
+                        continue;
+                    }
+                    let block_approval_id = object
+                        .get("approvalId")
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| object.get("approval_id").and_then(serde_json::Value::as_str));
+                    if block_approval_id != Some(query_approval_id.as_str()) {
+                        continue;
+                    }
+                    object.insert(
+                        "status".to_string(),
+                        serde_json::Value::String("answered".to_string()),
+                    );
+                    matched_block = true;
+                }
+                if !matched_block {
+                    anyhow::bail!("Codex runtime approval block was not found: {query_approval_id}");
+                }
+                let answered_at = runtime_env::system_time_rfc3339();
+                let blocks_json = blocks.to_string();
+                let message_rows = db::actions::update_runtime_approval_message_blocks(
+                    tx,
+                    &message_id,
+                    &thread_id,
+                    &raw_blocks,
+                    &blocks_json,
+                )?;
+                if message_rows == 0 {
+                    anyhow::bail!("Codex runtime approval message changed before update: {message_id}");
+                }
+                let approval_rows = db::actions::update_runtime_approval_pending(
+                    tx,
+                    &query_approval_id,
+                    &thread_id,
+                    "answered",
+                    &answered_at,
+                )?;
+                if approval_rows == 0 {
+                    anyhow::bail!("Codex runtime approval changed before update: {query_approval_id}");
+                }
+                let mut updated_thread = None;
+                if has_local_turn
+                    && current.thread_status.as_deref()
+                        == Some(ThreadStatusDto::AwaitingApproval.as_str())
+                {
+                    let thread_rows = db::actions::update_runtime_thread_status_if_current(
+                        tx,
+                        &thread_id,
+                        ThreadStatusDto::AwaitingApproval.as_str(),
+                        ThreadStatusDto::Streaming.as_str(),
+                        &answered_at,
+                    )?;
+                    if thread_rows > 0 {
+                        updated_thread = Some(
+                            db::actions::get_runtime_approval_thread(tx, &thread_id)?.ok_or_else(
+                                || anyhow::anyhow!("thread missing during approval resolution: {thread_id}"),
+                            )?,
+                        );
+                    }
+                }
+                Ok(Some((thread_id, updated_thread)))
+            })
+        })
+        .await
+        .context("提交 Codex 审批完成事务的数据库任务失败")??;
+        let Some((thread_id, updated_thread)) = transaction_result else {
+            return Ok(None);
+        };
+        Ok(Some(CodexRuntimeApprovalResolution {
+            thread_id,
+            updated_thread,
+        }))
+    }
+}
+
+/// 合并运行时事件提供的部分 Codex metadata，未提供字段继续保留旧值。
+fn merge_codex_runtime_event_metadata(
+    existing: Option<serde_json::Value>,
+    raw_status: Option<&str>,
+    active_flags: &[String],
+    preview: Option<&str>,
+    sync_required: Option<bool>,
+    sync_reason: Option<&str>,
+) -> serde_json::Value {
+    let mut metadata = existing.unwrap_or_else(|| serde_json::json!({}));
+    if !metadata.is_object() {
+        metadata = serde_json::json!({});
+    }
+    if let Some(object) = metadata.as_object_mut() {
+        if raw_status.is_some() {
+            match raw_status.map(str::trim).filter(|value| !value.is_empty()) {
+                Some(status) => {
+                    object.insert("codexThreadStatus".to_string(), serde_json::json!(status));
+                }
+                None => {
+                    object.remove("codexThreadStatus");
+                }
+            }
+            if active_flags.is_empty() {
+                object.remove("codexThreadActiveFlags");
+            } else {
+                object.insert(
+                    "codexThreadActiveFlags".to_string(),
+                    serde_json::json!(active_flags),
+                );
+            }
+        }
+        if preview.is_some() {
+            match preview.map(str::trim).filter(|value| !value.is_empty()) {
+                Some(preview) => {
+                    object.insert("codexPreview".to_string(), serde_json::json!(preview));
+                }
+                None => {
+                    object.remove("codexPreview");
+                }
+            }
+        }
+        if let Some(sync_required) = sync_required {
+            object.insert(
+                "codexSyncRequired".to_string(),
+                serde_json::json!(sync_required),
+            );
+            object.insert(
+                "codexSyncUpdatedAt".to_string(),
+                serde_json::json!(runtime_env::system_time_rfc3339()),
+            );
+            match sync_reason.map(str::trim).filter(|value| !value.is_empty()) {
+                Some(reason) => {
+                    object.insert("codexSyncReason".to_string(), serde_json::json!(reason));
+                }
+                None => {
+                    object.insert("codexSyncReason".to_string(), serde_json::Value::Null);
+                }
+            }
+        }
+    }
+    metadata
+}
+
+/// 构造沿用原 snake_case 字段契约的审批完成通知载荷。
+fn approval_resolved_payload(approval_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "ApprovalResolved",
+        "approval_id": approval_id,
+    })
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/codex_runtime_business_tests.rs"]
+mod runtime_business_tests;
+
 #[async_trait]
 impl CliTool for CodexCli {
     async fn list_opencode_thread_records(&self, _workspace_id: String, _cursor: Option<String>, _limit: Option<u32>, _search_term: Option<String>, _archived: Option<bool>) -> Result<crate::models::OpenCodeRemoteSessionPageDto> {
@@ -2819,8 +3340,9 @@ impl CliTool for CodexCli {
         })
     }
 
-    fn subscribe_codex_runtime_events(&self) -> broadcast::Receiver<CodexRuntimeEvent> {
-        self.state.engines.subscribe_codex_runtime_events()
+    /// 通过统一 CLI 入口运行 Codex 自身事件监听并同步页面状态。
+    async fn run_runtime_event_bridge(&self, app: tauri::AppHandle) -> Result<()> {
+        self.listen_runtime_events(app).await
     }
 
     async fn prewarm_engine(&self, context: &CliExecutionContext) -> Result<()> {

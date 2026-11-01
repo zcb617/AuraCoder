@@ -5,7 +5,7 @@ use crate::runtime_env;
 use crate::{
     config::app_config::AppConfig,
     db,
-    models::{PermissionComponentJson, ThreadDto, ThreadUpdateDto},
+    models::{PermissionComponentJson, ThreadDto, ThreadStatusDto, ThreadUpdateDto},
     state::AppState,
 };
 
@@ -19,6 +19,39 @@ impl ThreadService {
     /// 创建绑定应用状态的线程业务 Service。
     pub fn new(state: AppState) -> Self {
         Self { state }
+    }
+
+    /// 启动时原子恢复遗留消息和线程状态，供应用入口在构造 AppState 前调用。
+    pub fn recover_runtime_state(
+        db: &db::Database,
+    ) -> anyhow::Result<db::threads::RuntimeRecoveryReport> {
+        let result = db::threads::with_runtime_recovery_transaction(db, |tx| {
+            // 先将上次异常退出留下的 assistant streaming 消息归一为 interrupted。
+            let messages_marked_interrupted =
+                db::threads::mark_streaming_assistant_messages_interrupted(tx)?;
+            // 一次读取所有线程恢复事实，状态业务判断留在 Service。
+            let facts = db::threads::list_runtime_recovery_facts(tx)?;
+            let mut thread_status_updates = 0usize;
+            for fact in facts {
+                let target_status = derive_recovered_thread_status(
+                    fact.has_pending_approval,
+                    fact.last_assistant_status.as_deref(),
+                );
+                thread_status_updates += db::threads::update_recovered_thread_status(
+                    tx,
+                    &fact.thread_id,
+                    target_status,
+                )?;
+            }
+            Ok(db::threads::RuntimeRecoveryReport {
+                messages_marked_interrupted,
+                thread_status_updates,
+            })
+        });
+        if let Err(error) = &result {
+            log::error!("启动时恢复运行线程状态失败: {error:#}");
+        }
+        result
     }
 
     /// 按工作区读取活动线程，并返回包含统一权限对象 A 的线程 DTO。
@@ -185,6 +218,25 @@ impl ThreadService {
         result
     }
 }
+
+/// 按启动恢复业务规则推导线程目标状态，pending 审批优先于末条 assistant 状态。
+fn derive_recovered_thread_status(
+    has_pending_approval: bool,
+    last_assistant_status: Option<&str>,
+) -> ThreadStatusDto {
+    if has_pending_approval {
+        return ThreadStatusDto::AwaitingApproval;
+    }
+    match last_assistant_status {
+        Some("error") => ThreadStatusDto::Error,
+        Some("completed") => ThreadStatusDto::Completed,
+        _ => ThreadStatusDto::Idle,
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/thread_runtime_recovery_tests.rs"]
+mod runtime_recovery_tests;
 
 const MAX_THREAD_TITLE_CHARS: usize = 120;
 

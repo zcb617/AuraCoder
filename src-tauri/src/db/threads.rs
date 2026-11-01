@@ -13,6 +13,28 @@ pub struct RuntimeRecoveryReport {
     pub thread_status_updates: usize,
 }
 
+/// 启动恢复所需的线程状态事实，由 Mapper 读取并交给 Service 决策。
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeRecoveryFact {
+    /// 需要恢复的本地线程标识。
+    pub(crate) thread_id: String,
+    /// 线程是否仍有等待处理的审批。
+    pub(crate) has_pending_approval: bool,
+    /// 按原有时间和 rowid 顺序选出的最后一条 assistant 消息状态。
+    pub(crate) last_assistant_status: Option<String>,
+}
+
+/// 运行时恢复远端线程时返回的结构化结果。
+#[derive(Debug, Clone)]
+pub enum RuntimeThreadRestoreResult {
+    /// 线程从归档状态恢复后返回最新 DTO。
+    Updated(ThreadDto),
+    /// 线程本来就处于活动状态并返回当前 DTO。
+    AlreadyActive(ThreadDto),
+    /// 指定 Codex 远端线程不存在对应的本地记录。
+    NotFound,
+}
+
 /// 创建线程记录，并立即保存完整的统一默认权限对象 A。
 pub fn create_thread(
     db: &Database,
@@ -701,6 +723,56 @@ pub fn restore_thread(db: &Database, thread_id: &str) -> anyhow::Result<ThreadDt
         .ok_or_else(|| anyhow::anyhow!("thread not found after restore: {thread_id}"))
 }
 
+/// 按引擎线程标识结构化恢复 Codex 运行时线程，不解释前端事件或 CLI 请求。
+pub fn restore_runtime_thread(
+    db: &Database,
+    engine_id: &str,
+    engine_thread_id: &str,
+) -> anyhow::Result<RuntimeThreadRestoreResult> {
+    let mut conn = db.connect()?;
+    let tx = conn
+        .transaction()
+        .context("failed to start runtime thread restore transaction")?;
+    let thread_state = tx
+        .query_row(
+            "SELECT id, archived_at FROM threads
+             WHERE engine_id = ?1 AND engine_thread_id = ?2
+             LIMIT 1",
+            params![engine_id, engine_thread_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .context("failed to find runtime thread for restore")?;
+
+    let Some((thread_id, archived_at)) = thread_state else {
+        tx.commit()
+            .context("failed to commit missing runtime thread restore")?;
+        return Ok(RuntimeThreadRestoreResult::NotFound);
+    };
+
+    // 仅清除归档标记，保留线程 DTO 的其他持久化状态。
+    let result = if archived_at.is_some() {
+        tx.execute(
+            "UPDATE threads SET archived_at = NULL WHERE id = ?1 AND archived_at IS NOT NULL",
+            params![thread_id],
+        )
+        .context("failed to restore archived runtime thread")?;
+        RuntimeThreadRestoreResult::Updated(
+            get_thread_on_connection(&tx, &thread_id)?
+                .ok_or_else(|| anyhow::anyhow!("runtime thread missing after restore: {thread_id}"))?,
+        )
+    } else {
+        RuntimeThreadRestoreResult::AlreadyActive(
+            get_thread_on_connection(&tx, &thread_id)?
+                .ok_or_else(|| anyhow::anyhow!("runtime thread missing after lookup: {thread_id}"))?,
+        )
+    };
+
+    tx.commit()
+        .context("failed to commit runtime thread restore")?;
+    Ok(result)
+}
+
 pub fn update_engine_metadata(
     db: &Database,
     thread_id: &str,
@@ -1055,136 +1127,75 @@ fn thread_manual_title_locked(metadata: Option<&serde_json::Value>) -> bool {
         .unwrap_or(false)
 }
 
-pub fn reconcile_runtime_state(db: &Database) -> anyhow::Result<RuntimeRecoveryReport> {
+/// 在单个 SQLite 事务中执行启动线程恢复数据操作并提交结果。
+pub(crate) fn with_runtime_recovery_transaction<T>(
+    db: &Database,
+    work: impl FnOnce(&rusqlite::Transaction<'_>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     let mut conn = db.connect()?;
     let tx = conn
         .transaction()
         .context("failed to start runtime recovery transaction")?;
-
-    let messages_marked_interrupted = tx
-        .execute(
-            "UPDATE messages
-       SET status = 'interrupted'
-       WHERE role = 'assistant'
-         AND status = 'streaming'",
-            [],
-        )
-        .context("failed to normalize stale streaming assistant messages")?;
-
-    let thread_ids = {
-        let mut stmt = tx
-            .prepare("SELECT id FROM threads")
-            .context("failed to load threads for runtime recovery")?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .context("failed to iterate threads for runtime recovery")?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.context("failed to decode thread id during runtime recovery")?);
-        }
-        out
-    };
-
-    let mut thread_status_updates = 0usize;
-    for thread_id in thread_ids {
-        let next_status = derive_thread_status_for_recovery(&tx, &thread_id)?;
-        let changed = tx
-            .execute(
-                "UPDATE threads
-           SET status = ?1
-           WHERE id = ?2
-             AND status != ?1",
-                params![next_status.as_str(), thread_id],
-            )
-            .context("failed to apply runtime recovery thread status")?;
-        thread_status_updates += changed;
-    }
-
+    let result = work(&tx)?;
     tx.commit()
         .context("failed to commit runtime recovery transaction")?;
-
-    Ok(RuntimeRecoveryReport {
-        messages_marked_interrupted,
-        thread_status_updates,
-    })
+    Ok(result)
 }
 
-/// 审批被判死（消息块置灰落库）后调用：线程若仍停在 awaiting_approval，
-/// 按与启动恢复相同的规则重推状态——还有其他待答审批则维持不变，
-/// 否则复位（最后一条 assistant 消息为 interrupted 时归 idle）。
-/// 正在 streaming 的新轮次不动。
-pub fn refresh_thread_status_after_approval_expired(
-    db: &Database,
-    thread_id: &str,
-) -> anyhow::Result<bool> {
-    let conn = db.connect()?;
-    let current_status: String = conn
-        .query_row(
-            "SELECT status FROM threads WHERE id = ?1",
-            params![thread_id],
-            |row| row.get(0),
-        )
-        .context("failed to load thread status for approval expiry refresh")?;
-    if current_status != ThreadStatusDto::AwaitingApproval.as_str() {
-        return Ok(false);
-    }
-    let next_status = derive_thread_status_for_recovery(&conn, thread_id)?;
-    if next_status == ThreadStatusDto::AwaitingApproval {
-        return Ok(false);
-    }
-    conn.execute(
-        "UPDATE threads SET status = ?1 WHERE id = ?2",
-        params![next_status.as_str(), thread_id],
+/// 将遗留 assistant streaming 消息标记为 interrupted 并返回变更数量。
+pub(crate) fn mark_streaming_assistant_messages_interrupted(
+    tx: &rusqlite::Transaction<'_>,
+) -> anyhow::Result<usize> {
+    tx.execute(
+        "UPDATE messages
+         SET status = 'interrupted'
+         WHERE role = 'assistant' AND status = 'streaming'",
+        [],
     )
-    .context("failed to refresh thread status after approval expired")?;
-    Ok(true)
+    .context("failed to normalize stale streaming assistant messages")
 }
 
-fn derive_thread_status_for_recovery(
-    conn: &rusqlite::Connection,
-    thread_id: &str,
-) -> anyhow::Result<ThreadStatusDto> {
-    let has_pending_approval = conn
-        .query_row(
-            "SELECT 1
-       FROM approvals
-       WHERE thread_id = ?1
-         AND status = 'pending'
-       LIMIT 1",
-            params![thread_id],
-            |_| Ok(()),
+/// 在事务中读取每个线程的 pending 审批和最新 assistant 消息状态。
+pub(crate) fn list_runtime_recovery_facts(
+    tx: &rusqlite::Transaction<'_>,
+) -> anyhow::Result<Vec<RuntimeRecoveryFact>> {
+    let mut statement = tx
+        .prepare(
+            "SELECT t.id,
+                    EXISTS(SELECT 1 FROM approvals a WHERE a.thread_id = t.id AND a.status = 'pending'),
+                    (SELECT m.status FROM messages m
+                     WHERE m.thread_id = t.id AND m.role = 'assistant'
+                     ORDER BY julianday(m.created_at) DESC, m.rowid DESC LIMIT 1)
+             FROM threads t",
         )
-        .optional()
-        .context("failed to inspect pending approvals during runtime recovery")?
-        .is_some();
-
-    if has_pending_approval {
-        return Ok(ThreadStatusDto::AwaitingApproval);
+        .context("failed to prepare runtime recovery facts query")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(RuntimeRecoveryFact {
+                thread_id: row.get(0)?,
+                has_pending_approval: row.get(1)?,
+                last_assistant_status: row.get(2)?,
+            })
+        })
+        .context("failed to query runtime recovery facts")?;
+    let mut facts = Vec::new();
+    for row in rows {
+        facts.push(row.context("failed to decode runtime recovery facts")?);
     }
+    Ok(facts)
+}
 
-    let last_assistant_status = conn
-        .query_row(
-            "SELECT status
-       FROM messages
-       WHERE thread_id = ?1
-         AND role = 'assistant'
-       ORDER BY julianday(created_at) DESC, rowid DESC
-       LIMIT 1",
-            params![thread_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .context("failed to inspect latest assistant message during runtime recovery")?;
-
-    let status = match last_assistant_status.as_deref() {
-        Some("error") => ThreadStatusDto::Error,
-        Some("completed") => ThreadStatusDto::Completed,
-        Some("streaming") | Some("interrupted") => ThreadStatusDto::Idle,
-        _ => ThreadStatusDto::Idle,
-    };
-
-    Ok(status)
+/// 仅在线程当前状态与业务目标状态不同时写入恢复后的状态。
+pub(crate) fn update_recovered_thread_status(
+    tx: &rusqlite::Transaction<'_>,
+    thread_id: &str,
+    target_status: ThreadStatusDto,
+) -> anyhow::Result<usize> {
+    tx.execute(
+        "UPDATE threads SET status = ?1 WHERE id = ?2 AND status != ?1",
+        params![target_status.as_str(), thread_id],
+    )
+    .context("failed to apply runtime recovery thread status")
 }
 
 /// 解码线程统一权限对象 A；空值或旧原生格式返回默认 A，并记录原始错误。
@@ -1250,474 +1261,5 @@ fn map_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadDto> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        fs,
-        sync::{Arc, Mutex},
-    };
-
-    use serde_json::json;
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::db::{messages, workspaces, ConnectionPool, SQLITE_POOL_MAX_IDLE};
-
-    fn test_db() -> Database {
-        let path = std::env::temp_dir().join(format!("auracoder-threads-{}.db", Uuid::new_v4()));
-        let db = Database {
-            path,
-            pool: Arc::new(ConnectionPool {
-                idle: Mutex::new(Vec::new()),
-                max_idle: SQLITE_POOL_MAX_IDLE,
-            }),
-        };
-        db.run_migrations().expect("failed to run test migrations");
-        db
-    }
-
-    fn test_thread(db: &Database, title: &str) -> ThreadDto {
-        let root = std::env::temp_dir().join(format!("auracoder-workspace-{}", Uuid::new_v4()));
-        fs::create_dir_all(&root).expect("failed to create temp workspace root");
-        let workspace = workspaces::upsert_workspace(db, root.to_string_lossy().as_ref()).unwrap();
-        create_thread(db, &workspace.id, "codex", "gpt-5.3-codex", title).unwrap()
-    }
-
-    /// 验证 Claude 线程同步标记默认关闭，并可独立切换后读取。
-    #[test]
-    fn claude_sync_required_defaults_to_false_and_round_trips() {
-        let db = test_db();
-        let thread = test_thread(&db, "Claude sync flag");
-
-        assert!(!get_claude_sync_required(&db, &thread.id).unwrap());
-        set_claude_sync_required(&db, &thread.id, true).unwrap();
-        assert!(get_claude_sync_required(&db, &thread.id).unwrap());
-        set_claude_sync_required(&db, &thread.id, false).unwrap();
-        assert!(!get_claude_sync_required(&db, &thread.id).unwrap());
-    }
-
-    #[test]
-    fn update_thread_runtime_snapshot_preserves_manual_title() {
-        let db = test_db();
-        let thread = test_thread(&db, "Manual title");
-        let manual_metadata = json!({
-            "manualTitle": true,
-            "manualTitleUpdatedAt": "2026-03-06T12:00:00Z",
-        });
-        update_engine_metadata(&db, &thread.id, &manual_metadata).unwrap();
-
-        let updated = update_thread_runtime_snapshot(
-            &db,
-            &thread.id,
-            Some("Engine renamed title"),
-            Some(ThreadStatusDto::Idle),
-            Some(&json!({
-                "manualTitle": true,
-                "codexThreadStatus": "idle",
-                "codexSyncRequired": false,
-            })),
-        )
-        .unwrap();
-
-        assert_eq!(updated.title, "Manual title");
-        assert_eq!(updated.status, ThreadStatusDto::Idle);
-        assert_eq!(
-            updated
-                .engine_metadata
-                .as_ref()
-                .and_then(|value| value.get("codexThreadStatus"))
-                .and_then(serde_json::Value::as_str),
-            Some("idle")
-        );
-        assert_eq!(
-            updated
-                .engine_metadata
-                .as_ref()
-                .and_then(|value| value.get("manualTitle"))
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn update_thread_last_activity_persists_exact_timestamp() {
-        let db = test_db();
-        let thread = test_thread(&db, "Timestamp");
-        let raw_last_activity_at = "2026-08-19T12:33:53+00:00";
-        let expected_last_activity_at = runtime_env::normalize_time_to_local(raw_last_activity_at)
-            .unwrap();
-
-        let updated = update_thread_last_activity(&db, &thread.id, raw_last_activity_at).unwrap();
-
-        assert_eq!(updated.last_activity_at, expected_last_activity_at);
-        assert_eq!(updated.created_at, thread.created_at);
-
-        let persisted = get_thread(&db, &thread.id).unwrap().unwrap();
-        assert_eq!(persisted.last_activity_at, expected_last_activity_at);
-        assert_eq!(persisted.created_at, thread.created_at);
-    }
-
-    #[test]
-    fn update_thread_last_activity_rejects_missing_thread() {
-        let db = test_db();
-        let error = update_thread_last_activity(&db, "missing-thread", "2026-08-19T12:33:53+00:00")
-            .expect_err("missing thread must not update successfully");
-
-        assert!(error
-            .to_string()
-            .contains("thread not found: missing-thread"));
-    }
-
-    #[test]
-    fn ssh_remote_snapshot_preserves_local_runtime_selection_metadata() {
-        let db = test_db();
-        let thread = test_thread(&db, "Remote thread");
-        set_engine_thread_id(&db, &thread.id, "remote-thread-1").unwrap();
-        update_engine_metadata(
-            &db,
-            &thread.id,
-            &json!({
-                "codexRemote": {"version": "old"},
-            }),
-        )
-        .unwrap();
-        update_thread(
-            &db,
-            &ThreadUpdateDto {
-                id: thread.id.clone(),
-                reasoning_effort: Some("high".to_string()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let updated = upsert_ssh_remote_thread_snapshot(
-            &db,
-            &thread.workspace_id,
-            "codex",
-            "remote-thread-1",
-            "openai",
-            "Refreshed remote title",
-            ThreadStatusDto::Idle,
-            &json!({
-                "sshRemote": true,
-                "codexRemoteCwd": "/var/work/project",
-                "codexRemote": {"version": "new"},
-            }),
-            Some("medium"),
-            Some("2026-08-14T12:00:00Z"),
-        )
-        .unwrap();
-
-        let metadata = updated.engine_metadata.unwrap();
-        assert_eq!(updated.model_id, "gpt-5.3-codex");
-        assert_eq!(updated.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(
-            metadata.get("codexRemote"),
-            Some(&json!({"version": "new"}))
-        );
-        assert_eq!(metadata.get("sshRemote"), Some(&json!(true)));
-    }
-
-    #[test]
-    fn reconfigure_unstarted_thread_runtime_reuses_the_same_empty_thread() {
-        let db = test_db();
-        let thread = test_thread(&db, "New thread");
-        let metadata = json!({"opencodePermissionMode": "ask"});
-
-        let updated = reconfigure_unstarted_thread_runtime(
-            &db,
-            &thread.id,
-            "opencode",
-            "opencode-model",
-            Some(&metadata),
-        )
-        .unwrap();
-
-        assert_eq!(updated.id, thread.id);
-        assert_eq!(updated.title, "New thread");
-        assert_eq!(updated.engine_id, "opencode");
-        assert_eq!(updated.model_id, "opencode-model");
-        assert_eq!(updated.engine_metadata, Some(metadata));
-    }
-
-    #[test]
-    fn reconfigure_unstarted_thread_runtime_rejects_started_threads() {
-        let db = test_db();
-        let remote_thread = test_thread(&db, "Remote thread");
-        set_engine_thread_id(&db, &remote_thread.id, "remote-thread-1").unwrap();
-
-        let remote_error = reconfigure_unstarted_thread_runtime(
-            &db,
-            &remote_thread.id,
-            "opencode",
-            "opencode-model",
-            None,
-        )
-        .unwrap_err();
-        assert!(remote_error
-            .to_string()
-            .contains("thread has already started"));
-
-        let message_thread = test_thread(&db, "Message thread");
-        messages::insert_user_message(
-            &db,
-            &message_thread.id,
-            "Do not change this CLI",
-            None,
-            Some("codex"),
-            Some("gpt-5.3-codex"),
-            None,
-        )
-        .unwrap();
-
-        let stale_counter_thread = get_thread(&db, &message_thread.id).unwrap().unwrap();
-        assert_eq!(stale_counter_thread.message_count, 0);
-
-        let message_error = reconfigure_unstarted_thread_runtime(
-            &db,
-            &message_thread.id,
-            "opencode",
-            "opencode-model",
-            None,
-        )
-        .unwrap_err();
-        assert!(message_error
-            .to_string()
-            .contains("thread has already started"));
-    }
-
-    #[test]
-    fn update_thread_permissions_persists_component_without_changing_metadata() {
-        let db = test_db();
-        let thread = test_thread(&db, "Permissions");
-        let permission_values = PermissionComponentJson::default();
-        let original_metadata = json!({"unrelated": true});
-        update_engine_metadata(&db, &thread.id, &original_metadata).unwrap();
-
-        let updated =
-            update_thread_permissions(&db, &thread.id, Some(&permission_values)).unwrap();
-
-        assert_eq!(updated.permission_mode.as_ref(), Some(&permission_values));
-        assert_eq!(updated.engine_metadata, Some(original_metadata.clone()));
-        let persisted = get_thread(&db, &thread.id).unwrap().unwrap();
-        assert_eq!(persisted.permission_mode.as_ref(), Some(&permission_values));
-        assert_eq!(persisted.engine_metadata, Some(original_metadata));
-    }
-
-    #[test]
-    fn update_thread_permissions_rejects_missing_thread() {
-        let db = test_db();
-        let permission_values = PermissionComponentJson::default();
-        let error = update_thread_permissions(
-            &db,
-            "missing-thread",
-            Some(&permission_values),
-        )
-        .expect_err("missing thread must not update successfully");
-
-        assert!(error
-            .to_string()
-            .contains("thread not found: missing-thread"));
-        assert!(get_thread(&db, "missing-thread").unwrap().is_none());
-    }
-
-    #[test]
-    fn update_thread_permissions_does_not_change_another_thread_on_failure() {
-        let db = test_db();
-        let thread = test_thread(&db, "Permissions unchanged");
-        let mut attempted_permissions = PermissionComponentJson::default();
-        attempted_permissions.autonomy_preset = vec!["full".to_owned()];
-        let original_metadata = json!({"original": true});
-        update_engine_metadata(&db, &thread.id, &original_metadata).unwrap();
-
-        let _ = update_thread_permissions(
-            &db,
-            "missing-thread",
-            Some(&attempted_permissions),
-        )
-        .expect_err("missing thread must roll back the failed transaction");
-
-        let unchanged = get_thread(&db, &thread.id).unwrap().unwrap();
-        assert_eq!(unchanged.permission_mode, thread.permission_mode);
-        assert_eq!(unchanged.engine_metadata, Some(original_metadata));
-    }
-
-    /// 验证按消息时间策略重算消息数量、Token 和活动时间。
-    #[test]
-    fn refresh_thread_message_stats_recomputes_counters_from_messages() {
-        let db = test_db();
-        let thread = test_thread(&db, "Stats");
-        let old_last_activity_at = "2026-01-01T00:00:00+00:00";
-        update_thread_last_activity(&db, &thread.id, old_last_activity_at).unwrap();
-        messages::insert_user_message(
-            &db,
-            &thread.id,
-            "Count this turn",
-            None,
-            Some("codex"),
-            Some("gpt-5.3-codex"),
-            Some("low"),
-        )
-        .unwrap();
-        let assistant = messages::insert_assistant_placeholder(
-            &db,
-            &thread.id,
-            Some("codex"),
-            Some("gpt-5.3-codex"),
-            Some("low"),
-        )
-        .unwrap();
-        messages::complete_assistant_message(
-            &db,
-            &assistant.id,
-            crate::models::MessageStatusDto::Completed,
-            Some((13, 21)),
-            Some("gpt-5.3-codex"),
-        )
-        .unwrap();
-
-        refresh_thread_message_stats(
-            &db,
-            &thread.id,
-            ThreadMessageStatsActivityPolicy::FromMessages,
-        )
-        .unwrap();
-
-        let refreshed = get_thread(&db, &thread.id).unwrap().unwrap();
-        assert_eq!(refreshed.message_count, 2);
-        assert_eq!(refreshed.total_tokens, 34);
-        assert!(!refreshed.last_activity_at.is_empty());
-        assert_ne!(refreshed.last_activity_at, old_last_activity_at);
-    }
-
-    /// 验证无消息时仅重算统计不会改写已有活动时间。
-    #[test]
-    fn refresh_thread_message_stats_preserves_existing_activity_without_messages() {
-        let db = test_db();
-        let thread = test_thread(&db, "Empty stats");
-        let raw_last_activity_at = "2026-01-02T00:00:00+00:00";
-        let old_last_activity_at = runtime_env::normalize_time_to_local(raw_last_activity_at).unwrap();
-        update_thread_last_activity(&db, &thread.id, raw_last_activity_at).unwrap();
-
-        refresh_thread_message_stats(
-            &db,
-            &thread.id,
-            ThreadMessageStatsActivityPolicy::PreserveExisting,
-        )
-        .unwrap();
-
-        let refreshed = get_thread(&db, &thread.id).unwrap().unwrap();
-        assert_eq!(refreshed.message_count, 0);
-        assert_eq!(refreshed.total_tokens, 0);
-        assert_eq!(refreshed.last_activity_at, old_last_activity_at);
-    }
-
-    /// 验证有消息时仅重算统计不会改写已有活动时间。
-    #[test]
-    fn refresh_thread_message_stats_preserves_existing_activity_while_recomputing_counters() {
-        let db = test_db();
-        let thread = test_thread(&db, "Preserved stats");
-        let raw_last_activity_at = "2026-01-03T00:00:00+00:00";
-        let old_last_activity_at = runtime_env::normalize_time_to_local(raw_last_activity_at).unwrap();
-        update_thread_last_activity(&db, &thread.id, raw_last_activity_at).unwrap();
-        messages::insert_user_message(
-            &db,
-            &thread.id,
-            "Count this turn",
-            None,
-            Some("codex"),
-            Some("gpt-5.3-codex"),
-            Some("low"),
-        )
-        .unwrap();
-        let assistant = messages::insert_assistant_placeholder(
-            &db,
-            &thread.id,
-            Some("codex"),
-            Some("gpt-5.3-codex"),
-            Some("low"),
-        )
-        .unwrap();
-        messages::complete_assistant_message(
-            &db,
-            &assistant.id,
-            crate::models::MessageStatusDto::Completed,
-            Some((13, 21)),
-            Some("gpt-5.3-codex"),
-        )
-        .unwrap();
-
-        refresh_thread_message_stats(
-            &db,
-            &thread.id,
-            ThreadMessageStatsActivityPolicy::PreserveExisting,
-        )
-        .unwrap();
-
-        let refreshed = get_thread(&db, &thread.id).unwrap().unwrap();
-        assert_eq!(refreshed.message_count, 2);
-        assert_eq!(refreshed.total_tokens, 34);
-        assert_eq!(refreshed.last_activity_at, old_last_activity_at);
-    }
-
-    /// 验证只更新线程状态时保留已有活动时间。
-    #[test]
-    fn update_thread_preserves_last_activity_when_only_status_changes() {
-        let db = test_db();
-        let thread = test_thread(&db, "Status only");
-        let raw_last_activity_at = "2026-01-04T00:00:00+00:00";
-        let old_last_activity_at = runtime_env::normalize_time_to_local(raw_last_activity_at).unwrap();
-        update_thread_last_activity(&db, &thread.id, raw_last_activity_at).unwrap();
-
-        let updated = update_thread(
-            &db,
-            &ThreadUpdateDto {
-                // 目标线程标识，确保只更新本条会话。
-                id: thread.id.clone(),
-                // 远端同步后的新运行状态。
-                status: Some(ThreadStatusDto::AwaitingApproval.as_str().to_owned()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        assert_eq!(updated.status, ThreadStatusDto::AwaitingApproval);
-        assert_eq!(updated.last_activity_at, old_last_activity_at);
-    }
-
-    #[test]
-    fn list_threads_for_workspace_includes_engine_backed_threads_without_messages() {
-        let db = test_db();
-        let visible = test_thread(&db, "Remote");
-        let hidden = test_thread(&db, "Hidden");
-        set_engine_thread_id(&db, &visible.id, "codex-thread-123").unwrap();
-
-        let listed = list_threads_for_workspace(&db, &visible.workspace_id).unwrap();
-        let listed_ids = listed
-            .into_iter()
-            .map(|thread| thread.id)
-            .collect::<Vec<_>>();
-
-        assert!(listed_ids.contains(&visible.id));
-        assert!(!listed_ids.contains(&hidden.id));
-    }
-
-    #[test]
-    fn list_archived_threads_for_workspace_includes_engine_backed_threads_without_messages() {
-        let db = test_db();
-        let visible = test_thread(&db, "Archived remote");
-        let hidden = test_thread(&db, "Archived hidden");
-        set_engine_thread_id(&db, &visible.id, "codex-thread-archived").unwrap();
-        archive_thread(&db, &visible.id).unwrap();
-        archive_thread(&db, &hidden.id).unwrap();
-
-        let listed = list_archived_threads_for_workspace(&db, &visible.workspace_id).unwrap();
-        let listed_ids = listed
-            .into_iter()
-            .map(|thread| thread.id)
-            .collect::<Vec<_>>();
-
-        assert!(listed_ids.contains(&visible.id));
-        assert!(!listed_ids.contains(&hidden.id));
-    }
-}
+#[path="../../tests/unit/thread_mapper_tests.rs"]
+mod tests;

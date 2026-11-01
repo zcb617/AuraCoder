@@ -43,13 +43,11 @@ use std::sync::{
     Arc,
 };
 
-use anyhow::Context;
-use rusqlite::OptionalExtension;
-
-use cli_tools::{factory::CliToolFactory, CliTool};
+use cli_tools::factory::CliToolFactory;
 use config::app_config::AppConfig;
 use db::Database;
-use engines::{CodexRuntimeEvent, EngineManager};
+use db::UnsupportedDatabaseVersion;
+use engines::EngineManager;
 use extensions::refresh::{spawn_catalog_refresh_scheduler, ExtensionCatalogRefreshManager};
 use git::repo::FileTreeCache;
 use git::watcher::GitWatcherManager;
@@ -59,11 +57,11 @@ use locale::{
     resolve_app_locale, scheduled_exit_confirmation_strings, tray_menu_strings,
     ScheduledExitConfirmationStrings,
 };
-use models::{EngineRuntimeUpdatedDto, ThreadDto, ThreadStatusDto};
 use power::KeepAwakeManager;
 use remote::RemoteTunnelManager;
 use scheduled_tasks::ScheduledTaskManager;
 use state::{AppState, TurnManager};
+use services::thread_service::ThreadService;
 #[cfg(target_os = "macos")]
 use tauri::menu::{AboutMetadata, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{
@@ -87,6 +85,7 @@ pub fn initialize_from_cli() -> anyhow::Result<()> {
     runtime_env::initialize_from_cli()
 }
 
+/// 初始化应用运行环境、数据库和桌面窗口，并启动应用服务。
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     if let Err(error) = runtime_env::migrate_legacy_app_data_dir() {
@@ -114,7 +113,7 @@ pub fn run() {
     let db = match Database::init() {
         Ok(db) => db,
         Err(error) => {
-            if let Some(version_error) = error.downcast_ref::<db::UnsupportedDatabaseVersion>() {
+            if let Some(version_error) = error.downcast_ref::<UnsupportedDatabaseVersion>() {
                 show_database_version_error(
                     tauri_context,
                     version_error.current_version,
@@ -125,7 +124,7 @@ pub fn run() {
             panic!("failed to initialize database: {error:#}");
         }
     };
-    match db::threads::reconcile_runtime_state(&db) {
+    match ThreadService::recover_runtime_state(&db) {
         Ok(report) => {
             if report.messages_marked_interrupted > 0 || report.thread_status_updates > 0 {
                 log::info!(
@@ -315,7 +314,25 @@ pub fn run() {
             ) {
                 log::warn!("AuraCoder 启动时初始化本地 CLI 服务失败: {error:#}");
             }
-            tauri::async_runtime::spawn(run_codex_runtime_bridge(handle.clone(), state.clone()));
+            // 通过工厂和统一接口启动各 CLI 自身的运行时事件监听。
+            for cli_id in ["codex", "opencode", "claude"] {
+                match CliToolFactory::new(state.clone()).create(cli_id) {
+                    Ok(cli) => {
+                        let app_handle = handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(error) = cli.run_runtime_event_bridge(app_handle).await {
+                                log::error!(
+                                    "CLI 运行时事件监听退出失败: cli_id={} error={error:#}",
+                                    cli_id
+                                );
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        log::error!("创建 CLI 运行时事件监听实现失败: cli_id={cli_id} error={error:#}");
+                    }
+                }
+            }
             spawn_catalog_refresh_scheduler(handle.clone(), state.clone());
             cli_service_health::spawn_cli_service_health_scheduler(
                 handle.clone(),
@@ -819,19 +836,20 @@ fn build_system_tray(
     Ok(())
 }
 
+/// 在存在启用定时任务或无法查询任务时请求用户确认退出。
 fn request_tray_exit(
     app: &tauri::AppHandle,
     strings: ScheduledExitConfirmationStrings,
     confirmation_open: &Arc<AtomicBool>,
 ) {
-    let has_enabled_tasks =
-        match db::scheduled_tasks::has_tasks_in_enabled_column(&app.state::<AppState>().db) {
-            Ok(has_enabled_tasks) => has_enabled_tasks,
-            Err(error) => {
-                log::warn!("failed to check enabled scheduled tasks before exit: {error}");
-                true
-            }
-        };
+    let state = app.state::<AppState>();
+    let has_enabled_tasks = match state.scheduled_tasks.has_enabled_tasks(&state) {
+        Ok(has_enabled_tasks) => has_enabled_tasks,
+        Err(error) => {
+            log::warn!("failed to check enabled scheduled tasks before exit: {error:#}");
+            true
+        }
+    };
     if !has_enabled_tasks {
         app.exit(0);
         return;
@@ -869,555 +887,6 @@ fn show_main_window(window: &WebviewWindow) {
     if let Err(error) = window.set_focus() {
         log::warn!("failed to focus main window: {error}");
     }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ThreadUpdatedEvent {
-    thread_id: String,
-    workspace_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thread: Option<ThreadDto>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CodexRemoteThreadRemovedEvent {
-    thread: ThreadDto,
-    remote_action: &'static str,
-}
-
-async fn run_codex_runtime_bridge(app: tauri::AppHandle, state: AppState) {
-    let codex = CliToolFactory::new(state.clone())
-        .create("codex")
-        .expect("Codex CLI factory mapping must exist");
-    let cli: &dyn CliTool = codex.as_ref();
-    let mut rx = cli.subscribe_codex_runtime_events();
-    loop {
-        match rx.recv().await {
-            Ok(event) => handle_codex_runtime_event(&app, &state, event).await,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                log::warn!("codex runtime bridge lagged and skipped {skipped} events");
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-        }
-    }
-}
-
-async fn handle_codex_runtime_event(
-    app: &tauri::AppHandle,
-    state: &AppState,
-    event: CodexRuntimeEvent,
-) {
-    match event {
-        CodexRuntimeEvent::DiagnosticsUpdated { diagnostics, toast } => {
-            let _ = app.emit(
-                "engine-runtime-updated",
-                EngineRuntimeUpdatedDto {
-                    engine_id: "codex".to_string(),
-                    protocol_diagnostics: Some(diagnostics),
-                    toast,
-                },
-            );
-        }
-        CodexRuntimeEvent::ApprovalResolved { approval_id } => {
-            resolve_codex_runtime_approval(app, state, &approval_id).await;
-        }
-        CodexRuntimeEvent::ThreadStatusChanged {
-            engine_thread_id,
-            status_type,
-            active_flags,
-        } => {
-            if let Some(updated_thread) = apply_codex_runtime_thread_update(
-                state,
-                &engine_thread_id,
-                None,
-                Some(status_type.as_str()),
-                &active_flags,
-                None,
-                None,
-                None,
-            )
-            .await
-            {
-                let _ = app.emit(
-                    "thread-updated",
-                    ThreadUpdatedEvent {
-                        thread_id: updated_thread.id.clone(),
-                        workspace_id: updated_thread.workspace_id.clone(),
-                        thread: Some(updated_thread),
-                    },
-                );
-            }
-        }
-        CodexRuntimeEvent::ThreadNameUpdated {
-            engine_thread_id,
-            thread_name,
-        } => {
-            let normalized_thread_name = thread_name.and_then(|name| {
-                let trimmed = name.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            });
-            let sync_required = if normalized_thread_name.is_some() {
-                Some(false)
-            } else {
-                Some(true)
-            };
-            let sync_reason = if normalized_thread_name.is_some() {
-                None
-            } else {
-                Some("thread_name_updated")
-            };
-            if let Some(updated_thread) = apply_codex_runtime_thread_update(
-                state,
-                &engine_thread_id,
-                normalized_thread_name.as_deref(),
-                None,
-                &[],
-                None,
-                sync_required,
-                sync_reason,
-            )
-            .await
-            {
-                let _ = app.emit(
-                    "thread-updated",
-                    ThreadUpdatedEvent {
-                        thread_id: updated_thread.id.clone(),
-                        workspace_id: updated_thread.workspace_id.clone(),
-                        thread: Some(updated_thread),
-                    },
-                );
-            }
-        }
-        CodexRuntimeEvent::ThreadSnapshotUpdated {
-            engine_thread_id,
-            thread_name,
-            status_type,
-            active_flags,
-            preview,
-        } => {
-            if let Some(updated_thread) = apply_codex_runtime_thread_update(
-                state,
-                &engine_thread_id,
-                thread_name.as_deref(),
-                status_type.as_deref(),
-                &active_flags,
-                preview.as_deref(),
-                Some(false),
-                None,
-            )
-            .await
-            {
-                let _ = app.emit(
-                    "thread-updated",
-                    ThreadUpdatedEvent {
-                        thread_id: updated_thread.id.clone(),
-                        workspace_id: updated_thread.workspace_id.clone(),
-                        thread: Some(updated_thread),
-                    },
-                );
-            }
-        }
-        CodexRuntimeEvent::ThreadArchived { engine_thread_id } => {
-            emit_codex_remote_thread_removed(app, state, &engine_thread_id, "archived").await;
-        }
-        CodexRuntimeEvent::ThreadDeleted { engine_thread_id } => {
-            emit_codex_remote_thread_removed(app, state, &engine_thread_id, "deleted").await;
-        }
-        CodexRuntimeEvent::ThreadUnarchived { engine_thread_id } => {
-            if let Some(updated_thread) =
-                restore_codex_runtime_thread(state, &engine_thread_id).await
-            {
-                let _ = app.emit(
-                    "thread-updated",
-                    ThreadUpdatedEvent {
-                        thread_id: updated_thread.id.clone(),
-                        workspace_id: updated_thread.workspace_id.clone(),
-                        thread: Some(updated_thread),
-                    },
-                );
-            }
-        }
-    }
-}
-
-async fn resolve_codex_runtime_approval(
-    app: &tauri::AppHandle,
-    state: &AppState,
-    approval_id: &str,
-) {
-    let Some((thread_id, message_id)) = run_db(state.db.clone(), {
-        let approval_id = approval_id.to_string();
-        move |db| db::actions::find_approval_context(db, &approval_id)
-    })
-    .await
-    .ok()
-    .flatten() else {
-        return;
-    };
-
-    let has_local_turn = state.turns.get(&thread_id).await.is_some();
-    let updated_thread = match run_db(state.db.clone(), {
-        let approval_id = approval_id.to_string();
-        let thread_id = thread_id.clone();
-        let message_id = message_id.clone();
-        move |db| {
-            let mut conn = db.connect()?;
-            let answered_at = runtime_env::system_time_rfc3339();
-            let tx = conn
-                .transaction()
-                .context("failed to start approval resolution transaction")?;
-
-            // Resolve the approval record.
-            tx.execute(
-                "UPDATE approvals
-                 SET status = 'answered', answered_at = COALESCE(answered_at, ?1)
-                 WHERE id = ?2",
-                rusqlite::params![answered_at, approval_id],
-            )
-            .context("failed to resolve approval")?;
-
-            // Update the approval block inside the message's blocks_json (best-effort).
-            let raw_blocks: Option<String> = tx
-                .query_row(
-                    "SELECT blocks_json FROM messages WHERE id = ?1",
-                    rusqlite::params![message_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .context("failed to load message blocks for approval update")?;
-            if let Some(raw_blocks) = raw_blocks {
-                let mut blocks_value: serde_json::Value =
-                    serde_json::from_str(&raw_blocks).unwrap_or_else(|_| serde_json::json!([]));
-                let changed = if let Some(items) = blocks_value.as_array_mut() {
-                    let mut any_changed = false;
-                    for block in items.iter_mut() {
-                        let Some(object) = block.as_object_mut() else {
-                            continue;
-                        };
-                        if object.get("type").and_then(serde_json::Value::as_str)
-                            != Some("approval")
-                        {
-                            continue;
-                        }
-                        let bid = object
-                            .get("approvalId")
-                            .and_then(serde_json::Value::as_str)
-                            .or_else(|| {
-                                object
-                                    .get("approval_id")
-                                    .and_then(serde_json::Value::as_str)
-                            });
-                        if bid != Some(approval_id.as_str()) {
-                            continue;
-                        }
-                        let should_update = object
-                            .get("status")
-                            .and_then(serde_json::Value::as_str)
-                            .map(|v| v != "answered")
-                            .unwrap_or(true);
-                        if should_update {
-                            object.insert(
-                                "status".to_string(),
-                                serde_json::Value::String("answered".to_string()),
-                            );
-                            any_changed = true;
-                        }
-                    }
-                    any_changed
-                } else {
-                    false
-                };
-                if changed {
-                    tx.execute(
-                        "UPDATE messages SET blocks_json = ?1 WHERE id = ?2",
-                        rusqlite::params![blocks_value.to_string(), message_id],
-                    )
-                    .context("failed to persist answered approval in message blocks")?;
-                }
-            }
-
-            // Conditionally advance the thread status.
-            if has_local_turn {
-                tx.execute(
-                    "UPDATE threads
-                     SET status = ?1, last_activity_at = ?2
-                     WHERE id = ?3
-                       AND status = ?4",
-                    rusqlite::params![
-                        ThreadStatusDto::Streaming.as_str(),
-                        runtime_env::system_time_rfc3339(),
-                        thread_id,
-                        ThreadStatusDto::AwaitingApproval.as_str()
-                    ],
-                )
-                .context("failed to conditionally update thread status")?;
-            }
-
-            tx.commit()
-                .context("failed to commit approval resolution transaction")?;
-
-            // Read the updated thread after the transaction has committed (non-atomic read is fine).
-            let updated_thread = if has_local_turn {
-                db::threads::get_thread(db, &thread_id)?
-            } else {
-                None
-            };
-
-            Ok(updated_thread)
-        }
-    })
-    .await
-    {
-        Ok(updated_thread) => updated_thread,
-        Err(error) => {
-            log::warn!("failed to reconcile resolved runtime approval {approval_id}: {error}");
-            return;
-        }
-    };
-
-    let stream_event_topic = format!("stream-event-{thread_id}");
-    let _ = app.emit(
-        &stream_event_topic,
-        serde_json::json!({
-            "type": "ApprovalResolved",
-            "approval_id": approval_id,
-        }),
-    );
-
-    if let Some(thread) = updated_thread {
-        let _ = app.emit(
-            "thread-updated",
-            ThreadUpdatedEvent {
-                thread_id: thread.id.clone(),
-                workspace_id: thread.workspace_id.clone(),
-                thread: Some(thread),
-            },
-        );
-    }
-}
-
-async fn apply_codex_runtime_thread_update(
-    state: &AppState,
-    engine_thread_id: &str,
-    title: Option<&str>,
-    raw_status: Option<&str>,
-    active_flags: &[String],
-    preview: Option<&str>,
-    sync_required: Option<bool>,
-    sync_reason: Option<&str>,
-) -> Option<ThreadDto> {
-    let thread = run_db(state.db.clone(), {
-        let engine_thread_id = engine_thread_id.to_string();
-        move |db| db::threads::find_thread_by_engine_thread_id(db, "codex", &engine_thread_id)
-    })
-    .await
-    .ok()??;
-
-    let has_local_turn = state.turns.get(&thread.id).await.is_some();
-    let next_status = map_codex_runtime_status_to_local(raw_status, active_flags, has_local_turn);
-    let metadata = merge_codex_runtime_metadata(
-        thread.engine_metadata.clone(),
-        raw_status,
-        active_flags,
-        preview,
-        sync_required,
-        sync_reason,
-    );
-
-    run_db(state.db.clone(), {
-        let thread_id = thread.id.clone();
-        let title = title.map(str::to_string);
-        let metadata = metadata.clone();
-        let next_status = next_status.clone();
-        move |db| {
-            db::threads::update_thread_runtime_snapshot(
-                db,
-                &thread_id,
-                title.as_deref(),
-                next_status,
-                Some(&metadata),
-            )
-        }
-    })
-    .await
-    .ok()
-}
-
-async fn emit_codex_remote_thread_removed(
-    app: &tauri::AppHandle,
-    state: &AppState,
-    engine_thread_id: &str,
-    remote_action: &'static str,
-) {
-    let Some(thread) = find_active_codex_runtime_thread(state, engine_thread_id).await else {
-        return;
-    };
-
-    let _ = app.emit(
-        "codex-remote-thread-removed",
-        CodexRemoteThreadRemovedEvent {
-            thread,
-            remote_action,
-        },
-    );
-}
-
-async fn find_active_codex_runtime_thread(
-    state: &AppState,
-    engine_thread_id: &str,
-) -> Option<ThreadDto> {
-    run_db(state.db.clone(), {
-        let engine_thread_id = engine_thread_id.to_string();
-        move |db| {
-            let Some(thread) =
-                db::threads::find_thread_by_engine_thread_id(db, "codex", &engine_thread_id)?
-            else {
-                return Ok::<Option<ThreadDto>, anyhow::Error>(None);
-            };
-            let active = db::threads::list_threads_for_workspace(db, &thread.workspace_id)?
-                .into_iter()
-                .any(|candidate| candidate.id == thread.id);
-            Ok(active.then_some(thread))
-        }
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-async fn restore_codex_runtime_thread(
-    state: &AppState,
-    engine_thread_id: &str,
-) -> Option<ThreadDto> {
-    let thread = run_db(state.db.clone(), {
-        let engine_thread_id = engine_thread_id.to_string();
-        move |db| db::threads::find_thread_by_engine_thread_id(db, "codex", &engine_thread_id)
-    })
-    .await
-    .ok()??;
-
-    run_db(state.db.clone(), {
-        let thread_id = thread.id.clone();
-        let existing = thread.clone();
-        move |db| match db::threads::restore_thread(db, &thread_id) {
-            Ok(restored) => Ok(restored),
-            Err(error) if error.to_string().contains("not archived") => Ok(existing),
-            Err(error) => Err(error),
-        }
-    })
-    .await
-    .ok()
-}
-
-fn merge_codex_runtime_metadata(
-    existing: Option<serde_json::Value>,
-    raw_status: Option<&str>,
-    active_flags: &[String],
-    preview: Option<&str>,
-    sync_required: Option<bool>,
-    sync_reason: Option<&str>,
-) -> serde_json::Value {
-    let mut metadata = existing.unwrap_or_else(|| serde_json::json!({}));
-    if !metadata.is_object() {
-        metadata = serde_json::json!({});
-    }
-
-    if let Some(object) = metadata.as_object_mut() {
-        if raw_status.is_some() {
-            match raw_status.map(str::trim).filter(|value| !value.is_empty()) {
-                Some(status) => {
-                    object.insert("codexThreadStatus".to_string(), serde_json::json!(status));
-                }
-                None => {
-                    object.remove("codexThreadStatus");
-                }
-            }
-
-            if active_flags.is_empty() {
-                object.remove("codexThreadActiveFlags");
-            } else {
-                object.insert(
-                    "codexThreadActiveFlags".to_string(),
-                    serde_json::json!(active_flags),
-                );
-            }
-        }
-
-        if preview.is_some() {
-            match preview.map(str::trim).filter(|value| !value.is_empty()) {
-                Some(preview) => {
-                    object.insert("codexPreview".to_string(), serde_json::json!(preview));
-                }
-                None => {
-                    object.remove("codexPreview");
-                }
-            }
-        }
-
-        if let Some(sync_required) = sync_required {
-            object.insert(
-                "codexSyncRequired".to_string(),
-                serde_json::json!(sync_required),
-            );
-            object.insert(
-                "codexSyncUpdatedAt".to_string(),
-                serde_json::json!(chrono::Utc::now().to_rfc3339()),
-            );
-            match sync_reason.map(str::trim).filter(|value| !value.is_empty()) {
-                Some(reason) => {
-                    object.insert("codexSyncReason".to_string(), serde_json::json!(reason));
-                }
-                None => {
-                    object.insert("codexSyncReason".to_string(), serde_json::Value::Null);
-                }
-            }
-        }
-    }
-
-    metadata
-}
-
-fn map_codex_runtime_status_to_local(
-    raw_status: Option<&str>,
-    active_flags: &[String],
-    has_local_turn: bool,
-) -> Option<ThreadStatusDto> {
-    if has_local_turn {
-        return None;
-    }
-
-    match raw_status.map(str::trim).filter(|value| !value.is_empty()) {
-        Some("systemError") => Some(ThreadStatusDto::Error),
-        Some("idle") | Some("notLoaded") => Some(ThreadStatusDto::Idle),
-        Some("active") => {
-            if active_flags
-                .iter()
-                .any(|flag| matches!(flag.as_str(), "waitingOnApproval" | "waitingOnUserInput"))
-            {
-                Some(ThreadStatusDto::AwaitingApproval)
-            } else {
-                Some(ThreadStatusDto::Streaming)
-            }
-        }
-        _ => None,
-    }
-}
-
-async fn run_db<T, F>(db: crate::db::Database, operation: F) -> Result<T, String>
-where
-    T: Send + 'static,
-    F: FnOnce(&crate::db::Database) -> anyhow::Result<T> + Send + 'static,
-{
-    tokio::task::spawn_blocking(move || operation(&db))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
 }
 
 fn build_app_menu(handle: &tauri::AppHandle, locale: &str) -> tauri::Result<Menu<tauri::Wry>> {

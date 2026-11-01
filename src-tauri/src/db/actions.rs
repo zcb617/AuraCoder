@@ -486,6 +486,139 @@ pub fn find_approval_context(
     Ok(context)
 }
 
+/// 保存 Codex 运行时审批完成事件时使用的事务化审批数据。
+#[derive(Debug, Clone)]
+pub struct RuntimeApprovalRecord {
+    /// 审批持久化标识。
+    pub approval_id: String,
+    /// 审批所属线程标识；缺失时由业务层判定记录无效。
+    pub thread_id: Option<String>,
+    /// 审批卡片所在消息标识；缺失时由业务层判定记录无效。
+    pub message_id: Option<String>,
+    /// 审批持久化状态，用于阻止迟到事件覆盖终态。
+    pub status: String,
+    /// 所属线程引擎标识，用于限制 Codex 运行时事件的归属。
+    pub engine_id: Option<String>,
+    /// 所属线程当前状态，用于条件性推进本地活动轮次。
+    pub thread_status: Option<String>,
+    /// 消息所属线程标识，用于校验审批卡片归属。
+    pub message_thread_id: Option<String>,
+    /// 审批卡片 JSON 原文，用于严格解析并原子更新。
+    pub blocks_json: Option<String>,
+}
+
+/// 在单个 SQLite 事务中执行运行时审批业务并提交结果。
+pub fn with_runtime_approval_transaction<T>(
+    db: &Database,
+    work: impl FnOnce(&rusqlite::Transaction<'_>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut conn = db.connect()?;
+    let tx = conn
+        .transaction()
+        .context("failed to start runtime approval transaction")?;
+    let result = work(&tx)?;
+    tx.commit()
+        .context("failed to commit runtime approval transaction")?;
+    Ok(result)
+}
+
+/// 在连接或事务内读取审批、线程和消息的当前持久化事实。
+pub fn get_runtime_approval_record(
+    conn: &rusqlite::Connection,
+    approval_id: &str,
+) -> anyhow::Result<Option<RuntimeApprovalRecord>> {
+    conn.query_row(
+        "SELECT a.id, a.thread_id, a.message_id, a.status,
+                t.engine_id, t.status, m.thread_id, m.blocks_json
+         FROM approvals a
+         LEFT JOIN threads t ON t.id = a.thread_id
+         LEFT JOIN messages m ON m.id = a.message_id
+         WHERE a.id = ?1",
+        params![approval_id],
+        |row| {
+            Ok(RuntimeApprovalRecord {
+                approval_id: row.get(0)?,
+                thread_id: row.get(1)?,
+                message_id: row.get(2)?,
+                status: row.get(3)?,
+                engine_id: row.get(4)?,
+                thread_status: row.get(5)?,
+                message_thread_id: row.get(6)?,
+                blocks_json: row.get(7)?,
+            })
+        },
+    )
+    .optional()
+    .context("failed to load runtime approval record")
+}
+
+/// 从数据库读取 Codex 运行时审批上下文并复用连接级事实查询。
+pub fn read_runtime_approval_record(
+    db: &Database,
+    approval_id: &str,
+) -> anyhow::Result<Option<RuntimeApprovalRecord>> {
+    let connection = db.connect()?;
+    get_runtime_approval_record(&connection, approval_id)
+}
+
+/// 在审批事务内读取目标线程 DTO，供提交后通知页面使用。
+pub fn get_runtime_approval_thread(
+    tx: &rusqlite::Transaction<'_>,
+    thread_id: &str,
+) -> anyhow::Result<Option<ThreadDto>> {
+    super::threads::get_thread_on_connection(tx, thread_id)
+        .context("failed to read runtime approval thread snapshot")
+}
+
+/// 仅在审批仍为 pending 且线程归属匹配时保存审批终态。
+pub fn update_runtime_approval_pending(
+    tx: &rusqlite::Transaction<'_>,
+    approval_id: &str,
+    thread_id: &str,
+    target_status: &str,
+    answered_at: &str,
+) -> anyhow::Result<usize> {
+    tx.execute(
+        "UPDATE approvals
+         SET status = ?1, answered_at = COALESCE(answered_at, ?2)
+         WHERE id = ?3 AND thread_id = ?4 AND status = 'pending'",
+        params![target_status, answered_at, approval_id, thread_id],
+    )
+    .context("failed to update pending runtime approval")
+}
+
+/// 仅当消息内容仍等于业务读取的原文时保存新的审批卡片 JSON。
+pub fn update_runtime_approval_message_blocks(
+    tx: &rusqlite::Transaction<'_>,
+    message_id: &str,
+    thread_id: &str,
+    old_blocks_json: &str,
+    new_blocks_json: &str,
+) -> anyhow::Result<usize> {
+    tx.execute(
+        "UPDATE messages SET blocks_json = ?1
+         WHERE id = ?2 AND thread_id = ?3 AND blocks_json = ?4",
+        params![new_blocks_json, message_id, thread_id, old_blocks_json],
+    )
+    .context("failed to update runtime approval message blocks")
+}
+
+/// 仅当线程仍处于预期状态时更新运行时审批对应的线程状态。
+pub fn update_runtime_thread_status_if_current(
+    tx: &rusqlite::Transaction<'_>,
+    thread_id: &str,
+    current_status: &str,
+    target_status: &str,
+    last_activity_at: &str,
+) -> anyhow::Result<usize> {
+    tx.execute(
+        "UPDATE threads SET status = ?1, last_activity_at = ?2
+         WHERE id = ?3 AND status = ?4",
+        params![target_status, last_activity_at, thread_id, current_status],
+    )
+    .context("failed to conditionally update runtime thread status")
+}
+
 // 废弃，使用log4jrs
 // pub fn append_event_log(
 //     db: &Database,

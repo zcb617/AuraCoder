@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -33,7 +33,7 @@ use crate::{
         },
         approval_response_route_for_engine, map_engine_capabilities, map_model_info,
         map_provider_usage, normalize_approval_response_for_engine, ApprovalRequestRoute,
-        CodexRuntimeEvent, Engine, EngineCapabilities, EngineEvent, EngineSteerReceipt,
+        Engine, EngineCapabilities, EngineEvent, EngineSteerReceipt,
         EngineThread, ModelInfo, SandboxPolicy, ThreadScope, ThreadSyncSnapshot, TurnInput,
     },
     extensions,
@@ -1841,10 +1841,9 @@ impl CliTool for ClaudeCodeCli {
         })
     }
 
-    fn subscribe_codex_runtime_events(&self) -> broadcast::Receiver<CodexRuntimeEvent> {
-        let (sender, receiver) = broadcast::channel(1);
-        drop(sender);
-        receiver
+    /// Claude 当前没有独立的桌面运行时事件流，完成统一监听入口。
+    async fn run_runtime_event_bridge(&self, _app: tauri::AppHandle) -> Result<()> {
+        Ok(())
     }
 
     async fn prewarm_engine(&self, context: &CliExecutionContext) -> Result<()> {

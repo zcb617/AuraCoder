@@ -11,12 +11,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     engines::{
-        ApprovalRequestRoute, CodexRuntimeEvent, EngineCapabilities, EngineEvent,
+        ApprovalRequestRoute, EngineCapabilities, EngineEvent,
         EngineSteerReceipt, EngineThread, ModelInfo, SandboxPolicy, ThreadScope,
         ThreadSyncSnapshot, TurnInput,
     },
@@ -342,8 +342,8 @@ pub trait CliTool: Send + Sync {
     /// 用户查看或重试运行目标时，检查当前 CLI 是否可以使用，并在页面显示版本、问题和处理建议。
     async fn engine_health(&self, context: &CliExecutionContext) -> Result<EngineHealthDto>;
 
-    /// 用户使用 Codex 时，持续接收账户、模型、配置和运行状态变化，使页面及时显示最新状态和提示。
-    fn subscribe_codex_runtime_events(&self) -> broadcast::Receiver<CodexRuntimeEvent>;
+    /// 用户运行当前 CLI 时，由对应实现处理自身运行时事件并更新相关页面状态。
+    async fn run_runtime_event_bridge(&self, app: tauri::AppHandle) -> Result<()>;
 
     /// 用户进入当前 CLI 的聊天环境时，提前确认该 CLI 可以接受后续操作；失败时保留当前目标并显示不可用结果。
     async fn prewarm_engine(&self, context: &CliExecutionContext) -> Result<()>;
