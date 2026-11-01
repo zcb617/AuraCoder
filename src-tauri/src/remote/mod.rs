@@ -30,12 +30,11 @@ use crate::{
     // 历史分页已恢复：MessageWindowCursorDto 用于 message.list 游标分页。
     models::{
         chat::{ChatAttachmentPayload, SendMessageRequest},
-        EngineInfoDto, MessageWindowCursorDto, ThreadDto,
+        MessageWindowCursorDto, MessageWindowWithRowIds,
     },
-    services::chat_service::{
-        read_attachment_preview, save_pasted_image_attachment, ChatService,
-    },
+    services::chat_service::{save_pasted_image_attachment, ChatService},
     services::thread_service::ThreadService,
+    services::workspace_service::WorkspaceService,
     state::AppState,
 };
 
@@ -746,53 +745,54 @@ async fn process_batched_attachment_upload(
     serde_json::to_value(attachment).map_err(|error| error.to_string())
 }
 
-/// 手机端 thread.update_runtime 的纯校验与解析：
-/// 只允许未开始的空会话切换 CLI，并解析最终写入的引擎、模型与思考强度。
-/// 独立成自由函数是为了让单测直接覆盖三个判定分支（与 build_completed_message_event 同款模式）。
-fn resolve_remote_runtime_update(
-    thread: &ThreadDto,
-    engines: &[EngineInfoDto],
-    engine_id: &str,
-    model_id: Option<String>,
-    reasoning_effort: Option<String>,
-) -> Result<(String, String, Option<String>), String> {
-    if thread.message_count > 0 || thread.engine_thread_id.is_some() {
-        return Err("thread already started; runtime cannot be changed".to_string());
-    }
-    let engine = engines
-        .iter()
-        .find(|item| item.id == engine_id)
-        .ok_or_else(|| format!("unknown engine_id: {engine_id}"))?;
-    let resolved_model = match model_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        Some(value) => value,
-        None => {
-            let visible: Vec<&crate::models::EngineModelDto> =
-                engine.models.iter().filter(|item| !item.hidden).collect();
-            visible
-                .iter()
-                .find(|item| item.is_default)
-                .map(|item| item.id.clone())
-                .or_else(|| visible.first().map(|item| item.id.clone()))
-                .unwrap_or_else(|| thread.model_id.clone())
-        }
-    };
-    let resolved_effort = match reasoning_effort
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        Some(value) => Some(value),
-        None => engine
-            .models
-            .iter()
-            .find(|item| item.id == resolved_model)
-            .map(|item| item.default_reasoning_effort.clone())
-            .filter(|value| !value.is_empty()),
-    };
-    Ok((engine_id.to_string(), resolved_model, resolved_effort))
-}
+// 手机端 thread.update_runtime 的旧纯校验与模型选择函数已停用，保留原文供兼容审阅：
+// /// 手机端 thread.update_runtime 的纯校验与解析：
+// /// 只允许未开始的空会话切换 CLI，并解析最终写入的引擎、模型与思考强度。
+// /// 独立成自由函数是为了让单测直接覆盖三个判定分支（与 build_completed_message_event 同款模式）。
+// fn resolve_remote_runtime_update(
+//     thread: &ThreadDto,
+//     engines: &[EngineInfoDto],
+//     engine_id: &str,
+//     model_id: Option<String>,
+//     reasoning_effort: Option<String>,
+// ) -> Result<(String, String, Option<String>), String> {
+//     if thread.message_count > 0 || thread.engine_thread_id.is_some() {
+//         return Err("thread already started; runtime cannot be changed".to_string());
+//     }
+//     let engine = engines
+//         .iter()
+//         .find(|item| item.id == engine_id)
+//         .ok_or_else(|| format!("unknown engine_id: {engine_id}"))?;
+//     let resolved_model = match model_id
+//         .map(|value| value.trim().to_string())
+//         .filter(|value| !value.is_empty())
+//     {
+//         Some(value) => value,
+//         None => {
+//             let visible: Vec<&crate::models::EngineModelDto> =
+//                 engine.models.iter().filter(|item| !item.hidden).collect();
+//             visible
+//                 .iter()
+//                 .find(|item| item.is_default)
+//                 .map(|item| item.id.clone())
+//                 .or_else(|| visible.first().map(|item| item.id.clone()))
+//                 .unwrap_or_else(|| thread.model_id.clone())
+//         }
+//     };
+//     let resolved_effort = match reasoning_effort
+//         .map(|value| value.trim().to_string())
+//         .filter(|value| !value.is_empty())
+//     {
+//         Some(value) => Some(value),
+//         None => engine
+//             .models
+//             .iter()
+//             .find(|item| item.id == resolved_model)
+//             .map(|item| item.default_reasoning_effort.clone())
+//             .filter(|value| !value.is_empty()),
+//     };
+//     Ok((engine_id.to_string(), resolved_model, resolved_effort))
+// }
 
 /// 将聊天完成通知包装成移动端约定的远程事件。
 ///
@@ -1417,11 +1417,17 @@ impl RemoteTunnelManager {
                                             .map_err(|error| error.to_string())
                                             .and_then(|items| serde_json::to_value(items).map_err(|error| error.to_string())),
                                         "workspace.list" => {
-                                            let db = state.db.clone();
-                                            tokio::task::spawn_blocking(move || crate::db::workspaces::list_workspaces(&db))
+                                            // 旧远程入口直接查 Mapper 的实现停用，工作区列表改由既有 Service 读取。
+                                            // let db = state.db.clone();
+                                            // tokio::task::spawn_blocking(move || crate::db::workspaces::list_workspaces(&db))
+                                            //     .await
+                                            //     .map_err(|error| error.to_string())
+                                            //     .and_then(|result| result.map_err(|error| error.to_string()))
+                                            //     .and_then(|items| serde_json::to_value(items).map_err(|error| error.to_string()))
+                                            WorkspaceService::new(state.clone())
+                                                .list_workspaces()
                                                 .await
                                                 .map_err(|error| error.to_string())
-                                                .and_then(|result| result.map_err(|error| error.to_string()))
                                                 .and_then(|items| serde_json::to_value(items).map_err(|error| error.to_string()))
                                         }
                                         "thread.list" => {
@@ -1433,11 +1439,17 @@ impl RemoteTunnelManager {
                                                 .ok_or_else(|| "workspace_id is required".to_string());
                                             match workspace_id {
                                                 Ok(workspace_id) => {
-                                                    let db = state.db.clone();
-                                                    tokio::task::spawn_blocking(move || crate::db::threads::list_threads_for_workspace(&db, &workspace_id))
+                                                    // 旧远程入口直接查 Mapper 的实现停用，线程列表改由既有 Service 读取。
+                                                    // let db = state.db.clone();
+                                                    // tokio::task::spawn_blocking(move || crate::db::threads::list_threads_for_workspace(&db, &workspace_id))
+                                                    //     .await
+                                                    //     .map_err(|error| error.to_string())
+                                                    //     .and_then(|result| result.map_err(|error| error.to_string()))
+                                                    //     .and_then(|items| serde_json::to_value(items).map_err(|error| error.to_string()))
+                                                    ThreadService::new(state.clone())
+                                                        .list_threads(&workspace_id)
                                                         .await
                                                         .map_err(|error| error.to_string())
-                                                        .and_then(|result| result.map_err(|error| error.to_string()))
                                                         .and_then(|items| serde_json::to_value(items).map_err(|error| error.to_string()))
                                                 }
                                                 Err(error) => Err(error),
@@ -1513,35 +1525,46 @@ impl RemoteTunnelManager {
                                             match (thread_id, engine_id) {
                                                 (Ok(thread_id), Ok(engine_id)) => {
                                                     async {
-                                                        let db = state.db.clone();
-                                                        let query_thread_id = thread_id.clone();
-                                                        let thread = tokio::task::spawn_blocking(move || {
-                                                            crate::db::threads::get_thread(&db, &query_thread_id)
-                                                        })
-                                                        .await
-                                                        .map_err(|error| error.to_string())
-                                                        .and_then(|result| result.map_err(|error| error.to_string()))?
-                                                        .ok_or_else(|| "thread not found".to_string())?;
-                                                        let engines = crate::engines::catalog::list_local_engine_infos(&state).await?;
-                                                        let (engine_id, model_id, reasoning_effort) =
-                                                            resolve_remote_runtime_update(&thread, &engines, &engine_id, model_id, reasoning_effort)?;
-                                                        let db = state.db.clone();
-                                                        let update_thread_id = thread_id.clone();
-                                                        let updated = tokio::task::spawn_blocking(move || {
-                                                            crate::db::threads::update_thread_runtime_selection(
-                                                                &db,
-                                                                &update_thread_id,
-                                                                &engine_id,
-                                                                &model_id,
-                                                                None,
-                                                                None,
-                                                                reasoning_effort.as_deref(),
-                                                                None,
+                                                        // 旧远程 Mapper 读取、公共模型目录选择和窄运行时保存实现已停用。
+                                                        // let db = state.db.clone();
+                                                        // let query_thread_id = thread_id.clone();
+                                                        // let thread = tokio::task::spawn_blocking(move || {
+                                                        //     crate::db::threads::get_thread(&db, &query_thread_id)
+                                                        // })
+                                                        // .await
+                                                        // .map_err(|error| error.to_string())
+                                                        // .and_then(|result| result.map_err(|error| error.to_string()))?
+                                                        // .ok_or_else(|| "thread not found".to_string())?;
+                                                        // let engines = crate::engines::catalog::list_local_engine_infos(&state).await?;
+                                                        // let (engine_id, model_id, reasoning_effort) =
+                                                        //     resolve_remote_runtime_update(&thread, &engines, &engine_id, model_id, reasoning_effort)?;
+                                                        // let db = state.db.clone();
+                                                        // let update_thread_id = thread_id.clone();
+                                                        // let updated = tokio::task::spawn_blocking(move || {
+                                                        //     crate::db::threads::update_thread_runtime_selection(
+                                                        //         &db,
+                                                        //         &update_thread_id,
+                                                        //         &engine_id,
+                                                        //         &model_id,
+                                                        //         None,
+                                                        //         None,
+                                                        //         reasoning_effort.as_deref(),
+                                                        //         None,
+                                                        //     )
+                                                        // })
+                                                        // .await
+                                                        // .map_err(|error| error.to_string())
+                                                        // .and_then(|result| result.map_err(|error| error.to_string()))?;
+                                                        // 目标 CLI 通过其自身接口解析运行选择，Service 负责空会话校验与窄范围保存。
+                                                        let updated = ThreadService::new(state.clone())
+                                                            .update_unstarted_thread_runtime(
+                                                                thread_id,
+                                                                engine_id,
+                                                                model_id,
+                                                                reasoning_effort,
                                                             )
-                                                        })
-                                                        .await
-                                                        .map_err(|error| error.to_string())
-                                                        .and_then(|result| result.map_err(|error| error.to_string()))?;
+                                                            .await
+                                                            .map_err(|error| error.to_string())?;
                                                         // PC 端通过 thread-updated 事件实时刷新会话运行时显示。
                                                         let _ = app.emit("thread-updated", json!({
                                                             "threadId": updated.id,
@@ -1741,21 +1764,30 @@ impl RemoteTunnelManager {
                                             };
                                             match (thread_id, cursor) {
                                                 (Ok(thread_id), Ok(cursor)) => {
-                                                    let db = state.db.clone();
-                                                    let query_thread_id = thread_id.clone();
-                                                    let window = tokio::task::spawn_blocking(move || {
-                                                        crate::db::messages::get_thread_messages_window_with_row_ids(
-                                                            &db,
-                                                            &query_thread_id,
-                                                            cursor.as_ref(),
-                                                            limit,
+                                                    // 旧远程入口直接查带 row id 的 Mapper 实现停用，Service 保持消息与行号配对返回。
+                                                    // let db = state.db.clone();
+                                                    // let query_thread_id = thread_id.clone();
+                                                    // let window = tokio::task::spawn_blocking(move || {
+                                                    //     crate::db::messages::get_thread_messages_window_with_row_ids(
+                                                    //         &db,
+                                                    //         &query_thread_id,
+                                                    //         cursor.as_ref(),
+                                                    //         limit,
+                                                    //     )
+                                                    // })
+                                                    // .await
+                                                    // .map_err(|error| error.to_string())
+                                                    // .and_then(|result| result.map_err(|error| error.to_string()));
+                                                    let window = ChatService::new(state.clone())
+                                                        .get_thread_messages_window_with_row_ids(
+                                                            thread_id,
+                                                            cursor,
+                                                            Some(limit),
                                                         )
-                                                    })
-                                                    .await
-                                                    .map_err(|error| error.to_string())
-                                                    .and_then(|result| result.map_err(|error| error.to_string()));
+                                                        .await;
                                                     match window {
-                                                        Ok((window, row_ids)) => {
+                                                        Ok(window_with_row_ids) => {
+                                                            let MessageWindowWithRowIds { window, row_ids } = window_with_row_ids;
                                                             // 单条消息转手机端结构：附件仅暴露元数据并剥离输出类字段。
                                                             let converted = window
                                                                 .messages
@@ -1801,51 +1833,60 @@ impl RemoteTunnelManager {
                                                 .ok_or_else(|| "attachment_index is required".to_string());
                                             match (thread_id, message_id, attachment_index) {
                                                 (Ok(thread_id), Ok(message_id), Ok(attachment_index)) => {
-                                                    let db = state.db.clone();
-                                                    let query_message_id = message_id.clone();
-                                                    let message = tokio::task::spawn_blocking(move || {
-                                                        crate::db::messages::get_message(&db, &query_message_id)
-                                                    })
-                                                    .await
-                                                    .map_err(|error| error.to_string())
-                                                    .and_then(|result| result.map_err(|error| error.to_string()));
-                                                    match message {
-                                                        Ok(Some(message)) if message.thread_id == thread_id => {
-                                                            let attachment = message.blocks.as_ref()
-                                                                .and_then(Value::as_array)
-                                                                .and_then(|blocks| blocks.get(attachment_index))
-                                                                .filter(|block| block.get("type").and_then(Value::as_str) == Some("attachment"));
-                                                            let file_path = attachment
-                                                                .and_then(|block| block.get("filePath"))
-                                                                .and_then(Value::as_str)
-                                                                .map(str::trim)
-                                                                .filter(|value| !value.is_empty())
-                                                                .map(str::to_string);
-                                                            let mime_type = attachment
-                                                                .and_then(|block| block.get("mimeType"))
-                                                                .and_then(Value::as_str)
-                                                                .map(str::to_string);
-                                                            let preview_file_path = attachment
-                                                                .and_then(|block| block.get("previewFilePath"))
-                                                                .and_then(Value::as_str)
-                                                                .map(str::trim)
-                                                                .filter(|value| !value.is_empty())
-                                                                .map(str::to_string);
-                                                            match file_path {
-                                                                Some(file_path) => read_attachment_preview(
-                                                                    file_path,
-                                                                    mime_type,
-                                                                    preview_file_path,
-                                                                )
-                                                                    .await
-                                                                    .and_then(|preview| serde_json::to_value(preview).map_err(|error| error.to_string())),
-                                                                None => Err("history attachment was not found".to_string()),
-                                                            }
-                                                        }
-                                                        Ok(Some(_)) => Err("message does not belong to thread".to_string()),
-                                                        Ok(None) => Err("message was not found".to_string()),
-                                                        Err(error) => Err(error),
-                                                    }
+                                                    // 旧远程入口查询消息、校验归属并读取附件的实现停用，业务完整迁入 ChatService。
+                                                    // let db = state.db.clone();
+                                                    // let query_message_id = message_id.clone();
+                                                    // let message = tokio::task::spawn_blocking(move || {
+                                                    //     crate::db::messages::get_message(&db, &query_message_id)
+                                                    // })
+                                                    // .await
+                                                    // .map_err(|error| error.to_string())
+                                                    // .and_then(|result| result.map_err(|error| error.to_string()));
+                                                    // match message {
+                                                    //     Ok(Some(message)) if message.thread_id == thread_id => {
+                                                    //         let attachment = message.blocks.as_ref()
+                                                    //             .and_then(Value::as_array)
+                                                    //             .and_then(|blocks| blocks.get(attachment_index))
+                                                    //             .filter(|block| block.get("type").and_then(Value::as_str) == Some("attachment"));
+                                                    //         let file_path = attachment
+                                                    //             .and_then(|block| block.get("filePath"))
+                                                    //             .and_then(Value::as_str)
+                                                    //             .map(str::trim)
+                                                    //             .filter(|value| !value.is_empty())
+                                                    //             .map(str::to_string);
+                                                    //         let mime_type = attachment
+                                                    //             .and_then(|block| block.get("mimeType"))
+                                                    //             .and_then(Value::as_str)
+                                                    //             .map(str::to_string);
+                                                    //         let preview_file_path = attachment
+                                                    //             .and_then(|block| block.get("previewFilePath"))
+                                                    //             .and_then(Value::as_str)
+                                                    //             .map(str::trim)
+                                                    //             .filter(|value| !value.is_empty())
+                                                    //             .map(str::to_string);
+                                                    //         match file_path {
+                                                    //             Some(file_path) => read_attachment_preview(
+                                                    //                 file_path,
+                                                    //                 mime_type,
+                                                    //                 preview_file_path,
+                                                    //             )
+                                                    //                 .await
+                                                    //                 .and_then(|preview| serde_json::to_value(preview).map_err(|error| error.to_string())),
+                                                    //             None => Err("history attachment was not found".to_string()),
+                                                    //         }
+                                                    //     }
+                                                    //     Ok(Some(_)) => Err("message does not belong to thread".to_string()),
+                                                    //     Ok(None) => Err("message was not found".to_string()),
+                                                    //     Err(error) => Err(error),
+                                                    // }
+                                                    ChatService::new(state.clone())
+                                                        .read_message_attachment_preview(
+                                                            thread_id,
+                                                            message_id,
+                                                            attachment_index,
+                                                        )
+                                                        .await
+                                                        .and_then(|preview| serde_json::to_value(preview).map_err(|error| error.to_string()))
                                                 }
                                                 (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
                                             }

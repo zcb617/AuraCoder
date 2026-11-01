@@ -11,14 +11,15 @@ use crate::cli_tools::{factory::CliToolFactory, CliExecutionContext, CliLocation
 use crate::services::app_config_service::AppConfigService;
 use crate::models::{HarnessInfo, HarnessReport, InstallProgressEvent, InstallResult};
 use crate::process_utils;
-use crate::runtime_env;
+use crate::runtime_env::{self, detect_via_login_shell};
 use crate::state::AppState;
 
 fn err_to_string(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
-const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+// 旧探测超时常量已迁移至 runtime_env：
+// const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Harness definitions
@@ -700,78 +701,80 @@ async fn get_command_version(path: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-pub(crate) async fn detect_via_login_shell(
-    command: &str,
-    version_flag: &str,
-) -> Option<(String, String)> {
-    for shell in runtime_env::login_probe_shells() {
-        let probe_cmd = format!("command -v {command} && {command} {version_flag}");
-        let output = match timeout(
-            LOGIN_SHELL_PROBE_TIMEOUT,
-            Command::new(&shell)
-                .args(runtime_env::login_probe_shell_args(&shell, &probe_cmd))
-                .output(),
-        )
-        .await
-        {
-            Err(_) => {
-                log::warn!(
-                    "timed out probing `{command}` via login shell `{}`",
-                    shell.display()
-                );
-                continue;
-            }
-            Ok(Ok(output)) if output.status.success() => output,
-            _ => continue,
-        };
+// 旧非 Windows 探测实现已迁移至 runtime_env，保留原代码供逐行核对：
+// #[cfg(not(target_os = "windows"))]
+// pub(crate) async fn detect_via_login_shell(
+//     command: &str,
+//     version_flag: &str,
+// ) -> Option<(String, String)> {
+//     for shell in runtime_env::login_probe_shells() {
+//         let probe_cmd = format!("command -v {command} && {command} {version_flag}");
+//         let output = match timeout(
+//             LOGIN_SHELL_PROBE_TIMEOUT,
+//             Command::new(&shell)
+//                 .args(runtime_env::login_probe_shell_args(&shell, &probe_cmd))
+//                 .output(),
+//         )
+//         .await
+//         {
+//             Err(_) => {
+//                 log::warn!(
+//                     "timed out probing `{command}` via login shell `{}`",
+//                     shell.display()
+//                 );
+//                 continue;
+//             }
+//             Ok(Ok(output)) if output.status.success() => output,
+//             _ => continue,
+//         };
+//
+//         let stdout = String::from_utf8_lossy(&output.stdout);
+//         let Some((path, version)) = runtime_env::parse_login_probe_output(&stdout) else {
+//             continue;
+//         };
+//
+//         return Some((path, version));
+//     }
+//     None
+// }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let Some((path, version)) = runtime_env::parse_login_probe_output(&stdout) else {
-            continue;
-        };
-
-        return Some((path, version));
-    }
-    None
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) async fn detect_via_login_shell(
-    command: &str,
-    version_flag: &str,
-) -> Option<(String, String)> {
-    let probe_script = format!(
-        "$p = (Get-Command {cmd} -ErrorAction SilentlyContinue | Select-Object -First 1).Source; \
-         if ($p) {{ Write-Output $p; & $p {flag} }}",
-        cmd = command,
-        flag = version_flag,
-    );
-
-    for powershell in runtime_env::windows_login_probe_shells() {
-        let mut cmd = Command::new(&powershell);
-        cmd.args(["-NoLogo", "-Command", &probe_script]);
-        process_utils::configure_tokio_command(&mut cmd);
-
-        let Ok(Ok(output)) = timeout(Duration::from_secs(10), cmd.output()).await else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let Some((path, version)) = runtime_env::parse_windows_login_probe_output(&stdout) else {
-            continue;
-        };
-
-        if !path.is_empty() && Path::new(&path).is_file() {
-            return Some((path, version));
-        }
-    }
-
-    None
-}
+// 旧 Windows 探测实现已迁移至 runtime_env，保留原代码供逐行核对：
+// #[cfg(target_os = "windows")]
+// pub(crate) async fn detect_via_login_shell(
+//     command: &str,
+//     version_flag: &str,
+// ) -> Option<(String, String)> {
+//     let probe_script = format!(
+//         "$p = (Get-Command {cmd} -ErrorAction SilentlyContinue | Select-Object -First 1).Source; \
+//          if ($p) {{ Write-Output $p; & $p {flag} }}",
+//         cmd = command,
+//         flag = version_flag,
+//     );
+//
+//     for powershell in runtime_env::windows_login_probe_shells() {
+//         let mut cmd = Command::new(&powershell);
+//         cmd.args(["-NoLogo", "-Command", &probe_script]);
+//         process_utils::configure_tokio_command(&mut cmd);
+//
+//         let Ok(Ok(output)) = timeout(Duration::from_secs(10), cmd.output()).await else {
+//             continue;
+//         };
+//         if !output.status.success() {
+//             continue;
+//         }
+//
+//         let stdout = String::from_utf8_lossy(&output.stdout);
+//         let Some((path, version)) = runtime_env::parse_windows_login_probe_output(&stdout) else {
+//             continue;
+//         };
+//
+//         if !path.is_empty() && Path::new(&path).is_file() {
+//             return Some((path, version));
+//         }
+//     }
+//
+//     None
+// }
 
 async fn resolve_npm_path() -> String {
     if let Some(path) = runtime_env::resolve_executable("npm") {

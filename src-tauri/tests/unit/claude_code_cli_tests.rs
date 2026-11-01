@@ -5,7 +5,7 @@ use crate::{
     config::app_config::AppConfig,
     engines::EngineManager,
     git::{repo::FileTreeCache, watcher::GitWatcherManager},
-    models::SshConnectionInput,
+    models::{SshConnectionInput, STATUS_OK},
     power::KeepAwakeManager,
     state::{AppState, TurnManager},
     terminal::TerminalManager,
@@ -109,7 +109,8 @@ async fn ssh_archive_hook_returns_without_remote_archive_service() {
         &state.db,
         &connection.id,
         &connection.updated_at,
-        crate::db::ssh_connections::STATUS_OK,
+        // crate::db::ssh_connections::STATUS_OK,
+        STATUS_OK,
         None,
     )
     .expect("failed to mark test SSH connection ready");

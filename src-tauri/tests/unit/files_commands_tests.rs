@@ -13,6 +13,7 @@
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
+    /// 为文件业务测试创建临时目录和文本文件。
     fn with_temp_path<T>(f: impl FnOnce(PathBuf, PathBuf) -> T) -> T {
         let root = std::env::temp_dir().join(format!("auracoder-reveal-path-{}", Uuid::new_v4()));
         let dir = root.join("nested");
@@ -24,6 +25,7 @@
         result
     }
 
+    /// 验证文本文件类型识别规则。
     #[test]
     fn identifies_registered_plain_text_document_types() {
         assert!(is_text_document_type(".txt"));
@@ -34,6 +36,7 @@
         assert!(!is_text_document_type("application/pdf"));
     }
 
+    /// 验证剪贴板文件读取返回文本并忽略二进制文件。
     #[test]
     fn clipboard_reader_returns_text_and_ignores_binary_files() {
         with_temp_path(|_dir, file| {
@@ -50,6 +53,7 @@
         });
     }
 
+    /// 验证另存为操作复制源文件。
     #[test]
     fn save_file_as_copies_the_source_file() {
         with_temp_path(|dir, file| {
@@ -62,6 +66,7 @@
         });
     }
 
+    /// 验证文件与目录的所属目录解析。
     #[test]
     fn resolves_the_containing_directory_for_a_file() {
         with_temp_path(|dir, file| {
@@ -76,6 +81,7 @@
         });
     }
 
+    /// 验证 Windows 注册表命令中的程序路径解析。
     #[cfg(target_os = "windows")]
     #[test]
     fn extracts_the_executable_from_a_registered_windows_open_command() {
@@ -90,6 +96,7 @@
         );
     }
 
+    /// 验证 Windows 文件定位命令使用 Explorer 选择参数。
     #[test]
     fn windows_files_use_explorer_select_args() {
         with_temp_path(|_dir, file| {
@@ -107,6 +114,7 @@
         });
     }
 
+    /// 验证 Windows 目录定位命令使用 Explorer。
     #[test]
     fn windows_directories_open_in_explorer() {
         with_temp_path(|dir, _file| {
@@ -120,6 +128,7 @@
         });
     }
 
+    /// 验证 macOS 文件定位命令使用 open 的定位标记。
     #[test]
     fn mac_files_use_open_reveal_flag() {
         with_temp_path(|_dir, file| {
@@ -138,6 +147,7 @@
         });
     }
 
+    /// 验证 Linux 文件定位优先打开父目录。
     #[test]
     fn linux_prefers_xdg_open_for_parent_directory() {
         with_temp_path(|dir, file| {
@@ -156,6 +166,7 @@
         });
     }
 
+    /// 验证缺少 xdg-open 时使用 gio 定位目录。
     #[test]
     fn linux_falls_back_to_gio_when_xdg_open_is_missing() {
         with_temp_path(|dir, _file| {
@@ -180,6 +191,7 @@
         });
     }
 
+    /// 验证 Linux 缺少路径打开程序时返回明确错误。
     #[test]
     fn linux_returns_a_clear_error_without_openers() {
         with_temp_path(|dir, _file| {
@@ -192,6 +204,7 @@
         });
     }
 
+    /// 验证 macOS 默认打开命令使用 open。
     #[test]
     fn mac_files_use_open_for_default_app() {
         with_temp_path(|_dir, file| {
@@ -205,6 +218,7 @@
         });
     }
 
+    /// 验证 Windows 默认打开命令使用 cmd start。
     #[test]
     fn windows_files_use_cmd_start_for_default_app() {
         with_temp_path(|_dir, file| {
@@ -226,6 +240,7 @@
         });
     }
 
+    /// 验证 Linux 默认打开优先使用 xdg-open。
     #[test]
     fn linux_prefers_xdg_open_for_default_app() {
         with_temp_path(|_dir, file| {
@@ -244,6 +259,7 @@
         });
     }
 
+    /// 验证仓库路径允许位于尚未创建的嵌套目录中。
     #[test]
     fn resolve_target_path_for_repo_lookup_allows_nested_missing_parents() {
         with_temp_path(|dir, _file| {
@@ -263,6 +279,7 @@
         });
     }
 
+    /// 验证仓库路径拒绝越出根目录的父路径。
     #[test]
     fn resolve_target_path_for_repo_lookup_rejects_missing_parent_traversal() {
         with_temp_path(|dir, _file| {
@@ -277,6 +294,7 @@
         });
     }
 
+    /// 验证缺失祖先路径中的父目录分量会被拒绝。
     #[test]
     fn resolve_target_path_for_repo_lookup_rejects_parent_dir_components_inside_missing_ancestors()
     {
@@ -292,6 +310,7 @@
         });
     }
 
+    /// 验证仓库路径保留符号链接目录项。
     #[cfg(unix)]
     #[test]
     fn resolve_target_path_for_repo_lookup_preserves_symlink_entries() {

@@ -4,9 +4,12 @@ use crate::{
     db::{self, Database},
     fs_ops,
     git::repo,
-    models::{ExecutionTargetDto, FileTreeEntryDto, FileTreePageDto, TrustLevelDto, WorkspaceDto},
+    models::{
+        ExecutionTargetDto, FileTreeEntryDto, FileTreePageDto, TrustLevelDto, WorkspaceDto,
+        WorkspaceTarget,
+    },
     remote_project_session_refresh_service,
-    ssh::{remote_fs, runtime::resolve_workspace_target},
+    ssh::remote_fs,
     state::AppState,
     workspace_startup::{
         normalize_workspace_startup_preset as normalize_preset,
@@ -54,6 +57,54 @@ impl WorkspaceService {
             log::error!("读取工作区列表失败: error={error:#}");
         }
         result
+    }
+
+    /// 按标识查询单个工作区，并保持缺失记录的原业务错误。
+    pub async fn get_workspace(&self, workspace_id: &str) -> Result<WorkspaceDto> {
+        let query_workspace_id = workspace_id.to_string();
+        run_db(self.state.db.clone(), move |db| {
+            db::workspaces::find_workspace_by_id(db, &query_workspace_id)?
+                .ok_or_else(|| anyhow::anyhow!("workspace not found: {query_workspace_id}"))
+        })
+        .await
+    }
+
+    /// 校验工作区与 SSH 连接配置并解析本机或远端访问目标。
+    pub async fn resolve_workspace_target(
+        &self,
+        workspace_id: &str,
+    ) -> Result<WorkspaceTarget> {
+        let workspace = self.get_workspace(workspace_id).await?;
+        let connection = match workspace.ssh_connection_id.as_deref() {
+            Some(connection_id) => {
+                let record = crate::services::ssh_connection_service::SshConnectionService::new(
+                    self.state.clone(),
+                )
+                .get_runtime_record(connection_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("SSH 连接不存在: {connection_id}"))?;
+                if record.dto.deleted_at.is_some() {
+                    anyhow::bail!("SSH 连接已删除，请先恢复连接");
+                }
+                if !record.dto.enabled {
+                    anyhow::bail!("SSH 连接已禁用");
+                }
+                Some(record)
+            }
+            None => None,
+        };
+
+        if workspace.location_kind == "ssh" && connection.is_none() {
+            anyhow::bail!("远端项目未绑定 SSH 连接");
+        }
+        if workspace.location_kind != "ssh" && connection.is_some() {
+            anyhow::bail!("本地项目不能绑定 SSH 连接");
+        }
+
+        Ok(WorkspaceTarget {
+            workspace,
+            connection,
+        })
     }
 
     /// 查询本机或 SSH 工作区的展示目标，不改变连接的启用或删除状态。
@@ -425,12 +476,10 @@ impl WorkspaceService {
         // 先解析工作区目标，再按目标位置访问目录并仅返回子目录项。
         let log_workspace_id = workspace_id.clone();
         let result = async {
-            let target = run_db(self.state.db.clone(), {
-                let workspace_id = workspace_id.clone();
-                move |db| resolve_workspace_target(db, &workspace_id)
-            })
-            .await
-            .context("读取工作区目录目标失败")?;
+            let target = self
+                .resolve_workspace_target(&workspace_id)
+                .await
+                .context("读取工作区目录目标失败")?;
             if target.is_remote() {
                 let connection = target
                     .remote_connection()
@@ -475,12 +524,10 @@ impl WorkspaceService {
         let log_workspace_id = workspace_id.clone();
         let cache = self.state.file_tree_cache.clone();
         let result = async {
-            let target = run_db(self.state.db.clone(), {
-                let workspace_id = workspace_id.clone();
-                move |db| resolve_workspace_target(db, &workspace_id)
-            })
-            .await
-            .context("读取工作区文件树目标失败")?;
+            let target = self
+                .resolve_workspace_target(&workspace_id)
+                .await
+                .context("读取工作区文件树目标失败")?;
             if target.is_remote() {
                 let connection = target
                     .remote_connection()
@@ -532,12 +579,10 @@ impl WorkspaceService {
         let log_workspace_id = workspace_id.clone();
         let cache = self.state.file_tree_cache.clone();
         let result = async {
-            let target = run_db(self.state.db.clone(), {
-                let workspace_id = workspace_id.clone();
-                move |db| resolve_workspace_target(db, &workspace_id)
-            })
-            .await
-            .context("读取工作区搜索目标失败")?;
+            let target = self
+                .resolve_workspace_target(&workspace_id)
+                .await
+                .context("读取工作区搜索目标失败")?;
             if target.is_remote() {
                 let connection = target
                     .remote_connection()

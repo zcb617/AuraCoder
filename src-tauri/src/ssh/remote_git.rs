@@ -1,5 +1,5 @@
 use crate::{
-    db::ssh_connections::SshConnectionRecord,
+    models::SshConnectionRecord,
     models::{
         GitBranchDto, GitBranchPageDto, GitBranchScopeDto, GitCommitDto, GitCommitPageDto,
         GitDiffPreviewDto, GitFileStatusDto, GitRemoteDto, GitStashDto, GitStatusDto,

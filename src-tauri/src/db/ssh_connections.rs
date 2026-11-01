@@ -1,25 +1,28 @@
 use anyhow::Context;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::models::{SshConnectionDto, SshConnectionInput};
+use crate::models::{
+    SshConnectionDto, SshConnectionInput, SshConnectionRecord, STATUS_CONNECTING, STATUS_DELETED,
+    STATUS_DISABLED, STATUS_FAILED, STATUS_OK, STATUS_UNKNOWN,
+};
 use crate::runtime_env;
 
 use super::Database;
 
-pub const STATUS_UNKNOWN: &str = "unknown";
-pub const STATUS_CONNECTING: &str = "connecting";
-pub const STATUS_OK: &str = "ok";
-pub const STATUS_FAILED: &str = "failed";
-pub const STATUS_DISABLED: &str = "disabled";
-pub const STATUS_DELETED: &str = "deleted";
+// pub const STATUS_UNKNOWN: &str = "unknown";
+// pub const STATUS_CONNECTING: &str = "connecting";
+// pub const STATUS_OK: &str = "ok";
+// pub const STATUS_FAILED: &str = "failed";
+// pub const STATUS_DISABLED: &str = "disabled";
+// pub const STATUS_DELETED: &str = "deleted";
 
 const SELECT_COLUMNS: &str = "id, display_name, source_kind, config_alias, host_name, user_name, port, identity_file, host_key_type, enabled, connection_status, last_connected_at, last_error, deleted_at, created_at, updated_at, host_key_base64";
 
-#[derive(Debug, Clone)]
-pub struct SshConnectionRecord {
-    pub dto: SshConnectionDto,
-    pub host_key_base64: String,
-}
+// #[derive(Debug, Clone)]
+// pub struct SshConnectionRecord {
+//     pub dto: SshConnectionDto,
+//     pub host_key_base64: String,
+// }
 
 pub fn list(db: &Database, deleted: bool) -> anyhow::Result<Vec<SshConnectionDto>> {
     let conn = db.connect()?;

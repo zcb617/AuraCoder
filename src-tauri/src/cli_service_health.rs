@@ -13,12 +13,13 @@ use std::{
 use tauri::AppHandle;
 
 use crate::{
-    db::{self, Database},
     local_cli_service_lifecycle::LocalCliServiceLifecycle,
     message_notify_helper::{
         notify_cli_services_updated, CliHealthReconcileResult, CliServicesUpdatedEvent,
     },
     ssh::cli_service_lifecycle,
+    services::ssh_connection_service::SshConnectionService,
+    state::AppState,
 };
 
 /// 本地 CLI 健康检查周期：5 分钟。
@@ -41,13 +42,13 @@ pub async fn refresh_local_cli_health() -> Result<CliHealthReconcileResult, Stri
 }
 
 /// 启动本地和远端两条健康检查循环。
-pub fn spawn_cli_service_health_scheduler(app: AppHandle, db: Database) {
+pub fn spawn_cli_service_health_scheduler(app: AppHandle, state: AppState) {
     let local_app = app.clone();
     tauri::async_runtime::spawn(async move {
         run_local_health_loop(local_app).await;
     });
     tauri::async_runtime::spawn(async move {
-        run_remote_health_loop(app, db).await;
+        run_remote_health_loop(app, state).await;
     });
 }
 
@@ -71,11 +72,13 @@ async fn run_local_health_loop(app: AppHandle) {
     }
 }
 
-async fn run_remote_health_loop(app: AppHandle, db: Database) {
+/// 定期读取可监控 SSH 连接并按原周期执行远端 CLI 健康检查。
+async fn run_remote_health_loop(app: AppHandle, state: AppState) {
+    let service = SshConnectionService::new(state);
     loop {
         tokio::time::sleep(REMOTE_HEALTH_CHECK_INTERVAL).await;
 
-        let connection_ids = match load_monitorable_connection_ids(db.clone()).await {
+        let connection_ids = match service.list_monitorable_connection_ids().await {
             Ok(connection_ids) => connection_ids,
             Err(error) => {
                 log::warn!("健康检查读取 SSH 连接列表失败: {error:#}");
@@ -116,15 +119,15 @@ async fn run_remote_health_loop(app: AppHandle, db: Database) {
     }
 }
 
-/// 读取当前启用且未删除的 SSH 连接标识列表；与 SSH 连接监控使用同一筛选条件。
-async fn load_monitorable_connection_ids(db: Database) -> anyhow::Result<Vec<String>> {
-    tokio::task::spawn_blocking(move || {
-        let records = db::ssh_connections::list_records(&db, false)?;
-        Ok(records
-            .into_iter()
-            .filter(|record| record.dto.enabled && record.dto.deleted_at.is_none())
-            .map(|record| record.dto.id)
-            .collect())
-    })
-    .await?
-}
+// /// 读取当前启用且未删除的 SSH 连接标识列表；与 SSH 连接监控使用同一筛选条件。
+// async fn load_monitorable_connection_ids(db: Database) -> anyhow::Result<Vec<String>> {
+//     tokio::task::spawn_blocking(move || {
+//         let records = db::ssh_connections::list_records(&db, false)?;
+//         Ok(records
+//             .into_iter()
+//             .filter(|record| record.dto.enabled && record.dto.deleted_at.is_none())
+//             .map(|record| record.dto.id)
+//             .collect())
+//     })
+//     .await?
+// }

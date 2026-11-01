@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     db::{self, Database},
-    models::{SshConnectionInput, SshConnectionTestDto},
+    models::{SshConnectionInput, SshConnectionTestDto, STATUS_DISABLED},
     ssh::config::ParsedHost,
 };
 use uuid::Uuid;
@@ -216,7 +216,8 @@ fn stale_or_deleted_probe_results_are_not_accepted() {
         &disabled.updated_at,
         &after_probe,
     ));
-    assert_eq!(after_probe.dto.connection_status, db::ssh_connections::STATUS_DISABLED);
+    // assert_eq!(after_probe.dto.connection_status, db::ssh_connections::STATUS_DISABLED);
+    assert_eq!(after_probe.dto.connection_status, STATUS_DISABLED);
 
     let _ = std::fs::remove_file(path);
 }
@@ -377,7 +378,8 @@ fn directory_probe_does_not_accept_disabled_connection() {
     assert!(!after_probe.dto.enabled);
     assert_eq!(
         after_probe.dto.connection_status,
-        db::ssh_connections::STATUS_DISABLED
+        // db::ssh_connections::STATUS_DISABLED
+        STATUS_DISABLED
     );
 
     drop(db);

@@ -1,7 +1,7 @@
 use anyhow::Context;
 
 use crate::{
-    db::ssh_connections::SshConnectionRecord,
+    models::SshConnectionRecord,
     models::{FileTreeEntryDto, FileTreePageDto, ReadFileResultDto, WriteFileResultDto},
     ssh::{
         gateway,

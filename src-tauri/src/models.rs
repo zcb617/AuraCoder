@@ -3,6 +3,133 @@ use serde_json::Value;
 
 pub mod chat;
 
+/// SSH 数据库连接记录及其未向前端暴露的主机密钥信息。
+#[derive(Debug, Clone)]
+pub struct SshConnectionRecord {
+    /// SSH 连接的业务展示与配置数据。
+    pub dto: SshConnectionDto,
+    /// SSH 主机密钥的 Base64 编码，用于连接时校验远端身份。
+    pub host_key_base64: String,
+}
+
+/// SSH 连接尚未建立或未检测时的状态。
+pub const STATUS_UNKNOWN: &str = "unknown";
+/// SSH 连接正在建立时的状态。
+pub const STATUS_CONNECTING: &str = "connecting";
+/// SSH 连接可用时的状态。
+pub const STATUS_OK: &str = "ok";
+/// SSH 连接建立或检测失败时的状态。
+pub const STATUS_FAILED: &str = "failed";
+/// SSH 连接被用户禁用时的状态。
+pub const STATUS_DISABLED: &str = "disabled";
+/// SSH 连接被软删除时的状态。
+pub const STATUS_DELETED: &str = "deleted";
+
+/// 本机或 SSH 工作区当前解析出的文件访问目标。
+#[derive(Debug, Clone)]
+pub struct WorkspaceTarget {
+    /// 工作区的持久化业务信息。
+    pub workspace: WorkspaceDto,
+    /// SSH 工作区对应的连接记录；本机工作区没有连接。
+    pub connection: Option<SshConnectionRecord>,
+}
+
+impl WorkspaceTarget {
+    /// 判断工作区文件访问是否需要走 SSH。
+    pub fn is_remote(&self) -> bool {
+        self.workspace.location_kind == "ssh"
+    }
+
+    /// 取得 SSH 工作区的连接记录，缺失时保留原业务错误。
+    pub fn remote_connection(&self) -> anyhow::Result<&SshConnectionRecord> {
+        self.connection
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("远端项目未绑定 SSH 连接"))
+    }
+}
+
+/// 消息窗口及其数据库行号，供远程分页协议保持消息与 row id 配对。
+#[derive(Debug, Clone)]
+pub struct MessageWindowWithRowIds {
+    /// 按窗口顺序返回的消息分页。
+    pub window: MessageWindowDto,
+    /// 与消息一一对应的数据库行号。
+    pub row_ids: Vec<i64>,
+}
+
+/// 尚未开始的线程运行时选择结果。
+#[derive(Debug, Clone)]
+pub struct ThreadRuntimeSelection {
+    /// 被选中的 CLI 引擎标识。
+    pub engine_id: String,
+    /// 被选中的 CLI 模型标识。
+    pub model_id: String,
+    /// 被选中的推理强度；未设置时为 None。
+    pub reasoning_effort: Option<String>,
+}
+
+/// 扩展目录后台刷新的 provider、上下文和类型集合。
+#[derive(Debug, Clone)]
+pub struct ExtensionRefreshJob {
+    /// 负责刷新的 CLI provider 标识。
+    pub provider_id: String,
+    /// 扩展缓存对应的上下文键。
+    pub context_key: String,
+    /// 本次刷新的扩展类型列表。
+    pub kinds: Vec<String>,
+}
+
+/// 扩展目录刷新任务在数据库中的单类型记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionRefreshTarget {
+    /// 持有该扩展目录的 CLI provider 标识。
+    pub provider_id: String,
+    /// 扩展目录对应的工作区或全局上下文键。
+    pub context_key: String,
+    /// 本条刷新任务对应的扩展类型。
+    pub kind: String,
+}
+
+/// 扩展目录缓存的一类快照及刷新状态。
+#[derive(Debug, Clone)]
+pub struct ExtensionCatalogSnapshot {
+    /// 当前快照对应的扩展类型。
+    pub kind: String,
+    /// 缓存中的扩展项目列表。
+    pub items: Vec<ExtensionItemDto>,
+    /// 最近一次成功获取扩展目录的时间。
+    pub fetched_at: Option<String>,
+    /// 最近一次尝试刷新扩展目录的时间。
+    pub last_attempt_at: Option<String>,
+    /// 下一次允许刷新的时间。
+    pub next_refresh_at: Option<String>,
+    /// 最近一次刷新失败的错误文本。
+    pub last_error: Option<String>,
+}
+
+/// 当前支持的扩展目录类型。
+pub const EXTENSION_KINDS: [&str; 3] = ["skill", "plugin", "mcp"];
+
+/// 前端选择文本编辑器时使用的应用信息。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextEditorApplicationDto {
+    /// 已安装文本编辑器的稳定标识。
+    pub id: String,
+    /// 展示给用户的文本编辑器名称。
+    pub name: String,
+}
+
+/// 前端展示默认文件打开目标与可选文本编辑器的结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefaultFileOpenTargetDto {
+    /// 当前默认选择的文本编辑器标识。
+    pub selected_editor_id: Option<String>,
+    /// 当前系统可供选择的文本编辑器列表。
+    pub applications: Vec<TextEditorApplicationDto>,
+}
+
 /// 定时任务创建和更新时用于兼容前端 JSON 契约的输入对象。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

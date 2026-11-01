@@ -16,7 +16,8 @@ use crate::{
     cli_tools::{factory::CliToolFactory, CliLocationKind, CliMcpRuntime, CliTool},
     mcp_gateway::AuraCoderMcpGateway,
     message_notify_helper::CliHealthReconcileResult,
-    ssh::cli_tunnel_registry::{self, SshCliTunnel, SshConnectionRecord},
+    models::SshConnectionRecord,
+    ssh::cli_tunnel_registry::{self, SshCliTunnel},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -3,6 +3,8 @@
     use super::*;
     use crate::{
         config::app_config::AppConfig,
+        cli_tools::codex::requires_codex_catalog_refresh_lock,
+        db::extensions as snapshot_db,
         db::Database,
         engines::EngineManager,
         git::{repo::FileTreeCache, watcher::GitWatcherManager},
@@ -121,7 +123,8 @@
             )
             .unwrap()
             .len(),
-            snapshot_db::EXTENSION_KINDS.len(),
+            // snapshot_db::EXTENSION_KINDS.len(),
+            crate::models::EXTENSION_KINDS.len(),
         );
         tokio::time::timeout(
             Duration::from_millis(50),
@@ -149,7 +152,8 @@
             snapshot_db::load_snapshots(&state.db, "codex", &context_key(None))
                 .unwrap()
                 .len(),
-            snapshot_db::EXTENSION_KINDS.len(),
+            // snapshot_db::EXTENSION_KINDS.len(),
+            crate::models::EXTENSION_KINDS.len(),
         );
         tokio::time::timeout(
             Duration::from_millis(50),
@@ -206,7 +210,7 @@
         let attempted_at = Utc::now().to_rfc3339();
         snapshot_db::ensure_context(&state.db, "codex", &context_key, &attempted_at)
             .expect("failed to register cache context");
-        for kind in snapshot_db::EXTENSION_KINDS {
+        for kind in crate::models::EXTENSION_KINDS {
             snapshot_db::record_success(&state.db, "codex", &context_key, kind, &[], &attempted_at)
                 .expect("failed to save cached snapshot");
         }
@@ -243,10 +247,11 @@
             .expect("failed to schedule active workspace catalogs");
 
         let context_key = context_key(Some(&workspace.root_path));
-        for provider_id in EXTENSION_PROVIDER_IDS {
+        for provider_id in crate::cli_tools::factory::CliToolFactory::supported_cli_ids() {
             let snapshots = snapshot_db::load_snapshots(&state.db, provider_id, &context_key)
                 .expect("failed to load scheduled snapshots");
-            assert_eq!(snapshots.len(), snapshot_db::EXTENSION_KINDS.len());
+            // assert_eq!(snapshots.len(), snapshot_db::EXTENSION_KINDS.len());
+            assert_eq!(snapshots.len(), crate::models::EXTENSION_KINDS.len());
             for snapshot in snapshots {
                 let next_refresh_at = snapshot
                     .next_refresh_at
@@ -263,12 +268,15 @@
     async fn catalog_keeps_this_process_refresh_completion_after_the_page_misses_events() {
         let state = test_app_state();
         let cwd = "C:\\work\\project";
-        let key = RefreshKey {
-            provider_id: "codex".to_string(),
-            context_key: context_key(Some(cwd)),
-        };
-        assert!(state.extension_catalog_refreshes.begin(key.clone()).await);
-        state.extension_catalog_refreshes.finish(&key).await;
+        let context_key = context_key(Some(cwd));
+        assert!(state
+            .extension_catalog_refreshes
+            .begin("codex", &context_key)
+            .await);
+        state
+            .extension_catalog_refreshes
+            .finish("codex", &context_key)
+            .await;
 
         let catalog = load_cached_catalog(&state, "codex", Some(cwd))
             .await

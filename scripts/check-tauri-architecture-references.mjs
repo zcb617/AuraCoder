@@ -72,7 +72,7 @@ const SKIPPED_DIRECTORY_NAMES = new Set([
 ]);
 
 /**
- * 只允许三个 CLI Service、BaseCliMcp、公共会话只读查询 Service、聊天 Service、定时任务管理器、ThreadService 和 SshConnectionService 直接访问数据库 Mapper。
+ * 只允许三个 CLI Service、BaseCliMcp、公共会话只读查询 Service、业务 Service 和 Mapper 直接访问数据库 Mapper。
  */
 const DATABASE_SERVICE_PATHS = new Set([
   "src-tauri/src/cli_tools/claude_code.rs",
@@ -621,6 +621,26 @@ function isAllowedLibDatabaseTypeImportMatch(source, match) {
     }),
   );
 }
+
+/**
+ * 判断 AppState 的 REF-09 命中是否完整位于独立 Database 类型导入中。
+ * @param {ReturnType<typeof readCodeSource>} source 文件快照。
+ * @param {{text: string, index: number}} match REF-09 的单次命中。
+ * @returns {boolean} 命中完全处于独立类型导入语句时返回 true。
+ */
+function isAllowedStateDatabaseTypeImportMatch(source, match) {
+  if (source.path !== "src-tauri/src/state.rs") {
+    return false;
+  }
+  const allowedPatterns = [/^\s*use\s+crate\s*::\s*db\s*::\s*Database\s*;/gm];
+  return allowedPatterns.some((pattern) =>
+    findMatches(source.clean, pattern).some((statement) => {
+      const statementEnd = statement.index + statement.text.length;
+      const matchEnd = match.index + match.text.length;
+      return match.index >= statement.index && matchEnd <= statementEnd;
+    }),
+  );
+}
 /**
  * 将文件中的规则匹配转换为带原始行内容的违规结果。
  * @param {ReturnType<typeof readCodeSource>} source 文件快照。
@@ -632,7 +652,8 @@ function sourceRuleMatchesToFindings(source, rule) {
     if (
       rule.rule === "REF-09" &&
       (isAllowedRefreshDatabaseImportMatch(source, match) ||
-        isAllowedLibDatabaseTypeImportMatch(source, match))
+        isAllowedLibDatabaseTypeImportMatch(source, match) ||
+        isAllowedStateDatabaseTypeImportMatch(source, match))
     ) {
       return false;
     }
@@ -677,6 +698,13 @@ function isRemoteRuntimeAdapterPath(filePath) {
  */
 function isBusinessPath(filePath) {
   const normalized = normalizePath(filePath);
+  if (
+    normalized === "src-tauri/src/services/file_service.rs" ||
+    normalized === "src-tauri/src/services/git_service.rs" ||
+    normalized === "src-tauri/src/services/terminal_service.rs"
+  ) {
+    return true;
+  }
   if (normalized.startsWith("src-tauri/src/commands/")) {
     return true;
   }
@@ -717,7 +745,7 @@ function moduleReferencePattern(moduleNames) {
 }
 
 /**
- * 判断路径是否属于允许直接调用数据库 Mapper 的 CLI Service、公共基础实现、聊天 Service、定时任务管理器、ThreadService 或 Mapper 目录。
+ * 判断路径是否属于允许直接调用数据库 Mapper 的业务 Service 或 Mapper 目录。
  * @param {string} filePath 仓库相对路径。
  * @returns {boolean} 是否不受 REF-09 约束。
  */
@@ -741,7 +769,7 @@ function databaseRulesForPath(filePath) {
   }
 
   const direction =
-    "业务数据库访问仅允许已列明的 CLI Service、公共基础实现 BaseCliMcp、聊天 Service ChatService、定时任务管理器和 ThreadService 调用 Mapper；其他调用方应进入对应 Service，SQL 保留在 Mapper 层。";
+      "业务数据库访问仅允许已列明的 CLI 实现和业务 Service 调用 Mapper；其他调用方应进入对应 Service，SQL 保留在 Mapper 层。";
   const rules = [
     defineRule("REF-09", /\b(?:db|mapper|mappers)\s*::/g, direction),
     defineRule(
@@ -1332,11 +1360,14 @@ function runSelfChecks() {
     "src-tauri/src/services/auracoder_thread_mcp_service.rs",
     "src-tauri/src/services/chat_service.rs",
     "src-tauri/src/services/ssh_connection_service.rs",
-    "src-tauri/src/scheduled_tasks/manager.rs",
+    // "src-tauri/src/scheduled_tasks/manager.rs",
     "src-tauri/src/services/scheduled_task_service.rs",
     "src-tauri/src/services/thread_service.rs",
     "src-tauri/src/services/app_config_service.rs",
     "src-tauri/src/services/workspace_service.rs",
+    "src-tauri/src/services/file_service.rs",
+    "src-tauri/src/services/git_service.rs",
+    "src-tauri/src/services/terminal_service.rs",
   ]) {
     assert.equal(
       findSampleFindings(file, "db::threads::get_thread();").some(
@@ -1346,6 +1377,13 @@ function runSelfChecks() {
       `REF-09 不应限制允许的 Service 实现: ${file}`,
     );
   }
+  assert.ok(
+    findSampleFindings(
+      "src-tauri/src/scheduled_tasks/manager.rs",
+      "db::scheduled_tasks::list_tasks();",
+    ).some((finding) => finding.rule === "REF-09"),
+    "定时任务管理器必须继续拒绝 REF-09 Mapper 调用",
+  );
   assert.equal(
     findSampleFindings("src-tauri/src/services/other.rs", "db::threads::get_thread();").some(
       (finding) => finding.rule === "REF-09",
@@ -1475,6 +1513,38 @@ function runSelfChecks() {
     ),
     "普通 Service 不得继承应用入口的数据库类型导入例外",
   );
+  const statePath = "src-tauri/src/state.rs";
+  assert.equal(
+    findSampleFindings(statePath, "use crate::db::Database;").some(
+      (finding) => finding.rule === "REF-09",
+    ),
+    false,
+    "REF-09 必须只允许 AppState 的独立 Database 类型导入",
+  );
+  for (const snippet of [
+    "use crate::db::{Database, threads};",
+    "Database::open(path);",
+    "db.connect();",
+    'conn.execute("query");',
+  ]) {
+    assert.ok(
+      findSampleFindings(statePath, snippet).some((finding) => finding.rule === "REF-09"),
+      "AppState 仍须拒绝数据库操作或分组导入: " + snippet,
+    );
+  }
+  for (const file of [
+    "src-tauri/src/services/file_service.rs",
+    "src-tauri/src/services/git_service.rs",
+    "src-tauri/src/services/terminal_service.rs",
+  ]) {
+    assert.ok(
+      findSampleFindings(
+        file,
+        "crate::local_cli_service_lifecycle::LocalCliServiceLifecycle::get();",
+      ).some((finding) => finding.rule === "REF-01"),
+      `新增业务 Service 必须继续拒绝绕过工厂的 CLI 生命周期调用: ${file}`,
+    );
+  }
   assert.equal(
     findSampleFindings(libPath, "tauri::generate_handler![commands::threads::create_thread]").some(
       (finding) => finding.rule === "REF-10",

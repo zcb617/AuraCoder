@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::{
     db::{self, Database},
-    models::{SshConnectionInput, TrustLevelDto, WorkspaceDto},
+    models::{SshConnectionInput, TrustLevelDto, WorkspaceDto, STATUS_DISABLED},
     workspace_startup::{
         WorkspaceDefaultView, WorkspacePathBase, WorkspaceStartupApplyWhen,
         WorkspaceStartupGroup, WorkspaceStartupPreset, WorkspaceStartupSession,
@@ -214,7 +214,8 @@ fn execution_target_display_keeps_disabled_ssh_state() {
     );
     assert_eq!(
         ssh_target.connection_status.as_deref(),
-        Some(db::ssh_connections::STATUS_DISABLED)
+        // Some(db::ssh_connections::STATUS_DISABLED)
+        Some(STATUS_DISABLED)
     );
 
     // 关闭数据库后清理仅由本测试创建的临时目录。

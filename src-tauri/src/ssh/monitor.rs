@@ -3,7 +3,6 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Context;
 use tokio::{
     io::AsyncReadExt,
     net::TcpStream,
@@ -15,7 +14,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    db::{self, ssh_connections::SshConnectionRecord, Database},
+    models::{
+        SshConnectionRecord, STATUS_CONNECTING, STATUS_FAILED, STATUS_OK,
+    },
+    services::ssh_connection_service::SshConnectionService,
     ssh::gateway,
 };
 
@@ -33,9 +35,14 @@ struct MonitorTask {
 }
 
 impl SshConnectionMonitor {
-    pub async fn start(&self, db: Database, connection_id: &str) -> anyhow::Result<()> {
+    /// 为指定 SSH 连接启动监控任务，并避免同一连接被重复监控。
+    pub async fn start(
+        &self,
+        service: SshConnectionService,
+        connection_id: &str,
+    ) -> anyhow::Result<()> {
         let connection_id = connection_id.to_string();
-        let record = load_record(db.clone(), connection_id.clone()).await?;
+        let record = service.get_runtime_record(&connection_id).await?;
         let Some(record) = record else {
             return Ok(());
         };
@@ -52,7 +59,7 @@ impl SshConnectionMonitor {
         let task_cancel = cancel.clone();
         let task_id = connection_id.clone();
         let handle = tokio::spawn(async move {
-            run_monitor(db, task_id, task_cancel).await;
+            run_monitor(service, task_id, task_cancel).await;
         });
         tasks.insert(connection_id, MonitorTask { cancel, handle });
         Ok(())
@@ -67,8 +74,9 @@ impl SshConnectionMonitor {
         let _ = task.handle.await;
     }
 
-    pub async fn reconcile(&self, db: Database) -> anyhow::Result<()> {
-        let records = load_records(db.clone()).await?;
+    /// 根据当前 SSH 连接配置启动缺少的监控并停止失效任务。
+    pub async fn reconcile(&self, service: SshConnectionService) -> anyhow::Result<()> {
+        let records = service.list_runtime_records(false).await?;
         let desired = records
             .iter()
             .filter(|record| is_monitorable(record))
@@ -83,7 +91,7 @@ impl SshConnectionMonitor {
         }
         for record in records {
             if desired.contains(&record.dto.id) {
-                self.start(db.clone(), &record.dto.id).await?;
+                self.start(service.clone(), &record.dto.id).await?;
             }
         }
         Ok(())
@@ -97,13 +105,14 @@ impl SshConnectionMonitor {
     }
 }
 
-async fn run_monitor(db: Database, connection_id: String, cancel: CancellationToken) {
+/// 持续检查 SSH 连接状态并按连接配置版本写回监控结果。
+async fn run_monitor(service: SshConnectionService, connection_id: String, cancel: CancellationToken) {
     loop {
         if cancel.is_cancelled() {
             return;
         }
 
-        let Some(record) = (match load_record(db.clone(), connection_id.clone()).await {
+        let Some(record) = (match service.get_runtime_record(&connection_id).await {
             Ok(record) => record,
             Err(error) => {
                 log::warn!("failed to load SSH connection {connection_id} for monitoring: {error}");
@@ -118,10 +127,10 @@ async fn run_monitor(db: Database, connection_id: String, cancel: CancellationTo
         let version = record.dto.updated_at.clone();
 
         if !set_status(
-            db.clone(),
+            &service,
             &connection_id,
             &version,
-            db::ssh_connections::STATUS_CONNECTING,
+            STATUS_CONNECTING,
             None,
         )
         .await
@@ -133,10 +142,10 @@ async fn run_monitor(db: Database, connection_id: String, cancel: CancellationTo
             Ok(session) => session,
             Err(error) => {
                 if !set_status(
-                    db.clone(),
+                    &service,
                     &connection_id,
                     &version,
-                    db::ssh_connections::STATUS_FAILED,
+                    STATUS_FAILED,
                     Some(&error.to_string()),
                 )
                 .await
@@ -151,10 +160,10 @@ async fn run_monitor(db: Database, connection_id: String, cancel: CancellationTo
             ReadyState::Cancelled => return,
             ReadyState::Exited(error) => {
                 if !set_status(
-                    db.clone(),
+                    &service,
                     &connection_id,
                     &version,
-                    db::ssh_connections::STATUS_FAILED,
+                    STATUS_FAILED,
                     Some(&error),
                 )
                 .await
@@ -167,10 +176,10 @@ async fn run_monitor(db: Database, connection_id: String, cancel: CancellationTo
         }
 
         if !set_status(
-            db.clone(),
+            &service,
             &connection_id,
             &version,
-            db::ssh_connections::STATUS_OK,
+            STATUS_OK,
             None,
         )
         .await
@@ -198,10 +207,10 @@ async fn run_monitor(db: Database, connection_id: String, cancel: CancellationTo
             Err(error) => error.to_string(),
         };
         if !set_status(
-            db.clone(),
+            &service,
             &connection_id,
             &version,
-            db::ssh_connections::STATUS_FAILED,
+            STATUS_FAILED,
             Some(&error),
         )
         .await
@@ -279,50 +288,21 @@ async fn read_stderr(child: &mut Child) -> String {
     String::from_utf8_lossy(&bytes).trim().to_string()
 }
 
-async fn load_record(
-    db: Database,
-    connection_id: String,
-) -> anyhow::Result<Option<SshConnectionRecord>> {
-    tokio::task::spawn_blocking(move || db::ssh_connections::find(&db, &connection_id))
-        .await
-        .context("SSH connection monitor database task failed")?
-}
-
-async fn load_records(db: Database) -> anyhow::Result<Vec<SshConnectionRecord>> {
-    tokio::task::spawn_blocking(move || db::ssh_connections::list_records(&db, false))
-        .await
-        .context("SSH connection monitor database task failed")?
-}
-
+/// 通过 SSH 连接 Service 更新监控状态，更新失败时保留原日志行为。
 async fn set_status(
-    db: Database,
+    service: &SshConnectionService,
     connection_id: &str,
     version: &str,
     status: &str,
     error: Option<&str>,
 ) -> bool {
-    let connection_id = connection_id.to_string();
-    let version = version.to_string();
-    let status = status.to_string();
-    let error = error.map(str::to_string);
-    match tokio::task::spawn_blocking(move || {
-        db::ssh_connections::set_status_if_current(
-            &db,
-            &connection_id,
-            &version,
-            &status,
-            error.as_deref(),
-        )
-    })
-    .await
+    match service
+        .set_monitor_status_if_current(connection_id, version, status, error)
+        .await
     {
-        Ok(Ok(changed)) => changed,
-        Ok(Err(error)) => {
-            log::warn!("failed to update SSH connection monitor status: {error}");
-            false
-        }
+        Ok(changed) => changed,
         Err(error) => {
-            log::warn!("SSH connection monitor database task failed: {error}");
+            log::warn!("failed to update SSH connection monitor status: {error}");
             false
         }
     }

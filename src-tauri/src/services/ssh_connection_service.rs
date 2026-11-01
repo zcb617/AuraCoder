@@ -6,16 +6,17 @@ use uuid::Uuid;
 
 use crate::{
     cli_tools::{factory::CliToolFactory, CliExecutionContext, CliLocationKind},
-    db::{self, ssh_connections::SshConnectionRecord, Database},
+    db::{self, Database},
     models::{
         SshConfigHostDto, SshConnectionDto, SshConnectionImportResultDto, SshConnectionInput,
-        SshConnectionTestDto, SshRemoteDirectoryDto,
+        SshConnectionRecord, SshConnectionTestDto, SshRemoteDirectoryDto, STATUS_FAILED,
     },
     ssh::{config, gateway, known_hosts, runtime::quote_posix},
     state::AppState,
 };
 
 /// 集中承载 SSH 连接配置、检测和关联资源生命周期的业务服务。
+#[derive(Clone)]
 pub struct SshConnectionService {
     /// 当前应用的数据库、监控器和工作区资源依赖。
     state: AppState,
@@ -25,6 +26,65 @@ impl SshConnectionService {
     /// 创建 SSH 连接业务服务并绑定当前应用状态。
     pub fn new(state: AppState) -> Self {
         Self { state }
+    }
+
+    /// 按连接标识读取 SSH 监控所需的完整运行记录。
+    pub(crate) async fn get_runtime_record(
+        &self,
+        connection_id: &str,
+    ) -> Result<Option<SshConnectionRecord>> {
+        let connection_id = connection_id.to_string();
+        run_db(self.state.db.clone(), move |db| {
+            db::ssh_connections::find(db, &connection_id)
+        })
+        .await
+    }
+
+    /// 读取 SSH 监控启动或协调所需的连接记录列表。
+    pub(crate) async fn list_runtime_records(
+        &self,
+        include_deleted: bool,
+    ) -> Result<Vec<SshConnectionRecord>> {
+        run_db(self.state.db.clone(), move |db| {
+            db::ssh_connections::list_records(db, include_deleted)
+        })
+        .await
+    }
+
+    /// 查询当前需要远端健康检查的启用且未删除连接标识。
+    pub(crate) async fn list_monitorable_connection_ids(&self) -> Result<Vec<String>> {
+        run_db(self.state.db.clone(), |db| {
+            Ok(db::ssh_connections::list_records(db, false)?
+                .into_iter()
+                .filter(|record| record.dto.enabled && record.dto.deleted_at.is_none())
+                .map(|record| record.dto.id)
+                .collect())
+        })
+        .await
+    }
+
+    /// 按当前配置版本条件更新 SSH 监控状态并返回是否命中记录。
+    pub(crate) async fn set_monitor_status_if_current(
+        &self,
+        connection_id: &str,
+        version: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let connection_id = connection_id.to_string();
+        let version = version.to_string();
+        let status = status.to_string();
+        let error = error.map(str::to_string);
+        run_db(self.state.db.clone(), move |db| {
+            db::ssh_connections::set_status_if_current(
+                db,
+                &connection_id,
+                &version,
+                &status,
+                error.as_deref(),
+            )
+        })
+        .await
     }
 
     /// 查询所有未删除的 SSH 连接配置。
@@ -174,7 +234,12 @@ impl SshConnectionService {
             }
 
             // 导入结果已逐条生成，监控重建失败只附加到已保存记录，不丢弃结果。
-            if let Err(error) = self.state.ssh_monitor.reconcile(self.state.db.clone()).await {
+            if let Err(error) = self
+                .state
+                .ssh_monitor
+                .reconcile(SshConnectionService::new(self.state.clone()))
+                .await
+            {
                 log::error!("导入后同步 SSH 连接监控失败: error={error:#}");
                 for import_result in &mut results {
                     if import_result.connection.is_some() {
@@ -250,7 +315,12 @@ impl SshConnectionService {
                 }
             }
 
-            if let Err(error) = self.state.ssh_monitor.start(self.state.db.clone(), &saved.id).await {
+            if let Err(error) = self
+                .state
+                .ssh_monitor
+                .start(SshConnectionService::new(self.state.clone()), &saved.id)
+                .await
+            {
                 log::error!(
                     "手动 SSH 连接已保存，但监控启动失败: connection_id={} error={error:#}",
                     saved.id
@@ -263,7 +333,7 @@ impl SshConnectionService {
                         db,
                         &id,
                         &expected_updated_at,
-                        db::ssh_connections::STATUS_FAILED,
+                        STATUS_FAILED,
                         Some(&last_error),
                     )
                 })
@@ -344,7 +414,7 @@ impl SshConnectionService {
             let monitor_result = self
                 .state
                 .ssh_monitor
-                .start(self.state.db.clone(), &connection_id)
+                .start(self.clone(), &connection_id)
                 .await
                 .context("重启 SSH 连接监控失败");
 
@@ -429,7 +499,7 @@ impl SshConnectionService {
             if dto.enabled {
                 self.state
                     .ssh_monitor
-                    .start(self.state.db.clone(), &dto.id)
+                    .start(self.clone(), &dto.id)
                     .await
                     .context("SSH 连接已启用，但监控启动失败")?;
             } else {
@@ -516,7 +586,7 @@ impl SshConnectionService {
             if dto.enabled {
                 self.state
                     .ssh_monitor
-                    .start(self.state.db.clone(), &dto.id)
+                    .start(self.clone(), &dto.id)
                     .await
                     .context("SSH 连接已恢复，但监控启动失败")?;
             }

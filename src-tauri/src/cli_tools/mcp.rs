@@ -12,7 +12,7 @@ use crate::{
         resolve_mcp_target, ComputerControlAuthorization, ComputerControlTool,
     },
     // config::app_config::AppConfig,
-    models::{EngineInfoDto, ThreadDto},
+    models::{EngineInfoDto, ThreadDto, ThreadRuntimeSelection},
     state::AppState,
 };
 
@@ -42,6 +42,52 @@ impl BaseCliMcp {
     /// 创建绑定当前应用依赖和固定 CLI 运行位置的 MCP 公共实现。
     pub(crate) fn new(state: AppState, runtime: CliMcpRuntime) -> Self {
         Self { state, runtime }
+    }
+
+    /// 为指定 CLI 选择尚未开始线程的模型与思考强度。
+    pub(crate) fn resolve_unstarted_thread_runtime(
+        engine: &EngineInfoDto,
+        current_model: &str,
+        model_id: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> Result<ThreadRuntimeSelection, String> {
+        // 显式模型优先；未指定时沿用可见默认模型、首个可见模型和当前模型的顺序。
+        let resolved_model = match model_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => value,
+            None => {
+                let visible: Vec<&crate::models::EngineModelDto> =
+                    engine.models.iter().filter(|item| !item.hidden).collect();
+                visible
+                    .iter()
+                    .find(|item| item.is_default)
+                    .map(|item| item.id.clone())
+                    .or_else(|| visible.first().map(|item| item.id.clone()))
+                    .unwrap_or_else(|| current_model.to_string())
+            }
+        };
+
+        // 显式思考强度经过 trim 后优先，否则读取最终模型的 CLI 默认思考强度。
+        let resolved_effort = match reasoning_effort
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => Some(value),
+            None => engine
+                .models
+                .iter()
+                .find(|item| item.id == resolved_model)
+                .map(|item| item.default_reasoning_effort.clone())
+                .filter(|value| !value.is_empty()),
+        };
+
+        Ok(ThreadRuntimeSelection {
+            engine_id: engine.id.clone(),
+            model_id: resolved_model,
+            reasoning_effort: resolved_effort,
+        })
     }
 
     /// 根据数据库线程归属读取目标 CLI 的执行上下文和线程记录。
@@ -1730,7 +1776,10 @@ pub(crate) async fn process_stream_event(
         .await
         {
             Ok(Some(task_id)) => {
-                crate::scheduled_tasks::manager::emit_task_updated(app, &task_id);
+                crate::services::scheduled_task_service::ScheduledTaskService::emit_task_updated(
+                    app,
+                    &task_id,
+                );
             }
             Ok(None) => {}
             Err(error) => {
@@ -2346,13 +2395,10 @@ pub(crate) fn chat_notification_preview(blocks: &[ContentBlock]) -> Option<Strin
         blocks: &[ContentBlock],
     ) {
         let preview = chat_notification_preview(blocks);
-        if let Err(error) = crate::scheduled_tasks::manager::finish_chat_run(
-            app,
-            state,
-            assistant_message_id,
-            status,
-            preview,
+        if let Err(error) = crate::services::scheduled_task_service::ScheduledTaskService::new(
+            state.clone(),
         )
+        .finish_chat_run(app, assistant_message_id, status, preview)
         .await
         {
             log::error!("完成聊天定时任务运行失败: {error:#}");

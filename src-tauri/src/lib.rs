@@ -347,7 +347,7 @@ pub fn run() {
             spawn_catalog_refresh_scheduler(handle.clone(), state.clone());
             cli_service_health::spawn_cli_service_health_scheduler(
                 handle.clone(),
-                state.db.clone(),
+                state.clone(),
             );
             state
                 .scheduled_tasks
@@ -363,17 +363,20 @@ pub fn run() {
                     .await;
             });
             let ssh_monitor = state.ssh_monitor.clone();
-            let ssh_db = state.db.clone();
+            let ssh_state = state.clone();
         tauri::async_runtime::spawn(async move {
-            if let Err(error) = ssh_monitor.reconcile(ssh_db).await {
+            if let Err(error) = ssh_monitor
+                .reconcile(crate::services::ssh_connection_service::SshConnectionService::new(ssh_state))
+                .await
+            {
                 log::warn!("failed to start SSH connection monitors: {error}");
             }
         });
         let ssh_startup_handle = handle.clone();
-        let ssh_startup_db = state.db.clone();
+        let ssh_startup_state = state.clone();
         handle.once("ssh-remote-project-session-sync-ready", move |_| {
             let app_handle = ssh_startup_handle.clone();
-            let db = ssh_startup_db.clone();
+            let state = ssh_startup_state.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = message_notify_helper::notify_app_startup_progress(
                     &app_handle,
@@ -383,12 +386,18 @@ pub fn run() {
                     log::warn!("发送启动进度失败: {error:#}");
                 }
 
-                match ssh::cli_tunnel_registry::init_all_ssh_remote_server(
-                    &app_handle,
-                    db.clone().into(),
-                )
-                .await
+                let db = state.db.clone();
+                let initialization = match crate::services::ssh_connection_service::SshConnectionService::new(state)
+                    .list_runtime_records(false)
+                    .await
                 {
+                    Ok(records) => {
+                        ssh::cli_tunnel_registry::init_all_ssh_remote_server(&app_handle, records)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match initialization {
                     Ok(initialization) => {
                         for result in initialization {
                             if let Some(error) = result.error {
@@ -854,7 +863,10 @@ fn request_tray_exit(
     confirmation_open: &Arc<AtomicBool>,
 ) {
     let state = app.state::<AppState>();
-    let has_enabled_tasks = match state.scheduled_tasks.has_enabled_tasks(&state) {
+    let scheduled_task_service = services::scheduled_task_service::ScheduledTaskService::new(
+        state.inner().clone(),
+    );
+    let has_enabled_tasks = match scheduled_task_service.has_enabled_tasks() {
         Ok(has_enabled_tasks) => has_enabled_tasks,
         Err(error) => {
             log::warn!("failed to check enabled scheduled tasks before exit: {error:#}");

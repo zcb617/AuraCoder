@@ -44,7 +44,8 @@ use crate::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionCatalogRefreshErrorDto, ExtensionItemDto,
-        EngineCheckResultDto, OpenCodeRuntimeCatalogDto, SteerReceiptDto, ThreadDto, ThreadStatusDto, WorkspaceDto,
+        EngineCheckResultDto, OpenCodeRuntimeCatalogDto, ExtensionRefreshJob,
+        SshConnectionRecord, SteerReceiptDto, ThreadDto, ThreadStatusDto, WorkspaceDto,
     },
     models::chat::{
         ApprovalResponseOutcomeDto, ApprovalResponseRequest, ChatBusinessError,
@@ -595,6 +596,115 @@ impl ClaudeCodeCli {
         }
     }
 
+    /// 读取 Claude Code 本地扩展快照，并按当前上下文登记一次后台刷新排期。
+    async fn load_cached_extension_catalog(
+        &self,
+        cwd: Option<&str>,
+    ) -> Result<CachedExtensionCatalogDto> {
+        // 页面读取时先确保当前目录的首次刷新已排期，再读取该 provider 的缓存和活动状态。
+        // 页面请求只写排期并唤醒调度器，不在请求路径执行 Claude Code CLI。
+        self.schedule_extension_catalog_context(cwd.map(str::to_string))
+            .await?;
+        let context_key = extensions::refresh::context_key(cwd);
+        let snapshots = db::extensions::load_snapshots(&self.state.db, self.id(), &context_key)?;
+        let is_refreshing = self
+            .state
+            .extension_catalog_refreshes
+            .is_refreshing(self.id(), &context_key)
+            .await;
+        let refresh_completed_at = self
+            .state
+            .extension_catalog_refreshes
+            .refresh_completed_at(self.id(), &context_key)
+            .await;
+        Ok(extensions::refresh::cached_catalog_from_snapshots(
+            self.id(),
+            cwd,
+            &snapshots,
+            is_refreshing,
+            refresh_completed_at,
+        ))
+    }
+
+    /// 按 Claude Code 原扩展目录实现刷新各类型并写入缓存状态。
+    async fn run_extension_catalog_refresh(
+        &self,
+        app: tauri::AppHandle,
+        context_key: String,
+        cwd: Option<String>,
+        requested_kinds: Vec<String>,
+    ) {
+        // 每种扩展分别调用 Claude Code 原目录实现，并将成功或失败结果写回对应快照。
+        for kind in requested_kinds {
+            let attempted_at = runtime_env::system_time_rfc3339();
+            let context_result = match cwd.as_deref() {
+                Some(cwd) => self.execution_context_for_cwd(Some(cwd)).await,
+                None => Ok(CliExecutionContext {
+                    workspace_id: String::new(),
+                    root_path: String::new(),
+                    location_kind: CliLocationKind::Local,
+                    ssh_connection_id: None,
+                }),
+            };
+            let refresh_result = match context_result {
+                Ok(context) => {
+                    self.refresh_extension_catalog(&context, cwd.as_deref(), &[kind.clone()])
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            let write_result = match refresh_result {
+                Ok(results) => match results.into_iter().next() {
+                    Some(result) if result.success => db::extensions::record_success(
+                        &self.state.db,
+                        self.id(),
+                        &context_key,
+                        &kind,
+                        &result.items,
+                        &attempted_at,
+                    ),
+                    _ => db::extensions::record_failure(
+                        &self.state.db,
+                        self.id(),
+                        &context_key,
+                        &kind,
+                        &attempted_at,
+                        "refresh_failed",
+                    )
+                    .map(|_| ()),
+                },
+                Err(error) => {
+                    log::error!(
+                        "Claude Code 扩展目录刷新失败: context={context_key} kind={kind} error={error:#}"
+                    );
+                    db::extensions::record_failure(
+                        &self.state.db,
+                        self.id(),
+                        &context_key,
+                        &kind,
+                        &attempted_at,
+                        "refresh_failed",
+                    )
+                    .map(|_| ())
+                }
+            };
+            if let Err(error) = write_result {
+                log::error!(
+                    "保存 Claude Code 扩展目录刷新状态失败: context={context_key} kind={kind} error={error:#}"
+                );
+            }
+            // 每种类型落库后立即通知前端刷新对应目录缓存。
+            extensions::refresh::emit_catalog_updated(&app, self.id(), cwd.as_deref());
+        }
+
+        // 全部类型结束后清除上下文运行标记并发送最终完成事件。
+        self.state
+            .extension_catalog_refreshes
+            .finish(self.id(), &context_key)
+            .await;
+        extensions::refresh::emit_catalog_updated(&app, self.id(), cwd.as_deref());
+    }
+
     async fn local_engine(&self) -> Result<Arc<ClaudeSidecarEngine>> {
         let service = LocalCliServiceLifecycle::get("claude").await?;
         match service.handle() {
@@ -775,7 +885,7 @@ impl ClaudeCodeCli {
     async fn remote_connection(
         &self,
         workspace: &WorkspaceDto,
-    ) -> Result<db::ssh_connections::SshConnectionRecord> {
+    ) -> Result<SshConnectionRecord> {
         let connection_id =
             remote_project_claude_runtime_service::validate_remote_claude_workspace(workspace)?
                 .to_string();
@@ -1863,6 +1973,33 @@ impl CliTool for ClaudeCodeCli {
             })
     }
 
+    /// 按 Claude Code 当前模型目录为尚未开始的线程准备运行时选择。
+    async fn prepare_unstarted_thread_runtime(
+        &self,
+        current_model: &str,
+        model_id: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> Result<crate::models::ThreadRuntimeSelection> {
+        // 通过现有活动模型接口读取本机运行时，不启动新的 Claude Code CLI。
+        let context = CliExecutionContext {
+            workspace_id: String::new(),
+            root_path: String::new(),
+            location_kind: CliLocationKind::Local,
+            ssh_connection_id: None,
+        };
+        let engine = self
+            .get_active_engine_info(&context)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("unknown engine: {}", self.id()))?;
+        crate::cli_tools::BaseCliMcp::resolve_unstarted_thread_runtime(
+            &engine,
+            current_model,
+            model_id,
+            reasoning_effort,
+        )
+        .map_err(anyhow::Error::msg)
+    }
+
     /// 执行 Claude Code 健康报告中按原始标签登记的 shell 诊断命令。
     async fn run_engine_check(&self, command: &str) -> Result<EngineCheckResultDto> {
         let result: Result<EngineCheckResultDto> = async {
@@ -2721,8 +2858,8 @@ impl CliTool for ClaudeCodeCli {
         cwd: Option<&str>,
         requested_kinds: &[String],
     ) -> Result<Vec<ExtensionCatalogKindRefreshDto>> {
-        let workspace = self.load_workspace(context).await?;
         if context.location_kind == CliLocationKind::Ssh {
+            let workspace = self.load_workspace(context).await?;
             let catalog = self.remote_extension_catalog(&workspace).await?;
             return Ok(requested_kinds
                 .iter()
@@ -2739,6 +2876,9 @@ impl CliTool for ClaudeCodeCli {
                 })
                 .collect());
         }
+        if !context.workspace_id.is_empty() {
+            self.load_workspace(context).await?;
+        }
         let mut results = Vec::new();
         for kind in requested_kinds {
             results.push(extensions::claude::refresh_kind(&self.state.engines, cwd, kind).await);
@@ -2746,21 +2886,137 @@ impl CliTool for ClaudeCodeCli {
         Ok(results)
     }
 
+    /// 为当前 Claude Code 工作区创建一次性扩展目录排期。
+    async fn schedule_extension_catalog_context(&self, cwd: Option<String>) -> Result<bool> {
+        // 以 provider 和目录作为唯一键，避免页面重复读取造成重复首次排期。
+        let context_key = extensions::refresh::context_key(cwd.as_deref());
+        if !self
+            .state
+            .extension_catalog_refreshes
+            .schedule_once_per_run(self.id(), &context_key)
+            .await
+        {
+            return Ok(false);
+        }
+
+        // 初始化各扩展类型的缓存记录，并将首次刷新时间设为当前时间。
+        let observed_at = runtime_env::system_time_rfc3339();
+        let schedule_result = (|| {
+            db::extensions::ensure_context(
+                &self.state.db,
+                self.id(),
+                &context_key,
+                &observed_at,
+            )?;
+            for kind in crate::models::EXTENSION_KINDS {
+                db::extensions::schedule_startup_refresh(
+                    &self.state.db,
+                    self.id(),
+                    &context_key,
+                    kind,
+                    &observed_at,
+                )?;
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = schedule_result {
+            // 数据库排期失败时撤销进程内标记，允许后续页面读取重试。
+            self.state
+                .extension_catalog_refreshes
+                .forget_scheduled_context(self.id(), &context_key)
+                .await;
+            log::error!(
+                "Claude Code 扩展目录排期失败: context={context_key} error={error:#}"
+            );
+            return Err(error);
+        }
+
+        // 唤醒后台调度器尽快处理刚排入的扩展目录任务。
+        self.state
+            .extension_catalog_refreshes
+            .wake_catalog_scheduler();
+        Ok(true)
+    }
+
+    /// 确保 Claude Code 扩展刷新上下文并启动对应的后台刷新任务。
+    async fn request_extension_catalog_refresh(
+        &self,
+        app: tauri::AppHandle,
+        cwd: Option<String>,
+        requested_kinds: Vec<String>,
+    ) -> Result<bool> {
+        // 按固定类型顺序规范化请求，并确保快照记录先于运行状态建立。
+        let kinds = extensions::refresh::normalize_kinds(requested_kinds)?;
+        let context_key = extensions::refresh::context_key(cwd.as_deref());
+        db::extensions::ensure_context(
+            &self.state.db,
+            self.id(),
+            &context_key,
+            &runtime_env::system_time_rfc3339(),
+        )?;
+        if !self
+            .state
+            .extension_catalog_refreshes
+            .begin(self.id(), &context_key)
+            .await
+        {
+            return Ok(false);
+        }
+
+        // 先通知页面刷新状态，再由克隆的 CLI 实例在后台完成目录读取。
+        extensions::refresh::emit_catalog_updated(&app, self.id(), cwd.as_deref());
+        let cli = self.clone();
+        tauri::async_runtime::spawn(async move {
+            cli.run_extension_catalog_refresh(app, context_key, cwd, kinds)
+                .await;
+        });
+        Ok(true)
+    }
+
+    /// 查询 Claude Code provider 已到期的刷新上下文及扩展类型集合。
+    async fn list_due_extension_catalog_refreshes(
+        &self,
+        now: &str,
+    ) -> Result<Vec<ExtensionRefreshJob>> {
+        // 仅查询当前 CLI provider 的到期记录，再按上下文聚合给调度循环。
+        let targets = db::extensions::list_due_refreshes_for_provider(
+            &self.state.db,
+            self.id(),
+            now,
+        )?;
+        Ok(extensions::refresh::group_due_refreshes(targets)
+            .into_iter()
+            .map(|((provider_id, context_key), kinds)| ExtensionRefreshJob {
+                provider_id,
+                context_key,
+                kinds,
+            })
+            .collect())
+    }
+
+    /// 查询 Claude Code provider 最近一次计划刷新时间。
+    async fn next_extension_catalog_refresh_at(&self) -> Result<Option<String>> {
+        db::extensions::next_refresh_at_for_provider(&self.state.db, self.id())
+    }
+
+    /// 读取当前 Claude Code 本机缓存或 SSH 目录，并为本机目录登记首次刷新。
     async fn get_extension_catalog(
         &self,
         context: &CliExecutionContext,
         cwd: Option<&str>,
     ) -> Result<CachedExtensionCatalogDto> {
-        let workspace = self.load_workspace(context).await?;
         if context.location_kind == CliLocationKind::Ssh {
+            let workspace = self.load_workspace(context).await?;
             return self.remote_extension_catalog(&workspace).await;
         }
-        extensions::refresh::load_cached_catalog(
-            &self.state,
-            "claude",
-            cwd.or(Some(workspace.root_path.as_str())),
-        )
-        .await
+        let cwd = if context.workspace_id.is_empty() {
+            cwd.map(str::to_string)
+        } else {
+            let workspace = self.load_workspace(context).await?;
+            Some(cwd.unwrap_or(workspace.root_path.as_str()).to_string())
+        };
+        self.load_cached_extension_catalog(cwd.as_deref()).await
     }
 
     async fn get_extensions(&self, context: &CliExecutionContext) -> Result<Vec<ExtensionItemDto>> {

@@ -24,7 +24,7 @@ use crate::{
     models::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineCheckResultDto, EngineHealthDto, EngineInfoDto,
-        ExtensionActionResultDto,
+        ExtensionActionResultDto, ExtensionRefreshJob, ThreadRuntimeSelection,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
         ThreadDto, ThreadStatusDto, WorkspaceDto,
         chat::{
@@ -359,6 +359,14 @@ pub trait CliTool: Send + Sync {
         context: &CliExecutionContext,
     ) -> Result<Option<EngineInfoDto>>;
 
+    /// 为尚未开始的本机线程解析当前 CLI 的模型与推理强度选项。
+    async fn prepare_unstarted_thread_runtime(
+        &self,
+        current_model: &str,
+        model_id: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> Result<ThreadRuntimeSelection>;
+
     /// 执行经当前 CLI 健康报告许可的单个诊断动作。
     async fn run_engine_check(&self, command: &str) -> Result<EngineCheckResultDto>;
 
@@ -566,6 +574,26 @@ pub trait CliTool: Send + Sync {
         cwd: Option<&str>,
         requested_kinds: &[String],
     ) -> Result<Vec<ExtensionCatalogKindRefreshDto>>;
+
+    /// 按当前 CLI 和工作区目录创建一次性扩展目录刷新排期。
+    async fn schedule_extension_catalog_context(&self, cwd: Option<String>) -> Result<bool>;
+
+    /// 按当前 CLI 和工作区目录请求扩展目录后台刷新。
+    async fn request_extension_catalog_refresh(
+        &self,
+        app: tauri::AppHandle,
+        cwd: Option<String>,
+        requested_kinds: Vec<String>,
+    ) -> Result<bool>;
+
+    /// 查询当前 CLI 已到期的扩展目录刷新上下文。
+    async fn list_due_extension_catalog_refreshes(
+        &self,
+        now: &str,
+    ) -> Result<Vec<ExtensionRefreshJob>>;
+
+    /// 查询当前 CLI 最近一项扩展目录刷新时间。
+    async fn next_extension_catalog_refresh_at(&self) -> Result<Option<String>>;
 
     /// 用户打开扩展页或在聊天输入框中输入斜杠时，读取当前 CLI 在当前项目中可用的扩展，并只显示当前 CLI 的内容。
     async fn get_extension_catalog(

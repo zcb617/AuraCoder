@@ -9,7 +9,7 @@ use tokio::{
 };
 
 use crate::{
-    db::ssh_connections::SshConnectionRecord,
+    models::SshConnectionRecord,
     models::SshConnectionTestDto,
     // process_utils, runtime_env,
     process_utils,

@@ -12,6 +12,53 @@ use crate::{
     state::AppState,
 };
 
+// 纯模型选择规则已归到 BaseCliMcp，ThreadService 中的原 helper 保留如下：
+// /// 为指定 CLI 选择尚未开始线程的模型与思考强度。
+// pub(crate) fn resolve_unstarted_thread_runtime(
+//     engine: &EngineInfoDto,
+//     current_model: &str,
+//     model_id: Option<String>,
+//     reasoning_effort: Option<String>,
+// ) -> Result<ThreadRuntimeSelection, String> {
+//     // 显式模型优先；未指定时沿用可见默认模型、首个可见模型和当前模型的顺序。
+//     let resolved_model = match model_id
+//         .map(|value| value.trim().to_string())
+//         .filter(|value| !value.is_empty())
+//     {
+//         Some(value) => value,
+//         None => {
+//             let visible: Vec<&crate::models::EngineModelDto> =
+//                 engine.models.iter().filter(|item| !item.hidden).collect();
+//             visible
+//                 .iter()
+//                 .find(|item| item.is_default)
+//                 .map(|item| item.id.clone())
+//                 .or_else(|| visible.first().map(|item| item.id.clone()))
+//                 .unwrap_or_else(|| current_model.to_string())
+//         }
+//     };
+//
+//     // 显式思考强度经过 trim 后优先，否则读取最终模型的 CLI 默认思考强度。
+//     let resolved_effort = match reasoning_effort
+//         .map(|value| value.trim().to_string())
+//         .filter(|value| !value.is_empty())
+//     {
+//         Some(value) => Some(value),
+//         None => engine
+//             .models
+//             .iter()
+//             .find(|item| item.id == resolved_model)
+//             .map(|item| item.default_reasoning_effort.clone())
+//             .filter(|value| !value.is_empty()),
+//     };
+//
+//     Ok(ThreadRuntimeSelection {
+//         engine_id: engine.id.clone(),
+//         model_id: resolved_model,
+//         reasoning_effort: resolved_effort,
+//     })
+// }
+
 /// 提供线程统一权限对象 A 的业务校验、默认设置同步和数据库读写。
 pub struct ThreadService {
     /// 当前应用状态，提供数据库和全局配置写锁。
@@ -287,6 +334,60 @@ impl ThreadService {
                 db::threads::get_thread(&db, &query_id)?.context("线程不存在")
         }).await.context("读取线程数据库任务失败").and_then(|result| result);
         if let Err(error) = &result { log::error!("读取线程 {thread_id} 失败: {error:#}"); }
+        result
+    }
+
+    /// 为未开始的线程准备并保存指定 CLI 的运行时选择。
+    pub async fn update_unstarted_thread_runtime(
+        &self,
+        thread_id: String,
+        engine_id: String,
+        model_id: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> anyhow::Result<ThreadDto> {
+        let result: anyhow::Result<ThreadDto> = async {
+            // 读取线程原记录，并在任何运行时准备或保存前验证空会话条件。
+            let query_thread_id = thread_id.clone();
+            let db = self.state.db.clone();
+            let thread = tokio::task::spawn_blocking(move || {
+                db::threads::get_thread(&db, &query_thread_id)
+            })
+            .await??
+            .ok_or_else(|| anyhow::anyhow!("thread not found"))?;
+            anyhow::ensure!(
+                thread.message_count == 0 && thread.engine_thread_id.is_none(),
+                "thread already started; runtime cannot be changed"
+            );
+
+            // 经工厂取得目标 CLI，由其自身目录规则解析新模型和思考强度。
+            let cli = crate::cli_tools::factory::CliToolFactory::new(self.state.clone())
+                .create(&engine_id)?;
+            let selection = cli
+                .prepare_unstarted_thread_runtime(&thread.model_id, model_id, reasoning_effort)
+                .await?;
+
+            // 只更新引擎、模型与思考强度，保持 plan/send/权限字段不参与本次保存。
+            let db = self.state.db.clone();
+            let updated_thread_id = thread_id.clone();
+            tokio::task::spawn_blocking(move || {
+                db::threads::update_thread_runtime_selection(
+                    &db,
+                    &updated_thread_id,
+                    &selection.engine_id,
+                    &selection.model_id,
+                    None,
+                    None,
+                    selection.reasoning_effort.as_deref(),
+                    None,
+                )
+            })
+            .await?
+        }
+        .await;
+
+        if let Err(error) = &result {
+            log::error!("更新未开始线程运行时失败: {error:#}");
+        }
         result
     }
 

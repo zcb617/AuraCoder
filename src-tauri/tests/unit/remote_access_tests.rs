@@ -4,8 +4,8 @@
     use super::{
         build_completed_message_event, decode_relay_header_value, enforce_message_page_budget,
         mobile_message_value, parse_optional_batch_id, parse_remote_attachment_inputs,
-        relay_attachment_url, remote_batch_key, resolve_remote_runtime_update,
-        truncate_mobile_text, RemoteBatchState, RemoteTunnelManager,
+        relay_attachment_url, remote_batch_key, truncate_mobile_text, RemoteBatchState,
+        RemoteTunnelManager,
     };
     use crate::config::app_config::RemoteAccessConfig;
     use crate::models::{
@@ -15,6 +15,34 @@
     };
     use serde_json::{json, Value};
     use tokio::fs as tokio_fs;
+
+    /// 保留旧远程运行时选择测试合同，并委托 BaseCliMcp 的纯模型选择 helper。
+    fn resolve_remote_runtime_update(
+        thread: &ThreadDto,
+        engines: &[EngineInfoDto],
+        engine_id: &str,
+        model_id: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> Result<(String, String, Option<String>), String> {
+        if thread.message_count > 0 || thread.engine_thread_id.is_some() {
+            return Err("thread already started; runtime cannot be changed".to_string());
+        }
+        let engine = engines
+            .iter()
+            .find(|item| item.id == engine_id)
+            .ok_or_else(|| format!("unknown engine_id: {engine_id}"))?;
+        let selection = crate::cli_tools::BaseCliMcp::resolve_unstarted_thread_runtime(
+            engine,
+            &thread.model_id,
+            model_id,
+            reasoning_effort,
+        )?;
+        Ok((
+            selection.engine_id,
+            selection.model_id,
+            selection.reasoning_effort,
+        ))
+    }
 
     fn test_thread(message_count: i64, engine_thread_id: Option<&str>) -> ThreadDto {
         ThreadDto {

@@ -16,8 +16,8 @@ use crate::{
             AttachmentPreviewPayload, ChatAttachmentPayload, ChatBusinessError,
             ChatInputItemPayload, ClipboardImagePayload, SendMessageRequest,
         },
-        ActionOutputDto, MessageDto, MessageWindowCursorDto, MessageWindowDto, SearchResultDto,
-        ThreadDto,
+        ActionOutputDto, MessageDto, MessageWindowCursorDto, MessageWindowDto,
+        MessageWindowWithRowIds, SearchResultDto, ThreadDto,
     },
     runtime_env,
     services::thread_service::ThreadService,
@@ -354,6 +354,80 @@ impl ChatService {
             )
         })
         .await
+    }
+
+    /// 按游标和限制分页读取线程消息及对应数据库行号，供远程分页保持配对。
+    pub async fn get_thread_messages_window_with_row_ids(
+        &self,
+        thread_id: String,
+        cursor: Option<MessageWindowCursorDto>,
+        limit: Option<usize>,
+    ) -> Result<MessageWindowWithRowIds, String> {
+        let clamped_limit = limit
+            .unwrap_or(MESSAGE_WINDOW_DEFAULT_LIMIT)
+            .clamp(1, MESSAGE_WINDOW_MAX_LIMIT);
+        let (window, row_ids) = run_db(self.state.db.clone(), move |database| {
+            db::messages::get_thread_messages_window_with_row_ids(
+                database,
+                &thread_id,
+                cursor.as_ref(),
+                clamped_limit,
+            )
+        })
+        .await?;
+
+        Ok(MessageWindowWithRowIds { window, row_ids })
+    }
+
+    /// 验证消息归属并读取其指定附件的图片预览。
+    pub async fn read_message_attachment_preview(
+        &self,
+        thread_id: String,
+        message_id: String,
+        attachment_index: usize,
+    ) -> Result<Option<AttachmentPreviewPayload>, String> {
+        // 读取完整消息，以便在处理附件块前校验它属于请求线程。
+        let message = run_db(self.state.db.clone(), move |database| {
+            db::messages::get_message(database, &message_id)
+        })
+        .await?;
+
+        match message {
+            Some(message) if message.thread_id == thread_id => {
+                // 从指定位置只接受附件块，并提取原有路径、MIME 与预览路径字段。
+                let attachment = message
+                    .blocks
+                    .as_ref()
+                    .and_then(Value::as_array)
+                    .and_then(|blocks| blocks.get(attachment_index))
+                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("attachment"));
+                let file_path = attachment
+                    .and_then(|block| block.get("filePath"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let mime_type = attachment
+                    .and_then(|block| block.get("mimeType"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let preview_file_path = attachment
+                    .and_then(|block| block.get("previewFilePath"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+
+                match file_path {
+                    Some(file_path) => {
+                        read_attachment_preview(file_path, mime_type, preview_file_path).await
+                    }
+                    None => Err("history attachment was not found".to_string()),
+                }
+            }
+            Some(_) => Err("message does not belong to thread".to_string()),
+            None => Err("message was not found".to_string()),
+        }
     }
 
     /// 查询一条聊天消息已持久化的内容块。

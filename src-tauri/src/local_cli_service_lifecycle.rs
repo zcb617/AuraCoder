@@ -20,11 +20,14 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::engines::{claude_sidecar::ClaudeSidecarEngine, codex::CodexEngine};
+// 旧 Controller 探测导入已停用，探测职责迁至 runtime_env：
+// commands::harness::detect_via_login_shell,
 use crate::{
     cli_tools::{factory::CliToolFactory, CliLocationKind, CliMcpRuntime, CliTool},
-    commands::harness::detect_via_login_shell, mcp_gateway::AuraCoderMcpGateway,
+    mcp_gateway::AuraCoderMcpGateway,
     message_notify_helper::CliHealthReconcileResult, process_utils, runtime_env,
 };
+use crate::runtime_env::detect_via_login_shell;
 
 /// OpenCode 本机服务启动后提供给协议客户端的连接信息。
 ///

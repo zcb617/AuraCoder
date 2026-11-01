@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::{
-    cli_tools::{factory::CliToolFactory, CliExecutionContext, CliTool},
+    cli_tools::{factory::CliToolFactory, CliExecutionContext, CliLocationKind, CliTool},
     models::{
         ExtensionActionResultDto, ExtensionCatalogKindRefreshDto, ExtensionItemDto,
         ExtensionProviderCapabilitiesDto, ExtensionSourceDto,
@@ -131,68 +131,23 @@ pub async fn refresh_catalog_kinds(
     for kind in &requested {
         ensure_member("extension kind", kind, KINDS)?;
     }
-
-    let mut results = Vec::new();
-    for kind in KINDS {
-        if !requested.contains(kind) {
-            continue;
-        }
-        if cwd.is_none() {
-            let result = match provider_id {
-                "codex" => crate::extensions::codex::refresh_kind(&state.engines, None, kind).await,
-                "claude" => {
-                    crate::extensions::claude::refresh_kind(&state.engines, None, kind).await
-                }
-                "opencode" => {
-                    crate::extensions::opencode::refresh_kind(&state.engines, None, kind).await
-                }
-                _ => unreachable!(),
-            };
-            results.push(result);
-            continue;
-        }
-        let result = match provider_id {
-            "codex" => {
-                let codex = CliToolFactory::new(state.clone())
-                    .create("codex")
-                    .expect("Codex CLI factory mapping must exist");
-                let context = codex.execution_context_for_cwd(cwd).await?;
-                let cli: &dyn CliTool = codex.as_ref();
-                cli.refresh_extension_catalog(&context, cwd, &[kind.to_string()])
-                    .await?
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| ExtensionCatalogKindRefreshDto::failure(kind))
-            }
-            "claude" => {
-                let claude = CliToolFactory::new(state.clone())
-                    .create("claude")
-                    .expect("Claude CLI factory mapping must exist");
-                let context = claude.execution_context_for_cwd(cwd).await?;
-                let cli: &dyn CliTool = claude.as_ref();
-                cli.refresh_extension_catalog(&context, cwd, &[kind.to_string()])
-                    .await?
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| ExtensionCatalogKindRefreshDto::failure(kind))
-            }
-            "opencode" => {
-                let opencode = CliToolFactory::new(state.clone())
-                    .create("opencode")
-                    .expect("OpenCode CLI factory mapping must exist");
-                let context = opencode.execution_context_for_cwd(cwd).await?;
-                let cli: &dyn CliTool = opencode.as_ref();
-                cli.refresh_extension_catalog(&context, cwd, &[kind.to_string()])
-                    .await?
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| ExtensionCatalogKindRefreshDto::failure(kind))
-            }
-            _ => unreachable!(),
-        };
-        results.push(result);
-    }
-    Ok(results)
+    let requested_kinds = KINDS
+        .iter()
+        .filter(|kind| requested.contains(**kind))
+        .map(|kind| (*kind).to_string())
+        .collect::<Vec<_>>();
+    let cli = CliToolFactory::new(state.clone()).create(provider_id)?;
+    let context = match cwd {
+        Some(cwd) => cli.execution_context_for_cwd(Some(cwd)).await?,
+        None => CliExecutionContext {
+            workspace_id: String::new(),
+            root_path: String::new(),
+            location_kind: CliLocationKind::Local,
+            ssh_connection_id: None,
+        },
+    };
+    cli.refresh_extension_catalog(&context, cwd, &requested_kinds)
+        .await
 }
 
 pub async fn perform_action_for_item(
@@ -274,14 +229,17 @@ fn validate_extension_id(value: &str) -> Result<()> {
     Ok(())
 }
 
+//#[cfg(test)]
+//mod tests {
+//    use super::validate_extension_id;
+//
+//    #[test]
+//    fn rejects_option_and_line_injection_ids() {
+//        assert!(validate_extension_id("--help").is_err());
+//        assert!(validate_extension_id("valid\nother").is_err());
+//        assert!(validate_extension_id("normal@official").is_ok());
+//    }
+//}
 #[cfg(test)]
-mod tests {
-    use super::validate_extension_id;
-
-    #[test]
-    fn rejects_option_and_line_injection_ids() {
-        assert!(validate_extension_id("--help").is_err());
-        assert!(validate_extension_id("valid\nother").is_err());
-        assert!(validate_extension_id("normal@official").is_ok());
-    }
-}
+#[path = "../../tests/unit/extensions_module_tests.rs"]
+mod tests;
