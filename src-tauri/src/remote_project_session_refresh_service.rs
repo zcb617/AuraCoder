@@ -1,75 +1,61 @@
-//! SSH 远端项目会话同步服务。
+//! 公共本地与 SSH 项目会话刷新服务，仅负责调度、工作区校验和刷新报告。
 
 use std::{
     collections::HashSet,
     sync::{Arc, LazyLock, Mutex},
-    time::Duration,
 };
 
 use anyhow::{Context, Result};
-// 旧 OpenCode Tunnel HTTP 会话读取函数仅保留在下方注释中：
-// use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use futures::{SinkExt, StreamExt};
-use rusqlite::{params, OptionalExtension};
-use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use uuid::Uuid;
+
+use crate::db::Database;
+use crate::db::workspaces::{find_workspace_by_id, list_workspaces};
 
 use crate::{
     cli_tools::{factory::CliToolFactory, CliExecutionContext, CliTool},
-    db::{threads, workspaces, Database},
     message_notify_helper::{
         notify_app_startup_progress, notify_ssh_remote_project_sessions_refreshed,
         SshRemoteProjectSessionsRefreshedEvent,
     },
-    models::{ThreadStatusDto, WorkspaceDto},
-    path_utils,
-    runtime_env,
-    // 旧会话刷新入口曾直接使用 SSH CLI 生命周期和 Tunnel；现由 CliTool 统一接口负责：
-    // ssh::{
-    //     cli_service_lifecycle,
-    //     cli_tunnel_registry::{self, SshCliTunnel},
-    // },
+    models::WorkspaceDto,
     state::AppState,
 };
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_PAGES: usize = 50;
-
-/// 单个工作区的同步报告。
+/// 单个工作区的 SSH 会话刷新报告。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SshRemoteProjectSessionRefreshReport {
     /// 工作区唯一标识。
     pub workspace_id: String,
-    /// 成功同步的 CLI。
+    /// 成功刷新的 CLI。
     pub succeeded_cli_ids: Vec<String>,
-    /// 失败的 CLI。
+    /// 刷新失败的 CLI。
     pub failed_cli_ids: Vec<String>,
 }
 
-/// 单个本地工作区的会话同步报告。
+/// 单个本地工作区的会话刷新报告。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalProjectSessionRefreshReport {
     /// 工作区唯一标识。
     pub workspace_id: String,
-    /// 成功同步的 CLI。
+    /// 成功刷新的 CLI。
     pub succeeded_cli_ids: Vec<String>,
-    /// 失败的 CLI。
+    /// 刷新失败的 CLI。
     pub failed_cli_ids: Vec<String>,
 }
 
 static REFRESHING_WORKSPACES: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// 防止同一工作区同时执行多个刷新任务。
 struct WorkspaceRefreshGuard {
     /// 当前互斥锁占用的工作区标识。
     workspace_id: String,
 }
 
 impl WorkspaceRefreshGuard {
+    /// 获取工作区刷新锁；已有刷新任务时拒绝重复进入。
     fn acquire(id: &str) -> Option<Self> {
         let mut set = REFRESHING_WORKSPACES
             .lock()
@@ -89,14 +75,15 @@ impl Drop for WorkspaceRefreshGuard {
     }
 }
 
-/// 按数据库顺序刷新全部已启用 SSH 工作区。
+/// 按数据库顺序刷新全部已启用 SSH 工作区，并汇总可完成的报告。
 pub async fn refresh_all_ssh_remote_project_sessions(
     app: &AppHandle,
     db: Arc<Database>,
 ) -> Vec<SshRemoteProjectSessionRefreshReport> {
+    // 先统一读取工作区，再逐个调用公开的单工作区刷新入口。
     let records = match tokio::task::spawn_blocking({
         let db = db.clone();
-        move || workspaces::list_workspaces(db.as_ref())
+        move || list_workspaces(db.as_ref())
     })
     .await
     {
@@ -131,7 +118,7 @@ pub async fn refresh_ssh_remote_project_sessions(
 ) -> Result<SshRemoteProjectSessionRefreshReport> {
     let _guard = WorkspaceRefreshGuard::acquire(workspace_id)
         .ok_or_else(|| anyhow::anyhow!("workspace refresh already in progress: {workspace_id}"))?;
-    let workspace = load_workspace(db.clone(), workspace_id).await?;
+    let workspace = load_workspace(db, workspace_id).await?;
     let connection_id = workspace
         .ssh_connection_id
         .as_deref()
@@ -140,13 +127,14 @@ pub async fn refresh_ssh_remote_project_sessions(
     let state = app.state::<AppState>();
     let factory = CliToolFactory::new(state.inner().clone());
     let context = CliExecutionContext::from_workspace(&workspace)?;
-    let mut cli_ids = Vec::new();
+    let mut prepared_clis = Vec::new();
     let mut report = SshRemoteProjectSessionRefreshReport {
         workspace_id: workspace_id.to_string(),
         succeeded_cli_ids: Vec::new(),
         failed_cli_ids: Vec::new(),
     };
 
+    // 第一阶段按固定顺序创建 CLI 并确保服务就绪；每个失败 CLI 都立刻进入报告。
     for cli_id in ["codex", "opencode", "claude"] {
         let cli = match factory.create(cli_id) {
             Ok(cli) => cli,
@@ -161,24 +149,26 @@ pub async fn refresh_ssh_remote_project_sessions(
             }
         };
         match cli.ensure_service(&context).await {
-            Ok(()) => cli_ids.push(cli_id.to_string()),
+            Ok(()) => prepared_clis.push((cli_id.to_string(), cli)),
             Err(error) => {
                 log::warn!(
                     "确保 SSH 远端 CLI 服务失败: connection_id={} cli_id={} error={error:#}",
                     connection_id,
                     cli_id,
                 );
+                report.failed_cli_ids.push(cli_id.to_string());
             }
         }
     }
 
-    for cli_id in cli_ids {
+    // 第二阶段逐个刷新就绪 CLI；单个读取或落库错误只记入报告并继续后续 CLI。
+    for (cli_id, cli) in prepared_clis {
         if let Err(error) =
             notify_app_startup_progress(app, "syncing-remote-sessions", "正在同步远端会话……")
         {
             log::warn!("发送启动进度失败: {error:#}");
         }
-        match sync_cli(app, &workspace, &cli_id, db.clone()).await {
+        match sync_cli(&factory, &workspace, &cli_id, Some(cli)).await {
             Ok(()) => report.succeeded_cli_ids.push(cli_id),
             Err(error) => {
                 log::warn!(
@@ -203,6 +193,7 @@ pub async fn refresh_ssh_remote_project_sessions(
     Ok(report)
 }
 
+/// 判断工作区是否允许走 SSH 项目会话刷新入口。
 fn is_enabled_ssh_workspace(workspace: &WorkspaceDto) -> bool {
     workspace.location_kind == "ssh"
         && workspace.ssh_connection_id.is_some()
@@ -210,35 +201,34 @@ fn is_enabled_ssh_workspace(workspace: &WorkspaceDto) -> bool {
         && workspace.connection_deleted != Some(true)
 }
 
-/// 判断工作区是否允许走本机历史会话同步入口。
+/// 判断工作区是否允许走本机历史会话刷新入口。
 fn is_local_workspace(workspace: &WorkspaceDto) -> bool {
     workspace.location_kind != "ssh"
 }
 
+/// 从数据库读取并校验一个已启用 SSH 工作区。
 async fn load_workspace(db: Arc<Database>, workspace_id: &str) -> Result<WorkspaceDto> {
     let id = workspace_id.to_string();
-    let workspace =
-        tokio::task::spawn_blocking(move || workspaces::find_workspace_by_id(db.as_ref(), &id))
-            .await
-            .context("load workspace task failed")??;
+    let workspace = tokio::task::spawn_blocking(move || find_workspace_by_id(db.as_ref(), &id))
+        .await
+        .context("load workspace task failed")??;
     workspace
         .filter(is_enabled_ssh_workspace)
         .ok_or_else(|| anyhow::anyhow!("enabled SSH workspace not found: {workspace_id}"))
 }
 
-/// 从数据库读取并校验一个本地工作区，拒绝 SSH 工作区误用本地同步入口。
+/// 从数据库读取并校验一个本地工作区，拒绝 SSH 工作区误用本地刷新入口。
 async fn load_local_workspace(db: Arc<Database>, workspace_id: &str) -> Result<WorkspaceDto> {
     let id = workspace_id.to_string();
-    let workspace =
-        tokio::task::spawn_blocking(move || workspaces::find_workspace_by_id(db.as_ref(), &id))
-            .await
-            .context("读取本地 workspace 任务失败")??;
+    let workspace = tokio::task::spawn_blocking(move || find_workspace_by_id(db.as_ref(), &id))
+        .await
+        .context("读取本地 workspace 任务失败")??;
     workspace
         .filter(is_local_workspace)
         .ok_or_else(|| anyhow::anyhow!("本地 workspace 不存在或实际为 SSH 项目: {workspace_id}"))
 }
 
-/// 按固定的 Codex、OpenCode、Claude 顺序同步一个本地工作区的历史会话。
+/// 按固定的 Codex、OpenCode、Claude 顺序刷新一个本地工作区的历史会话。
 pub async fn refresh_local_project_sessions(
     app: &AppHandle,
     db: Arc<Database>,
@@ -246,19 +236,23 @@ pub async fn refresh_local_project_sessions(
 ) -> Result<LocalProjectSessionRefreshReport> {
     let _guard = WorkspaceRefreshGuard::acquire(workspace_id)
         .ok_or_else(|| anyhow::anyhow!("workspace refresh already in progress: {workspace_id}"))?;
-    let workspace = load_local_workspace(db.clone(), workspace_id).await?;
+    let workspace = load_local_workspace(db, workspace_id).await?;
     log::info!(
         "本地项目会话同步开始: workspace_id={} workspace_root_path={} cli_order=codex,opencode,claude succeeded_cli_ids=[] failed_cli_ids=[]",
         workspace_id,
         workspace.root_path
     );
+    let state = app.state::<AppState>();
+    let factory = CliToolFactory::new(state.inner().clone());
     let mut report = LocalProjectSessionRefreshReport {
         workspace_id: workspace_id.to_string(),
         succeeded_cli_ids: Vec::new(),
         failed_cli_ids: Vec::new(),
     };
+
+    // 每个 CLI 独立创建和刷新，失败时继续处理固定顺序中的其他 CLI。
     for cli_id in ["codex", "opencode", "claude"] {
-        match sync_cli(app, &workspace, cli_id, db.clone()).await {
+        match sync_cli(&factory, &workspace, cli_id, None).await {
             Ok(()) => report.succeeded_cli_ids.push(cli_id.to_string()),
             Err(error) => {
                 log::warn!(
@@ -280,1506 +274,22 @@ pub async fn refresh_local_project_sessions(
     Ok(report)
 }
 
+/// 通过 CLI 工厂和统一刷新接口完成一个 CLI 的项目会话刷新。
 async fn sync_cli(
-    app: &AppHandle,
+    factory: &CliToolFactory,
     workspace: &WorkspaceDto,
     cli_id: &str,
-    db: Arc<Database>,
+    prepared_cli: Option<Arc<dyn CliTool>>,
 ) -> Result<()> {
-    /*
-    旧实现会在会话扫描前直接登记 SSH 常驻服务，现由外层 refresh_ssh_remote_project_sessions
-    通过 CliTool::ensure_service 完成，避免同步业务绕过 CLI 实现和生命周期边界：
-    if let Some(connection_id) = connection_id {
-        cli_service_lifecycle::set(connection_id, cli_id)
-            .await
-            .with_context(|| {
-                format!(
-                    "启动并登记 SSH 远端 CLI 服务失败: connection_id={connection_id} cli_id={cli_id}"
-                )
-            })?;
-        if let Err(error) =
-            notify_app_startup_progress(app, "syncing-remote-sessions", "正在同步远端会话……")
-        {
-            log::warn!("发送启动进度失败: {error:#}");
-        }
-    }
-    */
-
-    if cli_id == "codex" {
-        let state = app.state::<AppState>();
-        let context = CliExecutionContext::from_workspace(workspace)?;
-        let codex = CliToolFactory::new(state.inner().clone())
-            .create("codex")
-            .expect("Codex CLI factory mapping must exist");
-        let cli: &dyn CliTool = codex.as_ref();
-        log::info!(
-            "调用 CLI list_sessions 前: workspace_id={} workspace_root_path={} cli_id={}",
-            workspace.id,
-            workspace.root_path,
-            cli_id
-        );
-        let sessions = cli.list_sessions(&context, None, Some(false)).await?;
-        log::info!(
-            "调用 CLI list_sessions 后: workspace_id={} workspace_root_path={} cli_id={} returned_session_count={}",
-            workspace.id,
-            workspace.root_path,
-            cli_id,
-            sessions.len()
-        );
-        let sessions = sessions
-            .into_iter()
-            .filter(|session| path_utils::paths_equal(&session.cwd, &workspace.root_path))
-            .map(|session| RemoteSessionSnapshot {
-                engine_thread_id: session.engine_thread_id,
-                title: session.title,
-                cwd: session.cwd,
-                model_id: session.model_id,
-                reasoning_effort: session.reasoning_effort,
-                updated_at: session.updated_at,
-                status: session.status,
-                metadata: session.metadata,
-            })
-            .collect();
-        return persist_sessions(db, workspace, "codex", sessions).await;
-    }
-
-    if cli_id == "opencode" {
-        let state = app.state::<AppState>();
-        let context = CliExecutionContext::from_workspace(workspace)?;
-        let opencode = CliToolFactory::new(state.inner().clone())
-            .create("opencode")
-            .expect("OpenCode CLI factory mapping must exist");
-        let cli: &dyn CliTool = opencode.as_ref();
-        log::info!(
-            "调用 CLI list_sessions 前: workspace_id={} workspace_root_path={} cli_id={}",
-            workspace.id,
-            workspace.root_path,
-            cli_id
-        );
-        let sessions = cli.list_sessions(&context, None, Some(false)).await?;
-        log::info!(
-            "调用 CLI list_sessions 后: workspace_id={} workspace_root_path={} cli_id={} returned_session_count={}",
-            workspace.id,
-            workspace.root_path,
-            cli_id,
-            sessions.len()
-        );
-        let sessions = sessions
-            .into_iter()
-            .filter(|session| path_utils::paths_equal(&session.cwd, &workspace.root_path))
-            .map(|session| RemoteSessionSnapshot {
-                engine_thread_id: session.engine_thread_id,
-                title: session.title,
-                cwd: session.cwd,
-                model_id: session.model_id,
-                reasoning_effort: session.reasoning_effort,
-                updated_at: session.updated_at,
-                status: session.status,
-                metadata: session.metadata,
-            })
-            .collect();
-        let result = persist_sessions(db, workspace, "opencode", sessions).await;
-        // 同步完成后关闭该项目的 OpenCode serve 进程，不常驻
-        if let Err(error) = cli.close_workspace_service(&context).await {
-            log::warn!(
-                "关闭本机 OpenCode 同步进程失败: workspace_id={} cwd={} error={error:#}",
-                workspace.id,
-                workspace.root_path
-            );
-        }
-        return result;
-    }
-
-    if cli_id == "claude" {
-        let state = app.state::<AppState>();
-        let context = CliExecutionContext::from_workspace(workspace)?;
-        let claude = CliToolFactory::new(state.inner().clone())
-            .create("claude")
-            .expect("Claude CLI factory mapping must exist");
-        let cli: &dyn CliTool = claude.as_ref();
-        log::info!(
-            "调用 CLI list_sessions 前: workspace_id={} workspace_root_path={} cli_id={}",
-            workspace.id,
-            workspace.root_path,
-            cli_id
-        );
-        let sessions = cli.list_sessions(&context, None, Some(false)).await?;
-        let returned_session_count = sessions.len();
-        log::info!(
-            "调用 CLI list_sessions 后: workspace_id={} workspace_root_path={} cli_id={} returned_session_count={}",
-            workspace.id,
-            workspace.root_path,
-            cli_id,
-            returned_session_count
-        );
-        let sessions = sessions
-            .into_iter()
-            .filter(|session| path_utils::paths_equal(&session.cwd, &workspace.root_path))
-            .collect::<Vec<_>>();
-        let filtered_session_count = sessions.len();
-        let mut skipped_command_only_session_ids = Vec::new();
-        let sessions = sessions
-            .into_iter()
-            .filter(|session| {
-                let is_command_only = session
-                    .metadata
-                    .get("claudeRemote")
-                    .and_then(|claude_remote| claude_remote.get("conversationKind"))
-                    .and_then(Value::as_str)
-                    == Some("command_only");
-                if is_command_only {
-                    skipped_command_only_session_ids.push(session.engine_thread_id.clone());
-                }
-                !is_command_only
-            })
-            .map(|session| RemoteSessionSnapshot {
-                engine_thread_id: session.engine_thread_id,
-                title: session.title,
-                cwd: session.cwd,
-                model_id: session.model_id,
-                reasoning_effort: session.reasoning_effort,
-                updated_at: session.updated_at,
-                status: session.status,
-                metadata: session.metadata,
-            })
-            .collect::<Vec<_>>();
-        log::info!(
-            "Claude list_sessions cwd 过滤完成: workspace_id={} workspace_root_path={} cli_id={} returned_session_count={} filtered_session_count={} skipped_command_only_count={} skipped_command_only_session_ids={:?}",
-            workspace.id,
-            workspace.root_path,
-            cli_id,
-            returned_session_count,
-            filtered_session_count,
-            skipped_command_only_session_ids.len(),
-            skipped_command_only_session_ids
-        );
-        return persist_sessions(db, workspace, "claude", sessions).await;
-    }
-
-    /*
-    旧实现会在刷新函数末尾直接取得并释放 Tunnel 的远端服务占用。三个受支持 CLI
-    已经全部通过上面的 CLI 工厂调用返回，这段 Tunnel 直连逻辑不再执行：
-    let tunnel = cli_tunnel_registry::acquire_temporary_service_use(connection_id, cli_id).await?;
-    let result = match cli_id {
-        "opencode" => unreachable!("OpenCode session sync already uses OpenCodeCli"),
-        "claude" => unreachable!("Claude session sync already uses ClaudeCodeCli"),
-        _ => Ok(()),
+    // 复用 SSH 预先确保就绪的实现，或为本地刷新创建对应 CLI 实现。
+    let cli = match prepared_cli {
+        Some(cli) => cli,
+        None => factory.create(cli_id)?,
     };
-    let release_result =
-        cli_tunnel_registry::release_temporary_service_use(connection_id, cli_id).await;
-    match (result, release_result) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Ok(_)) => Ok(()),
-        (Ok(()), Err(error)) => Err(error).context(format!(
-            "failed release SSH CLI temporary use: connection_id={connection_id} cli_id={cli_id}"
-        )),
-    }
-    */
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RemoteSessionSnapshot {
-    /// 远端会话 ID。
-    pub(crate) engine_thread_id: String,
-    /// 远端标题。
-    pub(crate) title: String,
-    /// 远端 cwd。
-    pub(crate) cwd: String,
-    /// 远端模型；不可靠时为 unknown。
-    pub(crate) model_id: String,
-    /// 远端思考强度。
-    pub(crate) reasoning_effort: Option<String>,
-    /// 远端最后活动时间。
-    pub(crate) updated_at: Option<String>,
-    /// 映射后的本地状态。
-    pub(crate) status: ThreadStatusDto,
-    /// 远端元数据。
-    pub(crate) metadata: Value,
-}
-
-/// 按远端会话更新时间导入或增量刷新指定工作区的会话持久化状态。
-async fn persist_sessions(
-    db: Arc<Database>,
-    workspace: &WorkspaceDto,
-    engine_id: &str,
-    sessions: Vec<RemoteSessionSnapshot>,
-) -> Result<()> {
-    if engine_id == "claude" {
-        log::info!(
-            "Claude 会话持久化开始: workspace_id={} session_count={}",
-            workspace.id,
-            sessions.len()
-        );
-    }
-    if sessions.is_empty() {
-        return Ok(());
-    }
-
-    if engine_id == "claude" {
-        // 在单个事务内按工作区和 Claude 会话身份导入或增量刷新远端快照。
-        let session_count = sessions.len();
-        let import_result = tokio::task::spawn_blocking({
-            let workspace_id = workspace.id.clone();
-            move || -> Result<()> {
-                let mut conn = db.connect()?;
-                let tx = conn
-                    .transaction()
-                    .context("failed begin Claude remote thread import transaction")?;
-
-                for session in sessions {
-                    let remote_time = match session.updated_at.as_deref() {
-                        Some(raw) if !raw.trim().is_empty() => {
-                            match chrono::DateTime::parse_from_rfc3339(raw.trim()) {
-                                Ok(value) => match runtime_env::normalize_time_to_local(raw) {
-                                    Ok(local) => Some((value.with_timezone(&chrono::Utc), local)),
-                                    Err(error) => {
-                                        log::warn!(
-                                            "Claude 会话远端时间本地化失败: workspace_id={} session_id={} raw={} error={error:#}",
-                                            workspace_id,
-                                            session.engine_thread_id,
-                                            raw
-                                        );
-                                        None
-                                    }
-                                },
-                                Err(error) => {
-                                    log::warn!(
-                                        "Claude 会话远端时间解析失败: workspace_id={} session_id={} raw={} error={error}",
-                                        workspace_id,
-                                        session.engine_thread_id,
-                                        raw
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                        Some(raw) => {
-                            log::warn!(
-                                "Claude 会话远端时间缺失: workspace_id={} session_id={} raw={}",
-                                workspace_id,
-                                session.engine_thread_id,
-                                raw
-                            );
-                            None
-                        }
-                        None => {
-                            log::warn!(
-                                "Claude 会话远端时间缺失: workspace_id={} session_id={}",
-                                workspace_id,
-                                session.engine_thread_id
-                            );
-                            None
-                        }
-                    };
-
-                    let existing = tx
-                        .query_row(
-                            "SELECT id, last_activity_at, engine_metadata_json, title,
-                                    claude_sync_required
-                             FROM threads
-                             WHERE workspace_id = ?1
-                               AND engine_id = 'claude'
-                               AND engine_thread_id = ?2",
-                            params![workspace_id, session.engine_thread_id],
-                            |row| {
-                                Ok((
-                                    row.get::<_, String>(0)?,
-                                    row.get::<_, Option<String>>(1)?,
-                                    row.get::<_, Option<String>>(2)?,
-                                    row.get::<_, Option<String>>(3)?,
-                                    row.get::<_, i64>(4)?,
-                                ))
-                            },
-                        )
-                        .optional()
-                        .context("failed query existing Claude remote thread")?;
-
-                    log::debug!(
-                        "Claude 会话扫描结果: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} existing_claude_sync_required={:?}",
-                        workspace_id,
-                        session.engine_thread_id,
-                        session.updated_at,
-                        existing.as_ref().and_then(|row| row.1.as_deref()),
-                        existing.as_ref().map(|row| row.4)
-                    );
-                    let Some((
-                        thread_id,
-                        db_last_activity_at,
-                        existing_metadata,
-                        existing_title,
-                        claude_sync_required,
-                    )) = existing
-                    else {
-                        log::info!(
-                            "Claude 会话持久化分支: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw=None existing_claude_sync_required=None final_branch=insert_new(flag=1)",
-                            workspace_id,
-                            session.engine_thread_id,
-                            session.updated_at
-                        );
-                        let created_at = runtime_env::system_time_rfc3339();
-                        let last_activity_at = remote_time
-                            .as_ref()
-                            .map(|(_, local)| local.as_str())
-                            .unwrap_or(&created_at);
-                        let model_id = if session.model_id.trim().is_empty() {
-                            "unknown"
-                        } else {
-                            session.model_id.trim()
-                        };
-                        tx.execute(
-                            "INSERT INTO threads (
-                                 id, workspace_id, engine_id, model_id, engine_thread_id,
-                                 engine_metadata_json, title, status, reasoning_effort,
-                                 last_activity_at, created_at, claude_sync_required
-                             ) VALUES (?1, ?2, 'claude', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)",
-                            params![
-                                Uuid::new_v4().to_string(),
-                                workspace_id,
-                                model_id,
-                                session.engine_thread_id,
-                                session.metadata.to_string(),
-                                session.title,
-                                session.status.as_str().to_string(),
-                                session.reasoning_effort,
-                                last_activity_at,
-                                created_at,
-                            ],
-                        )
-                        .context("failed insert Claude remote thread snapshot")?;
-                        continue;
-                    };
-
-                    let Some((remote_time, remote_time_local)) = remote_time else {
-                        log::info!(
-                            "Claude 会话持久化分支: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} existing_claude_sync_required={} final_branch=skip_missing_remote_timestamp",
-                            workspace_id,
-                            session.engine_thread_id,
-                            session.updated_at,
-                            db_last_activity_at,
-                            claude_sync_required
-                        );
-                        continue;
-                    };
-
-                    let db_time = match db_last_activity_at.as_deref() {
-                        Some(raw) if !raw.trim().is_empty() => {
-                            match runtime_env::parse_persisted_time_to_utc(raw) {
-                                Ok(value) => Some(value),
-                                Err(error) => {
-                                    log::warn!(
-                                        "Claude 会话数据库时间解析失败: workspace_id={} session_id={} raw={} error={error:#}",
-                                        workspace_id,
-                                        session.engine_thread_id,
-                                        raw
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                        Some(raw) => {
-                            log::warn!(
-                                "Claude 会话数据库时间缺失: workspace_id={} session_id={} raw={}",
-                                workspace_id,
-                                session.engine_thread_id,
-                                raw
-                            );
-                            None
-                        }
-                        None => None,
-                    };
-                    log::debug!(
-                        "Claude 会话时间比较: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} remote_time_utc={} database_time_utc={:?}",
-                        workspace_id,
-                        session.engine_thread_id,
-                        session.updated_at,
-                        db_last_activity_at,
-                        remote_time,
-                        db_time
-                    );
-                    if db_time.is_some_and(|value| remote_time <= value) {
-                        log::info!(
-                            "Claude 会话持久化分支: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} existing_claude_sync_required={} final_branch=skip_not_newer",
-                            workspace_id,
-                            session.engine_thread_id,
-                            session.updated_at,
-                            db_last_activity_at,
-                            claude_sync_required
-                        );
-                        continue;
-                    }
-                    // 只有远端时间严格晚于可解析的本地时间，才要求点击时读取完整历史。
-                    let remote_time_is_newer =
-                        db_time.map(|value| remote_time > value).unwrap_or(true);
-
-                    let mut manual_title = false;
-                    let metadata_raw = existing_metadata.clone().unwrap_or_default();
-                    let metadata_to_write = if metadata_raw.trim().is_empty() {
-                        let mut metadata = serde_json::Map::new();
-                        if let Value::Object(remote_metadata) = &session.metadata {
-                            metadata.extend(remote_metadata.clone());
-                        }
-                        Value::Object(metadata).to_string()
-                    } else {
-                        match serde_json::from_str::<Value>(&metadata_raw) {
-                            Ok(Value::Object(mut metadata)) => {
-                                let existing_manual_title = metadata.get("manualTitle").cloned();
-                                let existing_manual_title_updated_at =
-                                    metadata.get("manualTitleUpdatedAt").cloned();
-                                manual_title = existing_manual_title
-                                    .as_ref()
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false);
-                                if let Value::Object(remote_metadata) = &session.metadata {
-                                    metadata.extend(remote_metadata.clone());
-                                }
-                                if let Some(value) = existing_manual_title {
-                                    metadata.insert("manualTitle".to_string(), value);
-                                }
-                                if let Some(value) = existing_manual_title_updated_at {
-                                    metadata.insert("manualTitleUpdatedAt".to_string(), value);
-                                }
-                                Value::Object(metadata).to_string()
-                            }
-                            Ok(value) => {
-                                log::warn!(
-                                    "Claude 会话数据库 metadata 不是 JSON object: workspace_id={} session_id={} raw={} value={}",
-                                    workspace_id,
-                                    session.engine_thread_id,
-                                    metadata_raw,
-                                    value
-                                );
-                                metadata_raw.clone()
-                            }
-                            Err(error) => {
-                                log::warn!(
-                                    "Claude 会话数据库 metadata 解析失败: workspace_id={} session_id={} raw={} error={error}",
-                                    workspace_id,
-                                    session.engine_thread_id,
-                                    metadata_raw
-                                );
-                                metadata_raw.clone()
-                            }
-                        }
-                    };
-                    let title_to_write = if manual_title {
-                        existing_title
-                    } else {
-                        Some(session.title)
-                    };
-                    let final_branch = if remote_time_is_newer {
-                        "mark_sync_required=1"
-                    } else {
-                        "preserve_existing_flag"
-                    };
-                    log::info!(
-                        "Claude 会话持久化分支: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} existing_claude_sync_required={} final_branch={}",
-                        workspace_id,
-                        session.engine_thread_id,
-                        session.updated_at,
-                        db_last_activity_at,
-                        claude_sync_required,
-                        final_branch
-                    );
-                    tx.execute(
-                        "UPDATE threads
-                         SET title = ?1,
-                             engine_metadata_json = ?2,
-                             last_activity_at = ?3,
-                             claude_sync_required = CASE
-                                 WHEN ?4 THEN 1
-                                 ELSE ?5
-                             END
-                         WHERE id = ?6",
-                        params![
-                            title_to_write,
-                            metadata_to_write,
-                            remote_time_local,
-                            remote_time_is_newer,
-                            claude_sync_required,
-                            thread_id,
-                        ],
-                    )
-                    .context("failed update Claude remote thread snapshot")?;
-                }
-
-                tx.commit()
-                    .context("failed commit Claude remote thread import transaction")?;
-                log::info!(
-                    "Claude 会话事务提交成功: workspace_id={} engine_id=claude processed_session_count={}",
-                    workspace_id,
-                    session_count
-                );
-                Ok(())
-            }
-        })
-        .await
-        .context("Claude remote thread import task failed")
-        .and_then(|result| result);
-        if let Err(error) = import_result {
-            log::error!(
-                "Claude 会话持久化失败: workspace_id={} engine_id=claude processed_session_count={} error={error:#}",
-                workspace.id,
-                session_count
-            );
-            return Err(error);
-        }
-        return Ok(());
-    }
-
-    for session in sessions {
-        let workspace_id = workspace.id.clone();
-        let engine_id = engine_id.to_string();
-        tokio::task::spawn_blocking({
-            let db = db.clone();
-            move || {
-                threads::upsert_ssh_remote_thread_snapshot(
-                    db.as_ref(),
-                    &workspace_id,
-                    &engine_id,
-                    &session.engine_thread_id,
-                    &session.model_id,
-                    &session.title,
-                    session.status,
-                    &session.metadata,
-                    session.reasoning_effort.as_deref(),
-                    session.updated_at.as_deref(),
-                )
-            }
-        })
-        .await
-        .context("persist remote session task failed")??;
-    }
-    Ok(())
-}
-
-pub(crate) async fn list_codex_sessions(
-    local_port: u16,
-    cwd: &str,
-) -> Result<Vec<RemoteSessionSnapshot>> {
-    // 旧接口接收完整 SshCliTunnel：
-    // pub(crate) async fn list_codex_sessions(tunnel: &SshCliTunnel, cwd: &str) ...
-    // CLI 实现现在只从远端服务生命周期取得服务入口，不再向业务函数暴露 Tunnel。
-    let (mut socket, _) = connect_async(format!("ws://127.0.0.1:{local_port}/"))
-        .await
-        .context("connect Codex SSH tunnel")?;
-    let mut request_id = 1_u64;
-    send_ws_request(&mut socket, &mut request_id, "initialize", json!({"clientInfo":{"name":"auracoder-ssh-sync","title":"AuraCoder SSH Sync","version":"0"},"capabilities":{"experimentalApi":true}})).await?;
-    socket
-        .send(Message::Text(
-            json!({"method":"initialized","params":{}})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .map_err(|error| anyhow::anyhow!("send Codex initialized notification failed: {error}"))?;
-    let mut cursor: Option<String> = None;
-    let mut out = Vec::new();
-    for _ in 0..MAX_PAGES {
-        let response = send_ws_request(
-            &mut socket,
-            &mut request_id,
-            "thread/list",
-            json!({
-                "cursor": cursor,
-                "limit": 100,
-                "archived": false,
-                "sortKey": "updated_at",
-                "cwd": cwd,
-            }),
-        )
-        .await?;
-        for value in response
-            .get("data")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            // if let Some(session) = parse_codex_session(value, cwd) {
-            //     out.push(session);
-            // }
-            if let Some((mut session, title_needs_read)) = parse_codex_session(value, cwd) {
-                if title_needs_read {
-                    match send_ws_request(
-                        &mut socket,
-                        &mut request_id,
-                        "thread/read",
-                        json!({
-                            "threadId": session.engine_thread_id.clone(),
-                            "includeTurns": false,
-                        }),
-                    )
-                    .await
-                    {
-                        Ok(response) => {
-                            if let Some((resolved, false)) = parse_codex_session(&response, cwd) {
-                                session = resolved;
-                            }
-                        }
-                        Err(error) => log::warn!(
-                            "读取 SSH 远端 Codex 会话标题失败: thread_id={} error={error:#}",
-                            session.engine_thread_id
-                        ),
-                    }
-                }
-                out.push(session);
-            }
-        }
-        cursor = response
-            .get("nextCursor")
-            .or_else(|| response.get("next_cursor"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if cursor.is_none() {
-            break;
-        }
-    }
-    Ok(out)
-}
-
-async fn send_ws_request<S>(
-    socket: &mut S,
-    next_id: &mut u64,
-    method: &str,
-    params: Value,
-) -> Result<Value>
-where
-    S: futures::Sink<Message>
-        + futures::Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
-        + Unpin,
-    S::Error: std::fmt::Display,
-{
-    let id = *next_id;
-    *next_id += 1;
-    socket
-        .send(Message::Text(
-            json!({"id":id,"method":method,"params":params})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .map_err(|error| anyhow::anyhow!("send Codex RPC failed: {error}"))?;
-    loop {
-        let message = tokio::time::timeout(REQUEST_TIMEOUT, socket.next())
-            .await
-            .context("Codex RPC timeout")?
-            .ok_or_else(|| anyhow::anyhow!("Codex WebSocket closed"))??;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        let value: Value = serde_json::from_str(&text).context("parse Codex RPC")?;
-        if value.get("id").and_then(Value::as_u64) != Some(id) {
-            continue;
-        }
-        if let Some(error) = value.get("error") {
-            anyhow::bail!("Codex RPC error: {error}");
-        }
-        return Ok(value.get("result").cloned().unwrap_or(Value::Null));
-    }
-}
-
-fn parse_codex_session(value: &Value, expected_cwd: &str) -> Option<(RemoteSessionSnapshot, bool)> {
-    let thread = value.get("thread").unwrap_or(value);
-    let cwd = string_field(thread, &["cwd"])?;
-    if cwd != expected_cwd {
-        return None;
-    }
-    let id = string_field(thread, &["id"])?;
-    let updated = number_field(thread, &["updatedAt", "updated_at"])
-        .or_else(|| number_field(thread, &["createdAt", "created_at"]));
-    // let title = string_field(value, &["name", "threadName", "title"])
-    //     .or_else(|| string_field(thread, &["name", "threadName", "title"]))
-    //     .unwrap_or_else(|| id.clone());
-    let explicit_title = string_field(value, &["name", "threadName", "title"])
-        .or_else(|| string_field(thread, &["name", "threadName", "title"]))
-        .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|title| !title.is_empty());
-    let preview = string_field(value, &["preview"])
-        .or_else(|| string_field(thread, &["preview"]))
-        .map(|preview| preview.trim().to_string())
-        .filter(|preview| !preview.is_empty());
-    let title_needs_read = explicit_title.is_none()
-        && preview
-            .as_deref()
-            .is_none_or(|preview| preview.starts_with("<<ccr:") && preview.ends_with(">>"));
-    let title = explicit_title
-        .or_else(|| {
-            preview
-                .as_deref()
-                .filter(|_| !title_needs_read)
-                .and_then(|preview| preview.lines().next())
-                .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
-                .filter(|title| !title.is_empty())
-        })
-        .map(|title| title.chars().take(120).collect())
-        .unwrap_or_else(|| id.clone());
-    let model_id = string_field(thread, &["model", "modelId", "model_id"])
-        .or_else(|| string_field(value, &["model", "modelId", "model_id"]))
-        .unwrap_or_else(|| "unknown".to_string());
-    let reasoning_effort = string_field(thread, &["reasoningEffort", "reasoning_effort", "effort"])
-        .or_else(|| string_field(value, &["reasoningEffort", "reasoning_effort", "effort"]));
-    let model_provider = string_field(thread, &["modelProvider", "model_provider"])
-        .or_else(|| string_field(value, &["modelProvider", "model_provider"]));
-    Some((
-        RemoteSessionSnapshot {
-            engine_thread_id: id,
-            title,
-            cwd: cwd.clone(),
-            model_id,
-            updated_at: updated.map(unix_to_rfc3339),
-            status: status_from_value(value.get("status").or_else(|| thread.get("status"))),
-            metadata: json!({
-                "sshRemote": true,
-                "codexRemoteCwd": cwd,
-                "codexRemote": value,
-                "codexModelProvider": model_provider,
-            }),
-            reasoning_effort,
-        },
-        title_needs_read,
-    ))
-}
-
-/*
-旧 OpenCode 会话读取直接访问 Tunnel 和 HTTP 服务，现由 OpenCodeCli::list_sessions
-统一处理；保留旧实现作为迁移留痕，不参与编译。
-async fn list_opencode_sessions(
-    tunnel: &SshCliTunnel,
-    cwd: &str,
-) -> Result<Vec<RemoteSessionSnapshot>> {
-    let secret = tunnel
-        .remote_service_secret()
-        .context("OpenCode tunnel has no service secret")?;
-    let auth = format!("Basic {}", BASE64.encode(format!("opencode:{secret}")));
-    let values = reqwest::Client::new()
-        .get(format!("http://127.0.0.1:{}/session", tunnel.local_port()))
-        .header(reqwest::header::AUTHORIZATION, auth)
-        .query(&[("directory", cwd), ("roots", "true"), ("limit", "200")])
-        .send()
-        .await
-        .context("request OpenCode sessions")?
-        .error_for_status()
-        .context("OpenCode session request failed")?
-        .json::<Vec<Value>>()
-        .await
-        .context("parse OpenCode sessions")?;
-    Ok(values
-        .iter()
-        .filter_map(|value| parse_opencode_session(value, cwd))
-        .collect())
-}
-*/
-
-fn parse_opencode_session(value: &Value, expected_cwd: &str) -> Option<RemoteSessionSnapshot> {
-    let cwd = string_field(value, &["directory", "cwd"])?;
-    if cwd != expected_cwd {
-        return None;
-    }
-    let id = string_field(value, &["id"])?;
-    let title = string_field(value, &["title", "name"]).unwrap_or_else(|| id.clone());
-    let updated = value
-        .get("time")
-        .and_then(|time| number_field(time, &["updated"]));
-    Some(RemoteSessionSnapshot {
-        engine_thread_id: id,
-        title,
-        cwd: cwd.clone(),
-        model_id: "unknown".to_string(),
-        reasoning_effort: None,
-        updated_at: updated.map(unix_to_rfc3339),
-        status: ThreadStatusDto::Idle,
-        metadata: json!({"sshRemote":true,"opencodeRemoteCwd":cwd,"opencodeRemote":value}),
-    })
-}
-
-// Claude 会话查询已经归入 ClaudeCodeCli::list_sessions。公共刷新服务只调用统一
-// CLI 接口，不再直接通过 tunnel 调用 Claude /sessions 协议。
-// pub(crate) async fn list_claude_sessions(
-//     tunnel: &SshCliTunnel,
-//     cwd: &str,
-// ) -> Result<Vec<RemoteSessionSnapshot>> {
-//     let values = reqwest::Client::new()
-//         .get(format!("http://127.0.0.1:{}/sessions", tunnel.local_port()))
-//         .query(&[("cwd", cwd)])
-//         .send()
-//         .await
-//         .context("request Claude SSH remote sessions")?
-//         .error_for_status()
-//         .context("Claude SSH remote session request failed")?
-//         .json::<Vec<Value>>()
-//         .await
-//         .context("parse Claude SSH remote sessions")?;
-//     Ok(values
-//         .iter()
-//         .filter_map(|value| parse_claude_session(value, cwd))
-//         .collect())
-// }
-
-fn parse_claude_session(value: &Value, expected_cwd: &str) -> Option<RemoteSessionSnapshot> {
-    let cwd = string_field(value, &["cwd"])?;
-    if cwd != expected_cwd {
-        return None;
-    }
-    let id = string_field(value, &["id"])?;
-    let title = string_field(value, &["title", "name"]).unwrap_or_else(|| id.clone());
-    let updated_at = string_field(value, &["updatedAt", "updated_at"])
-        .or_else(|| number_field(value, &["updatedAt", "updated_at"]).map(unix_to_rfc3339));
-    Some(RemoteSessionSnapshot {
-        engine_thread_id: id,
-        title,
-        cwd: cwd.clone(),
-        model_id: "unknown".to_string(),
-        reasoning_effort: None,
-        updated_at,
-        status: ThreadStatusDto::Idle,
-        metadata: json!({"sshRemote":true,"claudeRemoteCwd":cwd,"claudeRemote":value}),
-    })
-}
-
-fn string_field(value: &Value, names: &[&str]) -> Option<String> {
-    names
-        .iter()
-        .find_map(|name| value.get(*name).and_then(Value::as_str).map(str::to_owned))
-}
-fn number_field(value: &Value, names: &[&str]) -> Option<i64> {
-    names
-        .iter()
-        .find_map(|name| value.get(*name).and_then(Value::as_i64))
-}
-fn unix_to_rfc3339(value: i64) -> String {
-    chrono::DateTime::from_timestamp(
-        if value > 10_000_000_000 {
-            value / 1000
-        } else {
-            value
-        },
-        0,
-    )
-    .map(|date| date.to_rfc3339())
-    .unwrap_or_default()
-}
-fn status_from_value(value: Option<&Value>) -> ThreadStatusDto {
-    match value
-        .and_then(|item| item.get("type").or(Some(item)))
-        .and_then(Value::as_str)
-    {
-        Some("inProgress") | Some("streaming") | Some("running") => ThreadStatusDto::Streaming,
-        Some("error") | Some("failed") => ThreadStatusDto::Error,
-        Some("completed") | Some("success") => ThreadStatusDto::Completed,
-        _ => ThreadStatusDto::Idle,
-    }
+    let context = CliExecutionContext::from_workspace(workspace)?;
+    cli.refresh_workspace_sessions(&context).await
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    use rusqlite::params;
-
-    fn test_database_and_workspace() -> (Database, WorkspaceDto) {
-        let path =
-            std::env::temp_dir().join(format!("auracoder-claude-refresh-{}.db", Uuid::new_v4()));
-        let db = Database::open(path).expect("failed to create test database");
-        let workspace_id = format!("workspace-{}", Uuid::new_v4());
-        let root_path = format!("/tmp/auracoder-claude-refresh-{}", Uuid::new_v4());
-        let conn = db.connect().expect("failed to connect test database");
-        conn.execute(
-            "INSERT INTO workspaces (id, name, root_path, location_kind)
-             VALUES (?1, ?2, ?3, 'local')",
-            params![workspace_id, "Test workspace", root_path],
-        )
-        .expect("failed to insert test workspace");
-        let workspace = WorkspaceDto {
-            id: workspace_id,
-            name: "Test workspace".to_string(),
-            root_path,
-            location_kind: "ssh".to_string(),
-            ssh_connection_id: Some("test-connection".to_string()),
-            connection_display_name: None,
-            connection_enabled: Some(true),
-            connection_deleted: Some(false),
-            connection_status: Some("ok".to_string()),
-            trust_level: crate::models::TrustLevelDto::Standard,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            last_opened_at: "2026-01-01T00:00:00Z".to_string(),
-        };
-        (db, workspace)
-    }
-
-    fn test_snapshot(engine_thread_id: &str, title: &str) -> RemoteSessionSnapshot {
-        RemoteSessionSnapshot {
-            engine_thread_id: engine_thread_id.to_string(),
-            title: title.to_string(),
-            cwd: "/tmp/project".to_string(),
-            model_id: String::new(),
-            reasoning_effort: None,
-            updated_at: Some("2026-08-18T10:00:00Z".to_string()),
-            status: ThreadStatusDto::Idle,
-            metadata: json!({"remote": true}),
-        }
-    }
-
-    #[tokio::test]
-    async fn claude_batch_import_inserts_all_new_sessions() {
-        let (db, workspace) = test_database_and_workspace();
-        let snapshots = vec![
-            test_snapshot("claude-new-1", "first"),
-            test_snapshot("claude-new-2", "second"),
-        ];
-
-        persist_sessions(Arc::new(db.clone()), &workspace, "claude", snapshots)
-            .await
-            .expect("Claude batch import should succeed");
-
-        let conn = db.connect().expect("failed to connect test database");
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM threads
-                 WHERE workspace_id = ?1 AND engine_id = 'claude'",
-                params![workspace.id],
-                |row| row.get(0),
-            )
-            .expect("failed to count imported Claude sessions");
-        assert_eq!(count, 2);
-        let sync_flags: Vec<i64> = conn
-            .prepare(
-                "SELECT claude_sync_required FROM threads
-                 WHERE workspace_id = ?1 AND engine_id = 'claude'
-                 ORDER BY engine_thread_id",
-            )
-            .expect("failed to prepare imported Claude sync flag query")
-            .query_map(params![workspace.id], |row| row.get(0))
-            .expect("failed to read imported Claude sync flags")
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .expect("failed to decode imported Claude sync flags");
-        assert_eq!(sync_flags, vec![1, 1]);
-    }
-
-    #[tokio::test]
-    async fn claude_batch_import_accepts_remote_limit_of_500_sessions() {
-        let (db, workspace) = test_database_and_workspace();
-        let snapshots: Vec<_> = (0..500)
-            .map(|index| {
-                test_snapshot(
-                    &format!("claude-batch-{index}"),
-                    &format!("batch title {index}"),
-                )
-            })
-            .collect();
-
-        persist_sessions(Arc::new(db.clone()), &workspace, "claude", snapshots)
-            .await
-            .expect("Claude 500-session batch import should succeed");
-
-        let conn = db.connect().expect("failed to connect test database");
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM threads
-                 WHERE workspace_id = ?1 AND engine_id = 'claude'",
-                params![workspace.id],
-                |row| row.get(0),
-            )
-            .expect("failed to count 500 imported Claude sessions");
-        assert_eq!(count, 500);
-    }
-
-        /// 验证 Claude 远端较新时只刷新允许的来源字段，并保护本地状态和配置。
-    #[tokio::test]
-    async fn claude_batch_import_updates_existing_sessions_without_overwriting_local_state() {
-        let (db, workspace) = test_database_and_workspace();
-        let conn = db.connect().expect("failed to connect test database");
-        conn.execute(
-            "INSERT INTO threads (
-                 id, workspace_id, engine_id, model_id, engine_thread_id,
-                 engine_metadata_json, title, status, archived_at,
-                 message_count, total_tokens, plan_mode, send_method,
-                 reasoning_effort, permission_mode, created_at, last_activity_at
-             ) VALUES (?1, ?2, 'claude', 'local-model', 'claude-existing',
-                       ?3, 'local-title', 'completed', ?4, 5, 42, 1, 'manual',
-                       'low', 'default', ?5, ?6)",
-            params![
-                "local-thread-id",
-                workspace.id,
-                r#"{"local":true,"manualTitle":true,"manualTitleUpdatedAt":"2026-08-17T09:00:00Z"}"#,
-                "2026-08-17T10:00:00Z",
-                "2026-08-16T10:00:00Z",
-                "2026-08-16T11:00:00Z",
-            ],
-        )
-        .expect("failed to insert existing Claude session");
-        conn.execute(
-            "INSERT INTO threads (
-                 id, workspace_id, engine_id, model_id, engine_thread_id,
-                 engine_metadata_json, title, status, archived_at,
-                 message_count, total_tokens, plan_mode, send_method,
-                 reasoning_effort, permission_mode, created_at, last_activity_at
-             ) VALUES (?1, ?2, 'claude', 'local-active-model', 'claude-existing-active',
-                       ?3, 'local-active-title', 'idle', NULL, 7, 84, 0, 'auto',
-                       'medium', 'safe', ?4, ?5)",
-            params![
-                "local-active-thread-id",
-                workspace.id,
-                r#"{"local":true,"active":true}"#,
-                "2026-08-15T10:00:00Z",
-                "2026-08-15T11:00:00Z",
-            ],
-        )
-        .expect("failed to insert active existing Claude session");
-        drop(conn);
-
-        let mut existing = test_snapshot("claude-existing", "remote-title");
-        existing.model_id = "remote-model".to_string();
-        existing.status = ThreadStatusDto::Streaming;
-        existing.reasoning_effort = Some("remote-effort".to_string());
-        existing.metadata = json!({
-            "remote": true,
-            "manualTitle": false,
-            "manualTitleUpdatedAt": "remote-value",
-            "remoteOnly": "new"
-        });
-        let mut active_existing = test_snapshot("claude-existing-active", "remote-active-title");
-        active_existing.model_id = "remote-active-model".to_string();
-        active_existing.status = ThreadStatusDto::Completed;
-        active_existing.metadata = json!({"remoteActive": true});
-        let snapshots = vec![
-            existing,
-            active_existing,
-            test_snapshot("claude-new", "new title"),
-        ];
-        persist_sessions(Arc::new(db.clone()), &workspace, "claude", snapshots)
-            .await
-            .expect("Claude mixed batch import should succeed");
-
-        let conn = db.connect().expect("failed to read Claude sessions");
-        let existing_row: (
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            String,
-            String,
-            i64,
-            i64,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            i64,
-        ) = conn
-            .query_row(
-                "SELECT title, model_id, status, archived_at, created_at, last_activity_at,
-                        COALESCE(engine_metadata_json, ''), message_count, total_tokens,
-                        plan_mode, send_method, reasoning_effort, permission_mode,
-                        claude_sync_required
-                 FROM threads
-                 WHERE workspace_id = ?1 AND engine_thread_id = 'claude-existing'",
-                params![workspace.id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                        row.get(10)?,
-                        row.get(11)?,
-                        row.get(12)?,
-                        row.get(13)?,
-                    ))
-                },
-            )
-            .expect("failed to read existing Claude session");
-        assert_eq!(existing_row.0, "local-title");
-        assert_eq!(existing_row.1, "local-model");
-        assert_eq!(existing_row.2, "completed");
-        assert_eq!(existing_row.3.as_deref(), Some("2026-08-17T10:00:00Z"));
-        assert_eq!(existing_row.4, "2026-08-16T10:00:00Z");
-        assert_eq!(
-            existing_row.5,
-            runtime_env::normalize_time_to_local("2026-08-18T10:00:00Z").unwrap()
-        );
-        assert_eq!(existing_row.7, 5);
-        assert_eq!(existing_row.8, 42);
-        assert_eq!(existing_row.9, Some(1));
-        assert_eq!(existing_row.10.as_deref(), Some("manual"));
-        assert_eq!(existing_row.11.as_deref(), Some("low"));
-        assert_eq!(existing_row.12.as_deref(), Some("default"));
-        assert_eq!(existing_row.13, 1);
-        let existing_metadata: Value = serde_json::from_str(&existing_row.6)
-            .expect("existing Claude metadata should remain valid JSON");
-        assert_eq!(existing_metadata.get("local"), Some(&json!(true)));
-        assert_eq!(existing_metadata.get("remote"), Some(&json!(true)));
-        assert_eq!(existing_metadata.get("remoteOnly"), Some(&json!("new")));
-        assert_eq!(existing_metadata.get("manualTitle"), Some(&json!(true)));
-        assert_eq!(
-            existing_metadata.get("manualTitleUpdatedAt"),
-            Some(&json!("2026-08-17T09:00:00Z"))
-        );
-
-        let active_existing_row: (String, String, String, Option<String>, String, String, String, i64, i64, Option<i64>, Option<String>, Option<String>, Option<String>, i64) = conn
-            .query_row(
-                "SELECT title, model_id, status, archived_at, created_at, last_activity_at,
-                        COALESCE(engine_metadata_json, ''), message_count, total_tokens,
-                        plan_mode, send_method, reasoning_effort, permission_mode,
-                        claude_sync_required
-                 FROM threads
-                 WHERE workspace_id = ?1 AND engine_thread_id = 'claude-existing-active'",
-                params![workspace.id],
-                |row| Ok((
-                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-                    row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
-                    row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?,
-                )),
-            )
-            .expect("failed to read active existing Claude session");
-        assert_eq!(active_existing_row.0, "remote-active-title");
-        assert_eq!(active_existing_row.1, "local-active-model");
-        assert_eq!(active_existing_row.2, "idle");
-        assert_eq!(active_existing_row.3, None);
-        assert_eq!(active_existing_row.4, "2026-08-15T10:00:00Z");
-        assert_eq!(
-            active_existing_row.5,
-            runtime_env::normalize_time_to_local("2026-08-18T10:00:00Z").unwrap()
-        );
-        assert_eq!(active_existing_row.7, 7);
-        assert_eq!(active_existing_row.8, 84);
-        assert_eq!(active_existing_row.9, Some(0));
-        assert_eq!(active_existing_row.10.as_deref(), Some("auto"));
-        assert_eq!(active_existing_row.11.as_deref(), Some("medium"));
-        assert_eq!(active_existing_row.12.as_deref(), Some("safe"));
-        assert_eq!(active_existing_row.13, 1);
-        let active_metadata: Value = serde_json::from_str(&active_existing_row.6)
-            .expect("active Claude metadata should remain valid JSON");
-        assert_eq!(active_metadata.get("local"), Some(&json!(true)));
-        assert_eq!(active_metadata.get("active"), Some(&json!(true)));
-        assert_eq!(active_metadata.get("remoteActive"), Some(&json!(true)));
-
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM threads
-                 WHERE workspace_id = ?1 AND engine_id = 'claude'",
-                params![workspace.id],
-                |row| row.get(0),
-            )
-            .expect("failed to count mixed Claude sessions");
-        assert_eq!(count, 3);
-    }
-
-    /// 验证 RFC3339 绝对时间、毫秒边界和无效时间的跳过或修复规则。
-    #[tokio::test]
-    async fn claude_refresh_compares_rfc3339_times_and_repairs_database_time() {
-        let (db, workspace) = test_database_and_workspace();
-        let conn = db.connect().expect("failed to connect test database");
-        for (thread_id, last_activity_at, metadata) in [
-            ("claude-equal-zone", Some("2026-08-18T10:00:00Z"), "{\"keep\":true}"),
-            ("claude-older", Some("2026-08-18T10:00:00Z"), "{\"keep\":true}"),
-            ("claude-millisecond", Some("2026-08-18T10:00:00.000Z"), "{\"keep\":true}"),
-            ("claude-invalid-db", Some("not-a-time"), "{\"keep\":true}"),
-            ("claude-empty-db", Some(""), "{\"keep\":true}"),
-            ("claude-invalid-remote", Some("2026-08-18T10:00:00Z"), "{\"keep\":true}"),
-            ("claude-none-remote", Some("2026-08-18T10:00:00Z"), "{\"keep\":true}"),
-            ("claude-empty-remote", Some("2026-08-18T10:00:00Z"), "{\"keep\":true}"),
-        ] {
-            conn.execute(
-                "INSERT INTO threads (
-                     id, workspace_id, engine_id, model_id, engine_thread_id,
-                     engine_metadata_json, title, status, created_at, last_activity_at
-                 ) VALUES (?1, ?2, 'claude', 'local-model', ?3, ?4, 'local-title',
-                           'completed', '2026-08-16T10:00:00Z', ?5)",
-                params![Uuid::new_v4().to_string(), workspace.id, thread_id, metadata, last_activity_at],
-            )
-            .expect("failed to insert time comparison fixture");
-        }
-        drop(conn);
-
-        let mut equal_zone = test_snapshot("claude-equal-zone", "remote-equal");
-        equal_zone.updated_at = Some("2026-08-18T12:00:00+02:00".to_string());
-        let mut older = test_snapshot("claude-older", "remote-older");
-        older.updated_at = Some("2026-08-18T09:59:59Z".to_string());
-        let mut millisecond = test_snapshot("claude-millisecond", "remote-millisecond");
-        millisecond.updated_at = Some("2026-08-18T10:00:00.001Z".to_string());
-        let mut invalid_db = test_snapshot("claude-invalid-db", "remote-invalid-db");
-        invalid_db.updated_at = Some("2026-08-18T11:00:00Z".to_string());
-        let mut empty_db = test_snapshot("claude-empty-db", "remote-empty-db");
-        empty_db.updated_at = Some("2026-08-18T11:00:00Z".to_string());
-        let mut invalid_remote = test_snapshot("claude-invalid-remote", "remote-invalid");
-        invalid_remote.updated_at = Some("not-a-time".to_string());
-        let mut none_remote = test_snapshot("claude-none-remote", "remote-none");
-        none_remote.updated_at = None;
-        let mut empty_remote = test_snapshot("claude-empty-remote", "remote-empty");
-        empty_remote.updated_at = Some("   ".to_string());
-        persist_sessions(
-            Arc::new(db.clone()),
-            &workspace,
-            "claude",
-            vec![
-                equal_zone,
-                older,
-                millisecond,
-                invalid_db,
-                empty_db,
-                invalid_remote,
-                none_remote,
-                empty_remote,
-            ],
-        )
-        .await
-        .expect("Claude time comparison should succeed");
-
-        let conn = db.connect().expect("failed to read time comparison fixtures");
-        let read_last_activity = |thread_id: &str| -> String {
-            conn.query_row(
-                "SELECT last_activity_at FROM threads
-                 WHERE workspace_id = ?1 AND engine_thread_id = ?2",
-                params![workspace.id, thread_id],
-                |row| row.get(0),
-            )
-            .expect("failed to read last activity timestamp")
-        };
-        let read_sync_flag = |thread_id: &str| -> i64 {
-            conn.query_row(
-                "SELECT claude_sync_required FROM threads
-                 WHERE workspace_id = ?1 AND engine_thread_id = ?2",
-                params![workspace.id, thread_id],
-                |row| row.get(0),
-            )
-            .expect("failed to read Claude sync flag")
-        };
-        assert_eq!(
-            runtime_env::parse_persisted_time_to_utc(&read_last_activity("claude-equal-zone"))
-                .unwrap(),
-            runtime_env::parse_persisted_time_to_utc("2026-08-18T10:00:00Z").unwrap()
-        );
-        assert_eq!(
-            runtime_env::parse_persisted_time_to_utc(&read_last_activity("claude-older"))
-                .unwrap(),
-            runtime_env::parse_persisted_time_to_utc("2026-08-18T10:00:00Z").unwrap()
-        );
-        assert_eq!(
-            read_last_activity("claude-millisecond"),
-            runtime_env::normalize_time_to_local("2026-08-18T10:00:00.001Z").unwrap()
-        );
-        assert_eq!(
-            read_last_activity("claude-invalid-db"),
-            runtime_env::normalize_time_to_local("2026-08-18T11:00:00Z").unwrap()
-        );
-        assert_eq!(
-            read_last_activity("claude-empty-db"),
-            runtime_env::normalize_time_to_local("2026-08-18T11:00:00Z").unwrap()
-        );
-        assert_eq!(
-            runtime_env::parse_persisted_time_to_utc(&read_last_activity("claude-invalid-remote"))
-                .unwrap(),
-            runtime_env::parse_persisted_time_to_utc("2026-08-18T10:00:00Z").unwrap()
-        );
-        assert_eq!(
-            runtime_env::parse_persisted_time_to_utc(&read_last_activity("claude-none-remote"))
-                .unwrap(),
-            runtime_env::parse_persisted_time_to_utc("2026-08-18T10:00:00Z").unwrap()
-        );
-        assert_eq!(
-            runtime_env::parse_persisted_time_to_utc(&read_last_activity("claude-empty-remote"))
-                .unwrap(),
-            runtime_env::parse_persisted_time_to_utc("2026-08-18T10:00:00Z").unwrap()
-        );
-        assert_eq!(read_sync_flag("claude-equal-zone"), 0);
-        assert_eq!(read_sync_flag("claude-older"), 0);
-        assert_eq!(read_sync_flag("claude-millisecond"), 1);
-        assert_eq!(read_sync_flag("claude-invalid-db"), 1);
-        assert_eq!(read_sync_flag("claude-empty-db"), 1);
-        assert_eq!(read_sync_flag("claude-invalid-remote"), 0);
-        assert_eq!(read_sync_flag("claude-none-remote"), 0);
-        assert_eq!(read_sync_flag("claude-empty-remote"), 0);
-    }
-
-    /// 验证已有非法 metadata 在远端刷新时保持原始字符串而不阻断时间更新。
-    #[tokio::test]
-    async fn claude_refresh_preserves_invalid_existing_metadata() {
-        let (db, workspace) = test_database_and_workspace();
-        let conn = db.connect().expect("failed to connect test database");
-        conn.execute(
-            "INSERT INTO threads (
-                 id, workspace_id, engine_id, model_id, engine_thread_id,
-                 engine_metadata_json, title, status, created_at, last_activity_at
-             ) VALUES (?1, ?2, 'claude', 'local-model', 'claude-invalid-metadata',
-                       ?3, 'local-title', 'completed', ?4, ?5)",
-            params![
-                "invalid-metadata-thread",
-                workspace.id,
-                "not-json",
-                "2026-08-16T10:00:00Z",
-                "2026-08-16T11:00:00Z",
-            ],
-        )
-        .expect("failed to insert invalid metadata fixture");
-        drop(conn);
-
-        let mut snapshot = test_snapshot("claude-invalid-metadata", "remote-title");
-        snapshot.updated_at = Some("2026-08-18T11:00:00Z".to_string());
-        persist_sessions(Arc::new(db.clone()), &workspace, "claude", vec![snapshot])
-            .await
-            .expect("Claude invalid metadata refresh should succeed");
-
-        let conn = db.connect().expect("failed to read invalid metadata fixture");
-        let row: (String, String, String) = conn
-            .query_row(
-                "SELECT engine_metadata_json, title, last_activity_at FROM threads
-                 WHERE workspace_id = ?1 AND engine_thread_id = 'claude-invalid-metadata'",
-                params![workspace.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("failed to read invalid metadata row");
-        assert_eq!(row.0, "not-json");
-        assert_eq!(row.1, "remote-title");
-        assert_eq!(
-            row.2,
-            runtime_env::normalize_time_to_local("2026-08-18T11:00:00Z").unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn non_claude_batch_persistence_keeps_existing_upsert_behavior() {
-        let (db, workspace) = test_database_and_workspace();
-        persist_sessions(
-            Arc::new(db.clone()),
-            &workspace,
-            "codex",
-            vec![test_snapshot("codex-session", "first title")],
-        )
-        .await
-        .expect("Codex import should succeed");
-        persist_sessions(
-            Arc::new(db.clone()),
-            &workspace,
-            "codex",
-            vec![test_snapshot("codex-session", "updated title")],
-        )
-        .await
-        .expect("Codex refresh should succeed");
-
-        let conn = db.connect().expect("failed to connect test database");
-        let (count, title): (i64, String) = conn
-            .query_row(
-                "SELECT COUNT(*), MAX(title) FROM threads
-                 WHERE workspace_id = ?1 AND engine_id = 'codex'",
-                params![workspace.id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("failed to read Codex session");
-        assert_eq!(count, 1);
-        assert_eq!(title, "updated title");
-    }
-
-    #[test]
-    fn codex_parser_filters_by_cwd() {
-        let value = json!({"thread":{"id":"same","cwd":"/a","createdAt":1}});
-        assert!(parse_codex_session(&value, "/b").is_none());
-        assert_eq!(
-            parse_codex_session(&value, "/a")
-                .unwrap()
-                .0
-                .engine_thread_id,
-            "same"
-        );
-    }
-
-    #[test]
-    fn codex_parser_uses_preview_when_explicit_title_is_missing() {
-        let value = json!({
-            "thread": {
-                "id": "thread-a",
-                "cwd": "/a",
-                "preview": "第一行标题\n后续内容",
-                "createdAt": 1
-            }
-        });
-
-        let (session, title_needs_read) = parse_codex_session(&value, "/a").unwrap();
-        assert_eq!(session.title, "第一行标题");
-        assert!(!title_needs_read);
-    }
-
-    #[test]
-    fn codex_parser_keeps_model_and_reasoning_effort() {
-        let value = json!({
-            "thread": {
-                "id": "thread-a",
-                "cwd": "/a",
-                "createdAt": 1,
-                "model": "gpt-5.6-terra",
-                "modelProvider": "llm_router",
-                "reasoningEffort": "high"
-            }
-        });
-
-        let (session, _) = parse_codex_session(&value, "/a").unwrap();
-        assert_eq!(session.model_id, "gpt-5.6-terra");
-        assert_eq!(session.reasoning_effort.as_deref(), Some("high"));
-        /*
-        // 旧实现把思考强度镜像写入 metadata，已停用：
-        assert_eq!(
-            session.metadata.get("reasoningEffort"),
-            Some(&json!("high"))
-        );
-        */
-        assert_eq!(
-            session.metadata.get("codexModelProvider"),
-            Some(&json!("llm_router"))
-        );
-    }
-
-    #[test]
-    fn codex_parser_marks_compacted_preview_for_thread_read() {
-        let value = json!({
-            "thread": {
-                "id": "thread-a",
-                "cwd": "/a",
-                "preview": "<<ccr:8859c5dfe071,string,279B>>",
-                "createdAt": 1
-            }
-        });
-
-        let (session, title_needs_read) = parse_codex_session(&value, "/a").unwrap();
-        assert_eq!(session.title, "thread-a");
-        assert!(title_needs_read);
-    }
-    #[test]
-    fn opencode_parser_filters_by_cwd() {
-        let value = json!({"id":"same","directory":"/a","time":{"updated":2}});
-        assert!(parse_opencode_session(&value, "/b").is_none());
-        assert_eq!(parse_opencode_session(&value, "/a").unwrap().cwd, "/a");
-    }
-
-    #[test]
-    fn claude_parser_filters_by_cwd_and_keeps_remote_timestamp() {
-        let value = json!({
-            "id":"same",
-            "cwd":"/a",
-            "title":"remote claude",
-            "updatedAt":"2026-08-14T09:00:00.000Z"
-        });
-        assert!(parse_claude_session(&value, "/b").is_none());
-        let session = parse_claude_session(&value, "/a").unwrap();
-        assert_eq!(session.engine_thread_id, "same");
-        assert_eq!(
-            session.updated_at.as_deref(),
-            Some("2026-08-14T09:00:00.000Z")
-        );
-    }
-
-    #[test]
-    fn local_workspace_predicate_rejects_ssh_workspace() {
-        let (_db, mut workspace) = test_database_and_workspace();
-        workspace.location_kind = "local".to_string();
-        assert!(is_local_workspace(&workspace));
-        workspace.location_kind = "ssh".to_string();
-        assert!(!is_local_workspace(&workspace));
-    }
-}
+#[path = "../tests/unit/project_session_refresh_tests.rs"]
+mod tests;

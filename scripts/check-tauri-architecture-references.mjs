@@ -569,6 +569,28 @@ function addMissingFinding(findings, file, rule, match, direction) {
 }
 
 /**
+ * 判断 REF-09 命中是否完整位于公共会话刷新服务的两个精确数据库导入语句中。
+ * @param {ReturnType<typeof readCodeSource>} source 文件快照。
+ * @param {{text: string, index: number}} match REF-09 的单次命中。
+ * @returns {boolean} 命中完全处于允许的 use 语句时返回 true。
+ */
+function isAllowedRefreshDatabaseImportMatch(source, match) {
+  if (source.path !== "src-tauri/src/remote_project_session_refresh_service.rs") {
+    return false;
+  }
+  const allowedPatterns = [
+    /^\s*use\s+crate\s*::\s*db\s*::\s*Database\s*;/gm,
+    /^\s*use\s+crate\s*::\s*db\s*::\s*workspaces\s*::\s*\{\s*(?:find_workspace_by_id\s*,\s*list_workspaces|list_workspaces\s*,\s*find_workspace_by_id)\s*\}\s*;/gm,
+  ];
+  return allowedPatterns.some((pattern) =>
+    findMatches(source.clean, pattern).some((statement) => {
+      const statementEnd = statement.index + statement.text.length;
+      const matchEnd = match.index + match.text.length;
+      return match.index >= statement.index && matchEnd <= statementEnd;
+    }),
+  );
+}
+/**
  * 将文件中的规则匹配转换为带原始行内容的违规结果。
  * @param {ReturnType<typeof readCodeSource>} source 文件快照。
  * @param {ReturnType<typeof defineRule>} rule 适用规则。
@@ -576,6 +598,9 @@ function addMissingFinding(findings, file, rule, match, direction) {
  */
 function sourceRuleMatchesToFindings(source, rule) {
   return findMatches(source.clean, rule.pattern).filter((match) => {
+    if (rule.rule === "REF-09" && isAllowedRefreshDatabaseImportMatch(source, match)) {
+      return false;
+    }
     if (rule.rule !== "REF-10" || source.path !== "src-tauri/src/lib.rs") {
       return true;
     }
@@ -675,13 +700,14 @@ function isDatabaseImplementationPath(filePath) {
  * @returns {ReturnType<typeof defineRule>[]} 文件适用的数据库访问规则。
  */
 function databaseRulesForPath(filePath) {
+  const normalized = normalizePath(filePath);
   if (isDatabaseImplementationPath(filePath)) {
     return [];
   }
 
   const direction =
     "业务数据库访问仅允许已列明的 CLI Service、公共基础实现 BaseCliMcp、聊天 Service ChatService、定时任务管理器和 ThreadService 调用 Mapper；其他调用方应进入对应 Service，SQL 保留在 Mapper 层。";
-  return [
+  const rules = [
     defineRule("REF-09", /\b(?:db|mapper|mappers)\s*::/g, direction),
     defineRule(
       "REF-09",
@@ -710,6 +736,16 @@ function databaseRulesForPath(filePath) {
       direction,
     ),
   ];
+  if (normalized === "src-tauri/src/remote_project_session_refresh_service.rs") {
+    rules.push(
+      defineRule(
+        "REF-09",
+        /\bworkspaces\s*::\s*(?!list_workspaces\b|find_workspace_by_id\b)[A-Za-z_]\w*/g,
+        direction,
+      ),
+    );
+  }
+  return rules;
 }
 
 /**
@@ -1347,6 +1383,44 @@ function runSelfChecks() {
     "REF-09 必须检查仓库根目录 tests 源码",
   );
 
+  // 公共刷新服务只允许两个精确 workspace 查询导入，其他数据库访问仍须报告。
+  const refreshServicePath = "src-tauri/src/remote_project_session_refresh_service.rs";
+  const allowedRefreshImports =
+    "use crate::db::Database;\nuse crate::db::workspaces::{find_workspace_by_id, list_workspaces};";
+  assert.equal(
+    findSampleFindings(refreshServicePath, allowedRefreshImports).some(
+      (finding) => finding.rule === "REF-09",
+    ),
+    false,
+    "REF-09 必须只允许公共刷新服务的两个精确数据库 use",
+  );
+  for (const snippet of [
+    "db::threads::get_thread();",
+    "use crate::db::{threads, Database};",
+    "workspaces::upsert_workspace();",
+    "db.connect();",
+    'conn.execute("query");',
+    "rusqlite::Connection;",
+  ]) {
+    assert.ok(
+      findSampleFindings(refreshServicePath, snippet).some(
+        (finding) => finding.rule === "REF-09",
+      ),
+      "公共刷新服务仍须报告 REF-09 引用: " + snippet,
+    );
+  }
+  assert.ok(
+    findSampleFindings(refreshServicePath, "commands::chat::send_message();").some(
+      (finding) => finding.rule === "REF-10",
+    ),
+    "公共刷新服务仍须报告 Controller 反向调用",
+  );
+  assert.ok(
+    findSampleFindings("src-tauri/src/services/other.rs", "use crate::db::Database;").some(
+      (finding) => finding.rule === "REF-09",
+    ),
+    "普通 Service 不得继承公共刷新服务的数据库导入例外",
+  );
   const commentedAndStringSample = `
     // use crate::local_cli_service_lifecycle::LocalCliServiceLifecycle;
     /* use crate::ssh::cli_tunnel_registry::SshCliTunnel; */

@@ -70,6 +70,69 @@ fn matches_claude_session_search(session: &ClaudeSessionSummary, query: Option<&
     })
 }
 
+/// 将 Claude SSH /sessions 返回值转换为统一快照，并应用搜索和 workspace 目录过滤。
+pub(crate) fn parse_ssh_session(
+    value: &Value,
+    expected_cwd: &str,
+    query: Option<&str>,
+) -> Option<CliSessionSnapshot> {
+    let cwd = value.get("cwd")?.as_str()?.to_string();
+    if !path_utils::paths_equal(&cwd, expected_cwd) {
+        return None;
+    }
+    let engine_thread_id = value.get("id")?.as_str()?.to_string();
+    let title = value
+        .get("title")
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| engine_thread_id.clone());
+    if query.is_some_and(|query| {
+        !title.to_lowercase().contains(&query.to_lowercase())
+            && !engine_thread_id.contains(query)
+    }) {
+        return None;
+    }
+    let updated_at = value
+        .get("updatedAt")
+        .or_else(|| value.get("updated_at"))
+        .and_then(|value| {
+            value.as_str().map(str::to_string).or_else(|| {
+                value.as_i64().and_then(|timestamp| {
+                    chrono::DateTime::from_timestamp(
+                        if timestamp > 10_000_000_000 {
+                            timestamp / 1000
+                        } else {
+                            timestamp
+                        },
+                        0,
+                    )
+                    .map(|date| date.to_rfc3339())
+                })
+            })
+        });
+    Some(CliSessionSnapshot {
+        engine_thread_id,
+        title,
+        preview: None,
+        cwd: cwd.clone(),
+        model_id: "unknown".to_string(),
+        reasoning_effort: None,
+        created_at: None,
+        updated_at,
+        source_kind: Some("claude".to_string()),
+        raw_status: Some("idle".to_string()),
+        active_flags: Vec::new(),
+        status: ThreadStatusDto::Idle,
+        archived: false,
+        metadata: json!({
+            "sshRemote": true,
+            "claudeRemoteCwd": cwd,
+            "claudeRemote": value,
+        }),
+    })
+}
+
 /// 将 Claude Code 完整 JSONL 历史转换为 AuraCoder 线程同步快照，保留文本、思考、工具和错误信息。
 fn build_claude_thread_sync_snapshot(
     session_id: &str,
@@ -927,6 +990,299 @@ impl ClaudeCodeCli {
     }
 }
 
+impl ClaudeCodeCli {
+    /// 在一个事务中按 Claude 时间、元数据和手工标题规则导入或更新项目会话。
+    pub(crate) async fn persist_session_snapshots(
+        db: Arc<db::Database>,
+        workspace: &WorkspaceDto,
+        sessions: Vec<CliSessionSnapshot>,
+    ) -> Result<()> {
+        log::info!(
+            "Claude 会话持久化开始: workspace_id={} session_count={}",
+            workspace.id,
+            sessions.len()
+        );
+        if sessions.is_empty() {
+            return Ok(());
+        }
+
+        let session_count = sessions.len();
+        let import_result = tokio::task::spawn_blocking({
+            let workspace_id = workspace.id.clone();
+            move || -> Result<()> {
+                // 在单个 Mapper 事务内先读取既有记录，再由 Service 决策并完成整批写入。
+                db::threads::with_session_refresh_transaction(db.as_ref(), |tx| {
+                    for session in sessions {
+                        // 远端时间必须能解析并转换成本地时间，非法或缺失时保留既有记录。
+                        let remote_time = match session.updated_at.as_deref() {
+                            Some(raw) if !raw.trim().is_empty() => {
+                                match chrono::DateTime::parse_from_rfc3339(raw.trim()) {
+                                    Ok(value) => match runtime_env::normalize_time_to_local(raw) {
+                                        Ok(local) => Some((value.with_timezone(&chrono::Utc), local)),
+                                        Err(error) => {
+                                            log::warn!(
+                                                "Claude 会话远端时间本地化失败: workspace_id={} session_id={} raw={} error={error:#}",
+                                                workspace_id,
+                                                session.engine_thread_id,
+                                                raw
+                                            );
+                                            None
+                                        }
+                                    },
+                                    Err(error) => {
+                                        log::warn!(
+                                            "Claude 会话远端时间解析失败: workspace_id={} session_id={} raw={} error={error}",
+                                            workspace_id,
+                                            session.engine_thread_id,
+                                            raw
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            Some(raw) => {
+                                log::warn!(
+                                    "Claude 会话远端时间缺失: workspace_id={} session_id={} raw={}",
+                                    workspace_id,
+                                    session.engine_thread_id,
+                                    raw
+                                );
+                                None
+                            }
+                            None => {
+                                log::warn!(
+                                    "Claude 会话远端时间缺失: workspace_id={} session_id={}",
+                                    workspace_id,
+                                    session.engine_thread_id
+                                );
+                                None
+                            }
+                        };
+
+                        // 按 workspace、Claude 引擎和原生会话 ID 获取时间比较与更新所需字段。
+                        let existing = db::threads::find_session_refresh_record(
+                            tx,
+                            &workspace_id,
+                            "claude",
+                            &session.engine_thread_id,
+                        )?;
+                        log::debug!(
+                            "Claude 会话扫描结果: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} existing_claude_sync_required={:?}",
+                            workspace_id,
+                            session.engine_thread_id,
+                            session.updated_at,
+                            existing.as_ref().and_then(|record| record.last_activity_at.as_deref()),
+                            existing.as_ref().map(|record| record.claude_sync_required)
+                        );
+
+                        let Some(existing) = existing else {
+                            log::info!(
+                                "Claude 会话持久化分支: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw=None existing_claude_sync_required=None final_branch=insert_new(flag=1)",
+                                workspace_id,
+                                session.engine_thread_id,
+                                session.updated_at
+                            );
+                            let created_at = runtime_env::system_time_rfc3339();
+                            let last_activity_at = remote_time
+                                .as_ref()
+                                .map(|(_, local)| local.as_str())
+                                .unwrap_or(&created_at);
+                            let model_id = if session.model_id.trim().is_empty() {
+                                "unknown"
+                            } else {
+                                session.model_id.trim()
+                            };
+                            let thread_id = uuid::Uuid::new_v4().to_string();
+                            let metadata_json = session.metadata.to_string();
+                            let insert_record = db::threads::SessionRefreshInsertRecord {
+                                id: &thread_id,
+                                workspace_id: &workspace_id,
+                                engine_id: "claude",
+                                model_id,
+                                engine_thread_id: &session.engine_thread_id,
+                                engine_metadata_json: &metadata_json,
+                                title: &session.title,
+                                status: session.status.as_str(),
+                                reasoning_effort: session.reasoning_effort.as_deref(),
+                                last_activity_at,
+                                created_at: &created_at,
+                                claude_sync_required: 1,
+                            };
+                            db::threads::insert_session_refresh_record(tx, &insert_record)?;
+                            continue;
+                        };
+
+                        let Some((remote_time, remote_time_local)) = remote_time else {
+                            log::info!(
+                                "Claude 会话持久化分支: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} existing_claude_sync_required={} final_branch=skip_missing_remote_timestamp",
+                                workspace_id,
+                                session.engine_thread_id,
+                                session.updated_at,
+                                existing.last_activity_at,
+                                existing.claude_sync_required
+                            );
+                            continue;
+                        };
+
+                        // 比较远端 UTC 时间与数据库本地时间，数据库时间无法解析时保留原修复策略。
+                        let db_time = match existing.last_activity_at.as_deref() {
+                            Some(raw) if !raw.trim().is_empty() => {
+                                match runtime_env::parse_persisted_time_to_utc(raw) {
+                                    Ok(value) => Some(value),
+                                    Err(error) => {
+                                        log::warn!(
+                                            "Claude 会话数据库时间解析失败: workspace_id={} session_id={} raw={} error={error:#}",
+                                            workspace_id,
+                                            session.engine_thread_id,
+                                            raw
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            Some(raw) => {
+                                log::warn!(
+                                    "Claude 会话数据库时间缺失: workspace_id={} session_id={} raw={}",
+                                    workspace_id,
+                                    session.engine_thread_id,
+                                    raw
+                                );
+                                None
+                            }
+                            None => None,
+                        };
+                        log::debug!(
+                            "Claude 会话时间比较: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} remote_time_utc={} database_time_utc={:?}",
+                            workspace_id,
+                            session.engine_thread_id,
+                            session.updated_at,
+                            existing.last_activity_at,
+                            remote_time,
+                            db_time
+                        );
+                        if db_time.is_some_and(|value| remote_time <= value) {
+                            log::info!(
+                                "Claude 会话持久化分支: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} existing_claude_sync_required={} final_branch=skip_not_newer",
+                                workspace_id,
+                                session.engine_thread_id,
+                                session.updated_at,
+                                existing.last_activity_at,
+                                existing.claude_sync_required
+                            );
+                            continue;
+                        }
+
+                        // 保留既有更新时间修复、手工标题和用户元数据字段的判断顺序。
+                        let remote_time_is_newer =
+                            db_time.map(|value| remote_time > value).unwrap_or(true);
+                        let mut manual_title = false;
+                        let metadata_raw = existing.engine_metadata_json.clone().unwrap_or_default();
+                        let metadata_to_write = if metadata_raw.trim().is_empty() {
+                            let mut metadata = serde_json::Map::new();
+                            if let Value::Object(remote_metadata) = &session.metadata {
+                                metadata.extend(remote_metadata.clone());
+                            }
+                            Value::Object(metadata).to_string()
+                        } else {
+                            match serde_json::from_str::<Value>(&metadata_raw) {
+                                Ok(Value::Object(mut metadata)) => {
+                                    let existing_manual_title = metadata.get("manualTitle").cloned();
+                                    let existing_manual_title_updated_at =
+                                        metadata.get("manualTitleUpdatedAt").cloned();
+                                    manual_title = existing_manual_title
+                                        .as_ref()
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false);
+                                    if let Value::Object(remote_metadata) = &session.metadata {
+                                        metadata.extend(remote_metadata.clone());
+                                    }
+                                    if let Some(value) = existing_manual_title {
+                                        metadata.insert("manualTitle".to_string(), value);
+                                    }
+                                    if let Some(value) = existing_manual_title_updated_at {
+                                        metadata.insert("manualTitleUpdatedAt".to_string(), value);
+                                    }
+                                    Value::Object(metadata).to_string()
+                                }
+                                Ok(value) => {
+                                    log::warn!(
+                                        "Claude 会话数据库 metadata 不是 JSON object: workspace_id={} session_id={} raw={} value={}",
+                                        workspace_id,
+                                        session.engine_thread_id,
+                                        metadata_raw,
+                                        value
+                                    );
+                                    metadata_raw.clone()
+                                }
+                                Err(error) => {
+                                    log::warn!(
+                                        "Claude 会话数据库 metadata 解析失败: workspace_id={} session_id={} raw={} error={error}",
+                                        workspace_id,
+                                        session.engine_thread_id,
+                                        metadata_raw
+                                    );
+                                    metadata_raw.clone()
+                                }
+                            }
+                        };
+                        let title_to_write = if manual_title {
+                            existing.title
+                        } else {
+                            Some(session.title)
+                        };
+                        let final_branch = if remote_time_is_newer {
+                            "mark_sync_required=1"
+                        } else {
+                            "preserve_existing_flag"
+                        };
+                        log::info!(
+                            "Claude 会话持久化分支: workspace_id={} engine_thread_id={} remote_updated_at_raw={:?} database_last_activity_at_raw={:?} existing_claude_sync_required={} final_branch={}",
+                            workspace_id,
+                            session.engine_thread_id,
+                            session.updated_at,
+                            existing.last_activity_at,
+                            existing.claude_sync_required,
+                            final_branch
+                        );
+                        let sync_required = if remote_time_is_newer {
+                            1
+                        } else {
+                            existing.claude_sync_required
+                        };
+                        db::threads::update_session_refresh_record(
+                            tx,
+                            &existing.id,
+                            title_to_write.as_deref(),
+                            &metadata_to_write,
+                            &remote_time_local,
+                            sync_required,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+                log::info!(
+                    "Claude 会话事务提交成功: workspace_id={} engine_id=claude processed_session_count={}",
+                    workspace_id,
+                    session_count
+                );
+                Ok(())
+            }
+        })
+        .await
+        .context("Claude remote thread import task failed")
+        .and_then(|result| result);
+        if let Err(error) = import_result {
+            log::error!(
+                "Claude 会话持久化失败: workspace_id={} engine_id=claude processed_session_count={} error={error:#}",
+                workspace.id,
+                session_count
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl CliTool for ClaudeCodeCli {
     /// 使用同一个 Claude 实例委托公共流程完成用户消息发送。
@@ -1508,6 +1864,46 @@ impl CliTool for ClaudeCodeCli {
         Ok(false)
     }
 
+    /// 刷新 Claude 项目会话，排除 command-only 记录后按原批量事务规则保存。
+    async fn refresh_workspace_sessions(&self, context: &CliExecutionContext) -> Result<()> {
+        // 通过 Claude 统一列表读取快照，再执行当前 workspace 的原业务过滤。
+        let workspace = self.load_workspace(context).await?;
+        let sessions = self.list_sessions(context, None, Some(false)).await?;
+        let returned_session_count = sessions.len();
+        let sessions = sessions
+            .into_iter()
+            .filter(|session| path_utils::paths_equal(&session.cwd, &workspace.root_path))
+            .collect::<Vec<_>>();
+        let filtered_session_count = sessions.len();
+        let mut skipped_command_only_session_ids = Vec::new();
+        let sessions = sessions
+            .into_iter()
+            .filter(|session| {
+                let is_command_only = session
+                    .metadata
+                    .get("claudeRemote")
+                    .and_then(|claude_remote| claude_remote.get("conversationKind"))
+                    .and_then(Value::as_str)
+                    == Some("command_only");
+                if is_command_only {
+                    skipped_command_only_session_ids.push(session.engine_thread_id.clone());
+                }
+                !is_command_only
+            })
+            .collect::<Vec<_>>();
+        log::info!(
+            "Claude list_sessions cwd 过滤完成: workspace_id={} workspace_root_path={} cli_id=claude returned_session_count={} filtered_session_count={} skipped_command_only_count={} skipped_command_only_session_ids={:?}",
+            workspace.id,
+            workspace.root_path,
+            returned_session_count,
+            filtered_session_count,
+            skipped_command_only_session_ids.len(),
+            skipped_command_only_session_ids
+        );
+        // 交给 Claude Service helper 在单事务中应用远端时间和本地配置保护规则。
+        Self::persist_session_snapshots(Arc::new(self.state.db.clone()), &workspace, sessions).await
+    }
+
     async fn list_sessions(
         &self,
         context: &CliExecutionContext,
@@ -1596,61 +1992,7 @@ impl CliTool for ClaudeCodeCli {
             values
                 .into_iter()
                 .filter_map(|value| {
-                    let cwd = value.get("cwd")?.as_str()?.to_string();
-                    if !path_utils::paths_equal(&cwd, &workspace.root_path) {
-                        return None;
-                    }
-                    let engine_thread_id = value.get("id")?.as_str()?.to_string();
-                    let title = value
-                        .get("title")
-                        .or_else(|| value.get("name"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| engine_thread_id.clone());
-                    if query.is_some_and(|query| {
-                        !title.to_lowercase().contains(&query.to_lowercase())
-                            && !engine_thread_id.contains(query)
-                    }) {
-                        return None;
-                    }
-                    let updated_at = value
-                        .get("updatedAt")
-                        .or_else(|| value.get("updated_at"))
-                        .and_then(|value| {
-                            value.as_str().map(str::to_string).or_else(|| {
-                                value.as_i64().and_then(|timestamp| {
-                                    chrono::DateTime::from_timestamp(
-                                        if timestamp > 10_000_000_000 {
-                                            timestamp / 1000
-                                        } else {
-                                            timestamp
-                                        },
-                                        0,
-                                    )
-                                    .map(|date| date.to_rfc3339())
-                                })
-                            })
-                        });
-                    Some(CliSessionSnapshot {
-                        engine_thread_id,
-                        title,
-                        preview: None,
-                        cwd: cwd.clone(),
-                        model_id: "unknown".to_string(),
-                        reasoning_effort: None,
-                        created_at: None,
-                        updated_at,
-                        source_kind: Some("claude".to_string()),
-                        raw_status: Some("idle".to_string()),
-                        active_flags: Vec::new(),
-                        status: ThreadStatusDto::Idle,
-                        archived: false,
-                        metadata: json!({
-                            "sshRemote": true,
-                            "claudeRemoteCwd": cwd,
-                            "claudeRemote": value,
-                        }),
-                    })
+                    parse_ssh_session(&value, &workspace.root_path, query)
                 })
                 .collect()
         })

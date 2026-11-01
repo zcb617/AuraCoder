@@ -56,6 +56,14 @@ pub struct OpenCodeCli {
     local_engines: Arc<Mutex<HashMap<String, (u64, Arc<OpenCodeEngine>)>>>,
 }
 
+/// 保留目录与当前 workspace 根目录精确匹配的 OpenCode 刷新快照。
+pub(crate) fn session_for_refresh(
+    session: CliSessionSnapshot,
+    expected_cwd: &str,
+) -> Option<CliSessionSnapshot> {
+    path_utils::paths_equal(&session.cwd, expected_cwd).then_some(session)
+}
+
 impl OpenCodeCli {
     pub fn new(state: AppState) -> Self {
         Self::with_mcp_runtime(
@@ -263,7 +271,11 @@ impl OpenCodeCli {
         Ok(sessions)
     }
 
-    fn map_session(summary: OpenCodeRemoteSessionSummary, is_ssh: bool) -> CliSessionSnapshot {
+    /// 将 OpenCode 会话摘要映射为统一 CLI 会话快照供刷新和列表展示。
+    pub(crate) fn map_session(
+        summary: OpenCodeRemoteSessionSummary,
+        is_ssh: bool,
+    ) -> CliSessionSnapshot {
         let timestamp_to_rfc3339 = |timestamp: i64| {
             let (seconds, nanos) = if timestamp > 10_000_000_000 {
                 (timestamp / 1000, ((timestamp % 1000) as u32) * 1_000_000)
@@ -1074,6 +1086,64 @@ impl CliTool for OpenCodeCli {
             .into_iter()
             .map(|summary| Self::map_session(summary, is_ssh))
             .collect())
+    }
+
+    /// 刷新 OpenCode 项目会话，并在所有刷新结果后关闭该项目的临时服务。
+    async fn refresh_workspace_sessions(&self, context: &CliExecutionContext) -> Result<()> {
+        // 在结果块内完成 workspace 读取、CLI 列表过滤和 Mapper 持久化，以便外层总能收尾。
+        let refresh_result = async {
+            let workspace = self.load_workspace(context).await?;
+            let sessions = self.list_sessions(context, None, Some(false)).await?;
+            let sessions = sessions
+                .into_iter()
+                .filter_map(|session| session_for_refresh(session, &workspace.root_path))
+                .collect::<Vec<_>>();
+
+            // 使用既有远端线程 Mapper 保存会话快照，空结果保持本地旧记录。
+            for session in sessions {
+                let db = self.state.db.clone();
+                let workspace_id = workspace.id.clone();
+                tokio::task::spawn_blocking(move || {
+                    db::threads::upsert_ssh_remote_thread_snapshot(
+                        &db,
+                        &workspace_id,
+                        "opencode",
+                        &session.engine_thread_id,
+                        &session.model_id,
+                        &session.title,
+                        session.status,
+                        &session.metadata,
+                        session.reasoning_effort.as_deref(),
+                        session.updated_at.as_deref(),
+                    )
+                })
+                .await
+                .context("persist remote session task failed")??;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        // 无论读取或落库结果如何，都执行现有的 workspace 服务收尾。
+        let cleanup_result = self.close_workspace_service(context).await;
+        match (refresh_result, cleanup_result) {
+            (Err(refresh_error), Err(cleanup_error)) => {
+                log::warn!(
+                    "OpenCode workspace 服务收尾失败: workspace_id={} error={cleanup_error:#}; 刷新原始错误: {refresh_error:#}",
+                    context.workspace_id
+                );
+                Err(refresh_error)
+            }
+            (Err(refresh_error), Ok(())) => Err(refresh_error),
+            (Ok(()), Err(cleanup_error)) => {
+                log::warn!(
+                    "OpenCode workspace 服务收尾失败，刷新数据已提交: workspace_id={} error={cleanup_error:#}",
+                    context.workspace_id
+                );
+                Ok(())
+            }
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     async fn read_session(

@@ -285,6 +285,143 @@ pub fn upsert_ssh_remote_thread_snapshot(
         .ok_or_else(|| anyhow::anyhow!("remote thread missing after sync: {engine_thread_id}"))
 }
 
+/// Claude 刷新事务中供 Service 执行业务判断的既有线程字段。
+pub struct SessionRefreshExistingRecord {
+    /// 既有线程主键，用于后续更新目标。
+    pub id: String,
+    /// 数据库中保存的最近活动时间，用于与远端时间比较。
+    pub last_activity_at: Option<String>,
+    /// 数据库中保存的引擎元数据原文，用于保留用户维护字段。
+    pub engine_metadata_json: Option<String>,
+    /// 数据库中保存的会话标题，用于保护手工标题。
+    pub title: Option<String>,
+    /// Claude 完整历史同步标记，用于保留已有同步状态。
+    pub claude_sync_required: i64,
+}
+
+/// Claude 新建线程时由 Service 决定并提交的完整 INSERT 字段。
+pub struct SessionRefreshInsertRecord<'a> {
+    /// 新线程的主键，由 Claude Service 生成。
+    pub id: &'a str,
+    /// 新线程所属的 workspace 标识。
+    pub workspace_id: &'a str,
+    /// 新线程所属的引擎标识。
+    pub engine_id: &'a str,
+    /// 新线程采用的模型标识。
+    pub model_id: &'a str,
+    /// 引擎侧原生会话标识。
+    pub engine_thread_id: &'a str,
+    /// 远端会话元数据 JSON。
+    pub engine_metadata_json: &'a str,
+    /// 远端会话标题。
+    pub title: &'a str,
+    /// 远端会话状态。
+    pub status: &'a str,
+    /// 远端会话思考强度。
+    pub reasoning_effort: Option<&'a str>,
+    /// 远端活动时间已转换成本地时区后的值。
+    pub last_activity_at: &'a str,
+    /// Service 创建的新线程时间。
+    pub created_at: &'a str,
+    /// Service 判断的新线程完整历史同步标记。
+    pub claude_sync_required: i64,
+}
+
+/// 在单个 SQLite 事务中执行 Claude 会话刷新读写，保证整批快照原子提交。
+pub fn with_session_refresh_transaction<T>(
+    db: &Database,
+    work: impl FnOnce(&rusqlite::Transaction<'_>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut conn = db.connect().context("failed connect Claude refresh database")?;
+    let tx = conn
+        .transaction()
+        .context("failed begin Claude remote thread import transaction")?;
+    // 先在事务内完成整批业务读写，再一次性提交所有 Claude 会话快照。
+    let result = work(&tx)?;
+    tx.commit()
+        .context("failed commit Claude remote thread import transaction")?;
+    Ok(result)
+}
+
+/// 按 workspace、引擎和原生会话标识读取 Claude 刷新所需的既有线程字段。
+pub fn find_session_refresh_record(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    engine_id: &str,
+    engine_thread_id: &str,
+) -> anyhow::Result<Option<SessionRefreshExistingRecord>> {
+    tx.query_row(
+        "SELECT id, last_activity_at, engine_metadata_json, title, claude_sync_required
+         FROM threads
+         WHERE workspace_id = ?1 AND engine_id = ?2 AND engine_thread_id = ?3
+         LIMIT 1",
+        params![workspace_id, engine_id, engine_thread_id],
+        |row| {
+            Ok(SessionRefreshExistingRecord {
+                id: row.get(0)?,
+                last_activity_at: row.get(1)?,
+                engine_metadata_json: row.get(2)?,
+                title: row.get(3)?,
+                claude_sync_required: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .context("failed query existing Claude remote thread")
+}
+
+/// 插入由 Claude Service 完整决策的远端线程快照，不在 Mapper 中补默认业务值。
+pub fn insert_session_refresh_record(
+    tx: &rusqlite::Transaction<'_>,
+    record: &SessionRefreshInsertRecord<'_>,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "INSERT INTO threads (
+             id, workspace_id, engine_id, model_id, engine_thread_id,
+             engine_metadata_json, title, status, reasoning_effort,
+             last_activity_at, created_at, claude_sync_required
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            record.id,
+            record.workspace_id,
+            record.engine_id,
+            record.model_id,
+            record.engine_thread_id,
+            record.engine_metadata_json,
+            record.title,
+            record.status,
+            record.reasoning_effort,
+            record.last_activity_at,
+            record.created_at,
+            record.claude_sync_required,
+        ],
+    )
+    .context("failed insert Claude remote thread snapshot")?;
+    Ok(())
+}
+
+/// 更新 Claude Service 已完成决策的四个可变快照字段。
+pub fn update_session_refresh_record(
+    tx: &rusqlite::Transaction<'_>,
+    thread_id: &str,
+    title: Option<&str>,
+    metadata_json: &str,
+    last_activity_at: &str,
+    sync_required: i64,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE threads
+         SET title = ?1,
+             engine_metadata_json = ?2,
+             last_activity_at = ?3,
+             claude_sync_required = ?4
+         WHERE id = ?5",
+        params![title, metadata_json, last_activity_at, sync_required, thread_id],
+    )
+    .context("failed update Claude remote thread snapshot")?;
+    Ok(())
+}
+
 pub fn list_threads_for_workspace(
     db: &Database,
     workspace_id: &str,

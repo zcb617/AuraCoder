@@ -359,6 +359,9 @@ pub trait CliTool: Send + Sync {
         archived: Option<bool>,
     ) -> Result<Vec<CliSessionSnapshot>>;
 
+    /// 用户刷新当前项目的历史会话时，读取该 CLI 的会话并将本地快照完整保存后返回成功。
+    async fn refresh_workspace_sessions(&self, context: &CliExecutionContext) -> Result<()>;
+
     /// 用户选择一个已有 CLI 会话时，读取该会话的最新信息，并确认它仍属于当前项目。
     async fn read_session(
         &self,

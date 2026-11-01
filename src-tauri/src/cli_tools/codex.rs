@@ -1,12 +1,14 @@
 use std::sync::Arc;
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, time::{Duration, Instant}};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tauri::Emitter;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use super::{
     BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
@@ -37,9 +39,14 @@ use crate::{
         ApprovalResponseOutcomeDto, ApprovalResponseRequest, ChatBusinessError, ChatReviewRequest,
         CodexReviewDeliveryPayload, CodexReviewTargetPayload, SteerMessageRequest,
     },
-    path_utils, remote_project_codex_runtime_service, remote_project_session_refresh_service, ssh,
+    path_utils, remote_project_codex_runtime_service, ssh,
     state::AppState,
 };
+
+/// Codex SSH 会话刷新单次 WebSocket 请求的原有等待上限。
+const SESSION_REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Codex SSH 会话刷新保留的原有最大分页数。
+const SESSION_REFRESH_MAX_PAGES: usize = 50;
 
 /// Codex 对统一 CLI 操作接口的实现。
 ///
@@ -2838,6 +2845,32 @@ impl CliTool for CodexCli {
         }
     }
 
+    /// 刷新 Codex 项目会话并将完整快照保存到当前 workspace。
+    async fn refresh_workspace_sessions(&self, context: &CliExecutionContext) -> Result<()> {
+        // 读取当前项目的 CLI 会话并仅持久化目录精确匹配的快照。
+        let workspace = self.load_workspace(context).await?;
+        let sessions = self.list_sessions(context, None, Some(false)).await?;
+        let sessions = sessions
+            .into_iter()
+            .filter(|session| path_utils::paths_equal(&session.cwd, &workspace.root_path))
+            .collect::<Vec<_>>();
+        if let Err(error) = persist_session_snapshots(
+            Arc::new(self.state.db.clone()),
+            &workspace,
+            sessions,
+        )
+        .await
+        {
+            log::error!(
+                "Codex 项目会话刷新落库失败: workspace_id={} root_path={} error={error:#}",
+                workspace.id,
+                workspace.root_path
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
     async fn list_sessions(
         &self,
         context: &CliExecutionContext,
@@ -2855,31 +2888,13 @@ impl CliTool for CodexCli {
             let connection_id =
                 remote_project_codex_runtime_service::validate_remote_codex_workspace(&workspace)?;
             let service = ssh::cli_service_lifecycle::get(connection_id, "codex").await?;
-            let result = remote_project_session_refresh_service::list_codex_sessions(
+            let result = list_codex_sessions(
                 service.local_port(),
                 &workspace.root_path,
             )
             .await;
             // service_use.release().await;
-            let mut sessions = result?
-                .into_iter()
-                .map(|session| CliSessionSnapshot {
-                    engine_thread_id: session.engine_thread_id,
-                    title: session.title,
-                    preview: None,
-                    cwd: session.cwd,
-                    model_id: session.model_id,
-                    reasoning_effort: session.reasoning_effort.clone(),
-                    created_at: None,
-                    updated_at: session.updated_at,
-                    source_kind: None,
-                    raw_status: Some(session.status.as_str().to_string()),
-                    active_flags: Vec::new(),
-                    status: session.status,
-                    archived: false,
-                    metadata: session.metadata,
-                })
-                .collect::<Vec<_>>();
+            let mut sessions = result?;
             for session in &mut sessions {
                 if session.model_id == "unknown" || session.reasoning_effort.is_none() {
                     let engine_thread_id = session.engine_thread_id.clone();
@@ -3742,6 +3757,274 @@ impl CliTool for CodexCli {
         forward_started.await.context("等待代码审查会话失败")??;
         Ok(())
     }
+}
+
+/// 通过 Codex 的 SSH 远端服务协议读取当前目录会话，保留分页与缺少标题时的补读行为。
+async fn list_codex_sessions(local_port: u16, cwd: &str) -> Result<Vec<CliSessionSnapshot>> {
+    let (mut socket, _) = connect_async(format!("ws://127.0.0.1:{local_port}/"))
+        .await
+        .context("connect Codex SSH tunnel")?;
+    let mut request_id = 1_u64;
+    send_ws_request(
+        &mut socket,
+        &mut request_id,
+        "initialize",
+        json!({"clientInfo":{"name":"auracoder-ssh-sync","title":"AuraCoder SSH Sync","version":"0"},"capabilities":{"experimentalApi":true}}),
+    )
+    .await?;
+    socket
+        .send(Message::Text(
+            json!({"method":"initialized","params":{}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .map_err(|error| anyhow::anyhow!("send Codex initialized notification failed: {error}"))?;
+    let mut cursor: Option<String> = None;
+    let mut sessions = Vec::new();
+
+    // 按原有 50 页上限和每页 100 条读取，并对需要补读的标题逐条请求线程详情。
+    for _ in 0..SESSION_REFRESH_MAX_PAGES {
+        let response = send_ws_request(
+            &mut socket,
+            &mut request_id,
+            "thread/list",
+            json!({
+                "cursor": cursor,
+                "limit": 100,
+                "archived": false,
+                "sortKey": "updated_at",
+                "cwd": cwd,
+            }),
+        )
+        .await?;
+        for value in response
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some((mut session, title_needs_read)) = parse_codex_session(value, cwd) {
+                if title_needs_read {
+                    match send_ws_request(
+                        &mut socket,
+                        &mut request_id,
+                        "thread/read",
+                        json!({
+                            "threadId": session.engine_thread_id.clone(),
+                            "includeTurns": false,
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            if let Some((resolved, false)) = parse_codex_session(&response, cwd) {
+                                session = resolved;
+                            }
+                        }
+                        Err(error) => log::warn!(
+                            "读取 SSH 远端 Codex 会话标题失败: thread_id={} error={error:#}",
+                            session.engine_thread_id
+                        ),
+                    }
+                }
+                sessions.push(session);
+            }
+        }
+        cursor = response
+            .get("nextCursor")
+            .or_else(|| response.get("next_cursor"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(sessions)
+}
+
+/// 向 Codex WebSocket 服务发送单个 RPC 请求，并保留原始超时与错误上下文。
+async fn send_ws_request<S>(
+    socket: &mut S,
+    next_id: &mut u64,
+    method: &str,
+    params: Value,
+) -> Result<Value>
+where
+    S: futures::Sink<Message>
+        + futures::Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let id = *next_id;
+    *next_id += 1;
+    socket
+        .send(Message::Text(
+            json!({"id":id,"method":method,"params":params})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .map_err(|error| anyhow::anyhow!("send Codex RPC failed: {error}"))?;
+    loop {
+        let message = tokio::time::timeout(SESSION_REFRESH_REQUEST_TIMEOUT, socket.next())
+            .await
+            .context("Codex RPC timeout")?
+            .ok_or_else(|| anyhow::anyhow!("Codex WebSocket closed"))??;
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).context("parse Codex RPC")?;
+        if value.get("id").and_then(Value::as_u64) != Some(id) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            anyhow::bail!("Codex RPC error: {error}");
+        }
+        return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+    }
+}
+
+/// 将 Codex 远端列表或线程详情转换为统一会话快照，并标记是否需要补读标题。
+pub(crate) fn parse_codex_session(
+    value: &Value,
+    expected_cwd: &str,
+) -> Option<(CliSessionSnapshot, bool)> {
+    let thread = value.get("thread").unwrap_or(value);
+    let cwd = string_field(thread, &["cwd"])?;
+    if cwd != expected_cwd {
+        return None;
+    }
+    let id = string_field(thread, &["id"])?;
+    let updated = number_field(thread, &["updatedAt", "updated_at"])
+        .or_else(|| number_field(thread, &["createdAt", "created_at"]));
+    let explicit_title = string_field(value, &["name", "threadName", "title"])
+        .or_else(|| string_field(thread, &["name", "threadName", "title"]))
+        .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|title| !title.is_empty());
+    let preview = string_field(value, &["preview"])
+        .or_else(|| string_field(thread, &["preview"]))
+        .map(|preview| preview.trim().to_string())
+        .filter(|preview| !preview.is_empty());
+    let title_needs_read = explicit_title.is_none()
+        && preview
+            .as_deref()
+            .is_none_or(|preview| preview.starts_with("<<ccr:") && preview.ends_with(">>"));
+    let title = explicit_title
+        .or_else(|| {
+            preview
+                .as_deref()
+                .filter(|_| !title_needs_read)
+                .and_then(|preview| preview.lines().next())
+                .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|title| !title.is_empty())
+        })
+        .map(|title| title.chars().take(120).collect())
+        .unwrap_or_else(|| id.clone());
+    let model_id = string_field(thread, &["model", "modelId", "model_id"])
+        .or_else(|| string_field(value, &["model", "modelId", "model_id"]))
+        .unwrap_or_else(|| "unknown".to_string());
+    let reasoning_effort = string_field(thread, &["reasoningEffort", "reasoning_effort", "effort"])
+        .or_else(|| string_field(value, &["reasoningEffort", "reasoning_effort", "effort"]));
+    let model_provider = string_field(thread, &["modelProvider", "model_provider"])
+        .or_else(|| string_field(value, &["modelProvider", "model_provider"]));
+    let status = status_from_value(value.get("status").or_else(|| thread.get("status")));
+    Some((
+        CliSessionSnapshot {
+            engine_thread_id: id,
+            title,
+            preview: None,
+            cwd: cwd.clone(),
+            model_id,
+            reasoning_effort,
+            created_at: None,
+            updated_at: updated.map(unix_to_rfc3339),
+            source_kind: None,
+            raw_status: Some(status.as_str().to_string()),
+            active_flags: Vec::new(),
+            status,
+            archived: false,
+            metadata: json!({
+                "sshRemote": true,
+                "codexRemoteCwd": cwd,
+                "codexRemote": value,
+                "codexModelProvider": model_provider,
+            }),
+        },
+        title_needs_read,
+    ))
+}
+
+/// 从远端快照字段中按候选名称读取字符串值。
+fn string_field(value: &Value, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_str).map(str::to_owned))
+}
+
+/// 从远端快照字段中按候选名称读取整数值。
+fn number_field(value: &Value, names: &[&str]) -> Option<i64> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_i64))
+}
+
+/// 将 Codex 返回的秒或毫秒时间戳格式化为 RFC3339。
+fn unix_to_rfc3339(value: i64) -> String {
+    chrono::DateTime::from_timestamp(
+        if value > 10_000_000_000 {
+            value / 1000
+        } else {
+            value
+        },
+        0,
+    )
+    .map(|date| date.to_rfc3339())
+    .unwrap_or_default()
+}
+
+/// 将 Codex 远端原始状态映射为统一线程状态。
+fn status_from_value(value: Option<&Value>) -> ThreadStatusDto {
+    match value
+        .and_then(|item| item.get("type").or(Some(item)))
+        .and_then(Value::as_str)
+    {
+        Some("inProgress") | Some("streaming") | Some("running") => ThreadStatusDto::Streaming,
+        Some("error") | Some("failed") => ThreadStatusDto::Error,
+        Some("completed") | Some("success") => ThreadStatusDto::Completed,
+        _ => ThreadStatusDto::Idle,
+    }
+}
+
+/// 使用共享线程 Mapper 将 Codex 刷新快照逐条写入当前 workspace。
+pub(crate) async fn persist_session_snapshots(
+    db: Arc<crate::db::Database>,
+    workspace: &WorkspaceDto,
+    sessions: Vec<CliSessionSnapshot>,
+) -> Result<()> {
+    for session in sessions {
+        let workspace_id = workspace.id.clone();
+        tokio::task::spawn_blocking({
+            let db = db.clone();
+            move || {
+                db::threads::upsert_ssh_remote_thread_snapshot(
+                    db.as_ref(),
+                    &workspace_id,
+                    "codex",
+                    &session.engine_thread_id,
+                    &session.model_id,
+                    &session.title,
+                    session.status,
+                    &session.metadata,
+                    session.reasoning_effort.as_deref(),
+                    session.updated_at.as_deref(),
+                )
+            }
+        })
+        .await
+        .context("persist remote session task failed")??;
+    }
+    Ok(())
 }
 
 pub(crate) mod thread_business {
