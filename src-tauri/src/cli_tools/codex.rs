@@ -2662,6 +2662,31 @@ impl CliTool for CodexCli {
         self.mcp.validate_thread_reasoning(self, "codex", model_id, reasoning_effort).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=codex operation=validate_thread_reasoning error={error:#}"))
     }
 
+    /// 校验并规范化 Codex 定时任务运行配置及其专属服务档位。
+    async fn prepare_scheduled_runtime_config(
+        &self,
+        runtime: crate::models::ScheduledRuntimeConfig,
+    ) -> Result<crate::models::ScheduledRuntimeConfig> {
+        let result: Result<crate::models::ScheduledRuntimeConfig> = async {
+            // 使用公共流程校验当前 Codex 模型和推理强度。
+            let mut runtime = self
+                .mcp
+                .prepare_scheduled_model_config(self, runtime)
+                .await?;
+
+            // 按定时任务原接受规则规范化 Codex 专属服务档位。
+            runtime.service_tier =
+                thread_business::normalize_scheduled_codex_service_tier(runtime.service_tier)?;
+            Ok(runtime)
+        }
+        .await;
+        result
+            .context("校验 Codex 定时任务运行配置失败")
+            .inspect_err(|error| {
+                log::error!("CLI 定时任务运行配置校验失败: cli_id=codex operation=prepare_scheduled_runtime_config error={error:#}")
+            })
+    }
+
     async fn sync_thread_record(&self, thread_id: String) -> Result<ThreadDto> {
         self.thread_sync_record(thread_id).await.map_err(anyhow::Error::msg)
     }
@@ -4936,6 +4961,21 @@ pub(crate) mod thread_business {
             _ => Err(format!(
             "invalid service tier `{normalized}`. expected one of: fast, flex"
             )),
+        }
+    }
+
+    /// 校验 Codex 定时任务允许的服务档位，同时保留合法输入原值。
+    pub(crate) fn normalize_scheduled_codex_service_tier(
+        value: Option<String>,
+    ) -> Result<Option<String>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let trimmed_value = value.trim();
+        match trimmed_value {
+            "" | "inherit" => Ok(None),
+            "fast" | "flex" => Ok(Some(value)),
+            _ => anyhow::bail!("Codex 定时任务服务档位无效: `{trimmed_value}`"),
         }
     }
     pub(crate) fn normalize_thread_output_schema(value: Option<Value>) -> Result<Option<Value>, String> {

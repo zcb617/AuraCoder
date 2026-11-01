@@ -273,6 +273,12 @@ pub trait CliTool: Send + Sync {
 
     async fn validate_thread_reasoning(&self, model_id: &str, reasoning_effort: &str) -> Result<String>;
 
+    /// 校验并规范化计划任务使用的当前 CLI 运行配置。
+    async fn prepare_scheduled_runtime_config(
+        &self,
+        runtime: crate::models::ScheduledRuntimeConfig,
+    ) -> Result<crate::models::ScheduledRuntimeConfig>;
+
     /// 同步当前 CLI 的会话历史、统计及状态，成功后返回落库结果。
     async fn sync_thread_record(&self, thread_id: String) -> Result<ThreadDto>;
 

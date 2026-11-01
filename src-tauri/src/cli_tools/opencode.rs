@@ -644,6 +644,30 @@ impl CliTool for OpenCodeCli {
         self.mcp.validate_thread_reasoning(self, "opencode", model_id, reasoning_effort).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=opencode operation=validate_thread_reasoning error={error:#}"))
     }
 
+    /// 校验并规范化 OpenCode 定时任务运行配置。
+    async fn prepare_scheduled_runtime_config(
+        &self,
+        runtime: crate::models::ScheduledRuntimeConfig,
+    ) -> Result<crate::models::ScheduledRuntimeConfig> {
+        let result: Result<crate::models::ScheduledRuntimeConfig> = async {
+            // 使用公共流程校验当前 OpenCode 模型和推理强度。
+            let mut runtime = self
+                .mcp
+                .prepare_scheduled_model_config(self, runtime)
+                .await?;
+
+            // 延续非 Codex 定时任务清空服务档位的既有语义。
+            runtime.service_tier = None;
+            Ok(runtime)
+        }
+        .await;
+        result
+            .context("校验 OpenCode 定时任务运行配置失败")
+            .inspect_err(|error| {
+                log::error!("CLI 定时任务运行配置校验失败: cli_id=opencode operation=prepare_scheduled_runtime_config error={error:#}")
+            })
+    }
+
     async fn sync_thread_record(&self, thread_id: String) -> Result<ThreadDto> {
         self.thread_sync_record(thread_id).await.map_err(anyhow::Error::msg)
     }

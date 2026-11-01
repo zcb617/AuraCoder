@@ -390,3 +390,50 @@ fn runtime_event_payload_contracts_keep_existing_names() {
     assert_eq!(approval_payload["type"], "ApprovalResolved");
     assert_eq!(approval_payload["approval_id"], "approval-1");
 }
+
+/// 验证 Codex 定时任务服务档位保留原有大小写和值域接受规则。
+#[test]
+fn scheduled_codex_tier_keeps_task_acceptance_rules() {
+    // 缺省、空值和继承设置都不保存显式服务档位。
+    assert_eq!(
+        thread_business::normalize_scheduled_codex_service_tier(None)
+            .expect("missing tier should be accepted"),
+        None
+    );
+    assert_eq!(
+        thread_business::normalize_scheduled_codex_service_tier(Some("  ".to_string()))
+            .expect("blank tier should be accepted"),
+        None
+    );
+    assert_eq!(
+        thread_business::normalize_scheduled_codex_service_tier(Some(" inherit ".to_string()))
+            .expect("inherit tier should be accepted"),
+        None
+    );
+
+    // 精确 fast/flex 值有效，首尾空格用于判断但合法输入原值保持不变。
+    assert_eq!(
+        thread_business::normalize_scheduled_codex_service_tier(Some("fast".to_string()))
+            .expect("fast tier should be accepted")
+            .as_deref(),
+        Some("fast")
+    );
+    assert_eq!(
+        thread_business::normalize_scheduled_codex_service_tier(Some("flex".to_string()))
+            .expect("flex tier should be accepted")
+            .as_deref(),
+        Some("flex")
+    );
+    assert_eq!(
+        thread_business::normalize_scheduled_codex_service_tier(Some(" fast ".to_string()))
+            .expect("whitespace-padded fast tier should be accepted")
+            .as_deref(),
+        Some(" fast ")
+    );
+
+    // 定时任务继续拒绝大小写变体及其它未支持服务档位。
+    assert!(thread_business::normalize_scheduled_codex_service_tier(Some("Fast".to_string()))
+        .is_err());
+    assert!(thread_business::normalize_scheduled_codex_service_tier(Some("priority".to_string()))
+        .is_err());
+}

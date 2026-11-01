@@ -591,36 +591,34 @@ fn should_sync_cli_thread(engine_id: &str, message_count: u64) -> bool {
     matches!(engine_id, "codex" | "opencode" | "claude") && message_count == 0
 }
 
-#[cfg(test)]
-mod tests {
-    use super::should_sync_cli_thread;
+/// 校验并规范化定时任务中交给当前 CLI 的公共运行字段。
+fn normalize_scheduled_runtime_fields(
+    cli_id: &str,
+    mut runtime: crate::models::ScheduledRuntimeConfig,
+) -> anyhow::Result<crate::models::ScheduledRuntimeConfig> {
+    // 清理路由和模型字段，并确保任务配置属于当前 CLI。
+    runtime.engine_id = runtime.engine_id.trim().to_string();
+    runtime.model_id = runtime.model_id.trim().to_string();
+    anyhow::ensure!(!runtime.engine_id.is_empty(), "定时任务执行 CLI 不能为空");
+    anyhow::ensure!(!runtime.model_id.is_empty(), "定时任务模型不能为空");
+    anyhow::ensure!(
+        runtime.engine_id == cli_id,
+        "定时任务运行配置与当前 CLI 不匹配"
+    );
 
-    /// 验证 Codex 会话无本地消息时需要执行按需同步。
-    #[test]
-    fn codex_empty_thread_requires_sync() {
-        assert!(should_sync_cli_thread("codex", 0));
-    }
-
-    /// 验证已有本地消息的 Codex 会话不会执行按需同步。
-    #[test]
-    fn codex_thread_with_messages_skips_sync() {
-        assert!(!should_sync_cli_thread("codex", 1));
-    }
-
-    /// 验证 OpenCode 和 Claude Code 空消息会话也执行按需同步。
-    #[test]
-    fn supported_cli_threads_require_sync_when_empty() {
-        assert!(should_sync_cli_thread("opencode", 0));
-        assert!(should_sync_cli_thread("claude", 0));
-    }
-
-    /// 验证未知引擎和已有消息的会话不会执行按需同步。
-    #[test]
-    fn unsupported_or_non_empty_thread_skips_sync() {
-        assert!(!should_sync_cli_thread("unknown", 0));
-        assert!(!should_sync_cli_thread("claude", 1));
-    }
+    // 统一推理强度大小写并将空字符串转换为未设置。
+    runtime.reasoning_effort = runtime
+        .reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+    Ok(runtime)
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/base_cli_mcp_tests.rs"]
+mod tests;
 
 pub(crate) mod thread_business {
     use super::*;
@@ -704,6 +702,28 @@ pub(crate) mod thread_business {
         ))
     }
     impl BaseCliMcp {
+        /// 按任务使用的公共模型规则校验当前 CLI 的模型和推理强度。
+        pub(crate) async fn prepare_scheduled_model_config(
+            &self,
+            cli: &dyn CliTool,
+            runtime: crate::models::ScheduledRuntimeConfig,
+        ) -> anyhow::Result<crate::models::ScheduledRuntimeConfig> {
+            // 规范化公共字段，并沿用定时任务不绑定 workspace 的模型校验语义。
+            let mut runtime = super::normalize_scheduled_runtime_fields(cli.id(), runtime)?;
+            runtime.model_id = cli
+                .validate_thread_model(None, &runtime.model_id)
+                .await?;
+
+            // 仅在任务配置提供推理强度时调用当前 CLI 的现有校验规则。
+            if let Some(reasoning_effort) = runtime.reasoning_effort.as_deref() {
+                runtime.reasoning_effort = Some(
+                    cli.validate_thread_reasoning(&runtime.model_id, reasoning_effort)
+                        .await?,
+                );
+            }
+            Ok(runtime)
+        }
+
     /// 查询当前 CLI 的模型目录并校验；目录不可用策略沿用原入口，禁止跨 CLI 回退。
         pub(crate) async fn validate_thread_model(&self, cli: &dyn CliTool, _engine_id: &str, workspace_id: Option<&str>, model_id: &str) -> anyhow::Result<String> {
             let model_id = model_id.trim();

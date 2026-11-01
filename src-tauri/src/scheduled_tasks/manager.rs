@@ -1,15 +1,15 @@
 use std::{sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::{sync::Notify, time::sleep};
 
 use crate::{
     db,
     models::{
-        chat::SendMessageRequest, MessageStatusDto, ScheduledTaskDto, ScheduledTaskRunDto,
-        ThreadDto,
+        chat::SendMessageRequest, MessageStatusDto, ScheduledRuntimeConfig, ScheduledTaskDto,
+        ScheduledTaskRunDto, ThreadDto,
     },
     runtime_env,
     services::chat_service::ChatService,
@@ -32,15 +32,6 @@ pub struct ScheduledTaskManager {
 #[serde(rename_all = "camelCase")]
 struct ScheduledTaskEvent {
     task_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ScheduledRuntimeConfig {
-    engine_id: String,
-    model_id: String,
-    reasoning_effort: Option<String>,
-    service_tier: Option<String>,
 }
 
 impl ScheduledTaskManager {

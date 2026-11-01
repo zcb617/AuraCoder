@@ -3,6 +3,58 @@ use serde_json::Value;
 
 pub mod chat;
 
+/// 定时任务创建和更新时用于兼容前端 JSON 契约的输入对象。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTaskInput {
+    /// 定时任务执行时提供给 CLI 的任务描述。
+    pub description: String,
+    /// 用户是否启用该定时任务；省略时默认启用。
+    #[serde(default = "scheduled_task_default_enabled")]
+    pub enabled: bool,
+    /// 定时任务执行设备标识；当前业务默认使用本机设备。
+    #[serde(default = "scheduled_task_default_device_id")]
+    pub execution_device_id: String,
+    /// 定时任务目标类型，表示复用现有线程或创建新线程。
+    pub target_type: String,
+    /// 定时任务所属工作区标识。
+    pub workspace_id: String,
+    /// 复用现有线程时选中的线程标识。
+    pub thread_id: Option<String>,
+    /// 定时任务执行所需的 CLI、模型和推理运行配置。
+    pub runtime_config: Option<Value>,
+    /// 定时任务的周期类型。
+    pub schedule_type: String,
+    /// 定时任务周期规则的原始 JSON 配置。
+    pub schedule: Value,
+    /// 定时任务使用的时区名称。
+    pub timezone: String,
+}
+
+/// 定时任务保存和调度执行共用的 CLI 运行配置快照。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledRuntimeConfig {
+    /// 负责执行该定时任务的 CLI 标识。
+    pub engine_id: String,
+    /// 当前 CLI 任务使用的模型标识。
+    pub model_id: String,
+    /// 当前 CLI 任务使用的推理强度。
+    pub reasoning_effort: Option<String>,
+    /// Codex 任务使用的服务档位。
+    pub service_tier: Option<String>,
+}
+
+/// 为省略 enabled 的定时任务输入提供启用默认值。
+fn scheduled_task_default_enabled() -> bool {
+    true
+}
+
+/// 为省略 executionDeviceId 的定时任务输入提供本机设备默认值。
+fn scheduled_task_default_device_id() -> String {
+    "local".to_string()
+}
+
 /// 表示前端展示、编辑并由数据库保存的统一线程权限对象，不包含 CLI 原生权限。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

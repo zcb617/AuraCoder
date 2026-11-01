@@ -1505,6 +1505,30 @@ impl CliTool for ClaudeCodeCli {
         self.mcp.validate_thread_reasoning(self, "claude", model_id, reasoning_effort).await.inspect_err(|error| log::error!("CLI 线程业务失败: cli_id=claude operation=validate_thread_reasoning error={error:#}"))
     }
 
+    /// 校验并规范化 Claude Code 定时任务运行配置。
+    async fn prepare_scheduled_runtime_config(
+        &self,
+        runtime: crate::models::ScheduledRuntimeConfig,
+    ) -> Result<crate::models::ScheduledRuntimeConfig> {
+        let result: Result<crate::models::ScheduledRuntimeConfig> = async {
+            // 使用公共流程校验当前 Claude Code 模型和推理强度。
+            let mut runtime = self
+                .mcp
+                .prepare_scheduled_model_config(self, runtime)
+                .await?;
+
+            // 延续非 Codex 定时任务清空服务档位的既有语义。
+            runtime.service_tier = None;
+            Ok(runtime)
+        }
+        .await;
+        result
+            .context("校验 Claude Code 定时任务运行配置失败")
+            .inspect_err(|error| {
+                log::error!("CLI 定时任务运行配置校验失败: cli_id=claude operation=prepare_scheduled_runtime_config error={error:#}")
+            })
+    }
+
     async fn sync_thread_record(&self, thread_id: String) -> Result<ThreadDto> {
         self.thread_sync_record(thread_id).await.map_err(anyhow::Error::msg)
     }
@@ -2793,129 +2817,8 @@ impl CliTool for ClaudeCodeCli {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{fs, sync::Arc};
-
-    use super::*;
-    use crate::{
-        config::app_config::AppConfig,
-        engines::EngineManager,
-        git::{repo::FileTreeCache, watcher::GitWatcherManager},
-        models::SshConnectionInput,
-        power::KeepAwakeManager,
-        state::{AppState, TurnManager},
-        terminal::TerminalManager,
-        terminal_notifications::TerminalNotificationManager,
-    };
-    use uuid::Uuid;
-
-    fn test_app_state() -> AppState {
-        let root =
-            std::env::temp_dir().join(format!("auracoder-claude-archive-{}", Uuid::new_v4()));
-        fs::create_dir_all(&root).expect("failed to create test root");
-        let db = crate::db::Database::open(root.join("workspaces.db"))
-            .expect("failed to create test database");
-        AppState {
-            db: db.clone(),
-            config: Arc::new(AppConfig::default()),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            engines: Arc::new(EngineManager::new()),
-            git_watchers: Arc::new(GitWatcherManager::default()),
-            terminals: Arc::new(TerminalManager::default()),
-            notifications: Arc::new(TerminalNotificationManager::default()),
-            keep_awake: Arc::new(KeepAwakeManager::new()),
-            turns: Arc::new(TurnManager::default()),
-            file_tree_cache: Arc::new(FileTreeCache::new()),
-            extension_catalog_refreshes: Arc::new(
-                crate::extensions::refresh::ExtensionCatalogRefreshManager::default(),
-            ),
-            scheduled_tasks: Arc::new(crate::scheduled_tasks::ScheduledTaskManager::new()),
-            computer_control_service: Arc::new(
-                crate::computer_control_service::ComputerControlService::default(),
-            ),
-            auracoder_thread_mcp_service: Arc::new(
-                crate::auracoder_thread_mcp_service::AuraCoderThreadMcpService::new(db.clone()),
-            ),
-            mcp_gateway: Arc::new(crate::mcp_gateway::AuraCoderMcpGateway::new()),
-            remote_access: Arc::new(crate::remote::RemoteTunnelManager::default()),
-            ssh_monitor: Arc::new(crate::ssh::monitor::SshConnectionMonitor::default()),
-        }
-    }
-
-    #[tokio::test]
-    async fn ssh_archive_hook_returns_without_remote_archive_service() {
-        let state = test_app_state();
-        let connection_id = format!("ssh-test-{}", Uuid::new_v4());
-        let input = SshConnectionInput {
-            display_name: "Claude archive test SSH".to_string(),
-            host_name: "192.0.2.10".to_string(),
-            user: "tester".to_string(),
-            port: 22,
-            identity_file: None,
-            host_key: String::new(),
-            config_alias: None,
-        };
-        let connection = crate::db::ssh_connections::insert(
-            &state.db,
-            &connection_id,
-            "manual",
-            &input,
-            "ssh-ed25519",
-            "test-key",
-        )
-        .expect("failed to create test SSH connection");
-        crate::db::ssh_connections::set_status_if_current(
-            &state.db,
-            &connection.id,
-            &connection.updated_at,
-            crate::db::ssh_connections::STATUS_OK,
-            None,
-        )
-        .expect("failed to mark test SSH connection ready");
-        let workspace = crate::db::workspaces::create_ssh_workspace(
-            &state.db,
-            &connection_id,
-            "Claude archive test workspace",
-            &format!("/tmp/auracoder-claude-archive-{}", Uuid::new_v4()),
-        )
-        .expect("failed to create test SSH workspace");
-        let thread = crate::db::threads::create_thread(
-            &state.db,
-            &workspace.id,
-            "claude",
-            "claude-sonnet-4-6",
-            "Claude archive test thread",
-        )
-        .expect("failed to create test Claude thread");
-        let context = CliExecutionContext::from_workspace(&workspace)
-            .expect("failed to build Claude SSH execution context");
-
-        // 故意不登记 Claude 远端服务；若实现访问了远端归档协议，统一接口调用应失败。
-        let cli = ClaudeCodeCli::new(state);
-        let cli: &dyn CliTool = &cli;
-        cli.archive_thread(&context, &thread, "remote-claude-thread")
-            .await
-            .expect("SSH Claude archive hook should not require remote service");
-    }
-
-    #[test]
-    fn local_claude_session_search_matches_title_or_id_and_excludes_other_sessions() {
-        let session = ClaudeSessionSummary {
-            id: "session-abc123".to_string(),
-            cwd: "/workspace/project".to_string(),
-            title: "Deploy production".to_string(),
-            updated_at: "2026-08-27T00:00:00Z".to_string(),
-            // 测试缺失结构化会话分类时仍保持摘要兼容。
-            conversation_kind: None,
-        };
-
-        assert!(matches_claude_session_search(&session, Some("production")));
-        assert!(matches_claude_session_search(&session, Some("abc123")));
-        assert!(matches_claude_session_search(&session, Some("DEPLOY")));
-        assert!(!matches_claude_session_search(&session, Some("staging")));
-        assert!(matches_claude_session_search(&session, None));
-    }
-}
+#[path = "../../tests/unit/claude_code_cli_tests.rs"]
+mod tests;
 
 pub(crate) mod thread_business {
     use super::*;
