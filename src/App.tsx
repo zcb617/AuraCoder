@@ -56,7 +56,7 @@ import {
   isWorkspaceSurfaceVisible,
   toggleWorkspaceEditorLayout,
 } from "./lib/workspacePaneNavigation";
-import { workspaceThreadCatalogKey } from "./lib/workspaceThreadCatalog";
+// import { workspaceThreadCatalogKey } from "./lib/workspaceThreadCatalog";
 import {
   usesCustomWindowFrame,
   isTerminalInputFocused,
@@ -142,8 +142,8 @@ function resolveChatNotificationBody(
 
 export function App() {
   const loadWorkspaces = useWorkspaceStore((s) => s.loadWorkspaces);
-  const workspaces = useWorkspaceStore((s) => s.workspaces);
-  const threadCatalogKey = workspaceThreadCatalogKey(workspaces);
+  // const workspaces = useWorkspaceStore((s) => s.workspaces);
+  // const threadCatalogKey = workspaceThreadCatalogKey(workspaces);
   const activeWorkspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
   const completeSshSessionSync = useWorkspaceStore((s) => s.completeSshSessionSync);
   const loadEngines = useEngineStore((s) => s.load);
@@ -237,6 +237,7 @@ export function App() {
     workspaceCatalogLoaded,
   ]);
 
+  /*
   useEffect(() => {
     const currentWorkspaces = useWorkspaceStore.getState().workspaces;
     const localWorkspaceIds = currentWorkspaces
@@ -265,6 +266,7 @@ export function App() {
     refreshAllThreads,
     reloadThreadsFromLocalDatabase,
   ]);
+  */
 
   useEffect(() => {
     const hasSessionTimer = keepAwakeSessionTimer != null;
@@ -376,6 +378,7 @@ export function App() {
         // 后端初始化完成后，除取会话列表外，同时把本机和各远端机器的 CLI 目录
         // 预热进前端缓存；之后页面只读缓存，目录变化由后端健康检查事件驱动。
         void preloadEngineCatalogs();
+        /*
         const sshWorkspaceIds = useWorkspaceStore
           .getState()
           .workspaces.filter((workspace) => workspace.locationKind === "ssh")
@@ -390,6 +393,9 @@ export function App() {
             }),
           ),
         ).finally(() => setStartupCompleted(true));
+        */
+        const workspaceIds = useWorkspaceStore.getState().workspaces.map((workspace) => workspace.id);
+        void refreshAllThreads(workspaceIds).finally(() => setStartupCompleted(true));
       }
     }).then((fn) => {
       if (disposed) {
@@ -406,7 +412,8 @@ export function App() {
         unlisten();
       }
     };
-  }, [preloadEngineCatalogs, reloadThreadsFromLocalDatabase]);
+  // }, [preloadEngineCatalogs, reloadThreadsFromLocalDatabase]);
+  }, [preloadEngineCatalogs, refreshAllThreads]);
 
   // 后端健康检查 reconcile 生命周期 MAP 后推送本事件；收到后立即用与启动预热
   // 相同的接口刷新对应目标的前端 CLI 目录缓存。

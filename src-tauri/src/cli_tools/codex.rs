@@ -93,10 +93,11 @@ impl CodexCli {
         &self,
         cwd: Option<&str>,
     ) -> Result<CachedExtensionCatalogDto> {
-        // 先登记当前目录的刷新时间，再读取 provider 专属缓存快照。
-        // 页面请求只写排期并唤醒调度器，不在请求路径执行 Codex CLI。
-        self.schedule_extension_catalog_context(cwd.map(str::to_string))
-            .await?;
+        // 用户级目录沿用首次排期；项目目录只读取缓存，由项目业务主动获取。
+        // self.schedule_extension_catalog_context(cwd.map(str::to_string)).await?;
+        if cwd.is_none() {
+            self.schedule_extension_catalog_context(None).await?;
+        }
         let context_key = extensions::refresh::context_key(cwd);
         let snapshots = db::extensions::load_snapshots(&self.state.db, self.id(), &context_key)?;
         let is_refreshing = self
@@ -125,19 +126,24 @@ impl CodexCli {
         context_key: String,
         cwd: Option<String>,
         requested_kinds: Vec<String>,
+        context: Option<CliExecutionContext>,
     ) {
         // 逐类型使用 Codex 原目录实现刷新，并按每类结果写入缓存。
         for kind in requested_kinds {
             let attempted_at = runtime_env::system_time_rfc3339();
             // 只有带项目目录的刷新需要解析工作区；全局缓存使用空的本机上下文。
-            let context_result = match cwd.as_deref() {
-                Some(cwd) => self.execution_context_for_cwd(Some(cwd)).await,
-                None => Ok(CliExecutionContext {
-                    workspace_id: String::new(),
-                    root_path: String::new(),
-                    location_kind: CliLocationKind::Local,
-                    ssh_connection_id: None,
-                }),
+            let context_result = if let Some(context) = context.as_ref() {
+                Ok(context.clone())
+            } else {
+                match cwd.as_deref() {
+                    Some(cwd) => self.execution_context_for_cwd(Some(cwd)).await,
+                    None => Ok(CliExecutionContext {
+                        workspace_id: String::new(),
+                        root_path: String::new(),
+                        location_kind: CliLocationKind::Local,
+                        ssh_connection_id: None,
+                    }),
+                }
             };
             // Codex 扩展目录读取共用原有 runtime 锁，保持技能服务与 CLI 读取互斥。
             let refresh_result = match context_result {
@@ -4313,6 +4319,7 @@ impl CliTool for CodexCli {
         app: tauri::AppHandle,
         cwd: Option<String>,
         requested_kinds: Vec<String>,
+        context: Option<CliExecutionContext>,
     ) -> Result<bool> {
         // 保持 normalize、ensure、begin、事件和后台启动的既定顺序。
         let kinds = extensions::refresh::normalize_kinds(requested_kinds)?;
@@ -4335,7 +4342,7 @@ impl CliTool for CodexCli {
         extensions::refresh::emit_catalog_updated(&app, self.id(), cwd.as_deref());
         let cli = self.clone();
         tauri::async_runtime::spawn(async move {
-            cli.run_extension_catalog_refresh(app, context_key, cwd, kinds)
+            cli.run_extension_catalog_refresh(app, context_key, cwd, kinds, context)
                 .await;
         });
         Ok(true)

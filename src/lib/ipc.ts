@@ -111,6 +111,12 @@ export interface ClipboardImagePayload {
   sourcePath?: string | null;
 }
 
+export interface ProjectSessionRefreshReport {
+  workspaceId: string;
+  succeededCliIds: string[];
+  failedCliIds: string[];
+}
+
 export const ipc = {
   /** 读取 MCP 服务当前运行状态，供设置页 about 分区只读展示。 */
   getMcpServiceStatus: () => invoke<McpServiceStatus>("get_mcp_service_status"),
@@ -220,8 +226,12 @@ export const ipc = {
   showAgentNotification: (title: string, body: string) =>
     invoke<void>("show_agent_notification", { title, body }),
   listWorkspaces: () => invoke<Workspace[]>("list_workspaces"),
-  refreshLocalProjectSessions: (workspaceId: string) =>
-    invoke<void>("refresh_local_project_sessions", { workspaceId }),
+  // refreshLocalProjectSessions: (workspaceId: string) =>
+  //   invoke<void>("refresh_local_project_sessions", { workspaceId }),
+  refreshProjectSessions: (workspaceId: string) =>
+    invoke<ProjectSessionRefreshReport>("refresh_project_sessions", { workspaceId }),
+  refreshProjectCatalogs: (workspaceId: string) =>
+    invoke<void>("refresh_project_catalogs", { workspaceId }),
   listArchivedWorkspaces: () => invoke<Workspace[]>("list_archived_workspaces"),
   getSshConnectionHome: (connectionId: string) =>
     invoke<SshConnectionTest>("get_ssh_connection_home", { connectionId }),

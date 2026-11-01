@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { TrustLevel, Workspace } from "../types";
 import { ipc } from "../lib/ipc";
 import { useTerminalStore } from "./terminalStore";
+import { useThreadStore } from "./threadStore";
 
 interface WorkspaceState {
   /** 允许旧测试夹具在迁移期间携带未使用字段；生产状态不保存这些字段。 */
@@ -62,10 +63,26 @@ function resolveStartupWorkspaceId(workspaces: Workspace[], savedId: string | nu
 }
 
 /** 在项目切换后异步刷新项目扩展目录。 */
+/*
 function scheduleActiveWorkspaceExtensionRefresh(workspaceId: string): void {
   void Promise.resolve(ipc.scheduleExtensionCatalogWorkspaceRefresh(workspaceId)).catch(() => {
     // 扩展目录刷新失败不阻断项目启动。
   });
+}
+*/
+
+function refreshWorkspaceCatalogs(workspaceId: string): void {
+  void ipc.refreshProjectCatalogs(workspaceId).catch((error) => {
+    console.warn("获取项目扩展失败", workspaceId, error);
+  });
+}
+
+function syncWorkspaceSessions(workspaceId: string): void {
+  void ipc.refreshProjectSessions(workspaceId)
+    .then(() => useThreadStore.getState().reloadThreadsFromLocalDatabase(workspaceId))
+    .catch((error) => {
+      console.warn("同步项目会话失败", workspaceId, error);
+    });
 }
 
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
@@ -81,7 +98,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       if (activeWorkspaceId) {
         const workspace = workspaces.find((item) => item.id === activeWorkspaceId);
         if (workspace?.locationKind !== "ssh") {
-          scheduleActiveWorkspaceExtensionRefresh(activeWorkspaceId);
+          // scheduleActiveWorkspaceExtensionRefresh(activeWorkspaceId);
           await useTerminalStore.getState().prepareWorkspaceActivation(activeWorkspaceId);
         }
       }
@@ -96,9 +113,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     set({ loading: true, error: undefined });
     try {
       const workspace = await ipc.openWorkspace(path);
+      const isNewWorkspace = !get().workspaces.some((item) => item.id === workspace.id);
       set((state) => ({ workspaces: [workspace, ...state.workspaces.filter((item) => item.id !== workspace.id)], archivedWorkspaces: state.archivedWorkspaces.filter((item) => item.id !== workspace.id), activeWorkspaceId: workspace.id, loading: false }));
+      if (isNewWorkspace) {
+        syncWorkspaceSessions(workspace.id);
+        refreshWorkspaceCatalogs(workspace.id);
+      }
       localStorage.setItem(LAST_WORKSPACE_KEY, workspace.id);
-      scheduleActiveWorkspaceExtensionRefresh(workspace.id);
+      // scheduleActiveWorkspaceExtensionRefresh(workspace.id);
       await useTerminalStore.getState().prepareWorkspaceActivation(workspace.id);
       return workspace;
     } catch (error) { set({ loading: false, error: String(error) }); return null; }
@@ -107,8 +129,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     set((state) => ({ loading: true, error: undefined, sshWorkspaceCreationInFlight: state.sshWorkspaceCreationInFlight + 1 }));
     try {
       const workspace = await ipc.createSshWorkspace(connectionId, name, rootPath);
+      const isNewWorkspace = !get().workspaces.some((item) => item.id === workspace.id);
       localStorage.setItem(LAST_WORKSPACE_KEY, workspace.id);
       set((state) => ({ workspaces: [workspace, ...state.workspaces.filter((item) => item.id !== workspace.id)], archivedWorkspaces: state.archivedWorkspaces.filter((item) => item.id !== workspace.id), activeWorkspaceId: workspace.id, loading: false, sshWorkspaceCreationInFlight: Math.max(0, state.sshWorkspaceCreationInFlight - 1) }));
+      if (isNewWorkspace) {
+        syncWorkspaceSessions(workspace.id);
+        refreshWorkspaceCatalogs(workspace.id);
+      }
       await useTerminalStore.getState().prepareWorkspaceActivation(workspace.id);
       return workspace;
     } catch (error) { set((state) => ({ loading: false, error: String(error), sshWorkspaceCreationInFlight: Math.max(0, state.sshWorkspaceCreationInFlight - 1) })); return null; }
@@ -138,6 +165,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     try {
       const restored = await ipc.restoreWorkspace(workspaceId);
       set((state) => ({ workspaces: [restored, ...state.workspaces.filter((workspace) => workspace.id !== workspaceId)], archivedWorkspaces: state.archivedWorkspaces.filter((workspace) => workspace.id !== workspaceId), activeWorkspaceId: state.activeWorkspaceId ?? restored.id, loading: false }));
+      syncWorkspaceSessions(restored.id);
+      refreshWorkspaceCatalogs(restored.id);
       if (get().activeWorkspaceId === restored.id) await useTerminalStore.getState().prepareWorkspaceActivation(restored.id);
     } catch (error) { set({ loading: false, error: String(error) }); }
   },
@@ -148,7 +177,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   setActiveWorkspace: async (workspaceId) => {
     get().setActiveWorkspaceLocal(workspaceId);
     const workspace = get().workspaces.find((item) => item.id === workspaceId);
-    if (workspace) { scheduleActiveWorkspaceExtensionRefresh(workspaceId); await useTerminalStore.getState().prepareWorkspaceActivation(workspaceId); }
+    // if (workspace) { scheduleActiveWorkspaceExtensionRefresh(workspaceId); await useTerminalStore.getState().prepareWorkspaceActivation(workspaceId); }
+    if (workspace) await useTerminalStore.getState().prepareWorkspaceActivation(workspaceId);
   },
   setWorkspaceTrustLevel: async (workspaceId, trustLevel) => {
     try {

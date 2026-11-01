@@ -414,16 +414,22 @@ pub fn run() {
                         ) {
                             log::warn!("发送启动进度失败: {error:#}");
                         }
-                        remote_project_session_refresh_service::refresh_all_ssh_remote_project_sessions(
-                            &app_handle,
-                            db.into(),
-                        )
-                        .await;
+                        // remote_project_session_refresh_service::refresh_all_ssh_remote_project_sessions(
+                        //     &app_handle,
+                        //     db.into(),
+                        // )
+                        // .await;
                     }
                     Err(error) => {
                         log::warn!("failed to initialize SSH remote server tunnel Map: {error:#}");
                     }
                 }
+
+                remote_project_session_refresh_service::refresh_all_project_sessions(
+                    &app_handle,
+                    db.into(),
+                )
+                .await;
 
                 if let Err(error) = message_notify_helper::notify_app_startup_progress(
                     &app_handle,
@@ -523,7 +529,9 @@ pub fn run() {
             commands::chat::search_messages,
             commands::workspace::open_workspace,
             commands::workspace::list_workspaces,
-            commands::workspace::refresh_local_project_sessions,
+            // commands::workspace::refresh_local_project_sessions,
+            commands::workspace::refresh_project_sessions,
+            commands::workspace::refresh_project_catalogs,
             commands::workspace::list_archived_workspaces,
             commands::workspace::get_ssh_connection_home,
             commands::workspace::list_ssh_directories,

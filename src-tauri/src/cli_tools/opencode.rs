@@ -106,10 +106,11 @@ impl OpenCodeCli {
         &self,
         cwd: Option<&str>,
     ) -> Result<CachedExtensionCatalogDto> {
-        // 页面读取时先确保当前目录的首次刷新已排期，再读取该 provider 的缓存和活动状态。
-        // 页面请求只写排期并唤醒调度器，不在请求路径执行 OpenCode CLI。
-        self.schedule_extension_catalog_context(cwd.map(str::to_string))
-            .await?;
+        // 用户级目录沿用首次排期；项目目录只读取缓存，由项目业务主动获取。
+        // self.schedule_extension_catalog_context(cwd.map(str::to_string)).await?;
+        if cwd.is_none() {
+            self.schedule_extension_catalog_context(None).await?;
+        }
         let context_key = extensions::refresh::context_key(cwd);
         let snapshots = db::extensions::load_snapshots(&self.state.db, self.id(), &context_key)?;
         let is_refreshing = self
@@ -138,18 +139,23 @@ impl OpenCodeCli {
         context_key: String,
         cwd: Option<String>,
         requested_kinds: Vec<String>,
+        context: Option<CliExecutionContext>,
     ) {
         // 每种扩展分别调用 OpenCode 原目录实现，并将成功或失败结果写回对应快照。
         for kind in requested_kinds {
             let attempted_at = runtime_env::system_time_rfc3339();
-            let context_result = match cwd.as_deref() {
-                Some(cwd) => self.execution_context_for_cwd(Some(cwd)).await,
-                None => Ok(CliExecutionContext {
-                    workspace_id: String::new(),
-                    root_path: String::new(),
-                    location_kind: CliLocationKind::Local,
-                    ssh_connection_id: None,
-                }),
+            let context_result = if let Some(context) = context.as_ref() {
+                Ok(context.clone())
+            } else {
+                match cwd.as_deref() {
+                    Some(cwd) => self.execution_context_for_cwd(Some(cwd)).await,
+                    None => Ok(CliExecutionContext {
+                        workspace_id: String::new(),
+                        root_path: String::new(),
+                        location_kind: CliLocationKind::Local,
+                        ssh_connection_id: None,
+                    }),
+                }
             };
             let refresh_result = match context_result {
                 Ok(context) => {
@@ -1984,6 +1990,7 @@ impl CliTool for OpenCodeCli {
         app: tauri::AppHandle,
         cwd: Option<String>,
         requested_kinds: Vec<String>,
+        context: Option<CliExecutionContext>,
     ) -> Result<bool> {
         // 按固定类型顺序规范化请求，并确保快照记录先于运行状态建立。
         let kinds = extensions::refresh::normalize_kinds(requested_kinds)?;
@@ -2007,7 +2014,7 @@ impl CliTool for OpenCodeCli {
         extensions::refresh::emit_catalog_updated(&app, self.id(), cwd.as_deref());
         let cli = self.clone();
         tauri::async_runtime::spawn(async move {
-            cli.run_extension_catalog_refresh(app, context_key, cwd, kinds)
+            cli.run_extension_catalog_refresh(app, context_key, cwd, kinds, context)
                 .await;
         });
         Ok(true)

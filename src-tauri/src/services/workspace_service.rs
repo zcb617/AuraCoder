@@ -8,7 +8,7 @@ use crate::{
         ExecutionTargetDto, FileTreeEntryDto, FileTreePageDto, TrustLevelDto, WorkspaceDto,
         WorkspaceTarget,
     },
-    remote_project_session_refresh_service,
+    // remote_project_session_refresh_service,
     ssh::remote_fs,
     state::AppState,
     workspace_startup::{
@@ -138,15 +138,15 @@ impl WorkspaceService {
         result
     }
 
-    /// 解析 SSH 项目根目录并创建工作区，再异步刷新其远端会话。
+    /// 解析 SSH 项目根目录并创建工作区。
     pub async fn create_ssh_workspace(
         &self,
-        app: tauri::AppHandle,
+        _app: tauri::AppHandle,
         connection_id: String,
         name: String,
         root_path: String,
     ) -> Result<WorkspaceDto> {
-        // 先通过 SSH 连接服务确认目录，再持久化工作区并启动原有会话刷新任务。
+        // 先通过 SSH 连接服务确认目录，再持久化工作区。
         let log_connection_id = connection_id.clone();
         let log_name = name.clone();
         let result = async {
@@ -162,6 +162,7 @@ impl WorkspaceService {
             .await
             .context("创建 SSH 工作区失败")?;
 
+            /*
             let sync_app = app.clone();
             let sync_db = self.state.db.clone();
             let workspace_id = workspace.id.clone();
@@ -179,6 +180,7 @@ impl WorkspaceService {
                     );
                 }
             });
+            */
 
             Ok(workspace)
         }

@@ -226,55 +226,118 @@ pub async fn request_catalog_refresh(
     requested_kinds: Vec<String>,
 ) -> Result<bool> {
     validate_provider(provider_id)?;
-    let cli = CliToolFactory::new(state.clone()).create(provider_id)?;
-    cli.request_extension_catalog_refresh(app, cwd, requested_kinds)
-        .await
+    refresh_one_catalog(&app, &state, None, cwd, Some(provider_id), requested_kinds).await
 }
 
-/// 启动扩展目录刷新循环，并将排期与目录读取交给每个 CLI 实现。
+/// 获取当前已到期的扩展目录，供启动和定时器调用。
+pub async fn refresh_due_catalogs(app: &AppHandle, state: &AppState) {
+    let now = runtime_env::system_time_rfc3339();
+    let factory = CliToolFactory::new(state.clone());
+    for provider_id in CliToolFactory::supported_cli_ids() {
+        let cli = match factory.create(provider_id) {
+            Ok(cli) => cli,
+            Err(error) => {
+                log::error!("创建扩展刷新 CLI 失败: provider={provider_id} error={error:#}");
+                continue;
+            }
+        };
+        match cli.list_due_extension_catalog_refreshes(&now).await {
+            Ok(jobs) => {
+                for job in jobs {
+                    let cwd = cwd_from_context_key(&job.context_key);
+                    if let Err(error) = refresh_one_catalog(
+                        app,
+                        state,
+                        None,
+                        cwd,
+                        Some(provider_id),
+                        job.kinds,
+                    )
+                    .await
+                    {
+                        log::error!(
+                            "扩展目录后台刷新请求失败: provider={} context={} error={error:#}",
+                            job.provider_id,
+                            job.context_key
+                        );
+                    }
+                }
+            }
+            Err(error) => log::error!(
+                "查询已到期扩展目录刷新失败: provider={provider_id} error={error:#}"
+            ),
+        }
+    }
+}
+
+/// 按项目标识获取该项目的扩展目录。
+pub async fn refresh_project_catalogs(
+    app: &AppHandle,
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<()> {
+    let workspace = WorkspaceService::new(state.clone()).get_workspace(workspace_id).await?;
+    let context = CliExecutionContext::from_workspace(&workspace)?;
+    refresh_one_catalog(app, state, Some(context), Some(workspace.root_path), None, Vec::new())
+        .await?;
+    Ok(())
+}
+
+/// 获取一个项目或全局上下文的扩展目录。
+async fn refresh_one_catalog(
+    app: &AppHandle,
+    state: &AppState,
+    context: Option<CliExecutionContext>,
+    cwd: Option<String>,
+    requested_provider: Option<&str>,
+    requested_kinds: Vec<String>,
+) -> Result<bool> {
+    let factory = CliToolFactory::new(state.clone());
+    let mut started = false;
+    let mut first_error = None;
+    for provider_id in CliToolFactory::supported_cli_ids() {
+        if requested_provider.is_some_and(|requested| requested != *provider_id) {
+            continue;
+        }
+        let result = async {
+            let cli = factory.create(provider_id)?;
+            if let Some(context) = context.as_ref().filter(|context| context.location_kind == CliLocationKind::Ssh) {
+                let kinds = normalize_kinds(requested_kinds.clone())?;
+                let results = cli.refresh_extension_catalog(context, cwd.as_deref(), &kinds).await?;
+                anyhow::ensure!(results.iter().all(|result| result.success), "获取远端项目扩展失败");
+                return Ok(true);
+            }
+            cli.request_extension_catalog_refresh(
+                app.clone(), cwd.clone(), requested_kinds.clone(), context.clone(),
+            ).await
+        }.await;
+        match result {
+            Ok(request_started) => started |= request_started,
+            Err(error) => {
+                log::error!("获取扩展失败: provider={provider_id} cwd={cwd:?} error={error:#}");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(started),
+    }
+}
+
+/// 启动扩展目录刷新循环，并将获取工作交给同一个核心方法。
 pub fn spawn_catalog_refresh_scheduler(app: AppHandle, state: AppState) {
     tauri::async_runtime::spawn(async move {
         schedule_startup_refreshes(&state).await;
+        refresh_due_catalogs(&app, &state).await;
         loop {
-            let now = runtime_env::system_time_rfc3339();
-            let factory = CliToolFactory::new(state.clone());
-            for provider_id in CliToolFactory::supported_cli_ids() {
-                let cli = match factory.create(provider_id) {
-                    Ok(cli) => cli,
-                    Err(error) => {
-                        log::error!("创建扩展刷新 CLI 失败: provider={provider_id} error={error:#}");
-                        continue;
-                    }
-                };
-                match cli.list_due_extension_catalog_refreshes(&now).await {
-                    Ok(jobs) => {
-                        for job in jobs {
-                            let cwd = cwd_from_context_key(&job.context_key);
-                            if let Err(error) = cli
-                                .request_extension_catalog_refresh(
-                                    app.clone(),
-                                    cwd,
-                                    job.kinds,
-                                )
-                                .await
-                            {
-                                log::error!(
-                                    "扩展目录后台刷新请求失败: provider={} context={} error={error:#}",
-                                    job.provider_id,
-                                    job.context_key
-                                );
-                            }
-                        }
-                    }
-                    Err(error) => log::error!(
-                        "查询已到期扩展目录刷新失败: provider={provider_id} error={error:#}"
-                    ),
-                }
-            }
             tokio::select! {
                 _ = sleep(next_scheduler_sleep(&state).await) => {}
                 _ = state.extension_catalog_refreshes.wait_for_scheduler_wakeup() => {}
             }
+            refresh_due_catalogs(&app, &state).await;
         }
     });
 }

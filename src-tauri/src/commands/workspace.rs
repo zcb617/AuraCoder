@@ -30,6 +30,7 @@ pub async fn list_workspaces(state: State<'_, AppState>) -> Result<Vec<Workspace
         .map_err(|error| error.to_string())
 }
 
+/*
 /// 启动时按项目同步本地 Codex、OpenCode 与 Claude 历史会话，并返回各 CLI 同步结果。
 #[tauri::command]
 pub async fn refresh_local_project_sessions(
@@ -51,6 +52,41 @@ pub async fn refresh_local_project_sessions(
         );
         format!("刷新本地项目会话失败: {error:#}")
     })
+}
+*/
+
+/// 同步指定项目的 CLI 会话。
+#[tauri::command]
+pub async fn refresh_project_sessions(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> Result<crate::remote_project_session_refresh_service::ProjectSessionRefreshReport, String> {
+    crate::remote_project_session_refresh_service::refresh_project_sessions(
+        &app,
+        state.db.clone().into(),
+        &workspace_id,
+    )
+    .await
+    .map_err(|error| {
+        log::error!("同步项目会话失败: workspace_id={} error={error:#}", workspace_id);
+        format!("同步项目会话失败: {error:#}")
+    })
+}
+
+/// 获取指定项目的 CLI 扩展。
+#[tauri::command]
+pub async fn refresh_project_catalogs(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> Result<(), String> {
+    crate::extensions::refresh::refresh_project_catalogs(&app, state.inner(), &workspace_id)
+        .await
+        .map_err(|error| {
+            log::error!("获取项目扩展失败: workspace_id={} error={error:#}", workspace_id);
+            format!("获取项目扩展失败: {error:#}")
+        })
 }
 
 /// 查询所有已归档的工作区。
@@ -103,7 +139,7 @@ pub async fn resolve_ssh_directory(
         .map_err(|error| error.to_string())
 }
 
-/// 创建 SSH 工作区并安排远端会话刷新。
+/// 创建 SSH 工作区。
 #[tauri::command]
 pub async fn create_ssh_workspace(
     app: tauri::AppHandle,

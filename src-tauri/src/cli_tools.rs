@@ -584,6 +584,7 @@ pub trait CliTool: Send + Sync {
         app: tauri::AppHandle,
         cwd: Option<String>,
         requested_kinds: Vec<String>,
+        context: Option<CliExecutionContext>,
     ) -> Result<bool>;
 
     /// 查询当前 CLI 已到期的扩展目录刷新上下文。

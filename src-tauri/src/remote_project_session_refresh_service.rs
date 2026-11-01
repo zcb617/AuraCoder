@@ -21,6 +21,7 @@ use crate::{
     state::AppState,
 };
 
+/*
 /// 单个工作区的 SSH 会话刷新报告。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +44,134 @@ pub struct LocalProjectSessionRefreshReport {
     pub succeeded_cli_ids: Vec<String>,
     /// 刷新失败的 CLI。
     pub failed_cli_ids: Vec<String>,
+}
+
+*/
+
+// Service：src-tauri/src/remote_project_session_refresh_service.rs
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSessionRefreshReport {
+    pub workspace_id: String,
+    pub succeeded_cli_ids: Vec<String>,
+    pub failed_cli_ids: Vec<String>,
+}
+
+// private：按项目 ID 同步会话
+async fn sync_project_sessions(
+    app: &AppHandle,
+    db: Arc<Database>,
+    workspace_id: &str,
+) -> Result<ProjectSessionRefreshReport> {
+    let _guard = WorkspaceRefreshGuard::acquire(workspace_id)
+        .ok_or_else(|| anyhow::anyhow!("workspace refresh already in progress: {workspace_id}"))?;
+
+    let id = workspace_id.to_string();
+    let workspace = tokio::task::spawn_blocking({
+        let db = db.clone();
+        move || find_workspace_by_id(db.as_ref(), &id)
+    })
+    .await
+    .context("读取项目任务失败")??
+    .ok_or_else(|| anyhow::anyhow!("项目不存在: {workspace_id}"))?;
+
+    let is_ssh = workspace.location_kind == "ssh";
+    if is_ssh && !is_enabled_ssh_workspace(&workspace) {
+        anyhow::bail!("SSH 项目不可用: {workspace_id}");
+    }
+
+    let factory = CliToolFactory::new(app.state::<AppState>().inner().clone());
+    let context = CliExecutionContext::from_workspace(&workspace)?;
+    let mut report = ProjectSessionRefreshReport {
+        workspace_id: workspace_id.to_string(),
+        succeeded_cli_ids: Vec::new(),
+        failed_cli_ids: Vec::new(),
+    };
+    let mut prepared_clis: Vec<(&str, Arc<dyn CliTool>)> = Vec::new();
+
+    if !is_ssh {
+        log::info!(
+            "本地项目会话同步开始: workspace_id={} workspace_root_path={} cli_order=codex,opencode,claude succeeded_cli_ids=[] failed_cli_ids=[]",
+            workspace_id,
+            workspace.root_path
+        );
+    }
+
+    for cli_id in ["codex", "opencode", "claude"] {
+        let cli = match factory.create(cli_id) {
+            Ok(cli) => cli,
+            Err(error) => {
+                log::warn!(
+                    "创建 CLI 失败: workspace_id={} cli_id={} error={error:#}",
+                    workspace_id,
+                    cli_id
+                );
+                report.failed_cli_ids.push(cli_id.to_string());
+                continue;
+            }
+        };
+
+        if is_ssh {
+            if let Err(error) = cli.ensure_service(&context).await {
+                log::warn!(
+                    "确保 SSH CLI 服务失败: workspace_id={} cli_id={} error={error:#}",
+                    workspace_id,
+                    cli_id
+                );
+                report.failed_cli_ids.push(cli_id.to_string());
+                continue;
+            }
+        }
+        prepared_clis.push((cli_id, cli));
+    }
+
+    for (cli_id, cli) in prepared_clis {
+        if is_ssh {
+            if let Err(error) = notify_app_startup_progress(
+                app,
+                "syncing-remote-sessions",
+                "正在同步远端会话……",
+            ) {
+                log::warn!("发送启动进度失败: {error:#}");
+            }
+        }
+        match sync_cli(&factory, &workspace, cli_id, Some(cli)).await {
+            Ok(()) => report.succeeded_cli_ids.push(cli_id.to_string()),
+            Err(error) => {
+                log::warn!(
+                    "同步项目会话失败: workspace_id={} cli_id={} error={error:#}",
+                    workspace_id,
+                    cli_id
+                );
+                report.failed_cli_ids.push(cli_id.to_string());
+            }
+        }
+    }
+
+    if !is_ssh {
+        log::info!(
+            "本地项目会话同步结束: workspace_id={} workspace_root_path={} cli_order=codex,opencode,claude succeeded_cli_ids={:?} failed_cli_ids={:?}",
+            workspace_id,
+            workspace.root_path,
+            report.succeeded_cli_ids,
+            report.failed_cli_ids
+        );
+    }
+
+    if is_ssh {
+        if let Err(error) = notify_ssh_remote_project_sessions_refreshed(
+            app,
+            SshRemoteProjectSessionsRefreshedEvent {
+                workspace_id: report.workspace_id.clone(),
+                succeeded_cli_ids: report.succeeded_cli_ids.clone(),
+                failed_cli_ids: report.failed_cli_ids.clone(),
+            },
+        ) {
+            log::warn!("发送 SSH 会话刷新通知失败: {error:#}");
+        }
+    }
+
+    Ok(report)
 }
 
 static REFRESHING_WORKSPACES: LazyLock<Mutex<HashSet<String>>> =
@@ -75,6 +204,7 @@ impl Drop for WorkspaceRefreshGuard {
     }
 }
 
+/*
 /// 按数据库顺序刷新全部已启用 SSH 工作区，并汇总可完成的报告。
 pub async fn refresh_all_ssh_remote_project_sessions(
     app: &AppHandle,
@@ -193,6 +323,58 @@ pub async fn refresh_ssh_remote_project_sessions(
     Ok(report)
 }
 
+*/
+
+// Service：src-tauri/src/remote_project_session_refresh_service.rs
+// public：同步全部项目
+pub async fn refresh_all_project_sessions(
+    app: &AppHandle,
+    db: Arc<Database>,
+) -> Vec<ProjectSessionRefreshReport> {
+    let workspaces = match tokio::task::spawn_blocking({
+        let db = db.clone();
+        move || list_workspaces(db.as_ref())
+    })
+    .await
+    {
+        Ok(Ok(workspaces)) => workspaces,
+        Ok(Err(error)) => {
+            log::warn!("读取项目列表失败: {error:#}");
+            return Vec::new();
+        }
+        Err(error) => {
+            log::warn!("读取项目列表任务失败: {error:#}");
+            return Vec::new();
+        }
+    };
+
+    let mut reports = Vec::new();
+    for workspace in workspaces {
+        if !is_local_workspace(&workspace) && !is_enabled_ssh_workspace(&workspace) {
+            continue;
+        }
+        match sync_project_sessions(app, db.clone(), &workspace.id).await {
+            Ok(report) => reports.push(report),
+            Err(error) => {
+                log::warn!(
+                    "同步项目会话失败: workspace_id={} error={error:#}",
+                    workspace.id,
+                );
+            }
+        }
+    }
+    reports
+}
+
+// public：同步指定项目
+pub async fn refresh_project_sessions(
+    app: &AppHandle,
+    db: Arc<Database>,
+    workspace_id: &str,
+) -> Result<ProjectSessionRefreshReport> {
+    sync_project_sessions(app, db, workspace_id).await
+}
+
 /// 判断工作区是否允许走 SSH 项目会话刷新入口。
 fn is_enabled_ssh_workspace(workspace: &WorkspaceDto) -> bool {
     workspace.location_kind == "ssh"
@@ -206,6 +388,7 @@ fn is_local_workspace(workspace: &WorkspaceDto) -> bool {
     workspace.location_kind != "ssh"
 }
 
+/*
 /// 从数据库读取并校验一个已启用 SSH 工作区。
 async fn load_workspace(db: Arc<Database>, workspace_id: &str) -> Result<WorkspaceDto> {
     let id = workspace_id.to_string();
@@ -273,6 +456,8 @@ pub async fn refresh_local_project_sessions(
     );
     Ok(report)
 }
+
+*/
 
 /// 通过 CLI 工厂和统一刷新接口完成一个 CLI 的项目会话刷新。
 async fn sync_cli(

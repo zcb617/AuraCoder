@@ -621,14 +621,14 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       */
       const results: Array<{ workspaceId: string; threads: Thread[] }> = [];
       for (const workspaceId of workspaceIds) {
-        try {
-          await ipc.refreshLocalProjectSessions(workspaceId);
-        } catch (error) {
-          console.warn(
-            `Failed to refresh local project sessions for workspace ${workspaceId}: ${String(error)}`,
-            error,
-          );
-        }
+        // try {
+        //   await ipc.refreshLocalProjectSessions(workspaceId);
+        // } catch (error) {
+        //   console.warn(
+        //     `Failed to refresh local project sessions for workspace ${workspaceId}: ${String(error)}`,
+        //     error,
+        //   );
+        // }
         // 旧启动路径通过 listThreads + discoverCodexRemoteThreads 发现远端会话；
         // await discoverCodexRemoteThreads(workspaceId, await ipc.listThreads(workspaceId));
         results.push({
