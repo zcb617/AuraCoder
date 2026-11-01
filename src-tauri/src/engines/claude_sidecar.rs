@@ -30,7 +30,7 @@ use crate::{
 
 use super::{
     normalize_approval_response_for_engine, trim_action_output_delta_content, ActionResult,
-    ActionType, ApprovalRequestRoute, Engine, EngineEvent, EngineSteerReceipt, EngineThread,
+    ActionType, ApprovalRequestRoute, Engine, EngineCheckAction, EngineEvent, EngineSteerReceipt, EngineThread,
     ModelInfo, OutputStream, ReasoningEffortOption, SandboxPolicy, ThreadScope,
     TurnCompletionStatus, TurnInput, TurnInputItem,
 };
@@ -1497,69 +1497,104 @@ impl ClaudeSidecarEngine {
         let mut checks = Vec::new();
         let mut warnings = Vec::new();
         let mut fixes = Vec::new();
+        let mut actions = Vec::new();
 
-        checks.extend(node_health_checks_for_platform(runtime_env::platform_id()));
+        // Node 运行环境检查项均来自明确的 CLI shell 检查命令。
+        let node_checks = node_health_checks_for_platform(runtime_env::platform_id());
+        actions.extend(
+            node_checks
+                .iter()
+                .cloned()
+                .map(EngineCheckAction::Shell),
+        );
+        checks.extend(node_checks);
 
         if let Some(node_path) = node_resolution.executable.as_ref() {
-            checks.push(format!(
+            let check = format!(
                 "Node.js resolved via {} at `{}`",
                 node_resolution.source,
                 node_path.display()
-            ));
-            checks.extend(
-                node_resolution
-                    .rejected_executables
-                    .iter()
-                    .map(|candidate| {
-                        format!(
-                            "Ignored incompatible Node.js {} at `{}`",
-                            candidate
-                                .version
-                                .as_deref()
-                                .unwrap_or("with unknown version"),
-                            candidate.path.display()
-                        )
-                    }),
             );
+            checks.push(check.clone());
+            actions.push(EngineCheckAction::Information(check));
+            let rejected_checks = node_resolution
+                .rejected_executables
+                .iter()
+                .map(|candidate| {
+                    format!(
+                        "Ignored incompatible Node.js {} at `{}`",
+                        candidate
+                            .version
+                            .as_deref()
+                            .unwrap_or("with unknown version"),
+                        candidate.path.display()
+                    )
+                })
+                .collect::<Vec<_>>();
+            actions.extend(
+                rejected_checks
+                    .iter()
+                    .cloned()
+                    .map(EngineCheckAction::Information),
+            );
+            checks.extend(rejected_checks);
         } else {
             warnings.push(node_unavailable_details(&node_resolution));
-            fixes.extend(node_fix_commands(&node_resolution));
-            fixes.push("Install Node.js 20.5+ from https://nodejs.org".to_string());
+            let node_fix_actions = node_fix_actions(&node_resolution);
+            fixes.extend(
+                node_fix_actions
+                    .iter()
+                    .map(|action| action.label().to_string()),
+            );
+            actions.extend(node_fix_actions);
+            let install_guidance = "Install Node.js 20.5+ from https://nodejs.org".to_string();
+            fixes.push(install_guidance.clone());
+            actions.push(EngineCheckAction::Information(install_guidance));
         }
 
         if sidecar_exists {
-            checks.push("Agent SDK sidecar script found".to_string());
+            let check = "Agent SDK sidecar script found".to_string();
+            checks.push(check.clone());
+            actions.push(EngineCheckAction::Information(check));
         } else {
             warnings.push("Agent SDK sidecar script not found".to_string());
         }
 
         if let Some(claude_path) = system_claude.as_ref() {
-            checks.push(format!(
+            let check = format!(
                 "System Claude Code runtime resolved at `{}`",
                 claude_path.display()
-            ));
+            );
+            checks.push(check.clone());
+            actions.push(EngineCheckAction::Information(check));
         } else if sidecar_exists {
-            checks.push("Using the Claude Code runtime bundled with the Agent SDK".to_string());
+            let check = "Using the Claude Code runtime bundled with the Agent SDK".to_string();
+            checks.push(check.clone());
+            actions.push(EngineCheckAction::Information(check));
         }
 
         if let Some(sdk_version) = runtime_info
             .as_ref()
             .and_then(|runtime| runtime.sdk_version.as_deref())
         {
-            checks.push(format!("Claude Agent SDK version: {sdk_version}"));
+            let check = format!("Claude Agent SDK version: {sdk_version}");
+            checks.push(check.clone());
+            actions.push(EngineCheckAction::Information(check));
         }
 
         if api_key_set {
-            checks.push("ANTHROPIC_API_KEY is set".to_string());
+            let check = "ANTHROPIC_API_KEY is set".to_string();
+            checks.push(check.clone());
+            actions.push(EngineCheckAction::Information(check));
         } else {
             warnings.push(
                 "ANTHROPIC_API_KEY is not set. Claude may still work via Claude Code login or auth token."
                     .to_string(),
             );
-            fixes.push(
-                "Optional: set ANTHROPIC_API_KEY, or sign in with Claude Code so the SDK can use existing auth."
-                    .to_string(),
-            );
+            let auth_guidance = "Optional: set ANTHROPIC_API_KEY, or sign in with Claude Code so the SDK can use existing auth."
+                .to_string();
+            fixes.push(auth_guidance.clone());
+            actions.push(EngineCheckAction::Information(auth_guidance));
         }
 
         let available = node_available && sidecar_exists;
@@ -1623,6 +1658,7 @@ impl ClaudeSidecarEngine {
             warnings,
             checks,
             fixes,
+            actions,
         }
     }
 
@@ -1862,6 +1898,11 @@ fn node_fix_commands(resolution: &NodeExecutableResolution) -> Vec<String> {
     node_fix_commands_for_platform(runtime_env::platform_id(), resolution)
 }
 
+/// 为当前平台生成带来源类型的 Node 修复建议。
+fn node_fix_actions(resolution: &NodeExecutableResolution) -> Vec<EngineCheckAction> {
+    node_fix_actions_for_platform(runtime_env::platform_id(), resolution)
+}
+
 fn node_unavailable_details_for_platform(
     platform: &str,
     resolution: &NodeExecutableResolution,
@@ -1910,21 +1951,36 @@ fn node_fix_commands_for_platform(
     platform: &str,
     resolution: &NodeExecutableResolution,
 ) -> Vec<String> {
+    node_fix_actions_for_platform(platform, resolution)
+        .iter()
+        .map(|action| action.label().to_string())
+        .collect()
+}
+
+/// 按建议生成来源区分可执行的 Node 修复命令和用户说明。
+fn node_fix_actions_for_platform(
+    platform: &str,
+    resolution: &NodeExecutableResolution,
+) -> Vec<EngineCheckAction> {
     if platform == "macos" {
         let _ = resolution;
         return vec![
-            "/bin/zsh -lic 'command -v node && node --version'".to_string(),
-            "open -a AuraCoder".to_string(),
+            EngineCheckAction::Shell(
+                "/bin/zsh -lic 'command -v node && node --version'".to_string(),
+            ),
+            EngineCheckAction::Shell("open -a AuraCoder".to_string()),
         ];
     }
 
     if platform == "windows" {
         let _ = resolution;
         return vec![
-            "where node".to_string(),
-            "echo %PATH%".to_string(),
-            "Ensure your Node.js install directory is present in PATH, then restart AuraCoder."
-                .to_string(),
+            EngineCheckAction::Shell("where node".to_string()),
+            EngineCheckAction::Shell("echo %PATH%".to_string()),
+            EngineCheckAction::Information(
+                "Ensure your Node.js install directory is present in PATH, then restart AuraCoder."
+                    .to_string(),
+            ),
         ];
     }
 
@@ -2354,6 +2410,8 @@ pub struct ClaudeHealthReport {
     pub warnings: Vec<String>,
     pub checks: Vec<String>,
     pub fixes: Vec<String>,
+    /// 与 checks/fixes 同源的许可命令、原生检查和说明动作。
+    pub(crate) actions: Vec<EngineCheckAction>,
 }
 
 #[async_trait]

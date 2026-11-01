@@ -1,74 +1,18 @@
-use std::{path::Path, time::Instant};
-
-use anyhow::Context;
 use tauri::State;
-use tokio::process::Command;
-
-// 旧实现曾直接读取本机 CLI 生命周期；现由 CliTool::is_service_ready 统一查询：
-// use crate::local_cli_service_lifecycle::LocalCliServiceLifecycle;
-
-use crate::runtime_env;
 use crate::{
-    cli_tools::{factory::CliToolFactory, CliExecutionContext, CliLocationKind, CliTool},
-    engines::{capabilities_for_engine, map_engine_capabilities},
+    cli_tools::factory::CliToolFactory,
     models::{
         ChatProviderUsageDto, CliContextUsageDto, CodexAppDto, CodexPluginDto, CodexSkillDto,
         EngineCheckResultDto, EngineHealthDto, EngineInfoDto, ExecutionTargetDto,
         OpenCodeRuntimeCatalogDto,
-        // ThreadDto,
     },
-    process_utils,
     state::AppState,
 };
 
-/// 本机 CLI 目录通过统一接口查询 Ready 服务，再读取对应 CLI 的引擎信息。
-/// 本机取数不依赖具体项目，因此使用仅标记 location_kind 的本机上下文。
-pub(crate) async fn list_local_engine_infos(
-    state: &AppState,
-) -> Result<Vec<EngineInfoDto>, String> {
-    let factory = CliToolFactory::new(state.clone());
-    let context = CliExecutionContext {
-        workspace_id: String::new(),
-        root_path: String::new(),
-        location_kind: CliLocationKind::Local,
-        ssh_connection_id: None,
-    };
-    let mut engines = Vec::new();
-    for cli_id in ["codex", "opencode", "claude"] {
-        let cli = factory.create(cli_id).map_err(err_to_string)?;
-        let ready = match cli.is_service_ready(&context).await {
-            Ok(ready) => ready,
-            Err(error) => {
-                log::warn!(
-                    "查询本机 CLI 服务状态失败，跳过引擎: cli_id={} error={error:#}",
-                    cli_id,
-                );
-                continue;
-            }
-        };
-        if !ready {
-            continue;
-        }
-        match cli.get_engine_info(&context).await {
-            Ok(engine) => engines.push(engine),
-            Err(error) => {
-                log::warn!(
-                    "读取本地引擎目录失败，保留其他引擎: cli_id={} error={error:#}",
-                    cli_id,
-                );
-                engines.push(EngineInfoDto {
-                    id: cli_id.to_string(),
-                    name: cli.name().to_string(),
-                    models: Vec::new(),
-                    capabilities: map_engine_capabilities(capabilities_for_engine(cli_id)),
-                });
-            }
-        }
-    }
-    engines.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(engines)
-}
-
+/*
+旧 get_execution_target 直接查询数据库和 SSH 连接，现由 WorkspaceService 处理，
+保留原实现供行为追溯：
+/// 查询工作区对应的本机或 SSH 执行目标展示信息。
 #[tauri::command]
 pub async fn get_execution_target(
     state: State<'_, AppState>,
@@ -139,7 +83,23 @@ pub async fn get_execution_target(
         connection_status: Some(connection.dto.connection_status),
     })
 }
+*/
 
+/// 查询工作区对应的本机或 SSH 执行目标展示信息。
+#[tauri::command]
+pub async fn get_execution_target(
+    state: State<'_, AppState>,
+    workspace_id: Option<String>,
+) -> Result<ExecutionTargetDto, String> {
+    crate::services::workspace_service::WorkspaceService::new(state.inner().clone())
+        .get_execution_target(workspace_id)
+        .await
+        .map_err(err_to_string)
+}
+
+/*
+旧实现已迁移至统一服务、目录或 CLI 接口，保留原代码供行为追溯：
+/// 查询本机或指定 SSH 连接上已就绪的 CLI 引擎目录。
 #[tauri::command]
 pub async fn list_actived_clis(
     state: State<'_, AppState>,
@@ -194,7 +154,7 @@ pub async fn list_actived_clis(
         return Ok(engines);
     }
 
-    /*
+    / *
     旧实现接收 workspaceId，先查询项目，再从远端项目取得 connectionId。CLI 列表属于
     本地电脑或指定的远端电脑，不属于项目目录，因此不再执行这段项目查询和分流逻辑：
     if let Some(workspace_id) = workspace_id {
@@ -219,7 +179,7 @@ pub async fn list_actived_clis(
                 .as_deref()
                 .ok_or_else(|| "远端项目未绑定 SSH 连接".to_string())?
                 .to_string();
-            /*
+            / *
             旧实现用 Tunnel Registry 判断 CLI 工具是否可用，并等待隧道数量稳定。隧道存在
             不代表统一 CLI 生命周期中的服务句柄已经 Ready，因此不再执行：
             let mut observed_tunnel_count = 0;
@@ -289,7 +249,7 @@ pub async fn list_actived_clis(
                 };
                 let _ = (engine_name, discovered);
             }
-            */
+            * /
             let services = crate::ssh::cli_service_lifecycle::list_ready(&connection_id).await;
             if services.is_empty() {
                 return Err(
@@ -324,8 +284,8 @@ pub async fn list_actived_clis(
             return Ok(engines);
         }
     }
-    */
-    /*
+    * /
+    / *
     旧实现先由 EngineManager 自有的未预热引擎实例取模型目录，再拿
     LocalCliServiceLifecycle::list_ready() 过滤；本机首次读取会冷启动新的
     codex app-server，导致页面转圈。现在直接由本地 CLI 生命周期取数，不再执行：
@@ -343,10 +303,25 @@ pub async fn list_actived_clis(
                 .any(|service| service.cli_id() == engine.id.as_str())
         })
         .collect())
-    */
+    * /
     list_local_engine_infos(state.inner()).await
 }
+*/
 
+/// 查询本机或指定 SSH 连接上已就绪的 CLI 引擎目录。
+#[tauri::command]
+pub async fn list_actived_clis(
+    state: State<'_, AppState>,
+    connection_id: Option<String>,
+) -> Result<Vec<EngineInfoDto>, String> {
+    crate::engines::catalog::list_actived_clis(state.inner(), connection_id)
+        .await
+        .map_err(err_to_string)
+}
+
+/*
+旧实现已迁移至统一服务、目录或 CLI 接口，保留原代码供行为追溯：
+/// 读取指定 CLI 在当前项目运行目标上的模型目录。
 #[tauri::command]
 pub async fn get_engine_info(
     state: State<'_, AppState>,
@@ -426,7 +401,7 @@ pub async fn get_engine_info(
         }
     }
 
-    /*
+    / *
     旧实现回落到 EngineManager 的 list_actived_clis；该方法使用的引擎实例未在启动
     阶段预热，已整体停用。codex、opencode、claude 都在上方分支返回，走到这里的是
     不支持的引擎 id，不再执行：
@@ -438,10 +413,31 @@ pub async fn get_engine_info(
         .into_iter()
         .find(|engine| engine.id == engine_id)
         .ok_or_else(|| format!("engine not found: {engine_id}"))
-    */
+    * /
     Err(format!("engine not found: {engine_id}"))
 }
+*/
 
+/// 读取指定 CLI 在当前项目运行目标上的模型目录。
+#[tauri::command]
+pub async fn get_engine_info(
+    state: State<'_, AppState>,
+    engine_id: String,
+    workspace_id: Option<String>,
+) -> Result<EngineInfoDto, String> {
+    let cli = CliToolFactory::new(state.inner().clone())
+        .create(&engine_id)
+        .map_err(err_to_string)?;
+    let context = cli
+        .execution_context(workspace_id.as_deref())
+        .await
+        .map_err(err_to_string)?;
+    cli.get_engine_info(&context).await.map_err(err_to_string)
+}
+
+/*
+旧实现已迁移至统一服务、目录或 CLI 接口，保留原代码供行为追溯：
+/// 查询用户指定范围内的 CLI 用量信息。
 #[tauri::command]
 pub async fn get_chat_provider_usage(
     state: State<'_, AppState>,
@@ -576,11 +572,23 @@ pub async fn get_chat_provider_usage(
     }
     Ok(usage)
 }
+*/
 
-/// 查询指定 AuraCoder 线程所属 CLI 的真实上下文窗口快照。
-///
-/// 业务调用只按线程保存的 engine_id 选择统一 CLI 接口，并通过 workspace
-/// 上下文校验执行位置；具体协议和本机/SSH 生命周期由 CLI 实现负责。
+/// 查询用户指定范围内的 CLI 用量信息。
+#[tauri::command]
+pub async fn get_chat_provider_usage(
+    state: State<'_, AppState>,
+    workspace_id: Option<String>,
+    engine_id: Option<String>,
+) -> Result<Vec<ChatProviderUsageDto>, String> {
+    crate::engines::catalog::get_chat_provider_usage(state.inner(), workspace_id, engine_id)
+        .await
+        .map_err(err_to_string)
+}
+
+/*
+旧实现已迁移至统一服务、目录或 CLI 接口，保留原代码供行为追溯：
+/// 查询 AuraCoder 线程所属 CLI 的上下文 token 快照。
 #[tauri::command]
 pub async fn get_cli_context_usage(
     state: State<'_, AppState>,
@@ -755,7 +763,23 @@ pub async fn get_cli_context_usage(
         }
     }
 }
+*/
 
+/// 查询 AuraCoder 线程所属 CLI 的上下文 token 快照。
+#[tauri::command]
+pub async fn get_cli_context_usage(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<Option<CliContextUsageDto>, String> {
+    crate::services::thread_service::ThreadService::new(state.inner().clone())
+        .get_cli_context_usage(&thread_id)
+        .await
+        .map_err(err_to_string)
+}
+
+/*
+旧实现已迁移至统一服务、目录或 CLI 接口，保留原代码供行为追溯：
+/// 判断 Codex 是否使用外部管理的沙箱。
 #[tauri::command]
 pub async fn codex_uses_external_sandbox(
     state: State<'_, AppState>,
@@ -773,7 +797,29 @@ pub async fn codex_uses_external_sandbox(
         .await
         .map_err(err_to_string)
 }
+*/
 
+/// 判断 Codex 是否使用外部管理的沙箱。
+#[tauri::command]
+pub async fn codex_uses_external_sandbox(
+    state: State<'_, AppState>,
+    workspace_id: Option<String>,
+) -> Result<bool, String> {
+    let cli = CliToolFactory::new(state.inner().clone())
+        .create("codex")
+        .map_err(err_to_string)?;
+    let context = cli
+        .execution_context(workspace_id.as_deref())
+        .await
+        .map_err(err_to_string)?;
+    cli.uses_external_sandbox(&context)
+        .await
+        .map_err(err_to_string)
+}
+
+/*
+旧实现已迁移至统一服务、目录或 CLI 接口，保留原代码供行为追溯：
+/// 检查指定 CLI 在当前项目运行目标上的健康状态。
 #[tauri::command]
 pub async fn engine_health(
     state: State<'_, AppState>,
@@ -932,7 +978,28 @@ pub async fn engine_health(
         .await
         .map_err(err_to_string)
 }
+*/
 
+/// 检查指定 CLI 在当前项目运行目标上的健康状态。
+#[tauri::command]
+pub async fn engine_health(
+    state: State<'_, AppState>,
+    engine_id: String,
+    workspace_id: Option<String>,
+) -> Result<EngineHealthDto, String> {
+    let cli = CliToolFactory::new(state.inner().clone())
+        .create(&engine_id)
+        .map_err(err_to_string)?;
+    let context = cli
+        .execution_context(workspace_id.as_deref())
+        .await
+        .map_err(err_to_string)?;
+    cli.engine_health(&context).await.map_err(err_to_string)
+}
+
+/*
+旧实现已迁移至统一服务、目录或 CLI 接口，保留原代码供行为追溯：
+/// 预热指定 CLI 在当前项目运行目标上的服务。
 #[tauri::command]
 pub async fn prewarm_engine(
     state: State<'_, AppState>,
@@ -1004,7 +1071,28 @@ pub async fn prewarm_engine(
         .await
         .map_err(err_to_string)
 }
+*/
 
+/// 预热指定 CLI 在当前项目运行目标上的服务。
+#[tauri::command]
+pub async fn prewarm_engine(
+    state: State<'_, AppState>,
+    engine_id: String,
+    workspace_id: Option<String>,
+) -> Result<(), String> {
+    let cli = CliToolFactory::new(state.inner().clone())
+        .create(&engine_id)
+        .map_err(err_to_string)?;
+    let context = cli
+        .execution_context(workspace_id.as_deref())
+        .await
+        .map_err(err_to_string)?;
+    cli.prewarm_engine(&context).await.map_err(err_to_string)
+}
+
+/*
+旧实现已迁移至统一服务、目录或 CLI 接口，保留原代码供行为追溯：
+/// 查询指定项目目录下的 Codex Skills。
 #[tauri::command]
 pub async fn list_codex_skills(
     state: State<'_, AppState>,
@@ -1051,7 +1139,30 @@ pub async fn list_codex_skills(
         .await
         .map_err(err_to_string)
 }
+*/
 
+/// 查询指定项目目录下的 Codex Skills。
+#[tauri::command]
+pub async fn list_codex_skills(
+    state: State<'_, AppState>,
+    cwd: String,
+    workspace_id: Option<String>,
+) -> Result<Vec<CodexSkillDto>, String> {
+    let cli = CliToolFactory::new(state.inner().clone())
+        .create("codex")
+        .map_err(err_to_string)?;
+    let context = cli
+        .execution_context(workspace_id.as_deref())
+        .await
+        .map_err(err_to_string)?;
+    cli.list_codex_skills(&context, cwd.trim())
+        .await
+        .map_err(err_to_string)
+}
+
+/*
+旧实现已迁移至统一服务、目录或 CLI 接口，保留原代码供行为追溯：
+/// 查询当前 CLI 的 Codex Apps 目录。
 #[tauri::command]
 pub async fn list_codex_apps(
     state: State<'_, AppState>,
@@ -1090,7 +1201,27 @@ pub async fn list_codex_apps(
     }
     state.engines.list_codex_apps().await.map_err(err_to_string)
 }
+*/
 
+/// 查询当前 CLI 的 Codex Apps 目录。
+#[tauri::command]
+pub async fn list_codex_apps(
+    state: State<'_, AppState>,
+    workspace_id: Option<String>,
+) -> Result<Vec<CodexAppDto>, String> {
+    let cli = CliToolFactory::new(state.inner().clone())
+        .create("codex")
+        .map_err(err_to_string)?;
+    let context = cli
+        .execution_context(workspace_id.as_deref())
+        .await
+        .map_err(err_to_string)?;
+    cli.list_codex_apps(&context).await.map_err(err_to_string)
+}
+
+/*
+旧实现已迁移至统一服务、目录或 CLI 接口，保留原代码供行为追溯：
+/// 查询指定目录下的 Codex 插件市场。
 #[tauri::command]
 pub async fn list_codex_plugins(
     state: State<'_, AppState>,
@@ -1149,7 +1280,34 @@ pub async fn list_codex_plugins(
         .await
         .map_err(err_to_string)
 }
+*/
 
+/// 查询指定目录下的 Codex 插件市场。
+#[tauri::command]
+pub async fn list_codex_plugins(
+    state: State<'_, AppState>,
+    cwd: String,
+    workspace_id: Option<String>,
+) -> Result<Vec<CodexPluginDto>, String> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return Err("项目目录不能为空".to_string());
+    }
+    let cli = CliToolFactory::new(state.inner().clone())
+        .create("codex")
+        .map_err(err_to_string)?;
+    let context = cli
+        .execution_context(workspace_id.as_deref())
+        .await
+        .map_err(err_to_string)?;
+    cli.list_codex_plugins(&context, cwd)
+        .await
+        .map_err(err_to_string)
+}
+
+/*
+旧实现已迁移至统一服务、目录或 CLI 接口，保留原代码供行为追溯：
+/// 查询指定项目目录下的 OpenCode agent、command 和 MCP 目录。
 #[tauri::command]
 pub async fn get_opencode_runtime_catalog(
     state: State<'_, AppState>,
@@ -1174,7 +1332,36 @@ pub async fn get_opencode_runtime_catalog(
         .await
         .map_err(err_to_string)
 }
+*/
 
+/// 查询指定项目目录下的 OpenCode agent、command 和 MCP 目录。
+#[tauri::command]
+pub async fn get_opencode_runtime_catalog(
+    state: State<'_, AppState>,
+    cwd: String,
+    workspace_id: Option<String>,
+) -> Result<OpenCodeRuntimeCatalogDto, String> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return Err("项目目录不能为空".to_string());
+    }
+    let cli = CliToolFactory::new(state.inner().clone())
+        .create("opencode")
+        .map_err(err_to_string)?;
+    let context = if let Some(workspace_id) = workspace_id.as_deref() {
+        cli.execution_context(Some(workspace_id)).await
+    } else {
+        cli.execution_context_for_cwd(Some(cwd)).await
+    }
+    .map_err(err_to_string)?;
+    cli.get_opencode_runtime_catalog(&context, cwd)
+        .await
+        .map_err(err_to_string)
+}
+
+/*
+旧实现已迁移至统一服务、目录或 CLI 接口，保留原代码供行为追溯：
+/// 执行 CLI 健康报告中登记的单个诊断动作。
 #[tauri::command]
 pub async fn run_engine_check(
     state: State<'_, AppState>,
@@ -1200,65 +1387,21 @@ pub async fn run_engine_check(
         .await
         .map_err(err_to_string)
 }
+*/
 
-async fn execute_engine_check_command(command: &str) -> anyhow::Result<EngineCheckResultDto> {
-    let started = Instant::now();
-
-    let output = build_shell_command(command)
+/// 执行 CLI 健康报告中登记的单个诊断动作。
+#[tauri::command]
+pub async fn run_engine_check(
+    state: State<'_, AppState>,
+    engine_id: String,
+    command: String,
+) -> Result<EngineCheckResultDto, String> {
+    let cli = CliToolFactory::new(state.inner().clone())
+        .create(&engine_id)
+        .map_err(err_to_string)?;
+    cli.run_engine_check(&command)
         .await
-        .output()
-        .await
-        .with_context(|| format!("failed to execute check command: `{command}`"))?;
-
-    let duration_ms = started.elapsed().as_millis();
-
-    Ok(EngineCheckResultDto {
-        command: command.to_string(),
-        success: output.status.success(),
-        exit_code: output.status.code(),
-        stdout: truncate_output(&String::from_utf8_lossy(&output.stdout), 12_000),
-        stderr: truncate_output(&String::from_utf8_lossy(&output.stderr), 12_000),
-        duration_ms,
-    })
-}
-
-#[cfg(target_os = "windows")]
-async fn build_shell_command(command: &str) -> Command {
-    let mut cmd = Command::new("cmd");
-    process_utils::configure_tokio_command(&mut cmd);
-    cmd.arg("/C").arg(command);
-    cmd.envs(runtime_env::get(Path::new("cmd")).await);
-    cmd
-}
-
-#[cfg(not(target_os = "windows"))]
-async fn build_shell_command(command: &str) -> Command {
-    let spec = runtime_env::command_shell_for_string(command);
-    let mut cmd = Command::new(&spec.program);
-    process_utils::configure_tokio_command(&mut cmd);
-    cmd.args(&spec.args);
-    // 旧手工 PATH 处理由 runtime_env::get 接替：
-    // if let Some(augmented_path) = runtime_env::augmented_path_with_prepend(
-    //     spec.program
-    //         .parent()
-    //         .into_iter()
-    //         .map(|value| value.to_path_buf()),
-    // ) {
-    //     cmd.env("PATH", augmented_path);
-    // }
-    cmd.envs(runtime_env::get(&spec.program).await);
-    cmd
-}
-
-fn truncate_output(value: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() <= max_chars {
-        return value.to_string();
-    }
-
-    let mut out = chars.into_iter().take(max_chars).collect::<String>();
-    out.push_str("\n...[truncated]");
-    out
+        .map_err(err_to_string)
 }
 
 fn err_to_string(error: impl std::fmt::Display) -> String {

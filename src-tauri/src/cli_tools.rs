@@ -4,6 +4,7 @@ pub mod codex;
 pub mod factory;
 pub(crate) mod mcp;
 pub mod opencode;
+pub(crate) mod engine_check;
 
 pub(crate) use mcp::{BaseCliMcp, CliMcpRuntime};
 
@@ -22,7 +23,8 @@ use crate::{
     },
     models::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
-        CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
+        CodexPluginDto, CodexSkillDto, EngineCheckResultDto, EngineHealthDto, EngineInfoDto,
+        ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
         ThreadDto, ThreadStatusDto, WorkspaceDto,
         chat::{
@@ -39,6 +41,15 @@ pub enum CliLocationKind {
     Local,
     /// 用户正在使用 SSH 远端项目。
     Ssh,
+}
+
+/// 区分页面汇总用量查询与用户显式选择 CLI 的用量查询。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliUsageQueryScope {
+    /// 页面默认加载所有已支持 CLI 的可用额度摘要。
+    Summary,
+    /// 用户显式选择某 CLI 时保留该 CLI 的不可用结果。
+    Explicit,
 }
 
 /// Gateway 注入的可信 MCP 调用上下文。
@@ -336,14 +347,20 @@ pub trait CliTool: Send + Sync {
     async fn get_chat_provider_usage(
         &self,
         context: &CliExecutionContext,
+        scope: CliUsageQueryScope,
     ) -> Result<Option<ChatProviderUsageDto>>;
 
     /// 用户进入已有线程或发送消息时，读取当前 CLI 线程的上下文 token 快照，供输入区显示剩余上下文。
-    async fn get_context_usage(
+    async fn get_context_usage(&self, thread_id: &str) -> Result<Option<CliContextUsageDto>>;
+
+    /// 读取当前 CLI 在指定运行位置的可用模型信息；未就绪时返回 None。
+    async fn get_active_engine_info(
         &self,
         context: &CliExecutionContext,
-        thread: &ThreadDto,
-    ) -> Result<Option<CliContextUsageDto>>;
+    ) -> Result<Option<EngineInfoDto>>;
+
+    /// 执行经当前 CLI 健康报告许可的单个诊断动作。
+    async fn run_engine_check(&self, command: &str) -> Result<EngineCheckResultDto>;
 
     /// 用户查看或重试运行目标时，检查当前 CLI 是否可以使用，并在页面显示版本、问题和处理建议。
     async fn engine_health(&self, context: &CliExecutionContext) -> Result<EngineHealthDto>;

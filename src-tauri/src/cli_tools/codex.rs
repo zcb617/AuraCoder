@@ -13,10 +13,11 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use super::{
     BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
     CliReviewStarted, CliSessionNotFoundError,
-    CliSessionSnapshot, CliTool, McpInvocationContext, McpToolResult, map_context_usage,
+    CliSessionSnapshot, CliTool, CliUsageQueryScope, McpInvocationContext, McpToolResult,
+    map_context_usage,
 };
 use crate::{
-    cli_tools::mcp::chat_business::*,
+    cli_tools::{engine_check, mcp::chat_business::*},
     db,
     engines::{
         capabilities_for_engine,
@@ -33,7 +34,7 @@ use crate::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
-        EngineRuntimeUpdatedDto, MessageStatusDto, ThreadDto, ThreadStatusDto, ThreadUpdateDto,
+        EngineCheckResultDto, EngineRuntimeUpdatedDto, MessageStatusDto, ThreadDto, ThreadStatusDto, ThreadUpdateDto,
         WorkspaceDto,
     },
     models::chat::{
@@ -3206,9 +3207,11 @@ impl CliTool for CodexCli {
         Ok(engine.list_models_runtime().await)
     }
 
+    /// 用户查看 Codex 用量时，读取当前本机或 SSH 运行目标上的额度。
     async fn get_chat_provider_usage(
         &self,
         context: &CliExecutionContext,
+        _scope: CliUsageQueryScope,
     ) -> Result<Option<ChatProviderUsageDto>> {
         let workspace = self.load_workspace(context).await?;
         if context.location_kind == CliLocationKind::Ssh {
@@ -3230,9 +3233,24 @@ impl CliTool for CodexCli {
     /// 用户进入 Codex 线程时，直接读取线程记录中的持久化上下文 token 快照。
     async fn get_context_usage(
         &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
+        thread_id: &str,
     ) -> Result<Option<CliContextUsageDto>> {
+        // 按数据库线程归属读取执行上下文，再沿用 Codex 持久化 token 快照映射。
+        let (context, thread) = self
+            .mcp
+            .context_for_thread(self.id(), thread_id)
+            .await
+            .inspect_err(|error| {
+                log::error!(
+                    "读取 Codex 线程上下文失败: cli_id={} thread_id={} error={error:#}",
+                    self.id(),
+                    thread_id
+                )
+            })
+            .context("读取 Codex 线程上下文失败")?;
+        let context = &context;
+        let thread = &thread;
+
         log::info!(
             "Codex context usage service entered: stage=service_entry thread_id={} engine_thread_id={:?} workspace_id={} location_kind={:?} root_path={:?} ssh_connection_id={:?}",
             thread.id,
@@ -3305,6 +3323,43 @@ impl CliTool for CodexCli {
             mapped.is_none()
         );
         Ok(mapped)
+    }
+
+    /// 查询已登记 Codex 在当前运行位置的就绪状态和模型目录。
+    async fn get_active_engine_info(
+        &self,
+        context: &CliExecutionContext,
+    ) -> Result<Option<EngineInfoDto>> {
+        self.mcp
+            .active_engine_info(self, context)
+            .await
+            .inspect_err(|error| {
+                log::error!(
+                    "读取 Codex 活动模型目录失败: cli_id={} error={error:#}",
+                    self.id()
+                )
+            })
+    }
+
+    /// 执行 Codex 健康报告中按原始标签登记的 shell 诊断命令。
+    async fn run_engine_check(&self, command: &str) -> Result<EngineCheckResultDto> {
+        let result: Result<EngineCheckResultDto> = async {
+            // 仅从现有 Codex 引擎健康报告读取已登记动作，再交给公共 shell 执行器。
+            let _context = self.execution_context(None).await?;
+            let engine = self.local_engine().await?;
+            let report = engine.health_report().await;
+            let action = engine_check::find_action(&report.actions, command)?;
+            let shell_command = engine_check::shell_command_for_action(&action)?;
+            engine_check::execute_shell(shell_command).await
+        }
+        .await;
+        if let Err(error) = &result {
+            log::error!(
+                "执行 Codex 诊断动作失败: cli_id={} command={command:?} error={error:#}",
+                self.id()
+            );
+        }
+        result.with_context(|| format!("执行 Codex 诊断动作失败: cli_id={}", self.id()))
     }
 
     async fn engine_health(&self, context: &CliExecutionContext) -> Result<EngineHealthDto> {

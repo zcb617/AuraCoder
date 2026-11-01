@@ -4,7 +4,7 @@ use crate::{
     db::{self, Database},
     fs_ops,
     git::repo,
-    models::{FileTreeEntryDto, FileTreePageDto, TrustLevelDto, WorkspaceDto},
+    models::{ExecutionTargetDto, FileTreeEntryDto, FileTreePageDto, TrustLevelDto, WorkspaceDto},
     remote_project_session_refresh_service,
     ssh::{remote_fs, runtime::resolve_workspace_target},
     state::AppState,
@@ -52,6 +52,25 @@ impl WorkspaceService {
             .context("读取工作区列表失败");
         if let Err(error) = &result {
             log::error!("读取工作区列表失败: error={error:#}");
+        }
+        result
+    }
+
+    /// 查询本机或 SSH 工作区的展示目标，不改变连接的启用或删除状态。
+    pub async fn get_execution_target(
+        &self,
+        workspace_id: Option<String>,
+    ) -> Result<ExecutionTargetDto> {
+        let log_workspace_id = workspace_id.clone();
+
+        // 在线程池中读取工作区和连接展示信息，避免阻塞异步运行时。
+        let result = run_db(self.state.db.clone(), move |db| {
+            load_execution_target(db, &workspace_id)
+        })
+        .await
+        .context("读取执行目标失败");
+        if let Err(error) = &result {
+            log::error!("读取执行目标失败: workspace_id={log_workspace_id:?} error={error:#}");
         }
         result
     }
@@ -570,6 +589,64 @@ where
     tokio::task::spawn_blocking(move || operation(&db))
         .await
         .context("数据库任务执行失败")?
+}
+
+/// 根据工作区标识加载本机或 SSH 执行目标的展示 DTO。
+fn load_execution_target(
+    db: &Database,
+    workspace_id: &Option<String>,
+) -> Result<ExecutionTargetDto> {
+    // 未指定工作区时返回本机默认展示目标。
+    let Some(workspace_id) = workspace_id else {
+        return Ok(ExecutionTargetDto {
+            target_key: "local".to_string(),
+            kind: "local".to_string(),
+            display_name: "本机".to_string(),
+            connection_id: None,
+            host_name: None,
+            user: None,
+            port: None,
+            project_path: None,
+            connection_status: Some("ok".to_string()),
+        });
+    };
+
+    // 先查询工作区；本机工作区直接展示根目录路径。
+    let workspace = db::workspaces::find_workspace_by_id(db, workspace_id)?
+        .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
+    if workspace.location_kind != "ssh" {
+        return Ok(ExecutionTargetDto {
+            target_key: "local".to_string(),
+            kind: "local".to_string(),
+            display_name: "本机".to_string(),
+            connection_id: None,
+            host_name: None,
+            user: None,
+            port: None,
+            project_path: Some(workspace.root_path),
+            connection_status: Some("ok".to_string()),
+        });
+    }
+
+    // SSH 工作区只读取连接展示资料，不拒绝已禁用或已删除连接。
+    let connection_id = workspace
+        .ssh_connection_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("远端项目未绑定 SSH 连接"))?
+        .to_string();
+    let connection = db::ssh_connections::find(db, &connection_id)?
+        .ok_or_else(|| anyhow::anyhow!("SSH connection not found: {connection_id}"))?;
+    Ok(ExecutionTargetDto {
+        target_key: format!("ssh:{connection_id}"),
+        kind: "ssh".to_string(),
+        display_name: connection.dto.display_name,
+        connection_id: Some(connection_id),
+        host_name: Some(connection.dto.host_name),
+        user: Some(connection.dto.user),
+        port: Some(connection.dto.port),
+        project_path: Some(workspace.root_path),
+        connection_status: Some(connection.dto.connection_status),
+    })
 }
 
 /// 按工作区 ID 读取 DTO，并在记录不存在时返回业务错误。

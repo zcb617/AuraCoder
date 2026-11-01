@@ -12,9 +12,10 @@ use tokio_util::sync::CancellationToken;
 use super::{
     BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
     CliReviewStarted, CliSessionNotFoundError, CliSessionSnapshot, CliTool, McpInvocationContext,
-    McpToolResult, map_context_usage,
+    CliUsageQueryScope, McpToolResult, map_context_usage,
 };
 use crate::{
+    cli_tools::engine_check,
     db,
     engines::{
         approval_response_route_for_engine, capabilities_for_engine, map_engine_capabilities,
@@ -30,7 +31,7 @@ use crate::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, OpenCodeRuntimeCatalogDto,
-        PermissionComponentJson, SteerReceiptDto, ThreadDto, ThreadStatusDto, WorkspaceDto,
+        EngineCheckResultDto, PermissionComponentJson, SteerReceiptDto, ThreadDto, ThreadStatusDto, WorkspaceDto,
     },
     models::chat::{
         ApprovalResponseOutcomeDto, ApprovalResponseRequest, ChatBusinessError, ChatReviewRequest,
@@ -73,6 +74,19 @@ impl OpenCodeCli {
                 location: CliLocationKind::Local,
             },
         )
+    }
+
+    /// 按调用范围生成 OpenCode 的既有不可用额度结果。
+    fn opencode_provider_usage(scope: CliUsageQueryScope) -> Option<ChatProviderUsageDto> {
+        match scope {
+            CliUsageQueryScope::Summary => None,
+            CliUsageQueryScope::Explicit => Some(ChatProviderUsageDto {
+                engine_id: "opencode".to_string(),
+                name: "OpenCode".to_string(),
+                available: false,
+                windows: Vec::new(),
+            }),
+        }
     }
 
     /// 按 Factory 指定的本机或 SSH 运行位置创建 OpenCode MCP 实现。
@@ -980,20 +994,37 @@ impl CliTool for OpenCodeCli {
         Ok(engine.list_models_runtime().await)
     }
 
+    /// 用户查看 OpenCode 用量时，只对显式查询返回既有不可用结果。
     async fn get_chat_provider_usage(
         &self,
         context: &CliExecutionContext,
+        scope: CliUsageQueryScope,
     ) -> Result<Option<ChatProviderUsageDto>> {
         self.load_workspace(context).await?;
-        Ok(None)
+        Ok(Self::opencode_provider_usage(scope))
     }
 
     /// 用户进入 OpenCode 线程时，读取模型上下文上限和最新可靠 assistant token 快照。
     async fn get_context_usage(
         &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
+        thread_id: &str,
     ) -> Result<Option<CliContextUsageDto>> {
+        // 按数据库线程归属读取执行上下文，再沿用 OpenCode 的运行时上下文快照。
+        let (context, thread) = self
+            .mcp
+            .context_for_thread(self.id(), thread_id)
+            .await
+            .inspect_err(|error| {
+                log::error!(
+                    "读取 OpenCode 线程上下文失败: cli_id={} thread_id={} error={error:#}",
+                    self.id(),
+                    thread_id
+                )
+            })
+            .context("读取 OpenCode 线程上下文失败")?;
+        let context = &context;
+        let thread = &thread;
+
         let workspace = self.load_workspace(context).await?;
         let engine_thread_id = thread
             .engine_thread_id
@@ -1017,6 +1048,76 @@ impl CliTool for OpenCodeCli {
         Ok(usage.and_then(|(current_tokens, max_context_tokens)| {
             map_context_usage(Some(current_tokens), Some(max_context_tokens))
         }))
+    }
+
+    /// 查询已登记 OpenCode 在当前运行位置的就绪状态和模型目录。
+    async fn get_active_engine_info(
+        &self,
+        context: &CliExecutionContext,
+    ) -> Result<Option<EngineInfoDto>> {
+        self.mcp
+            .active_engine_info(self, context)
+            .await
+            .inspect_err(|error| {
+                log::error!(
+                    "读取 OpenCode 活动模型目录失败: cli_id={} error={error:#}",
+                    self.id()
+                )
+            })
+    }
+
+    /// 执行 OpenCode 健康报告中按原始标签登记的 shell 或 HTTP 诊断动作。
+    async fn run_engine_check(&self, command: &str) -> Result<EngineCheckResultDto> {
+        let result: Result<EngineCheckResultDto> = async {
+            // 仅从当前 OpenCode 引擎健康报告读取动作，不创建或启动引擎。
+            let context = self.execution_context(None).await?;
+            let engine = self.local_engine(&context.root_path).await?;
+            let report = engine.health_report().await;
+            let action = engine_check::find_action(&report.actions, command)?;
+            match action {
+                crate::engines::EngineCheckAction::Shell(shell_command) => {
+                    engine_check::execute_shell(&shell_command).await
+                }
+                crate::engines::EngineCheckAction::NativeHealth(native_command) => {
+                    let started_at = std::time::Instant::now();
+                    match engine.prewarm().await {
+                        Ok(()) => Ok(EngineCheckResultDto {
+                            command: native_command,
+                            success: true,
+                            exit_code: None,
+                            stdout: "OpenCode HTTP 健康检查通过".to_string(),
+                            stderr: String::new(),
+                            duration_ms: started_at.elapsed().as_millis(),
+                        }),
+                        Err(error) => {
+                            log::warn!(
+                                "OpenCode HTTP 健康检查失败: cli_id={} command={command:?} error={error:#}",
+                                self.id()
+                            );
+                            Ok(EngineCheckResultDto {
+                                command: native_command,
+                                success: false,
+                                exit_code: None,
+                                stdout: String::new(),
+                                stderr: format!("{error:#}"),
+                                duration_ms: started_at.elapsed().as_millis(),
+                            })
+                        }
+                    }
+                }
+                crate::engines::EngineCheckAction::Information(_) => {
+                    anyhow::bail!("OpenCode 健康报告中的说明不能执行")
+                }
+            }
+        }
+        .await;
+        if let Err(error) = &result {
+            log::error!(
+                "执行 OpenCode 诊断动作失败: cli_id={} command={command:?} error={error:#}",
+                self.id()
+            );
+        }
+        result.with_context(|| format!("执行 OpenCode 诊断动作失败: cli_id={}", self.id()))
     }
 
     async fn engine_health(&self, context: &CliExecutionContext) -> Result<EngineHealthDto> {
@@ -2577,3 +2678,7 @@ pub(crate) mod thread_business {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/opencode_cli_tests.rs"]
+mod engine_business_tests;

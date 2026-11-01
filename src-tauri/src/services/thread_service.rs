@@ -5,7 +5,9 @@ use crate::runtime_env;
 use crate::{
     config::app_config::AppConfig,
     db,
-    models::{PermissionComponentJson, ThreadDto, ThreadStatusDto, ThreadUpdateDto},
+    models::{
+        CliContextUsageDto, PermissionComponentJson, ThreadDto, ThreadStatusDto, ThreadUpdateDto,
+    },
     state::AppState,
 };
 
@@ -290,6 +292,32 @@ impl ThreadService {
     pub async fn cli_for_thread(&self, thread_id: &str) -> anyhow::Result<std::sync::Arc<dyn crate::cli_tools::CliTool>> {
         let thread = self.get_thread(thread_id).await?;
         crate::cli_tools::factory::CliToolFactory::new(self.state.clone()).create(&thread.engine_id)
+    }
+
+    /// 按线程归属选择 CLI 并读取该线程的上下文用量。
+    pub async fn get_cli_context_usage(
+        &self,
+        thread_id: &str,
+    ) -> anyhow::Result<Option<CliContextUsageDto>> {
+        let thread_id = thread_id.trim();
+        let result: anyhow::Result<Option<CliContextUsageDto>> = async {
+            // 拒绝空线程标识后，按线程记录中的 CLI 归属选择统一接口。
+            anyhow::ensure!(!thread_id.is_empty(), "线程标识不能为空");
+            let cli = self
+                .cli_for_thread(thread_id)
+                .await
+                .context("按线程归属获取 CLI 失败")?;
+
+            // 将线程标识交给当前 CLI，由实现类读取既有用量来源。
+            cli.get_context_usage(thread_id)
+                .await
+                .context("读取线程上下文用量失败")
+        }
+        .await;
+        if let Err(error) = &result {
+            log::error!("读取线程 {thread_id} 的 CLI 上下文用量失败: {error:#}");
+        }
+        result
     }
 
     /// 创建业务统一入口，供页面、定时任务和远程调用；具体业务由目标 CLI 实现。

@@ -1,15 +1,17 @@
 use std::time::Instant;
 
+use anyhow::Context;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::{CliLocationKind, McpInvocationContext, McpToolResult};
+use super::{CliExecutionContext, CliLocationKind, McpInvocationContext, McpToolResult};
 use crate::{
     computer_control_service::{
         is_known_mcp_computer_tool, mcp_operation_kind, mcp_request_targets_current_process,
         resolve_mcp_target, ComputerControlAuthorization, ComputerControlTool,
     },
     config::app_config::AppConfig,
+    models::{EngineInfoDto, ThreadDto},
     state::AppState,
 };
 
@@ -39,6 +41,61 @@ impl BaseCliMcp {
     /// 创建绑定当前应用依赖和固定 CLI 运行位置的 MCP 公共实现。
     pub(crate) fn new(state: AppState, runtime: CliMcpRuntime) -> Self {
         Self { state, runtime }
+    }
+
+    /// 根据数据库线程归属读取目标 CLI 的执行上下文和线程记录。
+    pub(crate) async fn context_for_thread(
+        &self,
+        cli_id: &str,
+        thread_id: &str,
+    ) -> anyhow::Result<(CliExecutionContext, ThreadDto)> {
+        let database = self.state.db.clone();
+        let cli_id = cli_id.to_string();
+        let thread_id = thread_id.to_string();
+        let log_thread_id = thread_id.clone();
+
+        // 在线程池中校验线程归属并读取对应工作区，再返回拥有所有权的上下文对象。
+        let result = tokio::task::spawn_blocking(move || {
+            load_cli_thread_context(&database, &cli_id, &thread_id)
+        })
+        .await
+        .context("读取 CLI 线程上下文的数据库任务失败")
+        .and_then(|result| result);
+        if let Err(error) = &result {
+            log::error!(
+                "读取 CLI 线程上下文失败: cli_id={} thread_id={} error={error:#}",
+                self.runtime.cli_id,
+                log_thread_id
+            );
+        }
+        result
+    }
+
+    /// 汇总当前 CLI 的已就绪状态和模型信息，模型读取失败时保留空目录结果。
+    pub(crate) async fn active_engine_info(
+        &self,
+        cli: &dyn crate::cli_tools::CliTool,
+        context: &CliExecutionContext,
+    ) -> anyhow::Result<Option<EngineInfoDto>> {
+        // 只从当前统一 CLI 接口查询就绪状态和引擎目录。
+        if !cli.is_service_ready(context).await? {
+            return Ok(None);
+        }
+        match cli.get_engine_info(context).await {
+            Ok(engine_info) => Ok(Some(engine_info)),
+            Err(error) => {
+                log::warn!(
+                    "读取已就绪 CLI 的模型目录失败，保留空模型结果: cli_id={} error={error:#}",
+                    cli.id()
+                );
+                Ok(Some(EngineInfoDto {
+                    id: cli.id().to_string(),
+                    name: cli.name().to_string(),
+                    models: Vec::new(),
+                    capabilities: crate::engines::map_engine_capabilities(cli.capabilities()),
+                }))
+            }
+        }
     }
 
     /// 列出当前 CLI 可用的会话工具和本机 CUA 工具。
@@ -584,6 +641,26 @@ impl BaseCliMcp {
             }
         }
     }
+}
+
+/// 校验当前 CLI 对线程的所有权并读取其工作区执行上下文。
+fn load_cli_thread_context(
+    database: &crate::db::Database,
+    cli_id: &str,
+    raw_thread_id: &str,
+) -> anyhow::Result<(CliExecutionContext, ThreadDto)> {
+    // 拒绝空线程标识，并确认数据库线程属于调用方当前 CLI。
+    let thread_id = raw_thread_id.trim();
+    anyhow::ensure!(!thread_id.is_empty(), "线程标识不能为空");
+    let thread = crate::db::threads::get_thread(database, thread_id)?
+        .ok_or_else(|| anyhow::anyhow!("线程不存在: {thread_id}"))?;
+    anyhow::ensure!(thread.engine_id == cli_id, "线程不属于当前 CLI");
+
+    // 根据线程保存的工作区标识构造执行位置，保持既有工作区校验规则。
+    let workspace = crate::db::workspaces::find_workspace_by_id(database, &thread.workspace_id)?
+        .ok_or_else(|| anyhow::anyhow!("线程所属工作区不存在: {}", thread.workspace_id))?;
+    let context = CliExecutionContext::from_workspace(&workspace)?;
+    Ok((context, thread))
 }
 
 /// 判断会话是否满足三种 CLI 空消息按需同步条件。

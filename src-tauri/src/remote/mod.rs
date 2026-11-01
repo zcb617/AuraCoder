@@ -1408,7 +1408,7 @@ impl RemoteTunnelManager {
                                             "version": app.package_info().version.to_string(),
                                             "online": true,
                                         })),
-                                        "engine.list" => crate::commands::engines::list_local_engine_infos(&state)
+                                        "engine.list" => crate::engines::catalog::list_local_engine_infos(&state)
                                             .await
                                             .map_err(|error| error.to_string())
                                             .and_then(|items| serde_json::to_value(items).map_err(|error| error.to_string())),
@@ -1518,7 +1518,7 @@ impl RemoteTunnelManager {
                                                         .map_err(|error| error.to_string())
                                                         .and_then(|result| result.map_err(|error| error.to_string()))?
                                                         .ok_or_else(|| "thread not found".to_string())?;
-                                                        let engines = crate::commands::engines::list_local_engine_infos(&state).await?;
+                                                        let engines = crate::engines::catalog::list_local_engine_infos(&state).await?;
                                                         let (engine_id, model_id, reasoning_effort) =
                                                             resolve_remote_runtime_update(&thread, &engines, &engine_id, model_id, reasoning_effort)?;
                                                         let db = state.db.clone();

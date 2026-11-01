@@ -12,9 +12,10 @@ use super::{
     },
     BaseCliMcp, CliExecutionContext, CliForkedThread, CliLocationKind, CliMcpRuntime,
     CliReviewStarted, CliSessionNotFoundError, CliSessionSnapshot, CliTool,
-    McpInvocationContext, McpToolResult, map_context_usage,
+    CliUsageQueryScope, McpInvocationContext, McpToolResult, map_context_usage,
 };
 use crate::{
+    cli_tools::engine_check,
     config::app_config::ClaudeCodeSessionMode,
     db,
     engines::{
@@ -43,7 +44,7 @@ use crate::{
         CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionCatalogRefreshErrorDto, ExtensionItemDto,
-        OpenCodeRuntimeCatalogDto, SteerReceiptDto, ThreadDto, ThreadStatusDto, WorkspaceDto,
+        EngineCheckResultDto, OpenCodeRuntimeCatalogDto, SteerReceiptDto, ThreadDto, ThreadStatusDto, WorkspaceDto,
     },
     models::chat::{
         ApprovalResponseOutcomeDto, ApprovalResponseRequest, ChatBusinessError,
@@ -1783,9 +1784,11 @@ impl CliTool for ClaudeCodeCli {
         Ok(engine.list_models_runtime().await)
     }
 
+    /// 用户查看 Claude Code 用量时，读取当前本机或 SSH 运行目标上的额度。
     async fn get_chat_provider_usage(
         &self,
         context: &CliExecutionContext,
+        _scope: CliUsageQueryScope,
     ) -> Result<Option<ChatProviderUsageDto>> {
         self.load_workspace(context).await?;
         if context.location_kind == CliLocationKind::Ssh {
@@ -1807,9 +1810,24 @@ impl CliTool for ClaudeCodeCli {
     /// 用户进入 Claude 线程时，读取当前本机或远端 Claude 会话的真实上下文快照。
     async fn get_context_usage(
         &self,
-        context: &CliExecutionContext,
-        thread: &ThreadDto,
+        thread_id: &str,
     ) -> Result<Option<CliContextUsageDto>> {
+        // 按数据库线程归属读取执行上下文，再沿用 Claude 运行时上下文快照。
+        let (context, thread) = self
+            .mcp
+            .context_for_thread(self.id(), thread_id)
+            .await
+            .inspect_err(|error| {
+                log::error!(
+                    "读取 Claude Code 线程上下文失败: cli_id={} thread_id={} error={error:#}",
+                    self.id(),
+                    thread_id
+                )
+            })
+            .context("读取 Claude Code 线程上下文失败")?;
+        let context = &context;
+        let thread = &thread;
+
         let workspace = self.load_workspace(context).await?;
         let snapshot = if context.location_kind == CliLocationKind::Ssh {
             remote_project_claude_runtime_service::runtime(&workspace)
@@ -1825,6 +1843,43 @@ impl CliTool for ClaudeCodeCli {
             snapshot.current_tokens,
             snapshot.max_context_tokens,
         ))
+    }
+
+    /// 查询已登记 Claude Code 在当前运行位置的就绪状态和模型目录。
+    async fn get_active_engine_info(
+        &self,
+        context: &CliExecutionContext,
+    ) -> Result<Option<EngineInfoDto>> {
+        self.mcp
+            .active_engine_info(self, context)
+            .await
+            .inspect_err(|error| {
+                log::error!(
+                    "读取 Claude Code 活动模型目录失败: cli_id={} error={error:#}",
+                    self.id()
+                )
+            })
+    }
+
+    /// 执行 Claude Code 健康报告中按原始标签登记的 shell 诊断命令。
+    async fn run_engine_check(&self, command: &str) -> Result<EngineCheckResultDto> {
+        let result: Result<EngineCheckResultDto> = async {
+            // 仅从现有 Claude 健康报告读取已登记动作，再交给公共 shell 执行器。
+            let _context = self.execution_context(None).await?;
+            let engine = self.local_engine().await?;
+            let report = engine.health_report().await;
+            let action = engine_check::find_action(&report.actions, command)?;
+            let shell_command = engine_check::shell_command_for_action(&action)?;
+            engine_check::execute_shell(shell_command).await
+        }
+        .await;
+        if let Err(error) = &result {
+            log::error!(
+                "执行 Claude Code 诊断动作失败: cli_id={} command={command:?} error={error:#}",
+                self.id()
+            );
+        }
+        result.with_context(|| format!("执行 Claude Code 诊断动作失败: cli_id={}", self.id()))
     }
 
     async fn engine_health(&self, context: &CliExecutionContext) -> Result<EngineHealthDto> {

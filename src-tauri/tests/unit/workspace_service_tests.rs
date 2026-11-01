@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::{
     db::{self, Database},
-    models::{TrustLevelDto, WorkspaceDto},
+    models::{SshConnectionInput, TrustLevelDto, WorkspaceDto},
     workspace_startup::{
         WorkspaceDefaultView, WorkspacePathBase, WorkspaceStartupApplyWhen,
         WorkspaceStartupGroup, WorkspaceStartupPreset, WorkspaceStartupSession,
@@ -11,7 +11,7 @@ use crate::{
 };
 use uuid::Uuid;
 
-use super::{load_workspace, normalize_preset_for_workspace};
+use super::{load_execution_target, load_workspace, normalize_preset_for_workspace};
 
 /// 构造用于工作区预设校验的最小工作区 DTO。
 fn workspace_dto(location_kind: &str, root_path: &str) -> WorkspaceDto {
@@ -134,4 +134,90 @@ fn missing_workspace_is_reported_before_preset_processing() {
     // 关闭数据库后清理仅由本测试创建的临时目录。
     drop(db);
     std::fs::remove_dir_all(temp_root).expect("failed to remove temporary workspace test root");
+}
+
+/// 验证本机与 SSH 执行目标展示数据库记录，并保留已禁用 SSH 连接状态。
+#[test]
+fn execution_target_display_keeps_disabled_ssh_state() {
+    let temp_root: PathBuf = std::env::temp_dir()
+        .join(format!("auracoder-execution-target-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_root).expect("failed to create temporary execution target root");
+    let db_path = temp_root.join("workspace.db");
+    let db = Database::open(db_path).expect("failed to initialize execution target database");
+
+    // 验证没有工作区时显示默认本机目标，登记本机工作区后显示其项目根目录。
+    let default_target = load_execution_target(&db, &None)
+        .expect("default local execution target should be available");
+    assert_eq!(default_target.kind, "local");
+    assert_eq!(default_target.project_path, None);
+
+    let local_root = temp_root.join("local-project");
+    std::fs::create_dir_all(&local_root).expect("failed to create local project root");
+    let local_workspace = db::workspaces::upsert_workspace(
+        &db,
+        local_root
+            .to_str()
+            .expect("temporary local project path should be valid UTF-8"),
+    )
+    .expect("failed to insert local workspace");
+    let local_target = load_execution_target(&db, &Some(local_workspace.id.clone()))
+        .expect("local workspace target should be available");
+    assert_eq!(local_target.kind, "local");
+    assert_eq!(
+        local_target.project_path.as_deref(),
+        Some(local_workspace.root_path.as_str())
+    );
+
+    // 通过连接 Mapper 完成远端项目绑定，再禁用连接并读取原展示资料。
+    let connection_id = format!("ssh-execution-target-{}", Uuid::new_v4());
+    let input = SshConnectionInput {
+        display_name: "Execution Target SSH".to_string(),
+        host_name: "192.0.2.10".to_string(),
+        user: "tester".to_string(),
+        port: 22,
+        identity_file: None,
+        host_key: String::new(),
+        config_alias: None,
+    };
+    let connection = db::ssh_connections::insert(
+        &db,
+        &connection_id,
+        "manual",
+        &input,
+        "ssh-ed25519",
+        "test-key",
+    )
+    .expect("failed to insert SSH connection");
+    db::ssh_connections::record_test(&db, &connection_id, &connection.updated_at, true, None)
+        .expect("failed to record successful SSH connection test");
+    let ssh_workspace = db::workspaces::create_ssh_workspace(
+        &db,
+        &connection_id,
+        "Remote Project",
+        "/srv/remote-project",
+    )
+    .expect("failed to insert SSH workspace");
+    let disabled_connection = db::ssh_connections::set_enabled(&db, &connection_id, false)
+        .expect("failed to disable SSH connection");
+
+    let ssh_target = load_execution_target(&db, &Some(ssh_workspace.id.clone()))
+        .expect("disabled SSH workspace should remain displayable");
+    assert_eq!(ssh_target.kind, "ssh");
+    assert_eq!(ssh_target.connection_id.as_deref(), Some(connection_id.as_str()));
+    assert_eq!(ssh_target.display_name, "Execution Target SSH");
+    assert_eq!(ssh_target.host_name.as_deref(), Some("192.0.2.10"));
+    assert_eq!(ssh_target.port, Some(22));
+    assert_eq!(ssh_target.project_path.as_deref(), Some("/srv/remote-project"));
+    assert_eq!(
+        ssh_target.connection_status.as_deref(),
+        Some(disabled_connection.connection_status.as_str())
+    );
+    assert_eq!(
+        ssh_target.connection_status.as_deref(),
+        Some(db::ssh_connections::STATUS_DISABLED)
+    );
+
+    // 关闭数据库后清理仅由本测试创建的临时目录。
+    drop(db);
+    std::fs::remove_dir_all(temp_root).expect("failed to remove temporary execution target root");
 }

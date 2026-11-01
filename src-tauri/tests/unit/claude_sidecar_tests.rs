@@ -709,3 +709,25 @@
         assert!(fixes.contains(&"echo %PATH%".to_string()));
         assert!(fixes.iter().any(|fix| fix.contains("restart AuraCoder")));
     }
+
+    /// 验证 Windows Node 修复命令和用户说明采用不同诊断动作类型。
+    #[test]
+    fn windows_node_fix_actions_distinguish_commands_and_instructions() {
+        let resolution = NodeExecutableResolution {
+            executable: None,
+            source: "unavailable",
+            app_path: Some(r"C:\Windows\System32".to_string()),
+            rejected_executables: Vec::new(),
+        };
+        let actions = node_fix_actions_for_platform("windows", &resolution);
+        let labels = actions
+            .iter()
+            .map(|action| action.label().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(&actions[0], EngineCheckAction::Shell(_)));
+        assert!(matches!(&actions[1], EngineCheckAction::Shell(_)));
+        assert!(matches!(&actions[2], EngineCheckAction::Information(_)));
+        assert_eq!(labels, node_fix_commands_for_platform("windows", &resolution));
+    }
