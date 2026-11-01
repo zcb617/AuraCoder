@@ -72,13 +72,14 @@ const SKIPPED_DIRECTORY_NAMES = new Set([
 ]);
 
 /**
- * 只允许三个 CLI Service 及其公共基础实现直接访问数据库 Mapper。
+ * 只允许三个 CLI Service、公共基础实现 BaseCliMcp 和 ThreadService 直接访问数据库 Mapper。
  */
 const DATABASE_SERVICE_PATHS = new Set([
   "src-tauri/src/cli_tools/claude_code.rs",
   "src-tauri/src/cli_tools/codex.rs",
   "src-tauri/src/cli_tools/mcp.rs",
   "src-tauri/src/cli_tools/opencode.rs",
+  "src-tauri/src/services/thread_service.rs",
 ]);
 
 /**
@@ -641,7 +642,7 @@ function moduleReferencePattern(moduleNames) {
 }
 
 /**
- * 判断路径是否属于允许直接调用数据库 Mapper 的 CLI Service、公共基础实现或 Mapper 目录。
+ * 判断路径是否属于允许直接调用数据库 Mapper 的 CLI Service、公共基础实现、ThreadService 或 Mapper 目录。
  * @param {string} filePath 仓库相对路径。
  * @returns {boolean} 是否不受 REF-09 约束。
  */
@@ -664,7 +665,7 @@ function databaseRulesForPath(filePath) {
   }
 
   const direction =
-    "业务数据库访问只能由 ClaudeCodeCli、CodexCli、OpenCodeCli 及其公共基础实现 BaseCliMcp 调用 Mapper；其他调用方应通过工厂和 CliTool 进入对应 Service，SQL 保留在 Mapper 层。";
+    "业务数据库访问仅允许已列明的 CLI Service、公共基础实现 BaseCliMcp 和 ThreadService 调用 Mapper；其他调用方应进入对应 Service，SQL 保留在 Mapper 层。";
   return [
     defineRule("REF-09", /\b(?:db|mapper|mappers)\s*::/g, direction),
     defineRule(
@@ -1190,19 +1191,20 @@ function runSelfChecks() {
     "REF-09 数据库连接 API 样例未被识别",
   );
 
-  // 验证三个 CLI Service、公共基础实现及 src-tauri/src/db 目录可直接访问 Mapper。
+  // 验证允许的 Service 实现及 src-tauri/src/db 目录可直接访问 Mapper。
   for (const file of [
     "src-tauri/src/cli_tools/codex.rs",
     "src-tauri/src/cli_tools/opencode.rs",
     "src-tauri/src/cli_tools/claude_code.rs",
     "src-tauri/src/cli_tools/mcp.rs",
+    "src-tauri/src/services/thread_service.rs",
   ]) {
     assert.equal(
       findSampleFindings(file, "db::threads::get_thread();").some(
         (finding) => finding.rule === "REF-09",
       ),
       false,
-      `REF-09 不应限制允许的 CLI Service 或公共基础实现: ${file}`,
+      `REF-09 不应限制允许的 Service 实现: ${file}`,
     );
   }
   assert.equal(
