@@ -72,7 +72,7 @@ const SKIPPED_DIRECTORY_NAMES = new Set([
 ]);
 
 /**
- * 只允许三个 CLI Service、公共基础实现 BaseCliMcp、聊天 Service、定时任务管理器和 ThreadService 直接访问数据库 Mapper。
+ * 只允许三个 CLI Service、公共基础实现 BaseCliMcp、聊天 Service、定时任务管理器、ThreadService 和 SshConnectionService 直接访问数据库 Mapper。
  */
 const DATABASE_SERVICE_PATHS = new Set([
   "src-tauri/src/cli_tools/claude_code.rs",
@@ -81,6 +81,7 @@ const DATABASE_SERVICE_PATHS = new Set([
   "src-tauri/src/cli_tools/opencode.rs",
   "src-tauri/src/scheduled_tasks/manager.rs",
   "src-tauri/src/services/chat_service.rs",
+  "src-tauri/src/services/ssh_connection_service.rs",
   "src-tauri/src/services/thread_service.rs",
 ]);
 
@@ -1321,6 +1322,7 @@ function runSelfChecks() {
     "src-tauri/src/cli_tools/claude_code.rs",
     "src-tauri/src/cli_tools/mcp.rs",
     "src-tauri/src/services/chat_service.rs",
+    "src-tauri/src/services/ssh_connection_service.rs",
     "src-tauri/src/scheduled_tasks/manager.rs",
     "src-tauri/src/services/thread_service.rs",
   ]) {
