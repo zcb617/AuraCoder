@@ -1,7 +1,6 @@
 import type { Dispatch, MutableRefObject, SetStateAction } from "react";
 import { useTranslation } from "react-i18next";
 import { Loader2, ListChecks, Plus, Send, Square } from "lucide-react";
-import { ipc } from "../../lib/ipc";
 import type { MessageSendMode } from "../../lib/chatInputSettings";
 import { toast } from "../../stores/toastStore";
 import type {
@@ -16,7 +15,6 @@ import type {
   OpenCodeRuntimeCatalog,
   PermissionComponentJson,
   Thread,
-  Workspace,
 } from "../../types";
 import { Dropdown } from "../shared/Dropdown";
 import { OpenCodeAgentPicker } from "./OpenCodeAgentPicker";
@@ -70,12 +68,8 @@ export interface ChatComposerToolbarProps {
   planMode: boolean;
   /** 当前会话发送模式。 */
   sessionMessageSendMode: MessageSendMode;
-  /** 当前活动聊天会话标识。 */
-  activeChatSessionId: string | null;
   /** 当前活动线程。 */
   activeThread: Thread | null;
-  /** 当前活动工作区对象。 */
-  activeWorkspace: Workspace | null;
   /** 当前线程是否已锁定运行时选择。 */
   activeThreadRuntimeLocked: boolean;
   /** 可用运行时引擎列表。 */
@@ -141,10 +135,6 @@ export interface ChatComposerToolbarProps {
   setSelectedModelId: Dispatch<SetStateAction<string | null>>;
   /** 更新当前选中的推理强度。 */
   setSelectedEffort: Dispatch<SetStateAction<string>>;
-  /** 更新线程本地的最后选中模型。 */
-  setThreadLastModelLocal: (threadId: string, modelId: string | null) => void;
-  /** 应用线程更新到本地线程状态。 */
-  applyThreadUpdateLocal: (thread: Thread) => boolean;
   /** 保存线程推理强度。 */
   onReasoningEffortChange: (nextEffort: string) => Promise<void>;
   /** 保存 Codex 配置变更。 */
@@ -179,9 +169,7 @@ export function ChatComposerToolbar({
   activePlanMode,
   planMode,
   sessionMessageSendMode,
-  activeChatSessionId,
   activeThread,
-  activeWorkspace,
   activeThreadRuntimeLocked,
   engines,
   health,
@@ -213,8 +201,6 @@ export function ChatComposerToolbar({
   setSelectedEngineId,
   setSelectedModelId,
   setSelectedEffort,
-  setThreadLastModelLocal,
-  applyThreadUpdateLocal,
   onReasoningEffortChange,
   onCodexConfigSave,
   loadEngines,
@@ -264,10 +250,9 @@ export function ChatComposerToolbar({
                     onClick={() => {
                       const nextPlanMode = !planMode;
                       setPlanMode(nextPlanMode);
-                      void saveThreadRuntimeSelectionPatch(
-                        activeThread?.id ?? activeChatSessionId,
-                        { planMode: nextPlanMode },
-                      );
+                      void saveThreadRuntimeSelectionPatch(activeThread?.id, {
+                        planMode: nextPlanMode,
+                      });
                     }}
                     disabled={!activeWorkspaceId}
                     title={
@@ -306,18 +291,21 @@ export function ChatComposerToolbar({
                     ) {
                       return;
                     }
-                    if (activeChatSessionId) {
+                    if (activeThread?.workspaceId === activeWorkspaceId) {
                       setThreadMessageSendMode(
-                        activeChatSessionId,
+                        activeThread.id,
                         nextMessageSendMode,
                       );
-                      void saveThreadRuntimeSelectionPatch(activeChatSessionId, {
+                      void saveThreadRuntimeSelectionPatch(activeThread.id, {
                         sendMethod: nextMessageSendMode,
                       });
                       return;
                     }
                     if (activeWorkspaceId) {
                       setPendingMessageSendMode(activeWorkspaceId, nextMessageSendMode);
+                      void saveThreadRuntimeSelectionPatch(null, {
+                        sendMethod: nextMessageSendMode,
+                      });
                     }
                   }}
                   disabled={!activeWorkspaceId}
@@ -426,27 +414,24 @@ export function ChatComposerToolbar({
                           runtimePatch.reasoningEffort = nextEffort;
                         }
                       }
-                      void saveThreadRuntimeSelectionPatch(
-                        activeThread?.id ?? activeChatSessionId,
-                        runtimePatch,
-                      );
-                      if (
-                        activeWorkspace?.locationKind === "ssh" &&
-                        activeThread?.workspaceId === activeWorkspaceId &&
-                        activeThread.engineId === engineId
-                      ) {
-                        setThreadLastModelLocal(activeThread.id, modelId);
-                        void ipc
-                          .setSshRemoteThreadSelectedModel(activeThread.id, modelId)
-                          .then((updatedThread) => {
-                            if (selectedModelIdRef.current === modelId) {
-                              applyThreadUpdateLocal(updatedThread);
-                            }
-                          })
-                          .catch((error) => {
-                            toast.error(String(error));
-                          });
-                      }
+                      void saveThreadRuntimeSelectionPatch(activeThread?.id, runtimePatch);
+                      /*
+                       * 旧 SSH 模型选择立即持久化分支完整保留，不再参与表单编辑：
+                       * if (
+                       *   activeWorkspace?.locationKind === "ssh" &&
+                       *   activeThread?.workspaceId === activeWorkspaceId &&
+                       *   activeThread.engineId === engineId
+                       * ) {
+                       *   setThreadLastModelLocal(activeThread.id, modelId);
+                       *   void ipc.setSshRemoteThreadSelectedModel(activeThread.id, modelId);
+                       *     .then((updatedThread) => {
+                       *       if (selectedModelIdRef.current === modelId) {
+                       *         applyThreadUpdateLocal(updatedThread);
+                       *       }
+                       *     })
+                       *     .catch((error) => toast.error(String(error)));
+                       * }
+                       */
                     }}
                     onEffortChange={(effort) => void onReasoningEffortChange(effort)}
                     onServiceTierChange={(serviceTier) => {
@@ -477,13 +462,13 @@ export function ChatComposerToolbar({
                 </>
               )}
 
-              {!showSpecialInputComposer && Boolean(activeThread?.id) && (
+              {!showSpecialInputComposer && Boolean(activeWorkspaceId) && (
                 <>
                   <div className="chat-toolbar-divider" />
                   <PermissionPicker
-                    disabled={!activeThread?.id}
+                    disabled={!activeWorkspaceId}
                     value={permissionComponent}
-                    onChange={(next) => void saveThreadRuntimeSelectionPatch(activeChatSessionId, { permissionMode: next })}
+                    onChange={(next) => void saveThreadRuntimeSelectionPatch(activeThread?.id, { permissionMode: next })}
                   />
                 </>
               )}

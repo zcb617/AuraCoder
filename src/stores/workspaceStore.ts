@@ -38,6 +38,8 @@ interface WorkspaceState {
   restoreWorkspace: (workspaceId: string) => Promise<void>;
   /** 切换当前项目。 */
   setActiveWorkspace: (workspaceId: string) => Promise<void>;
+  /** 仅切换前端当前项目，不刷新扩展或准备终端。 */
+  setActiveWorkspaceLocal: (workspaceId: string) => void;
   /** 更新项目级信任等级。 */
   setWorkspaceTrustLevel: (workspaceId: string, trustLevel: TrustLevel) => Promise<void>;
   /** 重新读取项目记录。 */
@@ -139,9 +141,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       if (get().activeWorkspaceId === restored.id) await useTerminalStore.getState().prepareWorkspaceActivation(restored.id);
     } catch (error) { set({ loading: false, error: String(error) }); }
   },
-  setActiveWorkspace: async (workspaceId) => {
+  setActiveWorkspaceLocal: (workspaceId) => {
     localStorage.setItem(LAST_WORKSPACE_KEY, workspaceId);
     set({ activeWorkspaceId: workspaceId, error: undefined });
+  },
+  setActiveWorkspace: async (workspaceId) => {
+    get().setActiveWorkspaceLocal(workspaceId);
     const workspace = get().workspaces.find((item) => item.id === workspaceId);
     if (workspace) { scheduleActiveWorkspaceExtensionRefresh(workspaceId); await useTerminalStore.getState().prepareWorkspaceActivation(workspaceId); }
   },

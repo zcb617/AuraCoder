@@ -33,7 +33,10 @@ import {
   getChatComposerSessionKey,
   useChatComposerStore,
 } from "../../stores/chatComposerStore";
-import type { PendingFlexibleMessage } from "../../stores/chatComposerStore";
+import type {
+  ChatSessionSettings,
+  PendingFlexibleMessage,
+} from "../../stores/chatComposerStore";
 import { isMessageSendMode } from "../../lib/chatInputSettings";
 import { useEngineStore } from "../../stores/engineStore";
 import { useFileStore } from "../../stores/fileStore";
@@ -121,7 +124,6 @@ import {
 } from "./formatters";
 import {
   parseStoredOutputSchema,
-  readThreadLastModelId,
   readThreadOpenCodeAgentValue,
   readThreadOutputSchemaText,
   readThreadPersonalityValue,
@@ -248,6 +250,8 @@ function prewarmEngineTransport(
 
 /** 普通聊天输入区拖动时必须保留的消息区最小可见高度，单位为像素。 */
 const CHAT_INPUT_MIN_VISIBLE_MESSAGE_SPACE = 120;
+
+const EMPTY_CHAT_SESSION_SETTINGS: ChatSessionSettings = {};
 
 interface ChatPanelProps {
   embedded?: boolean;
@@ -413,8 +417,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     attachOpenCodeRemoteSession,
     refreshThreads,
     setActiveThread: setActiveThreadInStore,
-    applyThreadUpdateLocal,
-    setThreadReasoningEffortLocal,
     setThreadLastModelLocal,
     renameThread,
     threadsByWorkspace,
@@ -429,20 +431,35 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       attachOpenCodeRemoteSession: state.attachOpenCodeRemoteSession,
       refreshThreads: state.refreshThreads,
       setActiveThread: state.setActiveThread,
-      applyThreadUpdateLocal: state.applyThreadUpdateLocal,
-      setThreadReasoningEffortLocal: state.setThreadReasoningEffortLocal,
       setThreadLastModelLocal: state.setThreadLastModelLocal,
       renameThread: state.renameThread,
       threadsByWorkspace: state.threadsByWorkspace,
     })),
   );
-  const activeChatSessionId = activeThread?.id ?? threadId ?? null;
+  const activeChatSessionId =
+    activeThread?.workspaceId === activeWorkspaceId ? activeThread.id : null;
   const composerSessionKey = activeWorkspaceId
     ? getChatComposerSessionKey(
         activeWorkspaceId,
         activeThread?.workspaceId === activeWorkspaceId ? activeThread.id : null,
       )
     : null;
+  const sessionSettings = useChatComposerStore((state) =>
+    composerSessionKey
+      ? state.settingsBySession[composerSessionKey] ?? EMPTY_CHAT_SESSION_SETTINGS
+      : EMPTY_CHAT_SESSION_SETTINGS,
+  );
+  const setSessionSettings = useChatComposerStore((state) => state.setSessionSettings);
+  const composerDraftRevision = useChatComposerStore((state) =>
+    activeWorkspaceId
+      ? state.newDraftRevisionByWorkspace[activeWorkspaceId] ?? 0
+      : 0,
+  );
+  const composerSettingsScopeKey = composerSessionKey
+    ? `${composerSessionKey}:${composerSessionKey.startsWith("new:") ? composerDraftRevision : 0}`
+    : null;
+  const sessionSettingsRef = useRef(sessionSettings);
+  sessionSettingsRef.current = sessionSettings;
   const flexibleMessageSessionKey = activeChatSessionId
     ? `thread:${activeChatSessionId}`
     : activeWorkspaceId
@@ -597,6 +614,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const sendShortcut = useChatComposerStore((state) => state.sendShortcut);
   const chatInputMode = useChatComposerStore((state) => state.chatInputMode);
   const sessionMessageSendMode = useChatComposerStore((state) => {
+    const configuredSendMethod = composerSessionKey
+      ? state.settingsBySession[composerSessionKey]?.sendMethod
+      : undefined;
+    if (configuredSendMethod && isMessageSendMode(configuredSendMethod)) {
+      return configuredSendMethod;
+    }
     if (activeChatSessionId) {
       return state.messageSendModeByThread[activeChatSessionId] ?? state.messageSendMode;
     }
@@ -843,8 +866,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   const prependLoadInFlightRef = useRef(false);
   const threadActivatedAtRef = useRef(0);
   const initialScrollThreadRef = useRef<string | null>(null);
-  // 保存每个线程正在执行的运行选择局部更新，保证同一线程按顺序落库。
-  const threadRuntimeSelectionRequestsRef = useRef<Record<string, Promise<boolean> | undefined>>({});
+  // 旧线程运行选择串行持久化队列：
+  // const threadRuntimeSelectionRequestsRef = useRef<Record<string, Promise<boolean> | undefined>>({});
   const viewportScrollTopRef = useRef(0);
   const [textAnnotationPopover, setTextAnnotationPopover] =
     useState<TextAnnotationPopover | null>(null);
@@ -865,6 +888,33 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     outputSchemaText: string;
     openCodeAgent: string;
   } | null>(null);
+
+  useEffect(() => {
+    // 会话或新草稿重置序号变化时清除只属于上一张表单的局部交互状态。
+    setSlashMenuOpen(false);
+    setSlashMenuQuery("");
+    setSlashMenuActiveIndex(0);
+    setThreadMentionMenuOpen(false);
+    setThreadMentionQuery("");
+    setThreadMentionActiveIndex(0);
+    setSelectedAuraCoderThreadMention(null);
+    threadMentionRangeRef.current = null;
+    setActiveCommandPanel(null);
+    setCommandPanelBusy(false);
+    setCommandPanelError(null);
+    setEditingThreadTitle(false);
+    setThreadTitleDraft("");
+    setTextAnnotationPopover(null);
+    setTextAnnotationComment("");
+    setPlanImplementationPrompt(null);
+    setWorkspaceRootPrompt(null);
+    setPlanMode(false);
+    inputHistoryRef.current = [];
+    inputHistCursorRef.current = -1;
+    inputLiveDraftRef.current = "";
+    const animationFrame = requestAnimationFrame(() => inputRef.current?.focus());
+    return () => cancelAnimationFrame(animationFrame);
+  }, [composerSettingsScopeKey]);
 
   useEffect(() => {
     if (textAnnotationPopover?.stage !== "comment") {
@@ -983,8 +1033,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       return null;
     }
   }, [outputSchemaText]);
-  const activeThreadHasRemoteSession =
-    activeWorkspace?.locationKind === "ssh" && Boolean(activeThread?.engineThreadId);
   /*
    * 旧逻辑只按 CLI 会话 ID或消息数锁定运行目标；该表达式由统一的空会话判断接管。
    * const activeThreadRuntimeLocked = Boolean(
@@ -993,28 +1041,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
    */
   const activeThreadRuntimeLocked =
     Boolean(activeThread) && !canChangeUnstartedThreadEngine(activeThread);
-  const activeThreadMatchesComposer = useMemo(() => {
-    if (!activeThread || !activeWorkspaceId || !selectedModelId) {
-      return false;
-    }
-
-    const inScope = activeThread.workspaceId === activeWorkspaceId;
-    const engineMatch = activeThread.engineId === selectedEngineId;
-    const modelMatch =
-      activeThreadHasRemoteSession ||
-      selectedEngineId === "codex" ||
-      activeThread.modelId === selectedModelId ||
-      readThreadLastModelId(activeThread) === selectedModelId;
-
-    return inScope && engineMatch && modelMatch;
-  }, [
-    activeThread,
-    activeThreadHasRemoteSession,
-    activeWorkspaceId,
-    selectedEngineId,
-    selectedModelId,
-  ]);
-
   useEffect(() => {
     selectedEngineIdRef.current = selectedEngineId;
   }, [selectedEngineId]);
@@ -1272,11 +1298,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     () => selectedModel?.supportedReasoningEfforts ?? [],
     [selectedModel],
   );
-  // 思考强度只读 threads 独立字段。
-  const activeThreadReasoningEffort =
-    typeof activeThread?.reasoningEffort === "string" ? activeThread.reasoningEffort : undefined;
   const activeThreadInCurrentWorkspace =
     activeThread?.workspaceId === activeWorkspaceId;
+  // 仅当前工作区线程的保存强度可作为当前表单的回退值。
+  const activeThreadReasoningEffort =
+    activeThreadInCurrentWorkspace && typeof activeThread?.reasoningEffort === "string"
+      ? activeThread.reasoningEffort
+      : undefined;
   const modelPickerLabel = useMemo(() => {
     return formatEngineModelLabel(t, selectedEngine?.name, selectedModel?.displayName);
   }, [t, selectedEngine?.name, selectedModel?.displayName]);
@@ -1335,72 +1363,127 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   }, [activeThread?.engineId, activeThread?.modelId, engines, selectedEngine, selectedEngineId, selectedModel?.id, t]);
 
   const workspaceTrustLevel: TrustLevel = activeWorkspace?.trustLevel ?? "standard";
-  const permissionComponent = activeThread?.permissionMode ?? EMPTY_PERMISSION_COMPONENT;
+  const permissionComponent =
+    sessionSettings.permissionMode ??
+    (activeThreadInCurrentWorkspace ? activeThread?.permissionMode : null) ??
+    EMPTY_PERMISSION_COMPONENT;
 
-  /** 串行保存线程运行时选择和统一权限对象；不同线程之间互不阻塞。 */
+  /** 将未发送的运行选项和权限暂存在当前会话表单中。 */
   const saveThreadRuntimeSelectionPatch = useCallback(
     (
       threadId: string | null | undefined,
       patch: ThreadRuntimeSelectionPatch,
     ): Promise<boolean> => {
-      if (!threadId || Object.keys(patch).length === 0) {
+      const sessionKey = threadId ? `thread:${threadId}` : composerSessionKey;
+      if (!sessionKey || Object.keys(patch).length === 0) {
         return Promise.resolve(true);
       }
-      // 先将完整补丁合并到线程缓存，让所有运行时字段立即反映最新编辑。
-      const currentThread =
-        useThreadStore.getState().threads.find((thread) => thread.id === threadId) ?? null;
-      if (currentThread) {
-        applyThreadUpdateLocal({
-          ...currentThread,
-          ...patch,
-          engineId: (patch.engineId ?? currentThread.engineId) as Thread["engineId"],
-          modelId: patch.modelId ?? currentThread.modelId,
-        });
+      const settings =
+        useChatComposerStore.getState().settingsBySession[sessionKey] ??
+        EMPTY_CHAT_SESSION_SETTINGS;
+      const targetThread = threadId
+        ? useThreadStore.getState().threads.find((thread) => thread.id === threadId) ?? null
+        : activeThreadInCurrentWorkspace
+          ? activeThread
+          : null;
+      const settingsPatch: ChatSessionSettings = { ...patch };
+      if (patch.permissionMode !== undefined) {
+        const previousPermission =
+          settings.permissionMode ?? targetThread?.permissionMode ?? EMPTY_PERMISSION_COMPONENT;
+        const nextPermission = patch.permissionMode ?? EMPTY_PERMISSION_COMPONENT;
+        settingsPatch.permissionDefaultsChanged =
+          settings.permissionDefaultsChanged === true ||
+          JSON.stringify(previousPermission.defaultForNewThreads) !==
+            JSON.stringify(nextPermission.defaultForNewThreads);
       }
-      const previous =
-        threadRuntimeSelectionRequestsRef.current[threadId] ?? Promise.resolve(true);
-      let trackedPromise: Promise<boolean>;
-      trackedPromise = previous
-        .catch(() => true)
-        .then(async () => {
-          try {
-            // 按线程顺序提交通用更新，只允许队列中最新请求应用响应。
-            const updatedThread = await ipc.updateThread({ id: threadId, ...patch });
-            if (threadRuntimeSelectionRequestsRef.current[threadId] === trackedPromise) {
-              applyThreadUpdateLocal(updatedThread);
-            }
-            return true;
-          } catch (error) {
-            if (threadRuntimeSelectionRequestsRef.current[threadId] === trackedPromise) {
-              toast.error(String(error));
-              if (currentThread) {
-                try {
-                  await refreshThreads(currentThread.workspaceId);
-                } catch {
-                  // 保存失败时刷新线程用于恢复服务端已存状态。
-                }
-              }
-            }
-            return false;
-          }
-        });
-      threadRuntimeSelectionRequestsRef.current[threadId] = trackedPromise;
-      void trackedPromise.then(
-        () => {
-          if (threadRuntimeSelectionRequestsRef.current[threadId] === trackedPromise) {
-            delete threadRuntimeSelectionRequestsRef.current[threadId];
-          }
-        },
-        () => {
-          if (threadRuntimeSelectionRequestsRef.current[threadId] === trackedPromise) {
-            delete threadRuntimeSelectionRequestsRef.current[threadId];
-          }
-        },
-      );
-      return trackedPromise;
+      setSessionSettings(sessionKey, settingsPatch);
+      return Promise.resolve(true);
     },
-    [applyThreadUpdateLocal, refreshThreads],
+    [activeThread, activeThreadInCurrentWorkspace, composerSessionKey, setSessionSettings],
   );
+
+  /*
+   * 旧线程运行选择串行持久化完整实现保留如下，不再参与编辑流程：
+   * const saveThreadRuntimeSelectionPatch = useCallback(
+   *   (threadId: string | null | undefined, patch: ThreadRuntimeSelectionPatch): Promise<boolean> => {
+   *     if (!threadId || Object.keys(patch).length === 0) return Promise.resolve(true);
+   *     const currentThread =
+   *       useThreadStore.getState().threads.find((thread) => thread.id === threadId) ?? null;
+   *     if (currentThread) {
+   *       applyThreadUpdateLocal({
+   *         ...currentThread,
+   *         ...patch,
+   *         engineId: (patch.engineId ?? currentThread.engineId) as Thread["engineId"],
+   *         modelId: patch.modelId ?? currentThread.modelId,
+   *       });
+   *     }
+   *     const previous =
+   *       threadRuntimeSelectionRequestsRef.current[threadId] ?? Promise.resolve(true);
+   *     let trackedPromise: Promise<boolean>;
+   *     trackedPromise = previous.catch(() => true).then(async () => {
+   *       try {
+   *         const updatedThread = await ipc.updateThread({ id: threadId, ...patch });
+   *         if (threadRuntimeSelectionRequestsRef.current[threadId] === trackedPromise) {
+   *           applyThreadUpdateLocal(updatedThread);
+   *         }
+   *         return true;
+   *       } catch (error) {
+   *         if (threadRuntimeSelectionRequestsRef.current[threadId] === trackedPromise) {
+   *           toast.error(String(error));
+   *           if (currentThread) {
+   *             try {
+   *               await refreshThreads(currentThread.workspaceId);
+   *             } catch {
+   *               // 保存失败时刷新线程用于恢复服务端已存状态。
+   *             }
+   *           }
+   *         }
+   *         return false;
+   *       }
+   *     });
+   *     threadRuntimeSelectionRequestsRef.current[threadId] = trackedPromise;
+   *     void trackedPromise.then(
+   *       () => {
+   *         if (threadRuntimeSelectionRequestsRef.current[threadId] === trackedPromise) {
+   *           delete threadRuntimeSelectionRequestsRef.current[threadId];
+   *         }
+   *       },
+   *       () => {
+   *         if (threadRuntimeSelectionRequestsRef.current[threadId] === trackedPromise) {
+   *           delete threadRuntimeSelectionRequestsRef.current[threadId];
+   *         }
+   *       },
+   *     );
+   *     return trackedPromise;
+   *   },
+   *   [applyThreadUpdateLocal, refreshThreads],
+   * );
+   */
+
+  /** 清除已提交且未在发送期间再次编辑的会话默认权限变更标记。 */
+  function clearSubmittedPermissionDefaultsChange(
+    sessionKey: string | null,
+    submittedPermission: PermissionComponentJson | undefined,
+  ) {
+    if (!sessionKey || !submittedPermission) {
+      return;
+    }
+    const currentSettings =
+      useChatComposerStore.getState().settingsBySession[sessionKey] ??
+      EMPTY_CHAT_SESSION_SETTINGS;
+    const currentDefaultPermission = JSON.stringify(
+      currentSettings.permissionMode?.defaultForNewThreads ?? [],
+    );
+    const submittedDefaultPermission = JSON.stringify(
+      submittedPermission.defaultForNewThreads,
+    );
+    if (
+      currentSettings.permissionDefaultsChanged === true &&
+      currentDefaultPermission === submittedDefaultPermission
+    ) {
+      setSessionSettings(sessionKey, { permissionDefaultsChanged: false });
+    }
+  }
 
   const activeThreadEngineInfo = useMemo(
     () =>
@@ -1505,15 +1588,29 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         return;
       }
       pendingPlanImplementationThreadIdRef.current = null;
+      const promptSettings =
+        useChatComposerStore.getState().settingsBySession[`thread:${promptThreadId}`] ??
+        EMPTY_CHAT_SESSION_SETTINGS;
       setPlanImplementationPrompt({
         threadId: promptThreadId,
         engineId: promptThread.engineId,
         modelId: promptThread.modelId,
-        effort: promptThread.reasoningEffort ?? activeThreadReasoningEffort ?? null,
-        personality: selectedPersonality,
-        serviceTier: selectedServiceTier,
-        outputSchemaText,
-        openCodeAgent: readThreadOpenCodeAgentValue(promptThread),
+        effort:
+          promptSettings.reasoningEffort ??
+          promptThread.reasoningEffort ??
+          activeThreadReasoningEffort ??
+          null,
+        personality:
+          promptSettings.personality !== undefined
+            ? (promptSettings.personality ?? "inherit") as CodexPersonalityValue
+            : selectedPersonality,
+        serviceTier:
+          promptSettings.serviceTier !== undefined
+            ? (promptSettings.serviceTier ?? "inherit") as CodexServiceTierValue
+            : selectedServiceTier,
+        outputSchemaText: promptSettings.outputSchemaText ?? outputSchemaText,
+        openCodeAgent:
+          promptSettings.openCodeAgent ?? readThreadOpenCodeAgentValue(promptThread),
       });
       return;
     }
@@ -2199,7 +2296,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   }, [engines, selectedEngineId, activeThread?.engineId]);
 
   useEffect(() => {
-    if (onboardingOpen || activeThread || !preferredOnboardingChatSelection) {
+    if (
+      onboardingOpen ||
+      activeThread ||
+      !preferredOnboardingChatSelection ||
+      sessionSettingsRef.current.engineId !== undefined ||
+      sessionSettingsRef.current.modelId !== undefined
+    ) {
       return;
     }
 
@@ -2214,7 +2317,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         ? current
         : preferredOnboardingChatSelection.modelId,
     );
-  }, [activeThread, onboardingOpen, preferredOnboardingChatSelection]);
+  }, [activeThread, composerSettingsScopeKey, onboardingOpen, preferredOnboardingChatSelection]);
 
   useEffect(() => {
     if (!selectedModel) {
@@ -2486,7 +2589,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   ]);
 
   useEffect(() => {
-    const syncKey = `${activeThread?.id ?? "none"}:${selectedModel?.id ?? "none"}`;
+    const syncKey = `${composerSettingsScopeKey ?? "none"}:${selectedModel?.id ?? "none"}`;
     if (effortSyncKeyRef.current === syncKey) {
       return;
     }
@@ -2501,8 +2604,11 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
      *   activeThreadReasoningEffort ?? selectedEffort,
      * );
      */
+    const configuredEffort = sessionSettingsRef.current.reasoningEffort;
     const nextEffort =
-      activeThreadReasoningEffort ?? resolveReasoningEffortForModel(selectedModel, null);
+      (typeof configuredEffort === "string" && configuredEffort) ||
+      activeThreadReasoningEffort ||
+      resolveReasoningEffortForModel(selectedModel, null);
 
     if (nextEffort && selectedEffort !== nextEffort) {
       setSelectedEffort(nextEffort);
@@ -2510,32 +2616,50 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   }, [
     activeThread?.id,
     activeThreadReasoningEffort,
+    composerSettingsScopeKey,
     selectedModel?.id,
     selectedModel?.defaultReasoningEffort,
     selectedEffort,
     supportedEfforts,
   ]);
 
-  // 切换会话时，从 threads 表独立字段恢复计划与发送方法。
-  // 计划默认 false，发送方法默认沿用全局；字段为 NULL（历史数据）时不动本地状态。
-  const lastSelectionSyncThreadIdRef = useRef<string | null>(null);
+  // 切换会话时优先恢复未发送的表单选择，再读取已保存线程字段和前端默认值。
+  const lastSelectionSyncScopeRef = useRef<string | null>(null);
   useEffect(() => {
-    const threadId = activeThread?.id ?? null;
-    if (lastSelectionSyncThreadIdRef.current === threadId) {
+    if (lastSelectionSyncScopeRef.current === composerSettingsScopeKey) {
       return;
     }
-    lastSelectionSyncThreadIdRef.current = threadId;
-    if (!activeThread) {
-      return;
-    }
-    if (typeof activeThread.planMode === "boolean") {
+    lastSelectionSyncScopeRef.current = composerSettingsScopeKey;
+    const settings = sessionSettingsRef.current;
+    const restoredEngineId =
+      settings.engineId ??
+      (activeThreadInCurrentWorkspace ? activeThread?.engineId : null) ??
+      preferredOnboardingChatSelection?.engineId ??
+      engines[0]?.id ??
+      "";
+    if (typeof settings.planMode === "boolean") {
+      setPlanMode(restoredEngineId === "opencode" ? false : settings.planMode);
+    } else if (typeof activeThread?.planMode === "boolean") {
       setPlanMode(activeThread.engineId === "opencode" ? false : activeThread.planMode);
+    } else {
+      setPlanMode(false);
     }
-    if (typeof activeThread.sendMethod === "string" && isMessageSendMode(activeThread.sendMethod)) {
+    if (
+      settings.sendMethod === undefined &&
+      typeof activeThread?.sendMethod === "string" &&
+      isMessageSendMode(activeThread.sendMethod)
+    ) {
       setThreadMessageSendMode(activeThread.id, activeThread.sendMethod);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeThread?.id]);
+  }, [
+    activeThread?.id,
+    activeThread?.engineId,
+    activeThreadInCurrentWorkspace,
+    composerSettingsScopeKey,
+    engines,
+    preferredOnboardingChatSelection,
+  ]);
 
   const composerRuntimeSnapshot = useMemo(
     () =>
@@ -2579,41 +2703,74 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     if (
       activeThreadInCurrentWorkspace &&
       activeThread?.engineId !== "codex" &&
-      selectedServiceTier !== "inherit"
+      selectedServiceTier !== "inherit" &&
+      sessionSettingsRef.current.serviceTier === undefined
     ) {
       setSelectedServiceTier("inherit");
     }
   }, [activeThread?.engineId, activeThreadInCurrentWorkspace, selectedServiceTier]);
 
   useEffect(() => {
-    if (activeThread?.engineId !== "codex") {
-      return;
-    }
-
-    setSelectedPersonality(readThreadPersonalityValue(activeThread));
-    setSelectedServiceTier(readThreadServiceTierValue(activeThread));
-    setOutputSchemaText(readThreadOutputSchemaText(activeThread));
-  }, [activeThread?.engineId, activeThread?.id, activeThread?.engineMetadata]);
+    const settings = sessionSettingsRef.current;
+    const savedCodexThread =
+      activeThreadInCurrentWorkspace && activeThread?.engineId === "codex"
+        ? activeThread
+        : null;
+    setSelectedPersonality(
+      settings.personality !== undefined
+        ? (settings.personality ?? "inherit") as CodexPersonalityValue
+        : savedCodexThread
+          ? readThreadPersonalityValue(savedCodexThread)
+          : "inherit",
+    );
+    setSelectedServiceTier(
+      settings.serviceTier !== undefined
+        ? (settings.serviceTier ?? "inherit") as CodexServiceTierValue
+        : savedCodexThread
+          ? readThreadServiceTierValue(savedCodexThread)
+          : "inherit",
+    );
+    setOutputSchemaText(
+      settings.outputSchemaText !== undefined
+        ? settings.outputSchemaText
+        : savedCodexThread
+          ? readThreadOutputSchemaText(savedCodexThread)
+          : "",
+    );
+  }, [
+    activeThread?.engineId,
+    activeThread?.id,
+    activeThread?.engineMetadata,
+    activeThreadInCurrentWorkspace,
+    composerSettingsScopeKey,
+  ]);
 
   useEffect(() => {
-    if (activeThread?.engineId === "opencode") {
-      setSelectedOpenCodeAgent(readThreadOpenCodeAgentValue(activeThread));
-    } else if (selectedEngineId !== "opencode") {
-      setSelectedOpenCodeAgent("build");
-    }
-  }, [activeThread?.engineId, activeThread?.id, activeThread?.engineMetadata, selectedEngineId]);
+    const settings = sessionSettingsRef.current;
+    const savedOpenCodeThread =
+      activeThreadInCurrentWorkspace && activeThread?.engineId === "opencode"
+        ? activeThread
+        : null;
+    setSelectedOpenCodeAgent(
+      settings.openCodeAgent !== undefined
+        ? settings.openCodeAgent
+        : savedOpenCodeThread
+          ? readThreadOpenCodeAgentValue(savedOpenCodeThread)
+          : "build",
+    );
+  }, [
+    activeThread?.engineId,
+    activeThread?.id,
+    activeThread?.engineMetadata,
+    activeThreadInCurrentWorkspace,
+    composerSettingsScopeKey,
+  ]);
 
   useEffect(() => {
-    if (!activeThread) {
-      lastSyncedThreadIdRef.current = null;
-      manuallyOverrodeThreadSelectionRef.current = false;
+    if (lastSyncedThreadIdRef.current === composerSettingsScopeKey) {
       return;
     }
-    const threadChanged = lastSyncedThreadIdRef.current !== activeThread.id;
-    if (!threadChanged && manuallyOverrodeThreadSelectionRef.current) {
-      return;
-    }
-    lastSyncedThreadIdRef.current = activeThread.id;
+    lastSyncedThreadIdRef.current = composerSettingsScopeKey;
     manuallyOverrodeThreadSelectionRef.current = false;
     setHasExplicitComposerRuntime(false);
     // 新建会话落库时引擎以 unknown 占位，等首发消息才确定真实引擎；占位值不在
@@ -2673,26 +2830,48 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     // unknown 是新会话落库前的占位值，不回写；环境不一致的切换由第二条路询问接管。
     // Thread.engineId 类型为 ChatEngineId，运行时为 unknown 占位（见 threadStore.ts
     // UNKNOWN_ENGINE_ID），比较处按 string 宽化。
-    if ((activeThread.engineId as string) === "unknown") {
-      return;
+    const settings = sessionSettingsRef.current;
+    const savedThread = activeThreadInCurrentWorkspace ? activeThread : null;
+    const savedThreadHasKnownEngine =
+      Boolean(savedThread) && (savedThread!.engineId as string) !== "unknown";
+    const defaultEngineId =
+      preferredOnboardingChatSelection?.engineId ?? engines[0]?.id ?? "";
+    const nextEngineId =
+      settings.engineId !== undefined
+        ? settings.engineId ?? defaultEngineId
+        : savedThreadHasKnownEngine
+          ? savedThread!.engineId
+          : defaultEngineId;
+    if (nextEngineId && nextEngineId !== selectedEngineId) {
+      setSelectedEngineId(nextEngineId);
     }
-    if (activeThread.engineId !== selectedEngineId) {
-      setSelectedEngineId(activeThread.engineId);
-    }
-    if (activeThread.modelId && activeThread.modelId !== "unknown") {
-      setSelectedModelId(activeThread.modelId);
+
+    const nextEngine = engines.find((engine) => engine.id === nextEngineId) ?? null;
+    const defaultModelId =
+      preferredOnboardingChatSelection?.engineId === nextEngineId
+        ? preferredOnboardingChatSelection.modelId
+        : nextEngine?.models.find((model) => model.isDefault && !model.hidden)?.id ??
+          nextEngine?.models.find((model) => !model.hidden)?.id ??
+          nextEngine?.models[0]?.id ??
+          null;
+    const nextModelId =
+      settings.modelId !== undefined
+        ? settings.modelId
+        : savedThreadHasKnownEngine && savedThread!.modelId !== "unknown"
+          ? savedThread!.modelId
+          : defaultModelId;
+    if (nextModelId !== selectedModelId) {
+      setSelectedModelId(nextModelId);
     }
   }, [
     activeThread?.id,
     activeThread?.engineId,
     activeThread?.modelId,
     activeThread?.engineMetadata,
-    activeWorkspace?.locationKind,
-    applyThreadUpdateLocal,
+    activeThreadInCurrentWorkspace,
+    composerSettingsScopeKey,
     engines,
-    selectedEngineId,
-    setThreadLastModelLocal,
-    t,
+    preferredOnboardingChatSelection,
   ]);
 
   // 第二条路：CLI 环境加载完成后与数据库比对，不一致时询问用户是否切换为默认。
@@ -2735,7 +2914,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     envMismatchHandledRef.current.set(threadId, handled);
   };
 
-  // 用户确认：切换为默认值并落库；SSH 远端工作区的模型沿用远端校验持久化路径。
+  // 用户确认：切换到当前运行环境默认值，并暂存到会话表单。
   const handleEnvMismatchConfirm = () => {
     const prompt = envMismatchPrompt;
     if (!prompt) {
@@ -2748,16 +2927,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       void saveThreadRuntimeSelectionPatch(prompt.threadId, { engineId: fallbackValue });
     } else if (kind === "model") {
       setSelectedModelId(fallbackValue);
-      if (activeWorkspace?.locationKind === "ssh") {
-        void ipc
-          .setSshRemoteThreadSelectedModel(prompt.threadId, fallbackValue)
-          .then((updatedThread) => applyThreadUpdateLocal(updatedThread))
-          .catch((error) => {
-            console.warn("Failed to persist SSH fallback model", error);
-          });
-      } else {
-        void saveThreadRuntimeSelectionPatch(prompt.threadId, { modelId: fallbackValue });
-      }
+      selectedModelIdRef.current = fallbackValue;
+      void saveThreadRuntimeSelectionPatch(prompt.threadId, { modelId: fallbackValue });
     } else {
       setSelectedEffort(fallbackValue);
       void saveThreadRuntimeSelectionPatch(prompt.threadId, { reasoningEffort: fallbackValue });
@@ -3025,7 +3196,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
   }
 
-  /** 保存 Codex 的人格、服务档位和输出结构配置。 */
+  /** 在当前会话表单中暂存 Codex 的人格、服务档位和输出结构配置。 */
   async function onCodexConfigSave(patch: CodexConfigPatch) {
     const nextPersonality =
       (patch.updatePersonality
@@ -3047,26 +3218,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       setOutputSchemaText(nextOutputSchemaText);
     };
 
-    if (!activeThreadMatchesComposer || activeThread?.engineId !== "codex") {
-      applyLocalState();
-      return;
-    }
-
-    try {
-      if (patch.updatePersonality || patch.updateServiceTier || patch.updateOutputSchema) {
-        const updatedThread = await ipc.setThreadCodexConfig(activeThread.id, {
-          personality: patch.updatePersonality ? patch.personality : undefined,
-          serviceTier: patch.updateServiceTier ? patch.serviceTier : undefined,
-          outputSchema: patch.updateOutputSchema ? patch.outputSchema : undefined,
-        });
-        applyThreadUpdateLocal(updatedThread);
-      }
-
-      applyLocalState();
-    } catch (error) {
-      throw new Error(
-        t("panel.toasts.updateCodexConfigFailed", { error: String(error) }),
-      );
+    applyLocalState();
+    if (composerSessionKey) {
+      setSessionSettings(composerSessionKey, {
+        personality: nextPersonality,
+        serviceTier: nextServiceTier,
+        outputSchemaText: nextOutputSchemaText,
+      });
     }
   }
 
@@ -3096,43 +3254,21 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     if (!outputSchemaDraft.ok) {
       return false;
     }
-    try {
-      const updatedConfigThread = await ipc.setThreadCodexConfig(targetThreadId, {
-        personality:
-          effectiveConfig.personality === "inherit" ? null : effectiveConfig.personality,
-        serviceTier:
-          effectiveConfig.serviceTier === "inherit" ? null : effectiveConfig.serviceTier,
-        outputSchema: outputSchemaDraft.value,
-      });
-      applyThreadUpdateLocal(updatedConfigThread);
-
-      return true;
-    } catch (error) {
-      toast.error(
-        t("panel.toasts.updateCodexConfigFailed", { error: String(error) }),
-      );
-      return false;
-    }
+    setSessionSettings(`thread:${targetThreadId}`, {
+      personality: effectiveConfig.personality,
+      serviceTier: effectiveConfig.serviceTier,
+      outputSchemaText: effectiveConfig.outputSchemaText,
+    });
+    return true;
   }
 
+  /** 在当前会话表单中暂存 OpenCode Agent 配置。 */
   async function onOpenCodeAgentChange(agent: string) {
     setSelectedOpenCodeAgent(agent);
     selectedOpenCodeAgentRef.current = agent;
     setHasExplicitComposerRuntime(true);
-
-    if (!activeThreadMatchesComposer || activeThread?.engineId !== "opencode") {
-      return;
-    }
-
-    try {
-      const updatedThread = await ipc.setThreadOpenCodeConfig(activeThread.id, {
-        agent: agent === "build" ? null : agent,
-      });
-      applyThreadUpdateLocal(updatedThread);
-    } catch (error) {
-      toast.error(
-        t("panel.toasts.updateOpenCodeConfigFailed", { error: String(error) }),
-      );
+    if (composerSessionKey) {
+      setSessionSettings(composerSessionKey, { openCodeAgent: agent });
     }
   }
 
@@ -3149,18 +3285,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
 
     const agent = config?.agent ?? selectedOpenCodeAgentRef.current;
-    try {
-      const updatedThread = await ipc.setThreadOpenCodeConfig(targetThreadId, {
-        agent: agent === "build" ? null : agent,
-      });
-      applyThreadUpdateLocal(updatedThread);
-      return true;
-    } catch (error) {
-      toast.error(
-        t("panel.toasts.updateOpenCodeConfigFailed", { error: String(error) }),
-      );
-      return false;
-    }
+    setSessionSettings(`thread:${targetThreadId}`, { openCodeAgent: agent });
+    return true;
   }
 
   async function onForkCodexThread() {
@@ -3924,6 +4050,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
   }
 
   // async function submitMessage(): Promise<boolean> {
+  /** 将当前会话消息、附件、计划与运行配置作为一次发送提交。 */
   async function submitMessage(
     submittedText: string,
     submittedAttachments: ChatAttachment[],
@@ -3955,6 +4082,36 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     const currentTextAnnotations = [...submittedTextAnnotations];
     // const currentReferences = [...references];
     const currentReferences = [...submittedReferences];
+    const submissionSourceSessionKey =
+      activeSubmissionSessionKeyRef.current ?? composerSessionKey;
+    const sourceSettings = submissionSourceSessionKey
+      ? useChatComposerStore.getState().settingsBySession[submissionSourceSessionKey] ??
+        EMPTY_CHAT_SESSION_SETTINGS
+      : EMPTY_CHAT_SESSION_SETTINGS;
+    const inheritNewDraftPermissions =
+      Boolean(composerSessionKey?.startsWith("new:")) &&
+      !activeThreadInCurrentWorkspace &&
+      sourceSettings.permissionMode === undefined;
+    const submittedPermissionValues = inheritNewDraftPermissions
+      ? undefined
+      : permissionComponent;
+    const submittedSendMethod = sessionMessageSendMode;
+    const submittedSettings: ChatSessionSettings = {
+      engineId: selectedEngineId,
+      modelId: selectedModelId,
+      reasoningEffort: selectedEffort,
+      planMode: submittedPlanMode,
+      sendMethod: submittedSendMethod,
+      permissionMode: submittedPermissionValues,
+      permissionDefaultsChanged: sourceSettings.permissionDefaultsChanged === true,
+      personality: selectedPersonality,
+      serviceTier: selectedServiceTier,
+      outputSchemaText,
+      openCodeAgent: selectedOpenCodeAgentRef.current,
+    };
+    if (submissionSourceSessionKey) {
+      setSessionSettings(submissionSourceSessionKey, submittedSettings);
+    }
 
     if (streaming) {
       if (!canSteerActiveTurn) {
@@ -4008,6 +4165,20 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     const submitReasoningEffort = composerRuntime.reasoningEffort;
     // const submitPlanMode = submitEngineId === "opencode" ? false : planMode;
     const submitPlanMode = submitEngineId === "opencode" ? false : submittedPlanMode;
+    submittedSettings.engineId = submitEngineId;
+    submittedSettings.modelId = submitModelId;
+    submittedSettings.reasoningEffort = submitReasoningEffort;
+    submittedSettings.planMode = submitPlanMode;
+    if (submissionSourceSessionKey) {
+      setSessionSettings(submissionSourceSessionKey, submittedSettings);
+    }
+    const outputSchemaDraft =
+      submitEngineId === "codex"
+        ? parseOutputSchemaDraft(submittedSettings.outputSchemaText ?? "")
+        : { ok: true as const, value: null };
+    if (!outputSchemaDraft.ok) {
+      return false;
+    }
 
     const activeThreadInScope = activeThread
       ? activeThread.workspaceId === activeWorkspaceId
@@ -4047,23 +4218,13 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         : null;
     let createdThread = false;
 
-    if (targetThreadId && !activeThreadEngineMatch) {
-      try {
-        const reconfiguredThread = await ipc.reconfigureUnstartedThreadRuntime(
-          targetThreadId,
-          submitEngineId,
-          submitModelId,
-          submitReasoningEffort,
-          submitEngineId === "codex" && selectedServiceTier !== "inherit"
-            ? selectedServiceTier
-            : null,
-        );
-        applyThreadUpdateLocal(reconfiguredThread);
-      } catch (error) {
-        toast.error(String(error));
-        return false;
-      }
-    }
+    /*
+     * 旧的发送前重配置 IPC 完整保留在注释中，现由 send_message 请求一次提交：
+     * if (targetThreadId && !activeThreadEngineMatch) {
+     *   const reconfiguredThread = await ipc.reconfigureUnstartedThreadRuntime(...);
+     *   applyThreadUpdateLocal(reconfiguredThread);
+     * }
+     */
 
     if (!targetThreadId) {
       const createdThreadId = await createThread({
@@ -4081,6 +4242,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         return false;
       }
       targetThreadId = createdThreadId;
+      // 首发前把来源草稿的表单快照复制到前端待发送线程，防止绑定触发恢复时丢失选择。
+      setSessionSettings(`thread:${createdThreadId}`, submittedSettings);
       // 新线程创建成功后，失败恢复目标从临时范围转为正式线程范围。
       activeSubmissionSessionKeyRef.current = getChatComposerSessionKey(
         activeWorkspaceId,
@@ -4097,61 +4260,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       }
     }
 
-    // 五项运行选择可能刚刚触发异步保存；发送必须等待同一线程最新任务完成。
-    while (true) {
-      const pendingRuntimeSelectionRequest =
-        threadRuntimeSelectionRequestsRef.current[targetThreadId];
-      if (!pendingRuntimeSelectionRequest) {
-        break;
-      }
-      const runtimeSelectionSaved = await pendingRuntimeSelectionRequest;
-      const latestRuntimeSelectionRequest =
-        threadRuntimeSelectionRequestsRef.current[targetThreadId];
-      if (
-        latestRuntimeSelectionRequest &&
-        latestRuntimeSelectionRequest !== pendingRuntimeSelectionRequest
-      ) {
-        continue;
-      }
-      if (!runtimeSelectionSaved) {
-        return false;
-      }
-      break;
-    }
-
     setThreadMessageSendMode(targetThreadId, sessionMessageSendMode);
     clearPendingMessageSendMode(activeWorkspaceId);
 
     const inputItems = await resolveInputItems(text, submitEngineId, currentReferences);
-
-
-    if (!createdThread) {
-      await ipc.setThreadReasoningEffort(
-        targetThreadId,
-        submitReasoningEffort,
-        submitModelId,
-      );
-    }
-    setThreadReasoningEffortLocal(targetThreadId, submitReasoningEffort);
-
-    const needsNewThreadCodexConfig =
-      submitEngineId === "codex" &&
-      (selectedPersonality !== "inherit" ||
-        outputSchemaText.trim().length > 0);
-    if (!createdThread || needsNewThreadCodexConfig) {
-      if (!(await applyCodexConfigToThread(targetThreadId))) {
-        return false;
-      }
-    }
-
-    const needsNewThreadOpenCodeConfig =
-      submitEngineId === "opencode" && selectedOpenCodeAgentRef.current !== "build";
-    if (!createdThread || needsNewThreadOpenCodeConfig) {
-      if (!(await applyOpenCodeConfigToThread(targetThreadId))) {
-        return false;
-      }
-    }
-    setThreadLastModelLocal(targetThreadId, submitModelId);
 
     recordPerfMetric("chat.send.preflight.ms", performance.now() - preflightStartedAt, {
       engineId: submitEngineId,
@@ -4168,13 +4280,53 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       attachments: transportAttachments.length > 0 ? transportAttachments : undefined,
       inputItems,
       planMode: submitPlanMode,
-      sendMethod: sessionMessageSendMode,
-      permissionValues: permissionComponent,
+      sendMethod: submittedSendMethod,
+      permissionValues: submittedPermissionValues,
+      configuration: {
+        permissionDefaultsChanged: submittedSettings.permissionDefaultsChanged === true,
+        ...(submitEngineId === "codex"
+          ? {
+              codexConfig: {
+                personality:
+                  submittedSettings.personality === "inherit"
+                    ? null
+                    : submittedSettings.personality ?? null,
+                serviceTier:
+                  submittedSettings.serviceTier === "inherit"
+                    ? null
+                    : submittedSettings.serviceTier ?? null,
+                outputSchema: outputSchemaDraft.value,
+              },
+            }
+          : submitEngineId === "opencode"
+            ? {
+                opencodeConfig: {
+                  agent:
+                    submittedSettings.openCodeAgent === "build"
+                      ? null
+                      : submittedSettings.openCodeAgent ?? null,
+                },
+              }
+            : {}),
+      },
       remoteAttachmentUpload:
         activeWorkspace?.locationKind === "ssh" && currentAttachments.length > 0,
       referencedAuraCoderThreadId,
     });
     if (sent) {
+      // 仅在发送期间权限默认数组仍未变化时清除本次已提交的全局默认变更标记。
+      if (
+        submittedSettings.permissionDefaultsChanged === true &&
+        submittedPermissionValues
+      ) {
+        const committedSessionKeys = [
+          submissionSourceSessionKey,
+          `thread:${targetThreadId}`,
+        ].filter((sessionKey): sessionKey is string => Boolean(sessionKey));
+        for (const sessionKey of new Set(committedSessionKeys)) {
+          clearSubmittedPermissionDefaultsChange(sessionKey, submittedPermissionValues);
+        }
+      }
       pendingPlanImplementationThreadIdRef.current = submitPlanMode ? targetThreadId : null;
       // const trimmed = input.trim();
       const trimmed = submittedText.trim();
@@ -4307,6 +4459,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
   }
 
+  /** 汇总灵活模式待发送消息，并在失败时将队列保留到实际会话范围。 */
   async function submitFlexibleMessages() {
     if (
       !activeWorkspaceId ||
@@ -4342,8 +4495,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
     isSubmittingRef.current = true;
     setIsSubmitting(true);
+    activeSubmissionSessionKeyRef.current = composerSessionKey;
+    let accepted = false;
     try {
-      const accepted = await submitMessage(
+      accepted = await submitMessage(
         submittedText,
         submittedAttachments,
         [],
@@ -4355,12 +4510,26 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         clearPendingFlexibleMessages(flexibleMessageSessionKey);
       }
     } finally {
+      // 首发失败后把原新草稿的灵活消息队列迁移到刚创建的前端待发送线程。
+      const restoreSessionKey = activeSubmissionSessionKeyRef.current;
+      if (
+        !accepted &&
+        restoreSessionKey &&
+        restoreSessionKey !== flexibleMessageSessionKey
+      ) {
+        for (const message of pendingFlexibleMessages) {
+          addPendingFlexibleMessage(restoreSessionKey, message);
+        }
+        clearPendingFlexibleMessages(flexibleMessageSessionKey);
+      }
       setPendingSubmission(null);
+      activeSubmissionSessionKeyRef.current = null;
       isSubmittingRef.current = false;
       setIsSubmitting(false);
     }
   }
 
+  /** 将已确认的工作区根目录操作与该会话配置一起提交。 */
   async function executeWorkspaceOptInSend() {
     const prompt = workspaceRootPrompt;
     if (!prompt) return;
@@ -4379,10 +4548,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     try {
       // 项目根目录是唯一写入范围，无需额外确认。
 
-      if (!prompt.reasoningConfigured) {
-        await ipc.setThreadReasoningEffort(prompt.threadId, prompt.effort, prompt.modelId);
-      }
-      setThreadReasoningEffortLocal(prompt.threadId, prompt.effort);
       if (!(await applyCodexConfigToThread(prompt.threadId, {
         engineId: prompt.engineId,
         personality: prompt.personality,
@@ -4411,9 +4576,28 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         );
         return;
       }
-      setThreadLastModelLocal(prompt.threadId, prompt.modelId);
 
       const promptPlanMode = prompt.engineId === "opencode" ? false : prompt.planMode;
+      const promptOutputSchema = prompt.engineId === "codex"
+        ? parseOutputSchemaDraft(prompt.outputSchemaText)
+        : { ok: true as const, value: null };
+      if (!promptOutputSchema.ok) {
+        restoreComposerContent(
+          promptSessionKey,
+          prompt.draftText,
+          prompt.attachments,
+          prompt.textAnnotations,
+          prompt.references,
+        );
+        return;
+      }
+      const promptSettings =
+        useChatComposerStore.getState().settingsBySession[promptSessionKey] ??
+        EMPTY_CHAT_SESSION_SETTINGS;
+      const promptThread =
+        useThreadStore.getState().threads.find((thread) => thread.id === prompt.threadId) ?? null;
+      const promptPermissionValues =
+        promptSettings.permissionMode ?? promptThread?.permissionMode ?? undefined;
       const sent = await send(prompt.text, {
         threadIdOverride: prompt.threadId,
         engineId: prompt.engineId,
@@ -4425,6 +4609,28 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
           : undefined,
         inputItems: prompt.inputItems ?? undefined,
         planMode: promptPlanMode,
+        sendMethod: promptSettings.sendMethod ?? promptThread?.sendMethod ?? undefined,
+        permissionValues: promptPermissionValues,
+        remoteAttachmentUpload:
+          activeWorkspace?.locationKind === "ssh" && prompt.attachments.length > 0,
+        configuration: {
+          permissionDefaultsChanged: promptSettings.permissionDefaultsChanged === true,
+          ...(prompt.engineId === "codex"
+            ? {
+                codexConfig: {
+                  personality: prompt.personality === "inherit" ? null : prompt.personality,
+                  serviceTier: prompt.serviceTier === "inherit" ? null : prompt.serviceTier,
+                  outputSchema: promptOutputSchema.value,
+                },
+              }
+            : prompt.engineId === "opencode"
+              ? {
+                  opencodeConfig: {
+                    agent: prompt.openCodeAgent === "build" ? null : prompt.openCodeAgent,
+                  },
+                }
+              : {}),
+        },
         referencedAuraCoderThreadId: prompt.referencedAuraCoderThreadId,
       });
       if (!sent) {
@@ -4438,7 +4644,9 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         return;
       }
 
+      clearSubmittedPermissionDefaultsChange(promptSessionKey, promptPermissionValues);
       pendingPlanImplementationThreadIdRef.current = promptPlanMode ? prompt.threadId : null;
+      setThreadLastModelLocal(prompt.threadId, prompt.modelId);
       restoreComposerContent(promptSessionKey, "", [], [], []);
 
       await refreshThreads(prompt.workspaceId);
@@ -4455,6 +4663,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     }
   }
 
+  /** 将计划模式确认后的实现请求连同原会话配置一起发送。 */
   async function executePlanImplementation() {
     const prompt = planImplementationPrompt;
     if (!prompt || !activeWorkspaceId) {
@@ -4473,8 +4682,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     setPlanImplementationPrompt(null);
     setPlanMode(false);
     try {
-      await ipc.setThreadReasoningEffort(currentThread.id, prompt.effort, prompt.modelId);
-      setThreadReasoningEffortLocal(currentThread.id, prompt.effort);
       if (
         !(await applyCodexConfigToThread(currentThread.id, {
           engineId: prompt.engineId,
@@ -4497,7 +4704,20 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         setPlanImplementationPrompt(prompt);
         return;
       }
-      setThreadLastModelLocal(currentThread.id, prompt.modelId);
+      const outputSchemaDraft = prompt.engineId === "codex"
+        ? parseOutputSchemaDraft(prompt.outputSchemaText)
+        : { ok: true as const, value: null };
+      if (!outputSchemaDraft.ok) {
+        setPlanMode(true);
+        setPlanImplementationPrompt(prompt);
+        return;
+      }
+      const promptSessionKey = `thread:${prompt.threadId}`;
+      const promptSettings =
+        useChatComposerStore.getState().settingsBySession[promptSessionKey] ??
+        EMPTY_CHAT_SESSION_SETTINGS;
+      const promptPermissionValues =
+        promptSettings.permissionMode ?? currentThread.permissionMode ?? undefined;
 
       const sent = await send(implementationMessage, {
         threadIdOverride: currentThread.id,
@@ -4505,10 +4725,33 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
         modelId: prompt.modelId,
         reasoningEffort: prompt.effort,
         planMode: false,
+        sendMethod: promptSettings.sendMethod ?? currentThread.sendMethod ?? undefined,
+        permissionValues: promptPermissionValues,
+        configuration: {
+          permissionDefaultsChanged: promptSettings.permissionDefaultsChanged === true,
+          ...(prompt.engineId === "codex"
+            ? {
+                codexConfig: {
+                  personality: prompt.personality === "inherit" ? null : prompt.personality,
+                  serviceTier: prompt.serviceTier === "inherit" ? null : prompt.serviceTier,
+                  outputSchema: outputSchemaDraft.value,
+                },
+              }
+            : prompt.engineId === "opencode"
+              ? {
+                  opencodeConfig: {
+                    agent: prompt.openCodeAgent === "build" ? null : prompt.openCodeAgent,
+                  },
+                }
+              : {}),
+        },
       });
       if (!sent) {
         setPlanMode(true);
         setPlanImplementationPrompt(prompt);
+      } else {
+        clearSubmittedPermissionDefaultsChange(promptSessionKey, promptPermissionValues);
+        setThreadLastModelLocal(currentThread.id, prompt.modelId);
       }
     } catch {
       setPlanMode(true);
@@ -4553,22 +4796,12 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     setWorkspaceRootPrompt(null);
   }
 
+  /** 更新思考强度的本地表单值并暂存到当前会话。 */
   async function onReasoningEffortChange(nextEffort: string) {
     setHasExplicitComposerRuntime(true);
     selectedEffortRef.current = nextEffort;
     setSelectedEffort(nextEffort);
-    const targetThreadId = threadId ?? activeThread?.id ?? null;
-    if (!targetThreadId) {
-      return;
-    }
-
-    setThreadReasoningEffortLocal(targetThreadId, nextEffort);
-    await ipc.setThreadReasoningEffort(
-      targetThreadId,
-      nextEffort,
-      selectedModelIdRef.current,
-    );
-    await saveThreadRuntimeSelectionPatch(targetThreadId, {
+    await saveThreadRuntimeSelectionPatch(activeThread?.id, {
       reasoningEffort: nextEffort,
     });
   }
@@ -4929,7 +5162,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
               pendingSubmission={pendingSubmission}
               assistantIdentityByMessageId={assistantIdentityByMessageId}
               highlightedMessageId={highlightedMessageId}
-              activeThread={activeThread}
+              activeThread={activeThreadInCurrentWorkspace ? activeThread : null}
               sessionReady={sessionReady}
               preparingAttachments={preparingAttachments}
               preparingEngineId={preparingEngineId}
@@ -5246,6 +5479,7 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
 
             {/* Input toolbar with selectors */}
             <ChatComposerToolbar
+              key={composerSettingsScopeKey ?? "no-session"}
               showSpecialInputComposer={showSpecialInputComposer}
               activeWorkspaceId={activeWorkspaceId}
               attachments={attachments}
@@ -5266,10 +5500,10 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
               activePlanMode={activePlanMode}
               planMode={planMode}
               sessionMessageSendMode={sessionMessageSendMode}
-              activeChatSessionId={activeChatSessionId}
               activeThread={activeThread}
-              activeWorkspace={activeWorkspace}
-              activeThreadRuntimeLocked={activeThreadRuntimeLocked}
+              activeThreadRuntimeLocked={
+                activeThreadInCurrentWorkspace && activeThreadRuntimeLocked
+              }
               engines={engines}
               health={health}
               selectedEngineId={selectedEngineId}
@@ -5300,8 +5534,6 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
               setSelectedEngineId={setSelectedEngineId}
               setSelectedModelId={setSelectedModelId}
               setSelectedEffort={setSelectedEffort}
-              setThreadLastModelLocal={setThreadLastModelLocal}
-              applyThreadUpdateLocal={applyThreadUpdateLocal}
               onReasoningEffortChange={onReasoningEffortChange}
               onCodexConfigSave={onCodexConfigSave}
               loadEngines={loadEngines}

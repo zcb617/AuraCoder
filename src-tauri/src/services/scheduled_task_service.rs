@@ -606,6 +606,10 @@ async fn execute_claimed_task_inner(
             client_turn_id: Some(format!("scheduled:{}", run.id)),
             scheduled_run_id: Some(run.id.clone()),
             referenced_thread_id: None,
+            new_thread: None,
+            codex_config: None,
+            opencode_config: None,
+            permission_defaults_changed: None,
         },
     )
     .await

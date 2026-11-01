@@ -44,6 +44,18 @@ pub fn create_thread(
     title: &str,
 ) -> anyhow::Result<ThreadDto> {
     let id = Uuid::new_v4().to_string();
+    create_thread_with_id(db, &id, workspace_id, engine_id, model_id, title)
+}
+
+/// 使用调用方提供的线程标识创建线程记录，并保存统一默认权限对象 A。
+pub fn create_thread_with_id(
+    db: &Database,
+    thread_id: &str,
+    workspace_id: &str,
+    engine_id: &str,
+    model_id: &str,
+    title: &str,
+) -> anyhow::Result<ThreadDto> {
     let created_at = runtime_env::system_time_rfc3339();
     let permission_mode = serde_json::to_string(&PermissionComponentJson::default())?;
     let conn = db.connect()?;
@@ -51,11 +63,11 @@ pub fn create_thread(
         "INSERT INTO threads (
             id, workspace_id, engine_id, model_id, title, status, created_at, last_activity_at, permission_mode
          ) VALUES (?1, ?2, ?3, ?4, ?5, 'idle', ?6, ?6, ?7)",
-        params![id, workspace_id, engine_id, model_id, title, created_at, permission_mode],
+        params![thread_id, workspace_id, engine_id, model_id, title, created_at, permission_mode],
     )
     .context("failed to create thread")?;
 
-    get_thread(db, &id)?.context("thread not found after insert")
+    get_thread(db, thread_id)?.context("thread not found after insert")
 }
 
 /// 读取指定线程的 Claude 完整历史同步标记，供点击 Claude 会话时决定是否读取消息。

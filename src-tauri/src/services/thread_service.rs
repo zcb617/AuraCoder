@@ -268,6 +268,41 @@ impl ThreadService {
         }
         result
     }
+
+    /// 保存本轮聊天选择的模型、计划模式、发送方式和推理强度。
+    pub async fn save_runtime_selection_for_send(
+        &self,
+        thread_id: String,
+        engine_id: String,
+        model_id: String,
+        plan_mode: bool,
+        send_method: Option<String>,
+        reasoning_effort: Option<String>,
+    ) -> anyhow::Result<ThreadDto> {
+        let log_thread_id = thread_id.clone();
+        let db = self.state.db.clone();
+        let result = match tokio::task::spawn_blocking(move || {
+            db::threads::update_thread_runtime_selection(
+                &db,
+                &thread_id,
+                &engine_id,
+                &model_id,
+                Some(plan_mode),
+                send_method.as_deref(),
+                reasoning_effort.as_deref(),
+                None,
+            )
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::Error::new(error).context("保存本轮聊天运行设置的数据库任务失败")),
+        };
+        if let Err(error) = &result {
+            log::error!("保存线程 {} 的本轮聊天运行设置失败: {error:#}", log_thread_id);
+        }
+        result
+    }
 }
 
 /// 按启动恢复业务规则推导线程目标状态，pending 审批优先于末条 assistant 状态。
@@ -428,6 +463,99 @@ impl ThreadService {
     pub async fn create_thread(&self, workspace_id: String, engine_id: String, model_id: String, title: String, reasoning_effort: Option<String>, service_tier: Option<String>) -> anyhow::Result<ThreadDto> {
         let cli = crate::cli_tools::factory::CliToolFactory::new(self.state.clone()).create(&engine_id)?;
         cli.create_thread_record(workspace_id, model_id, title, reasoning_effort, service_tier).await
+    }
+
+    /// 确保首次发送的会话记录存在，并为其保存工作区继承的统一默认权限对象 A。
+    pub async fn ensure_thread_for_send(
+        &self,
+        thread_id: String,
+        workspace_id: String,
+        engine_id: String,
+        model_id: String,
+        title: String,
+    ) -> anyhow::Result<ThreadDto> {
+        let log_thread_id = thread_id.clone();
+        let result = async {
+            // 一次阻塞任务检查幂等记录；只有新会话才读取配置和所属工作区。
+            let db = self.state.db.clone();
+            let query_thread_id = thread_id.clone();
+            let query_workspace_id = workspace_id.clone();
+            let (existing_thread, trust_level, default_autonomy_preset) =
+                tokio::task::spawn_blocking(move || -> anyhow::Result<(
+                    Option<ThreadDto>,
+                    Option<crate::models::TrustLevelDto>,
+                    Option<String>,
+                )> {
+                    if let Some(thread) = db::threads::get_thread(&db, &query_thread_id)? {
+                        return Ok((Some(thread), None, None));
+                    }
+
+                    let config = AppConfigService::load_or_create()?;
+                    let workspace = db::workspaces::find_workspace_by_id(&db, &query_workspace_id)?
+                        .context("新会话所属工作区不存在")?;
+                    Ok((
+                        None,
+                        Some(workspace.trust_level),
+                        config.default_autonomy_preset().map(ToOwned::to_owned),
+                    ))
+                })
+                .await
+                .context("检查首次发送会话记录的数据库任务失败")??;
+
+            // 发送失败后重试沿用同一线程 ID；已存在记录只校验工作区归属并直接复用。
+            if let Some(thread) = existing_thread {
+                anyhow::ensure!(
+                    thread.workspace_id == workspace_id,
+                    "线程 {thread_id} 已属于其他工作区"
+                );
+                return Ok(thread);
+            }
+
+            // 新记录要求前端生成的线程标识符合 UUID 格式。
+            uuid::Uuid::parse_str(&thread_id).context("首次发送会话标识不是有效 UUID")?;
+            let mut permission_mode = PermissionComponentJson::default();
+            permission_mode.trust = vec![trust_level
+                .context("新会话工作区信任等级不存在")?
+                .as_str()
+                .to_owned()];
+            if let Some(preset) = default_autonomy_preset {
+                permission_mode.autonomy_preset = vec![preset.clone()];
+                permission_mode.default_for_new_threads = vec![preset];
+            }
+            permission_mode.validate().context("新会话默认权限对象 A 校验失败")?;
+
+            // 使用指定 UUID 写入线程记录，再通过 ThreadService 保存工作区继承权限。
+            let db = self.state.db.clone();
+            let insert_thread_id = thread_id.clone();
+            let insert_workspace_id = workspace_id.clone();
+            let insert_engine_id = engine_id.clone();
+            let insert_model_id = model_id.clone();
+            let insert_title = title.clone();
+            tokio::task::spawn_blocking(move || {
+                db::threads::create_thread_with_id(
+                    &db,
+                    &insert_thread_id,
+                    &insert_workspace_id,
+                    &insert_engine_id,
+                    &insert_model_id,
+                    &insert_title,
+                )
+            })
+            .await
+            .context("创建首次发送线程记录的数据库任务失败")??;
+
+            self.update_thread(ThreadUpdateDto {
+                id: thread_id,
+                permission_mode: Some(permission_mode),
+                ..Default::default()
+            })
+            .await
+        }
+        .await;
+        if let Err(error) = &result {
+            log::error!("确保首次发送线程 {} 已持久化失败: {error:#}", log_thread_id);
+        }
+        result
     }
 
     pub async fn rename_thread(&self, thread_id: String, title: String) -> Result<ThreadDto, String> {

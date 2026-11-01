@@ -18,6 +18,7 @@ import type {
   ChatInputReference,
   ChatTextAnnotation,
 } from "../types";
+import type { PermissionComponentJson } from "../types";
 import {
   DEFAULT_LINK_OPEN_GESTURE,
   isLinkOpenGesture,
@@ -41,6 +42,32 @@ export interface PendingFlexibleMessage {
   text: string;
   attachments: ChatAttachment[];
   references: ChatInputReference[];
+}
+
+/** 保存当前会话尚未发送的运行配置，供切换会话后恢复表单。 */
+export interface ChatSessionSettings {
+  /** 当前选择的 CLI 引擎。 */
+  engineId?: string | null;
+  /** 当前选择的模型。 */
+  modelId?: string | null;
+  /** 当前选择的思考强度。 */
+  reasoningEffort?: string | null;
+  /** 当前是否启用计划模式。 */
+  planMode?: boolean | null;
+  /** 当前消息发送方式。 */
+  sendMethod?: string | null;
+  /** 当前会话尚未提交的权限配置。 */
+  permissionMode?: PermissionComponentJson | null;
+  /** 用户是否改变了权限配置中的新会话默认项。 */
+  permissionDefaultsChanged?: boolean;
+  /** 当前 Codex 个性化配置。 */
+  personality?: string | null;
+  /** 当前 Codex 服务等级配置。 */
+  serviceTier?: string | null;
+  /** 当前 Codex 输出格式草稿。 */
+  outputSchemaText?: string;
+  /** 当前 OpenCode Agent 配置。 */
+  openCodeAgent?: string;
 }
 
 /**
@@ -167,6 +194,10 @@ function persistLinkOpenGesture(linkOpenGesture: LinkOpenGesture): void {
 
 interface ChatComposerState {
   runtimeByWorkspace: Record<string, ComposerRuntimeSnapshot>;
+  /** 各会话尚未发送的运行配置。 */
+  settingsBySession: Record<string, ChatSessionSettings>;
+  /** 工作区新草稿重置序号，用于重复点击新建时重置表单局部状态。 */
+  newDraftRevisionByWorkspace: Record<string, number>;
   /** 当前会话的未发送文字草稿。 */
   draftBySession: Record<string, string>;
   /** 当前会话的未发送附件。 */
@@ -187,6 +218,12 @@ interface ChatComposerState {
     runtime: ComposerRuntimeSnapshot,
   ) => void;
   clearWorkspaceRuntime: (workspaceId: string) => void;
+  /** 按会话浅合并尚未发送的运行配置。 */
+  setSessionSettings: (sessionKey: string, patch: ChatSessionSettings) => void;
+  /** 清除指定会话尚未发送的运行配置。 */
+  clearSessionSettings: (sessionKey: string) => void;
+  /** 重置工作区新草稿输入和临时设置，并递增表单重置序号。 */
+  initializeWorkspaceDraft: (workspaceId: string) => void;
   /** 写入或清除指定会话范围的未发送文字。 */
   setSessionDraft: (sessionKey: string, draft: string) => void;
   /** 清除指定会话范围的未发送文字。 */
@@ -331,6 +368,8 @@ interface ChatComposerState {
 
 export const useChatComposerStore = create<ChatComposerState>((set) => ({
   runtimeByWorkspace: {},
+  settingsBySession: {},
+  newDraftRevisionByWorkspace: {},
   draftBySession: {},
   attachmentsBySession: {},
   textAnnotationsBySession: {},
@@ -354,6 +393,44 @@ export const useChatComposerStore = create<ChatComposerState>((set) => ({
       const { [workspaceId]: _removed, ...rest } = state.runtimeByWorkspace;
       return {
         runtimeByWorkspace: rest,
+      };
+    }),
+  setSessionSettings: (sessionKey, patch) =>
+    set((state) => ({
+      settingsBySession: {
+        ...state.settingsBySession,
+        [sessionKey]: { ...state.settingsBySession[sessionKey], ...patch },
+      },
+    })),
+  clearSessionSettings: (sessionKey) =>
+    set((state) => {
+      const { [sessionKey]: _removed, ...rest } = state.settingsBySession;
+      return { settingsBySession: rest };
+    }),
+  initializeWorkspaceDraft: (workspaceId) =>
+    set((state) => {
+      const sessionKey = `new:${workspaceId}`;
+      const { [sessionKey]: _removedDraft, ...draftBySession } = state.draftBySession;
+      const { [sessionKey]: _removedAttachments, ...attachmentsBySession } = state.attachmentsBySession;
+      const { [sessionKey]: _removedAnnotations, ...textAnnotationsBySession } = state.textAnnotationsBySession;
+      const { [sessionKey]: _removedReferences, ...referencesBySession } = state.referencesBySession;
+      const { [sessionKey]: _removedFlexibleMessages, ...pendingFlexibleMessagesBySession } = state.pendingFlexibleMessagesBySession;
+      const { [sessionKey]: _removedSettings, ...settingsBySession } = state.settingsBySession;
+      const { [workspaceId]: _removedSendMode, ...pendingMessageSendModeByWorkspace } = state.pendingMessageSendModeByWorkspace;
+      const { [workspaceId]: _removedRuntime, ...runtimeByWorkspace } = state.runtimeByWorkspace;
+      return {
+        draftBySession,
+        attachmentsBySession,
+        textAnnotationsBySession,
+        referencesBySession,
+        pendingFlexibleMessagesBySession,
+        settingsBySession,
+        pendingMessageSendModeByWorkspace,
+        runtimeByWorkspace,
+        newDraftRevisionByWorkspace: {
+          ...state.newDraftRevisionByWorkspace,
+          [workspaceId]: (state.newDraftRevisionByWorkspace[workspaceId] ?? 0) + 1,
+        },
       };
     }),
   setSessionDraft: (sessionKey, draft) =>

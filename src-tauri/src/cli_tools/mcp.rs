@@ -6175,6 +6175,8 @@ pub(crate) fn resolve_turn_model_id(
             client_turn_id,
             scheduled_run_id,
             referenced_thread_id,
+            permission_defaults_changed,
+            ..
         } = request;
 
         if state.turns.get(&thread_id).await.is_some() {
@@ -6215,42 +6217,37 @@ pub(crate) fn resolve_turn_model_id(
             .to_string();
         let selected_plan_mode = plan_mode.unwrap_or(false);
 
-        // 保持权限对象A先保存到ThreadService，再由当前CLI沿既有权限解析链使用。
+        // 会话权限由 ThreadService 保存；只有用户明确修改新会话默认值时才同步全局设置。
         if let Some(values) = permission_values {
-            thread = ThreadService::new(state.clone())
-                .save_permissions(&thread.id, values)
-                .await
-                .map_err(|error| {
-                    chat_operation_error(
-                        "CHAT_OPERATION_FAILED",
-                        "保存线程权限设置失败",
-                        error,
-                    )
-                })?;
+            let thread_service = ThreadService::new(state.clone());
+            let save_result = if permission_defaults_changed.unwrap_or(false) {
+                thread_service
+                    .update_thread(ThreadUpdateDto {
+                        id: thread.id.clone(),
+                        permission_mode: Some(values),
+                        ..Default::default()
+                    })
+                    .await
+            } else {
+                thread_service.save_permissions(&thread.id, values).await
+            };
+            thread = save_result.map_err(|error| {
+                chat_operation_error("CHAT_OPERATION_FAILED", "保存线程权限设置失败", error)
+            })?;
         }
-        thread = run_db(db.clone(), {
-            let thread_id = thread.id.clone();
-            let engine_id = cli.id().to_string();
-            let model_id = selected_model_id.clone();
-            let send_method = send_method.clone();
-            let reasoning_effort = reasoning_effort.clone();
-            move |db| {
-                db::threads::update_thread_runtime_selection(
-                    db,
-                    &thread_id,
-                    &engine_id,
-                    &model_id,
-                    Some(selected_plan_mode),
-                    send_method.as_deref(),
-                    reasoning_effort.as_deref(),
-                    None,
-                )
-            }
-        })
-        .await
-        .map_err(|error| {
-            chat_operation_error("CHAT_OPERATION_FAILED", "保存本轮聊天设置失败", error)
-        })?;
+        thread = ThreadService::new(state.clone())
+            .save_runtime_selection_for_send(
+                thread.id.clone(),
+                cli.id().to_string(),
+                selected_model_id,
+                selected_plan_mode,
+                send_method.clone(),
+                reasoning_effort.clone(),
+            )
+            .await
+            .map_err(|error| {
+                chat_operation_error("CHAT_OPERATION_FAILED", "保存本轮聊天设置失败", error)
+            })?;
 
         let workspace = run_db(db.clone(), {
             let workspace_id = thread.workspace_id.clone();

@@ -8,7 +8,7 @@ import {
 } from "../lib/newThreadRuntime";
 // 新建会话不再继承 composer/activeThread/onboarding 作为运行环境，以下 import 已停用。
 // import { resolvePreferredOnboardingChatSelection } from "../lib/onboarding";
-import type { Thread } from "../types";
+import type { ChatEngineId, Thread } from "../types";
 // import { useChatComposerStore } from "./chatComposerStore";
 // import { useEngineStore } from "./engineStore";
 // import { useOnboardingStore } from "./onboardingStore";
@@ -36,6 +36,13 @@ interface ThreadState {
   threads: Thread[];
   threadsByWorkspace: Record<string, Thread[]>;
   archivedThreadsByWorkspace: Record<string, Thread[]>;
+  /** 等待首次发送后由后端创建数据库记录的前端会话。 */
+  pendingCreationByThread: Record<string, {
+    /** 待创建会话所属的工作区标识。 */
+    workspaceId: string;
+    /** 待创建会话首次发送时使用的标题。 */
+    title: string;
+  }>;
   activeThreadId: string | null;
   loading: boolean;
   error?: string;
@@ -46,6 +53,8 @@ interface ThreadState {
   refreshThreads: (workspaceId: string) => Promise<void>;
   /** 仅从本地数据库重载指定 workspace 的线程，不触发远端会话发现。 */
   reloadThreadsFromLocalDatabase: (workspaceId: string) => Promise<void>;
+  /** 标记已由发送请求创建的会话记录，移除前端待创建标记。 */
+  markThreadPersisted: (threadId: string) => void;
   refreshArchivedThreads: (workspaceId: string) => Promise<void>;
   refreshAllThreads: (workspaceIds: string[]) => Promise<void>;
   removeThread: (threadId: string) => Promise<void>;
@@ -89,6 +98,26 @@ function mergeWorkspaceThreads(
     ...current,
     [workspaceId]: threads,
   };
+}
+
+/** 将仍等待首次发送的本地会话合并到数据库刷新结果之前。 */
+function mergePendingWorkspaceThreads(
+  workspaceThreads: Thread[],
+  existingThreads: Thread[],
+  workspaceId: string,
+  pendingCreationByThread: ThreadState["pendingCreationByThread"],
+): Thread[] {
+  const pendingThreadIds = new Set(
+    Object.entries(pendingCreationByThread)
+      .filter(([, pending]) => pending.workspaceId === workspaceId)
+      .map(([threadId]) => threadId),
+  );
+  const pendingThreads = existingThreads.filter((thread) => pendingThreadIds.has(thread.id));
+
+  return [
+    ...pendingThreads,
+    ...workspaceThreads.filter((thread) => !pendingThreadIds.has(thread.id)),
+  ];
 }
 
 function flattenThreadsByWorkspace(threadsByWorkspace: Record<string, Thread[]>): Thread[] {
@@ -272,9 +301,10 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
   threads: [],
   threadsByWorkspace: {},
   archivedThreadsByWorkspace: {},
+  pendingCreationByThread: {},
   activeThreadId: null,
   loading: false,
-  // 创建会话并更新线程集合；失败时保留错误状态并向公共动作传播原始异常。
+  // 用户进入首次发送流程时只创建前端草稿，不在此处写入数据库。
   createThread: async ({
     workspaceId,
     engineId,
@@ -283,8 +313,7 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
     serviceTier,
     title,
   }) => {
-    // 新建会话=生成 ID：未显式指定引擎/模型时以 unknown 占位直接创建，
-    // 引擎/模型由后续业务过程（选择 CLI、发送消息）确定并更新。
+    // 保留既有显式 CLI/模型选择及 unknown 占位语义，避免引入额外运行时推断。
     const hasExplicitRuntime = Boolean(
       engineId || modelId || reasoningEffort || serviceTier,
     );
@@ -301,39 +330,82 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
           reasoningEffort: null,
           serviceTier: null,
         };
+    // 创建完整前端线程并记录首次发送时应使用的工作区和标题。
+    const now = new Date().toISOString();
+    const created: Thread = {
+      id: crypto.randomUUID(),
+      workspaceId,
+      engineId: effectiveRuntime.engineId as ChatEngineId,
+      modelId: effectiveRuntime.modelId,
+      engineThreadId: null,
+      planMode: null,
+      sendMethod: null,
+      reasoningEffort: effectiveRuntime.reasoningEffort,
+      permissionMode: null,
+      title: title ?? "Workspace Chat",
+      status: "idle",
+      messageCount: 0,
+      totalTokens: 0,
+      createdAt: now,
+      lastActivityAt: now,
+    };
+    const currentState = get();
+    const existingWorkspaceThreads = currentState.threadsByWorkspace[workspaceId] ?? [];
+    const workspaceThreads = [
+      created,
+      ...existingWorkspaceThreads.filter((thread) => thread.id !== created.id),
+    ];
+    const threadsByWorkspace = mergeWorkspaceThreads(
+      currentState.threadsByWorkspace,
+      workspaceId,
+      workspaceThreads,
+    );
+    const threads = flattenThreadsByWorkspace(threadsByWorkspace);
 
-    set({ loading: true, error: undefined });
+    // 前端草稿只在调用者触发首次发送流程后创建；持久化由一次发送 IPC 完成。
+    localStorage.setItem(LAST_THREAD_KEY, created.id);
+    set({
+      threadsByWorkspace,
+      threads,
+      pendingCreationByThread: {
+        ...currentState.pendingCreationByThread,
+        [created.id]: { workspaceId, title: created.title },
+      },
+      activeThreadId: created.id,
+      error: undefined,
+    });
 
-    try {
-      const created = await ipc.createThread(
-        workspaceId,
-        effectiveRuntime.engineId,
-        effectiveRuntime.modelId,
-        title ?? "Workspace Chat",
-        effectiveRuntime.reasoningEffort,
-        effectiveRuntime.serviceTier,
-      );
-
-      const existingWorkspaceThreads = get().threadsByWorkspace[workspaceId] ?? [];
-      const workspaceThreads = [created, ...existingWorkspaceThreads.filter((thread) => thread.id !== created.id)];
-      const threadsByWorkspace = mergeWorkspaceThreads(get().threadsByWorkspace, workspaceId, workspaceThreads);
-      const threads = flattenThreadsByWorkspace(threadsByWorkspace);
-
-      localStorage.setItem(LAST_THREAD_KEY, created.id);
-      set({
-        threadsByWorkspace,
-        threads,
-        activeThreadId: created.id,
-        loading: false,
-      });
-
-      return created.id;
-    } catch (error) {
-      set({ loading: false, error: String(error) });
-      /* return null; */
-      throw error;
-    }
+    return created.id;
   },
+  /*
+   * 旧的 createThread 数据库写入实现保留作业务迁移记录，当前由首次 send_message 创建数据库会话。
+   * createThread: async ({ workspaceId, engineId, modelId, reasoningEffort, serviceTier, title }) => {
+   *   const hasExplicitRuntime = Boolean(engineId || modelId || reasoningEffort || serviceTier);
+   *   const effectiveRuntime = hasExplicitRuntime
+   *     ? { engineId: engineId ?? DEFAULT_ENGINE, modelId: modelId ?? DEFAULT_MODEL,
+   *         reasoningEffort: reasoningEffort ?? null, serviceTier: serviceTier ?? null }
+   *     : { engineId: UNKNOWN_ENGINE_ID, modelId: UNKNOWN_MODEL_ID,
+   *         reasoningEffort: null, serviceTier: null };
+   *   set({ loading: true, error: undefined });
+   *   try {
+   *     const created = await ipc.createThread(
+   *       workspaceId, effectiveRuntime.engineId, effectiveRuntime.modelId,
+   *       title ?? "Workspace Chat", effectiveRuntime.reasoningEffort, effectiveRuntime.serviceTier,
+   *     );
+   *     const existingWorkspaceThreads = get().threadsByWorkspace[workspaceId] ?? [];
+   *     const workspaceThreads = [created, ...existingWorkspaceThreads.filter((thread) => thread.id !== created.id)];
+   *     const threadsByWorkspace = mergeWorkspaceThreads(get().threadsByWorkspace, workspaceId, workspaceThreads);
+   *     const threads = flattenThreadsByWorkspace(threadsByWorkspace);
+   *     localStorage.setItem(LAST_THREAD_KEY, created.id);
+   *     set({ threadsByWorkspace, threads, activeThreadId: created.id, loading: false });
+   *     return created.id;
+   *   } catch (error) {
+   *     set({ loading: false, error: String(error) });
+   *     // return null;
+   *     throw error;
+   *   }
+   * }
+   */
   renameThread: async (threadId, title) => {
     set({ loading: true, error: undefined });
     try {
@@ -425,7 +497,13 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       // 旧逻辑先发现、后读取本地会话，无法按刷新前快照判断远端更新时间；顺序错误，禁止执行。
       // await discoverCodexRemoteThreads(workspaceId);
       await discoverCodexRemoteThreads(workspaceId, localThreads);
-      const workspaceThreads = await ipc.listThreads(workspaceId);
+      const refreshedWorkspaceThreads = await ipc.listThreads(workspaceId);
+      const workspaceThreads = mergePendingWorkspaceThreads(
+        refreshedWorkspaceThreads,
+        get().threadsByWorkspace[workspaceId] ?? [],
+        workspaceId,
+        get().pendingCreationByThread,
+      );
       const threadsByWorkspace = mergeWorkspaceThreads(get().threadsByWorkspace, workspaceId, workspaceThreads);
       const threads = flattenThreadsByWorkspace(threadsByWorkspace);
       const active = get().activeThreadId;
@@ -449,7 +527,13 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
   reloadThreadsFromLocalDatabase: async (workspaceId) => {
     try {
       // 同步通知只代表本地数据库已更新；这里禁止触发任何远端 CLI 会话发现。
-      const workspaceThreads = await ipc.listThreads(workspaceId);
+      const refreshedWorkspaceThreads = await ipc.listThreads(workspaceId);
+      const workspaceThreads = mergePendingWorkspaceThreads(
+        refreshedWorkspaceThreads,
+        get().threadsByWorkspace[workspaceId] ?? [],
+        workspaceId,
+        get().pendingCreationByThread,
+      );
       const threadsByWorkspace = mergeWorkspaceThreads(
         get().threadsByWorkspace,
         workspaceId,
@@ -463,6 +547,16 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       // 不修改线程集合，保留通知到达前的内存数据，并让调用方决定如何提示用户。
       throw error;
     }
+  },
+  markThreadPersisted: (threadId) => {
+    set((state) => {
+      if (!state.pendingCreationByThread[threadId]) {
+        return state;
+      }
+      const pendingCreationByThread = { ...state.pendingCreationByThread };
+      delete pendingCreationByThread[threadId];
+      return { pendingCreationByThread };
+    });
   },
   refreshArchivedThreads: async (workspaceId) => {
     try {
@@ -479,13 +573,33 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
   },
   refreshAllThreads: async (workspaceIds) => {
     if (!workspaceIds.length) {
-      set({
-        threads: [],
-        threadsByWorkspace: {},
-        archivedThreadsByWorkspace: {},
-        activeThreadId: null,
-        loading: false,
-        error: undefined,
+      set((state) => {
+        const threadsByWorkspace = Object.entries(state.threadsByWorkspace).reduce<
+          Record<string, Thread[]>
+        >((acc, [workspaceId, workspaceThreads]) => {
+          const pendingThreads = mergePendingWorkspaceThreads(
+            [],
+            workspaceThreads,
+            workspaceId,
+            state.pendingCreationByThread,
+          );
+          if (pendingThreads.length > 0) {
+            acc[workspaceId] = pendingThreads;
+          }
+          return acc;
+        }, {});
+        const threads = flattenThreadsByWorkspace(threadsByWorkspace);
+        return {
+          threads,
+          threadsByWorkspace,
+          archivedThreadsByWorkspace: {},
+          activeThreadId:
+            state.activeThreadId && threads.some((thread) => thread.id === state.activeThreadId)
+              ? state.activeThreadId
+              : null,
+          loading: false,
+          error: undefined,
+        };
       });
       return;
     }
@@ -543,7 +657,12 @@ export const useThreadStore = create<ThreadState>((set, get) => ({
       // });
       set((state) => {
         const threadsByWorkspace = results.reduce<Record<string, Thread[]>>((acc, item) => {
-          acc[item.workspaceId] = item.threads;
+          acc[item.workspaceId] = mergePendingWorkspaceThreads(
+            item.threads,
+            state.threadsByWorkspace[item.workspaceId] ?? [],
+            item.workspaceId,
+            state.pendingCreationByThread,
+          );
           return acc;
         }, { ...state.threadsByWorkspace });
         const threads = flattenThreadsByWorkspace(threadsByWorkspace);

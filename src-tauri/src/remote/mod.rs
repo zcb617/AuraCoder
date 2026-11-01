@@ -2182,6 +2182,10 @@ impl RemoteTunnelManager {
                                                                                             client_turn_id: Some(request.id.clone()),
                                                                                             scheduled_run_id: None,
                                                                                             referenced_thread_id: None,
+                                                                                            new_thread: None,
+                                                                                            codex_config: None,
+                                                                                            opencode_config: None,
+                                                                                            permission_defaults_changed: None,
                                                                                         },
                                                                                     )
                                                                                     .await
@@ -2261,6 +2265,10 @@ impl RemoteTunnelManager {
                                                                                 client_turn_id: Some(request.id.clone()),
                                                                                 scheduled_run_id: None,
                                                                                 referenced_thread_id: None,
+                                                                                new_thread: None,
+                                                                                codex_config: None,
+                                                                                opencode_config: None,
+                                                                                permission_defaults_changed: None,
                                                                             },
                                                                         )
                                                                         .await

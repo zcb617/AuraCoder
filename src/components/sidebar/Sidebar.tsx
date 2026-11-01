@@ -35,7 +35,7 @@ import { useUpdateStore } from "../../stores/updateStore";
 import { toast } from "../../stores/toastStore";
 import { formatRelativeTime } from "../../lib/formatters";
 import { handleDragMouseDown, handleDragDoubleClick } from "../../lib/windowDrag";
-import { createAndActivateWorkspaceThread } from "../../lib/newThreadActions";
+import { initializeWorkspaceChat } from "../../lib/newThreadActions";
 import { ConfirmDialog } from "../shared/ConfirmDialog";
 import { AuraCoderMark } from "../shared/AuraCoderBrand";
 import { WorkspaceMoreMenu } from "../workspace/WorkspaceMoreMenu";
@@ -263,8 +263,8 @@ function SidebarContent({ onPin }: { onPin?: () => void }) {
   }
 
   async function onCreateProjectThread(project: Workspace) {
-    const createdThreadId = await createAndActivateWorkspaceThread(project.id);
-    if (!createdThreadId) return;
+    const initialized = await initializeWorkspaceChat(project.id);
+    if (!initialized) return;
     setCollapsed((prev) => ({ ...prev, [project.id]: false }));
   }
 
@@ -948,7 +948,7 @@ function CollapsedRail({
   async function onNewThread() {
     const activeProject = projects.find((p) => p.id === activeWorkspaceId);
     if (!activeProject) return;
-    await createAndActivateWorkspaceThread(activeProject.id);
+    await initializeWorkspaceChat(activeProject.id);
   }
 
   return (

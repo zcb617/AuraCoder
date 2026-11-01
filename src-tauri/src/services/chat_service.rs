@@ -286,32 +286,148 @@ impl ChatService {
     pub async fn send_message(
         &self,
         app: AppHandle,
-        request: SendMessageRequest,
+        mut request: SendMessageRequest,
     ) -> Result<String, ChatBusinessError> {
-        let selected_engine_id = match request
-            .engine_id
+        let new_thread = request.new_thread.take();
+        let selected_model_id = request
+            .model_id
             .as_deref()
             .map(str::trim)
-            .filter(|engine_id| !engine_id.is_empty())
-        {
-            Some(engine_id) => engine_id.to_string(),
-            None => ThreadService::new(self.state.clone())
-                .get_thread(&request.thread_id)
-                .await
-                .map_err(|error| {
-                    log::error!("读取聊天线程归属失败: {error:#}");
-                    ChatBusinessError::new("CHAT_OPERATION_FAILED", "无法读取聊天线程")
-                })?
-                .engine_id,
+            .filter(|model_id| !model_id.is_empty())
+            .map(str::to_string);
+        let selected_engine_id = match new_thread.as_ref() {
+            Some(_) => {
+                let engine_id = request
+                    .engine_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|engine_id| !engine_id.is_empty())
+                    .ok_or_else(|| {
+                        ChatBusinessError::new(
+                            "VALIDATION_FAILED",
+                            "首次发送必须明确选择聊天工具",
+                        )
+                    })?;
+                if selected_model_id.is_none() {
+                    return Err(ChatBusinessError::new(
+                        "VALIDATION_FAILED",
+                        "首次发送必须明确选择模型",
+                    ));
+                }
+                engine_id.to_string()
+            }
+            None => match request
+                .engine_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|engine_id| !engine_id.is_empty())
+            {
+                Some(engine_id) => engine_id.to_string(),
+                None => ThreadService::new(self.state.clone())
+                    .get_thread(&request.thread_id)
+                    .await
+                    .map_err(|error| {
+                        log::error!("读取聊天线程归属失败: {error:#}");
+                        ChatBusinessError::new("CHAT_OPERATION_FAILED", "无法读取聊天线程")
+                    })?
+                    .engine_id,
+            },
         };
 
-        // 将普通发送转交给所选 CLI 接口，由该实现维持整轮生命周期。
+        // 通过工厂验证所选 CLI，再为新会话创建本地记录或读取既有线程。
         let cli = CliToolFactory::new(self.state.clone())
             .create(&selected_engine_id)
             .map_err(|error| {
                 log::error!("创建聊天 CLI `{selected_engine_id}` 失败: {error:#}");
                 ChatBusinessError::new("CLI_UNAVAILABLE", "当前聊天工具暂不可用")
             })?;
+
+        let thread_service = ThreadService::new(self.state.clone());
+        let mut thread = match new_thread {
+            Some(new_thread) => thread_service
+                .ensure_thread_for_send(
+                    request.thread_id.clone(),
+                    new_thread.workspace_id,
+                    selected_engine_id.clone(),
+                    selected_model_id.clone().unwrap_or_default(),
+                    new_thread.title,
+                )
+                .await
+                .map_err(|error| {
+                    log::error!("首次发送创建线程失败: {error:#}");
+                    ChatBusinessError::new("CHAT_OPERATION_FAILED", "创建聊天线程失败")
+                })?,
+            None => thread_service
+                .get_thread(&request.thread_id)
+                .await
+                .map_err(|error| {
+                    log::error!("读取聊天线程失败: {error:#}");
+                    ChatBusinessError::new("CHAT_OPERATION_FAILED", "无法读取聊天线程")
+                })?,
+        };
+
+        // 允许未开始线程切换 CLI；已开始线程保持原归属并返回明确业务错误。
+        if thread.engine_id != cli.id() {
+            if thread.engine_thread_id.is_some() || thread.message_count != 0 {
+                return Err(ChatBusinessError::new(
+                    "VALIDATION_FAILED",
+                    "已有消息的会话不能切换聊天工具",
+                ));
+            }
+            let model_id = selected_model_id
+                .clone()
+                .unwrap_or_else(|| thread.model_id.clone());
+            let service_tier = request
+                .codex_config
+                .as_ref()
+                .and_then(|configuration| configuration.service_tier.clone());
+            thread = cli
+                .reconfigure_thread_record(
+                    thread.id.clone(),
+                    model_id.clone(),
+                    request.reasoning_effort.clone(),
+                    service_tier,
+                )
+                .await
+                .map_err(|error| {
+                    log::error!("更换线程聊天工具失败: {error:#}");
+                    ChatBusinessError::new("CHAT_OPERATION_FAILED", "切换聊天工具失败")
+                })?;
+            request.engine_id = Some(cli.id().to_string());
+            request.model_id = Some(model_id);
+        }
+
+        // 通过统一 CLI 接口先保存本轮专属设置，再沿用原消息提交流程。
+        if let Some(configuration) = request.codex_config.take() {
+            cli.update_codex_thread_config(
+                thread.id.clone(),
+                true,
+                configuration.personality,
+                true,
+                configuration.service_tier,
+                true,
+                configuration.output_schema,
+            )
+            .await
+            .map_err(|error| {
+                log::error!("保存 Codex 会话发送配置失败: {error:#}");
+                ChatBusinessError::new("CHAT_OPERATION_FAILED", "保存 Codex 会话设置失败")
+            })?;
+        }
+        if let Some(configuration) = request.opencode_config.take() {
+            cli.update_opencode_thread_config(
+                thread.id.clone(),
+                true,
+                configuration.agent,
+            )
+            .await
+            .map_err(|error| {
+                log::error!("保存 OpenCode 会话发送配置失败: {error:#}");
+                ChatBusinessError::new("CHAT_OPERATION_FAILED", "保存 OpenCode 会话设置失败")
+            })?;
+        }
+
+        // 普通发送仍由当前工厂实例进入原 CLI 生命周期和消息处理链。
         cli.submit_chat_message(app, request).await
     }
 

@@ -50,7 +50,7 @@ import { CustomWindowFrame } from "./components/shared/CustomWindowFrame";
 import { useCustomWindowFrameState } from "./lib/customWindowFrame";
 import { runEditMenuAction } from "./lib/nativeEditActions";
 import { preventNativeContextMenu } from "./lib/nativeContextMenu";
-import { createAndActivateWorkspaceThread } from "./lib/newThreadActions";
+import { initializeWorkspaceChat } from "./lib/newThreadActions";
 import {
   cycleWorkspaceTerminalLayout,
   isWorkspaceSurfaceVisible,
@@ -80,7 +80,7 @@ function fireShortcut(id: string, action: () => void) {
 
 async function createNewWorkspaceThread() {
   const { activeWorkspaceId } = useWorkspaceStore.getState();
-  await createAndActivateWorkspaceThread(activeWorkspaceId);
+  await initializeWorkspaceChat(activeWorkspaceId);
 }
 
 function shouldSyncCodexThread(thread: Thread | null | undefined): boolean {

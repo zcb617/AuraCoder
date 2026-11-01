@@ -314,6 +314,26 @@ export interface Thread {
   lastActivityAt: string;
 }
 
+/** 单次聊天发送时需要保存到线程的 CLI 专属配置。 */
+export interface ChatSendConfiguration {
+  /** 本次权限选择是否显式修改了“作为新会话默认值”设置。 */
+  permissionDefaultsChanged?: boolean;
+  /** Codex 线程本次发送需要持久化的配置。 */
+  codexConfig?: {
+    /** 本次发送选择的 Codex 个性配置。 */
+    personality: string | null;
+    /** 本次发送选择的 Codex 服务档位。 */
+    serviceTier: string | null;
+    /** 本次发送选择的 Codex 输出结构约束。 */
+    outputSchema: unknown | null;
+  };
+  /** OpenCode 线程本次发送需要持久化的配置。 */
+  opencodeConfig?: {
+    /** 本次发送选择的 OpenCode Agent。 */
+    agent: string | null;
+  };
+}
+
 export type ComputerControlSdkState =
   | "disabled"
   | "uninitialized"

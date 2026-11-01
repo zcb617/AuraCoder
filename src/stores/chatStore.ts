@@ -11,6 +11,7 @@ import type {
   ChatBusinessError,
   AttachmentBlock,
   ChatAttachment,
+  ChatSendConfiguration,
   ChatInputItem,
   ChatProviderUsage,
   ChatProviderUsageLimits,
@@ -72,6 +73,8 @@ interface ChatState {
       sendMethod?: string | null;
       /** 本轮发送使用的当前统一权限对象。 */
       permissionValues?: PermissionComponentJson;
+      /** 本轮发送时需要由后端保存的 CLI 专属线程配置。 */
+      configuration?: ChatSendConfiguration;
       /** 发送时临时引用的 AuraCoder 会话 ID，不进入可见消息。 */
       referencedAuraCoderThreadId?: string | null;
     },
@@ -2198,6 +2201,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         contextUsageLoading: false,
         usageLimits: null,
         usageLimitsLoading: false,
+        error: undefined,
         unlisten: undefined,
       });
       console.info("[context-usage] thread unbind state cleared", {
@@ -2255,10 +2259,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       const threadState = useThreadStore.getState();
       let activeThread = threadState.threads.find((thread) => thread.id === threadId);
+      const isPendingCreation = Boolean(threadState.pendingCreationByThread[threadId]);
       // A CLI thread can advance while AuraCoder is closed or while it is being
       // used directly in its native CLI. Refresh every attached thread on activation;
       // the engine-specific sync flag only describes a transient in-progress remote turn.
-      if (activeThread && isCliThreadAttached(activeThread)) {
+      if (!isPendingCreation && activeThread && isCliThreadAttached(activeThread)) {
         try {
           const syncedThread = await ipc.syncThreadFromEngine(threadId);
           threadState.applyThreadUpdateLocal(syncedThread);
@@ -2268,14 +2273,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }
       }
 
-      const messageWindow = await ipc.getThreadMessagesWindow(
-        threadId,
-        null,
-        MESSAGE_WINDOW_INITIAL_LIMIT,
-      );
-      let messages = normalizeMessages(messageWindow.messages);
-      const olderCursor = messageWindow.nextCursor;
-      messages = applyHydrationWindow(messages);
+      let messages: Message[] = [];
+      let olderCursor: MessageWindowCursor | null = null;
+      // 首次发送前的前端会话尚无数据库记录，绑定时保留空消息区并跳过数据库读取。
+      if (!isPendingCreation) {
+        const messageWindow = await ipc.getThreadMessagesWindow(
+          threadId,
+          null,
+          MESSAGE_WINDOW_INITIAL_LIMIT,
+        );
+        messages = applyHydrationWindow(normalizeMessages(messageWindow.messages));
+        olderCursor = messageWindow.nextCursor;
+      }
       if (bindSeq !== activeThreadBindSeq) {
         console.info("[context-usage] stale thread bind discarded", {
           phase: "after-message-window-load",
@@ -2849,7 +2858,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ error: "No active thread selected" });
       return false;
     }
+    // 先为目标线程完成事件监听绑定，确保发送启动后不会错过首个 CLI 事件。
+    if (get().threadId !== threadId || !get().unlisten) {
+      await get().setActiveThread(threadId);
+    }
+    if (get().threadId !== threadId || !get().unlisten) {
+      set((current) =>
+        current.threadId === threadId
+          ? { ...current, error: "Unable to bind thread events before sending." }
+          : current,
+      );
+      return false;
+    }
     const startedAt = performance.now();
+    const pendingCreation = useThreadStore.getState().pendingCreationByThread[threadId];
     const clientTurnId = crypto.randomUUID();
     const optimisticAssistantMessageId = crypto.randomUUID();
     pendingTurnMetaByThread.set(threadId, {
@@ -2907,24 +2929,48 @@ export const useChatStore = create<ChatState>((set, get) => ({
         options?.engineId ?? null,
         options?.sendMethod ?? null,
         options?.permissionValues ?? null,
+        options?.configuration ?? null,
+        pendingCreation
+          ? { workspaceId: pendingCreation.workspaceId, title: pendingCreation.title }
+          : null,
       );
-      set({ preparingEngineId: null, preparingAttachments: false });
+      if (pendingCreation) {
+        useThreadStore.getState().markThreadPersisted(threadId);
+        try {
+          await useThreadStore
+            .getState()
+            .reloadThreadsFromLocalDatabase(pendingCreation.workspaceId);
+        } catch (error) {
+          console.error(`Failed to reload persisted thread ${threadId}:`, error);
+        }
+      }
+      set((current) =>
+        current.threadId === threadId
+          ? { ...current, preparingEngineId: null, preparingAttachments: false }
+          : current,
+      );
 
       // 旧的独立运行选择和权限保存入口已停用，保留参数变化时的保存入口供 ChatPanel 使用。
       return true;
     } catch (error) {
       pendingTurnMetaByThread.delete(threadId);
-      set((state) => ({
-        messages: state.messages.filter(
-          (item) => item.id !== userMessage.id && item.id !== optimisticAssistantMessage.id,
-        ),
-        status: "error",
-        streaming: false,
-        preparingEngineId: null,
-        preparingAttachments: false,
-        turnStartedAt: null,
-        error: String(error),
-      }));
+      set((current) => {
+        if (current.threadId !== threadId) {
+          return current;
+        }
+        return {
+          ...current,
+          messages: current.messages.filter(
+            (item) => item.id !== userMessage.id && item.id !== optimisticAssistantMessage.id,
+          ),
+          status: "error",
+          streaming: false,
+          preparingEngineId: null,
+          preparingAttachments: false,
+          turnStartedAt: null,
+          error: String(error),
+        };
+      });
       return false;
     }
   },

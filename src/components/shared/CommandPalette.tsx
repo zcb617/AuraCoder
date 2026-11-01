@@ -53,7 +53,7 @@ import {
   resolveCommandPaletteGitStatus,
 } from "../../lib/commandPaletteGit";
 import { formatRelativeTime } from "../../lib/formatters";
-import { createAndActivateWorkspaceThread } from "../../lib/newThreadActions";
+import { initializeWorkspaceChat } from "../../lib/newThreadActions";
 import {
   applyWorkspaceEditorChatSplit,
   applyWorkspaceLayoutMode,
@@ -578,7 +578,7 @@ export function getStaticCommands(
     keywords: ["new", "thread", "conversation", "chat", "nova", "conversa"],
     action: async ({ activeWorkspaceId, close }) => {
       close();
-      await createAndActivateWorkspaceThread(activeWorkspaceId);
+      await initializeWorkspaceChat(activeWorkspaceId);
     },
   },
   {

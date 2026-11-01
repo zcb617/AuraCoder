@@ -310,6 +310,44 @@ pub struct SendMessageRequest {
     pub(crate) scheduled_run_id: Option<String>,
     /// 本轮临时引用的 AuraCoder 线程主键。
     pub(crate) referenced_thread_id: Option<String>,
+    /// 本次首次发送需要由后端创建的本地会话信息。
+    pub(crate) new_thread: Option<NewChatThreadRequest>,
+    /// 本次发送需要保存的 Codex 专属会话配置。
+    pub(crate) codex_config: Option<ChatCodexSendConfig>,
+    /// 本次发送需要保存的 OpenCode 专属会话配置。
+    pub(crate) opencode_config: Option<ChatOpenCodeSendConfig>,
+    /// 本次发送是否明确修改了权限中的新会话默认值。
+    pub(crate) permission_defaults_changed: Option<bool>,
+}
+
+/// 首次发送时用于创建本地会话记录的工作区和标题。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewChatThreadRequest {
+    /// 新会话所属的工作区标识。
+    pub(crate) workspace_id: String,
+    /// 新会话首次发送时采用的标题。
+    pub(crate) title: String,
+}
+
+/// 本次发送需要应用到 Codex 会话的专属设置。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatCodexSendConfig {
+    /// 本次发送选择的 Codex 个性配置。
+    pub(crate) personality: Option<String>,
+    /// 本次发送选择的 Codex 服务档位。
+    pub(crate) service_tier: Option<String>,
+    /// 本次发送选择的 Codex 输出结构约束。
+    pub(crate) output_schema: Option<Value>,
+}
+
+/// 本次发送需要应用到 OpenCode 会话的专属设置。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatOpenCodeSendConfig {
+    /// 本次发送选择的 OpenCode Agent。
+    pub(crate) agent: Option<String>,
 }
 
 /// 向当前线程追加一条待处理消息的统一请求。

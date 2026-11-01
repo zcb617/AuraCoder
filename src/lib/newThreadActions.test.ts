@@ -1,60 +1,58 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mockToast = vi.hoisted(() => ({
-  // 向用户展示新建会话失败的固定业务提示。
-  error: vi.fn(),
-}));
-
 const mockWorkspaceState = vi.hoisted(() => ({
-  // 当前已激活的工作区标识，用于决定是否切换工作区。
+  /** 当前已激活的工作区标识，用于计算目标布局。 */
   activeWorkspaceId: "workspace-1" as string | null,
-  // 激活目标工作区并完成其上下文准备。
-  setActiveWorkspace: vi.fn(),
-  // 清除当前工作区的活动仓库选择。
-  setActiveRepo: vi.fn(),
+  /** 仅切换前端当前工作区。 */
+  setActiveWorkspaceLocal: vi.fn(),
 }));
 
 const mockTerminalState = vi.hoisted(() => ({
-  // 工作区的终端布局，用于计算新会话目标布局。
+  /** 当前工作区的终端布局，用于计算新草稿目标布局。 */
   workspaces: {} as Record<string, { layoutMode?: string }>,
 }));
 
 const mockThreadState = vi.hoisted(() => ({
-  // 创建会话并返回本地会话标识。
+  /** 清除前端选中的正式会话。 */
+  setActiveThread: vi.fn(),
+  /** 创建正式会话，仅用于确认新建草稿时不调用。 */
   createThread: vi.fn(),
 }));
 
-const mockUiState = vi.hoisted(() => ({
-  // 切换到对话主视图。
-  setActiveView: vi.fn(),
-}));
-
 const mockChatState = vi.hoisted(() => ({
-  // 激活新创建的会话。
+  /** 清除聊天展示并解绑当前正式会话。 */
   setActiveThread: vi.fn(),
 }));
 
+const mockComposerState = vi.hoisted(() => ({
+  /** 重置工作区的新草稿输入和临时表单状态。 */
+  initializeWorkspaceDraft: vi.fn(),
+}));
+
+const mockUiState = vi.hoisted(() => ({
+  /** 切换到对话主视图。 */
+  setActiveView: vi.fn(),
+}));
+
+const mockWorkspacePaneState = vi.hoisted(() => ({
+  /** 直接应用前端窗格布局，不启动终端。 */
+  applyLegacyLayoutMode: vi.fn(),
+}));
+
 const mockWorkspacePaneNavigation = vi.hoisted(() => ({
-  // 应用新会话所需的工作区窗格布局。
-  applyWorkspaceLayoutMode: vi.fn(),
-  // 读取当前工作区的窗格布局模式。
+  /** 读取当前工作区的窗格布局模式。 */
   getWorkspacePaneLayoutMode: vi.fn(() => null),
-}));
-
-const mockT = vi.hoisted(() => vi.fn((key: string) => {
-  if (key === "app:sidebar.newThreadFailed") {
-    return "Failed to create a new conversation";
-  }
-  return "New Thread";
-}));
-
-vi.mock("../i18n", () => ({
-  t: mockT,
 }));
 
 vi.mock("../stores/chatStore", () => ({
   useChatStore: {
     getState: () => mockChatState,
+  },
+}));
+
+vi.mock("../stores/chatComposerStore", () => ({
+  useChatComposerStore: {
+    getState: () => mockComposerState,
   },
 }));
 
@@ -70,13 +68,15 @@ vi.mock("../stores/threadStore", () => ({
   },
 }));
 
-vi.mock("../stores/toastStore", () => ({
-  toast: mockToast,
-}));
-
 vi.mock("../stores/uiStore", () => ({
   useUiStore: {
     getState: () => mockUiState,
+  },
+}));
+
+vi.mock("../stores/workspacePaneStore", () => ({
+  useWorkspacePaneStore: {
+    getState: () => mockWorkspacePaneState,
   },
 }));
 
@@ -88,46 +88,54 @@ vi.mock("../stores/workspaceStore", () => ({
 
 vi.mock("./workspacePaneNavigation", () => mockWorkspacePaneNavigation);
 
-import { createAndActivateWorkspaceThread } from "./newThreadActions";
+import { initializeWorkspaceChat } from "./newThreadActions";
 
-describe("createAndActivateWorkspaceThread", () => {
+describe("initializeWorkspaceChat", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockWorkspaceState.activeWorkspaceId = "workspace-1";
-    mockWorkspaceState.setActiveWorkspace.mockResolvedValue(undefined);
-    mockWorkspaceState.setActiveRepo.mockImplementation(() => undefined);
     mockTerminalState.workspaces = {};
-    mockThreadState.createThread.mockResolvedValue("thread-1");
-    mockUiState.setActiveView.mockImplementation(() => undefined);
-    mockChatState.setActiveThread.mockResolvedValue(undefined);
     mockWorkspacePaneNavigation.getWorkspacePaneLayoutMode.mockReturnValue(null);
-    mockT.mockImplementation((key: string) =>
-      key === "app:sidebar.newThreadFailed"
-        ? "Failed to create a new conversation"
-        : "New Thread",
-    );
   });
 
-  // 创建会话失败时仅展示固定业务文案，不泄露原始错误，也不激活不存在的会话。
-  it("shows a fixed toast and does not activate a thread when creation fails", async () => {
-    const error = new Error("database failure at /private/internal/aura.sqlite");
-    mockThreadState.createThread.mockRejectedValueOnce(error);
+  // 新建操作只初始化前端草稿，不创建正式线程或触发持久化流程。
+  it("initializes an empty workspace chat draft", async () => {
+    const result = await initializeWorkspaceChat("workspace-1");
 
-    const result = await createAndActivateWorkspaceThread("workspace-1");
-
-    expect(result).toBeNull();
-    expect(mockToast.error).toHaveBeenCalledTimes(1);
-    expect(mockToast.error).toHaveBeenCalledWith("Failed to create a new conversation");
-    expect(mockToast.error.mock.calls[0]?.[0]).not.toContain(error.message);
-    expect(mockChatState.setActiveThread).not.toHaveBeenCalled();
+    expect(result).toBe(true);
+    expect(mockUiState.setActiveView).toHaveBeenCalledWith("chat");
+    expect(mockThreadState.setActiveThread).toHaveBeenCalledWith(null);
+    expect(mockChatState.setActiveThread).toHaveBeenCalledWith(null);
+    expect(mockComposerState.initializeWorkspaceDraft).toHaveBeenCalledWith("workspace-1");
+    expect(mockWorkspaceState.setActiveWorkspaceLocal).toHaveBeenCalledWith("workspace-1");
+    expect(mockWorkspacePaneState.applyLegacyLayoutMode).toHaveBeenCalledWith("workspace-1", "chat");
+    expect(mockThreadState.createThread).not.toHaveBeenCalled();
   });
 
-  // 创建会话成功时返回会话标识，并保持新建后的会话激活行为。
-  it("returns and activates the newly created thread on success", async () => {
-    const result = await createAndActivateWorkspaceThread("workspace-1");
+  // 缺少工作区标识时不初始化空草稿或修改前端状态。
+  it("returns false when the workspace is unavailable", async () => {
+    const result = await initializeWorkspaceChat(null);
 
-    expect(result).toBe("thread-1");
-    expect(mockToast.error).not.toHaveBeenCalled();
-    expect(mockChatState.setActiveThread).toHaveBeenCalledWith("thread-1");
+    expect(result).toBe(false);
+    expect(mockUiState.setActiveView).not.toHaveBeenCalled();
+    expect(mockThreadState.setActiveThread).not.toHaveBeenCalled();
+    expect(mockComposerState.initializeWorkspaceDraft).not.toHaveBeenCalled();
   });
 });
+
+/*
+ * 旧契约依赖数据库创建、失败 toast 和 threadId 返回，按前端草稿初始化要求停用：
+ * it("shows a fixed toast and does not activate a thread when creation fails", async () => {
+ *   mockThreadState.createThread.mockRejectedValueOnce(new Error("database failure"));
+ *   const result = await createAndActivateWorkspaceThread("workspace-1");
+ *   expect(result).toBeNull();
+ *   expect(mockToast.error).toHaveBeenCalledWith("Failed to create a new conversation");
+ *   expect(mockChatState.setActiveThread).not.toHaveBeenCalled();
+ * });
+ * it("returns and activates the newly created thread on success", async () => {
+ *   mockThreadState.createThread.mockResolvedValue("thread-1");
+ *   const result = await createAndActivateWorkspaceThread("workspace-1");
+ *   expect(result).toBe("thread-1");
+ *   expect(mockChatState.setActiveThread).toHaveBeenCalledWith("thread-1");
+ * });
+ */

@@ -14,6 +14,7 @@ import type {
   BrowserAnnotationSelection,
   BrowserBounds,
   ChatAttachment,
+  ChatSendConfiguration,
   ChatEngineId,
   ChatInputItem,
   ChatProviderUsage,
@@ -694,6 +695,8 @@ export const ipc = {
     engineId?: string | null,
     sendMethod?: string | null,
     permissionValues?: PermissionComponentJson | null,
+    configuration?: ChatSendConfiguration | null,
+    newThread?: { workspaceId: string; title: string } | null,
   ) =>
     invoke<string>("send_message", {
       request: {
@@ -709,6 +712,10 @@ export const ipc = {
         inputItems: inputItems ?? null,
         clientTurnId: clientTurnId ?? null,
         referencedThreadId: referencedThreadId ?? null,
+        codexConfig: configuration?.codexConfig ?? null,
+        opencodeConfig: configuration?.opencodeConfig ?? null,
+        permissionDefaultsChanged: configuration?.permissionDefaultsChanged ?? null,
+        newThread: newThread ?? null,
       },
     }),
   /** 将当前统一权限对象随 steer 请求交给后端发送流程。 */
