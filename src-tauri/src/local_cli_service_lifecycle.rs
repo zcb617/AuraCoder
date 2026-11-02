@@ -120,8 +120,9 @@ static NEXT_OPENCODE_SERVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
 const OPENCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 /// OpenCode 服务健康检查使用的最长等待时间。
 const OPENCODE_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
-/// OpenCode stdout 宣布 HTTP 服务已监听时使用的前缀。
-const SERVER_READY_PREFIX: &str = "opencode server listening";
+/// OpenCode stdout 宣布 HTTP 服务已监听时使用的关键字。
+// const SERVER_READY_PREFIX: &str = "opencode server listening";
+const SERVER_READY_MARKER: &str = "server listening";
 /// OpenCode CLI 版本和模型目录命令使用的最长等待时间。
 const OPENCODE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// OpenCode 本机服务只绑定回环地址，避免暴露到外部网络。
@@ -355,12 +356,14 @@ async fn start_local_opencode_service(
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             log::debug!("opencode stdout: {line}");
-            if line.starts_with(SERVER_READY_PREFIX) {
+            // if line.starts_with(SERVER_READY_PREFIX) {
+            if line.contains(SERVER_READY_MARKER) {
                 if let Some(tx) = ready_tx.take() {
                     let url = line
                         .split_whitespace()
                         .last()
                         .map(str::to_string)
+                        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
                         .unwrap_or_else(|| format!("http://{DEFAULT_HOST}:{port}"));
                     let _ = tx.send(url);
                 }
