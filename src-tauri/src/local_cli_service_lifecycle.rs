@@ -144,7 +144,8 @@ impl LocalOpenCodeServiceHandle {
     /// 取得指定 cwd 已就绪的 OpenCode HTTP endpoint；首次访问时启动并登记服务。
     pub(crate) async fn endpoint_for_cwd(&self, cwd: &str) -> Result<LocalOpenCodeEndpoint> {
         let cwd = cwd.trim();
-        anyhow::ensure!(!cwd.is_empty(), "本机 OpenCode 服务缺少项目目录");
+        // 旧实现拒绝空目录；V2 用户级服务使用空 cwd 作为生命周期缓存键。
+        // anyhow::ensure!(!cwd.is_empty(), "本机 OpenCode 服务缺少项目目录");
         if let Some(service) = self.services.lock().await.get(cwd).cloned() {
             return Ok(service.endpoint());
         }
@@ -262,7 +263,13 @@ async fn start_local_opencode_service(
 ) -> Result<LocalOpenCodeService> {
     let executable = runtime_env::resolve_executable("opencode")
         .context("`opencode` executable not found")?;
-    let version = match run_local_opencode_command(&executable, Some(cwd), &["--version"]).await {
+    // 用户级服务使用主目录启动，同时保留空 cwd 作为生命周期键。
+    let process_dir = if cwd.is_empty() {
+        runtime_env::home_dir().context("无法确定本机 OpenCode 用户主目录")?
+    } else {
+        PathBuf::from(cwd)
+    };
+    let version = match run_local_opencode_command(&executable, process_dir.to_str(), &["--version"]).await {
         Ok(output) => output
             .lines()
             .next()
@@ -316,10 +323,15 @@ async fn start_local_opencode_service(
     let gateway_entry = gateway_config
         .get("mcp")
         .and_then(Value::as_object)
-        .and_then(|mcp| mcp.get("auracoder"))
+        .and_then(|mcp| mcp.get("servers"))
+        .and_then(|servers| servers.get("auracoder"))
         .cloned()
         .context("OpenCode MCP Gateway 配置生成失败")?;
-    mcp_object.insert("auracoder".to_string(), gateway_entry);
+    // 仅在隔离配置的 V2 servers 节点中注入 AuraCoder Gateway。
+    let servers = mcp_object.entry("servers".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut().context("本机 OpenCode MCP servers 配置必须是 JSON 对象")?;
+    servers.insert("auracoder".to_string(), gateway_entry);
     std::fs::write(
         &config_path,
         serde_json::to_vec_pretty(&config).context("序列化本机 OpenCode 配置失败")?,
@@ -335,7 +347,7 @@ async fn start_local_opencode_service(
         .arg(DEFAULT_HOST)
         .arg("--port")
         .arg(port.to_string())
-        .current_dir(cwd)
+        .current_dir(&process_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

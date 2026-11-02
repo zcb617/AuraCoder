@@ -138,13 +138,13 @@ pub async fn model_infos(
             service_use.connection_id == connection_id,
             "SSH 远端 OpenCode 模型请求与当前连接不一致"
         );
-        service_use.engine().list_models_runtime().await
+        service_use.engine().model_infos("").await?
     } else {
         let service = cli_service_lifecycle::get(connection_id, "opencode").await?;
         runtime_for_service(service.as_ref())
             .await?
-            .list_models_runtime()
-            .await
+            .model_infos("")
+            .await?
     };
     anyhow::ensure!(!models.is_empty(), "SSH 远端 OpenCode 未返回可用模型");
     Ok(models)

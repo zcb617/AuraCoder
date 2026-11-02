@@ -28,7 +28,7 @@ use crate::{
     local_cli_service_lifecycle::{LocalCliHandle, LocalCliServiceLifecycle},
     runtime_env,
     models::{
-        CachedExtensionCatalogDto, ChatProviderUsageDto, CliContextUsageDto, CodexAppDto,
+        CachedExtensionCatalogDto, ChatProviderUsageDto, ChatProviderUsageWindowDto, CliContextUsageDto, CodexAppDto,
         CodexPluginDto, CodexSkillDto, EngineHealthDto, EngineInfoDto, ExtensionActionResultDto,
         ExtensionCatalogKindRefreshDto, ExtensionItemDto, ExtensionRefreshJob,
         OpenCodeRuntimeCatalogDto,
@@ -238,6 +238,10 @@ impl OpenCodeCli {
             cwd.to_string(),
             endpoint_generation,
         ));
+        // 在缓存协议客户端之前验证服务确实提供 V2 API。
+        engine.prewarm().await.inspect_err(|error| {
+            log::error!("本机 OpenCode V2 服务检查失败: cwd={cwd}, error={error:#}");
+        })?;
         engine.set_computer_control_service(self.state.computer_control_service.clone());
         // engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
         engines.insert(cwd.to_string(), (endpoint_generation, engine.clone()));
@@ -247,6 +251,99 @@ impl OpenCodeCli {
     /// 配置本机 OpenCode 协议客户端的计算机控制和会话读取服务。
     async fn configure_local_computer_control(&self, cwd: &str) -> Result<Arc<OpenCodeEngine>> {
         self.local_engine(cwd).await
+    }
+
+    /// 通过 V2 integration 和 MCP 接口完成指定目录的认证或注销。
+    async fn perform_v2_extension_action(&self, engine: &OpenCodeEngine, cwd: &str, item: &ExtensionItemDto, action: &str) -> Result<ExtensionActionResultDto> {
+        anyhow::ensure!(item.kind == "mcp" && item.available_actions.iter().any(|value| value == action), "OpenCode 扩展动作不可用");
+        // 按名称查找对应 integration，避免操作其他服务的凭证。
+        let servers = engine.get_v2_data(cwd, "/api/mcp").await?;
+        let server = servers.as_array().context("OpenCode MCP 目录无效")?.iter()
+            .find(|server| server.get("name").and_then(Value::as_str) == Some(item.id.as_str()))
+            .context("OpenCode MCP 服务不存在")?;
+        let integration_id = server.get("integrationID").and_then(Value::as_str).context("OpenCode MCP 服务不支持认证")?;
+        let integration_segment = percent_encoding::utf8_percent_encode(integration_id, percent_encoding::NON_ALPHANUMERIC).to_string();
+        let name_segment = percent_encoding::utf8_percent_encode(&item.id, percent_encoding::NON_ALPHANUMERIC).to_string();
+        let integration_path = format!("/api/integration/{integration_segment}");
+        let integration = engine.get_v2_data(cwd, &integration_path).await?;
+        if action == "authenticate" {
+            // 仅接受唯一 OAuth 方式，表单输入由现有界面无法提供时明确报告。
+            let methods = integration.get("methods").and_then(Value::as_array).context("OpenCode integration 缺少认证方式")?;
+            let oauth = methods.iter().filter(|method| method.get("type").and_then(Value::as_str) == Some("oauth")).collect::<Vec<_>>();
+            anyhow::ensure!(oauth.len() == 1, "OpenCode MCP OAuth 认证方式不存在或不唯一");
+            let method = oauth[0];
+            anyhow::ensure!(method.get("form").and_then(Value::as_array).map_or(true, Vec::is_empty), "OpenCode MCP 认证需要填写表单: {}", method.get("form").unwrap_or(&Value::Null));
+            let method_id = method.get("id").and_then(Value::as_str).context("OpenCode OAuth 缺少 methodID")?;
+            let response = engine.send_v2_request(cwd, reqwest::Method::POST, &format!("{integration_path}/connect/oauth"), Some(json!({"methodID": method_id}))).await?;
+            let attempt = response.get("data").context("OpenCode OAuth 响应缺少 data")?;
+            let instructions = attempt.get("instructions").and_then(Value::as_str).unwrap_or("");
+            let attempt_id = attempt.get("attemptID").and_then(Value::as_str).context("OpenCode OAuth 缺少 attemptID")?;
+            let attempt_segment = percent_encoding::utf8_percent_encode(attempt_id, percent_encoding::NON_ALPHANUMERIC).to_string();
+            if attempt.get("mode").and_then(Value::as_str) != Some("auto") {
+                let cancel = engine.send_v2_request(cwd, reqwest::Method::DELETE, &format!("{integration_path}/connect/oauth/{attempt_segment}"), None).await;
+                if let Err(error) = cancel { log::error!("取消 OpenCode MCP OAuth 失败: {error:#}"); }
+                anyhow::bail!("OpenCode MCP 认证需要输入授权码: {instructions}");
+            }
+            let url = attempt.get("url").and_then(Value::as_str).context("OpenCode OAuth 缺少 URL")?;
+            let parsed = reqwest::Url::parse(url).context("OpenCode OAuth URL 无效")?;
+            anyhow::ensure!(matches!(parsed.scheme(), "http" | "https"), "OpenCode OAuth URL 协议无效");
+            let expires = attempt.pointer("/time/expires").and_then(Value::as_f64);
+            // 使用独立参数启动系统浏览器，不经过 shell 解析授权地址。
+            #[cfg(target_os = "windows")]
+            let mut command = { let mut command = tokio::process::Command::new("rundll32"); command.arg("url.dll,FileProtocolHandler"); command };
+            #[cfg(target_os = "macos")]
+            let mut command = tokio::process::Command::new("open");
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            let mut command = tokio::process::Command::new("xdg-open");
+            crate::process_utils::configure_tokio_command(&mut command);
+            if let Err(error) = command.arg(url).spawn() {
+                let cancel = engine.send_v2_request(cwd, reqwest::Method::DELETE, &format!("{integration_path}/connect/oauth/{attempt_segment}"), None).await;
+                if let Err(cancel_error) = cancel { log::error!("取消 OpenCode MCP OAuth 失败: {cancel_error:#}"); }
+                return Err(error).context("打开 OpenCode OAuth 浏览器失败");
+            }
+            let started = std::time::Instant::now();
+            loop {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as f64;
+                if started.elapsed() >= std::time::Duration::from_secs(300) || expires.is_some_and(|value| now >= value) {
+                    let cancel = engine.send_v2_request(cwd, reqwest::Method::DELETE, &format!("{integration_path}/connect/oauth/{attempt_segment}"), None).await;
+                    if let Err(error) = cancel { log::error!("取消 OpenCode MCP OAuth 失败: {error:#}"); }
+                    anyhow::bail!("OpenCode MCP OAuth 已过期: {instructions}");
+                }
+                let status = match engine.get_v2_data(cwd, &format!("{integration_path}/connect/oauth/{attempt_segment}")).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        let cancel = engine.send_v2_request(cwd, reqwest::Method::DELETE, &format!("{integration_path}/connect/oauth/{attempt_segment}"), None).await;
+                        if let Err(cancel_error) = cancel { log::error!("取消 OpenCode MCP OAuth 失败: {cancel_error:#}"); }
+                        return Err(error).context("读取 OpenCode MCP OAuth 状态失败");
+                    }
+                };
+                match status.get("status").and_then(Value::as_str) {
+                    Some("complete") => break,
+                    Some("pending") => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+                    _ => {
+                        let cancel = engine.send_v2_request(cwd, reqwest::Method::DELETE, &format!("{integration_path}/connect/oauth/{attempt_segment}"), None).await;
+                        if let Err(error) = cancel { log::error!("取消 OpenCode MCP OAuth 失败: {error:#}"); }
+                        anyhow::bail!("OpenCode MCP OAuth 失败或状态无效: {status}");
+                    }
+                }
+            }
+            engine.send_v2_request(cwd, reqwest::Method::POST, &format!("/api/experimental/mcp/{name_segment}/connect"), None).await?;
+        } else if action == "logout" {
+            // 只清除此 integration 的存储凭证，环境变量凭证不能删除。
+            let connections = integration.get("connections").and_then(Value::as_array).context("OpenCode integration 缺少连接列表")?;
+            anyhow::ensure!(!connections.iter().any(|connection| connection.get("type").and_then(Value::as_str) == Some("env")), "OpenCode MCP 环境变量凭证无法删除");
+            let credentials = connections.iter().filter(|connection| connection.get("type").and_then(Value::as_str) == Some("credential")).collect::<Vec<_>>();
+            anyhow::ensure!(credentials.len() <= 1, "OpenCode MCP 存在多个凭证，无法确定当前连接对应的凭证");
+            for connection in credentials {
+                if connection.get("type").and_then(Value::as_str) == Some("credential") {
+                    let id = connection.get("id").and_then(Value::as_str).context("OpenCode 凭证缺少 id")?;
+                    let segment = percent_encoding::utf8_percent_encode(id, percent_encoding::NON_ALPHANUMERIC).to_string();
+                    engine.send_v2_request(cwd, reqwest::Method::DELETE, &format!("/api/credential/{segment}"), None).await?;
+                }
+            }
+            engine.send_v2_request(cwd, reqwest::Method::POST, &format!("/api/experimental/mcp/{name_segment}/disconnect"), None).await?;
+        } else { anyhow::bail!("OpenCode 扩展动作不支持: {action}"); }
+        Ok(ExtensionActionResultDto { provider_id: self.id().to_string(), kind: item.kind.clone(), extension_id: item.id.clone(), action: action.to_string(), requires_new_session: item.requires_new_session })
     }
 
     /// 根据 workspace 建立 OpenCode 操作目标。
@@ -502,6 +599,7 @@ impl OpenCodeCli {
             "OpenCode 不支持 network 覆盖"
         );
 
+        /*
         // 按当前统一权限配置和 workspace 信任级别生成完整 OpenCode 原生权限数组。
         let trust = match permissions.trust.first().map(String::as_str) {
             Some("automatic") | None => workspace.trust_level.as_str(),
@@ -544,6 +642,41 @@ impl OpenCodeCli {
             Some(value) => anyhow::bail!("OpenCode autonomy preset 不支持: {value}"),
         };
         Ok(json!({ "permission": rules }))
+        */
+        // 先设置基线，再按 V2 最后匹配规则追加受控动作与外部目录例外。
+        let trust = match permissions.trust.first().map(String::as_str) {
+            Some("automatic") | None => workspace.trust_level.as_str(),
+            Some(value) => value,
+        };
+        anyhow::ensure!(matches!(trust, "restricted" | "trusted" | "standard"),
+            "workspace 信任级别不支持 OpenCode 权限映射: {trust}");
+        let mode = match permissions.autonomy_preset.first().map(String::as_str) {
+            Some("read-only") => "restricted",
+            Some("ask") => "ask",
+            Some("auto") => "workspace",
+            Some("full") => "full",
+            Some("automatic") | None => match permissions.approval.first().map(String::as_str) {
+                Some("restricted") => "restricted",
+                Some("ask") => "ask",
+                Some("autonomous") => "full",
+                Some("automatic") | None if trust == "restricted" => "restricted",
+                Some("automatic") | None => "ask",
+                Some(value) => anyhow::bail!("OpenCode approval 配置不支持: {value}"),
+            },
+            Some(value) => anyhow::bail!("OpenCode autonomy preset 不支持: {value}"),
+        };
+        let baseline = match mode { "restricted" => "deny", "ask" => "ask", _ => "allow" };
+        let mut rules = vec![json!({ "action": "*", "resource": "*", "effect": baseline })];
+        if mode == "restricted" || mode == "ask" {
+            // 只放行只读工具和原生表单，其他动作遵循受限基线。
+            for action in ["read", "glob", "grep", "question"] {
+                rules.push(json!({ "action": action, "resource": "*", "effect": "allow" }));
+            }
+        }
+        if mode == "workspace" {
+            rules.push(json!({ "action": "external_directory", "resource": "*", "effect": "ask" }));
+        }
+        Ok(json!({ "permissions": rules }))
     }
 
 }
@@ -1016,6 +1149,7 @@ impl CliTool for OpenCodeCli {
             });
         }
 
+        /*
         let models = if context.root_path.trim().is_empty() {
             let service = LocalCliServiceLifecycle::get("opencode").await?;
             let handle = match service.handle() {
@@ -1067,6 +1201,12 @@ impl CliTool for OpenCodeCli {
                 .list_models_runtime()
                 .await
         };
+        */
+        // 模型目录统一通过当前运行位置的 V2 API 获取。
+        let models = self.local_engine(&context.root_path).await?
+            .model_infos(&context.root_path).await
+            .inspect_err(|error| log::error!("读取本机 OpenCode V2 模型失败: {error:#}"))
+            .context("读取本机 OpenCode V2 模型失败")?;
         Ok(EngineInfoDto {
             id: "opencode".to_string(),
             name: "OpenCode".to_string(),
@@ -1099,15 +1239,12 @@ impl CliTool for OpenCodeCli {
                 .context("SSH 远端 OpenCode 未绑定连接")?;
             return remote_project_opencode_runtime_service::model_infos(connection_id, None).await;
         }
-        let engine = self.local_engine(&context.root_path).await?;
-        let cached_models = engine.runtime_model_fallback().await;
-        if cached_models
-            .iter()
-            .any(|model| model.id == requested_model_id)
-        {
-            return Ok(cached_models);
-        }
-        Ok(engine.list_models_runtime().await)
+        // 校验使用实时 V2 模型目录，失败时保留原始错误。
+        let _ = requested_model_id;
+        self.local_engine(&context.root_path).await?
+            .model_infos(&context.root_path).await
+            .inspect_err(|error| log::error!("读取 OpenCode V2 模型校验目录失败: {error:#}"))
+            .context("读取 OpenCode V2 模型校验目录失败")
     }
 
     /// 用户查看 OpenCode 用量时，只对显式查询返回既有不可用结果。
@@ -1116,8 +1253,30 @@ impl CliTool for OpenCodeCli {
         context: &CliExecutionContext,
         scope: CliUsageQueryScope,
     ) -> Result<Option<ChatProviderUsageDto>> {
-        self.load_workspace(context).await?;
-        Ok(Self::opencode_provider_usage(scope))
+        // 摘要查询不主动请求；显式查询使用当前本机或 SSH 服务。
+        if matches!(scope, CliUsageQueryScope::Summary) { return Ok(None); }
+        let engine = if context.location_kind == CliLocationKind::Ssh {
+            let workspace = self.load_workspace(context).await?;
+            remote_project_opencode_runtime_service::runtime(&workspace).await?
+        } else {
+            self.local_engine(&context.root_path).await?
+        };
+        let data = engine.get_v2_data(&context.root_path, "/api/experimental/usage/limits").await
+            .inspect_err(|error| log::error!("读取 OpenCode V2 用量失败: {error:#}"))?;
+        let mut windows = Vec::new();
+        if let Some(go) = data.get("go") {
+            for kind in ["rolling", "weekly", "monthly"] {
+                let meter = go.get(kind).context("OpenCode V2 用量窗口缺失")?;
+                let percent = meter.get("percent").and_then(Value::as_f64).context("OpenCode V2 用量百分比缺失")?;
+                let reset = meter.get("resetsAt").and_then(Value::as_f64).context("OpenCode V2 用量重置时间缺失")?;
+                windows.push(ChatProviderUsageWindowDto {
+                    kind: kind.to_string(),
+                    used_percent: percent.clamp(0.0, 100.0).round() as u8,
+                    resets_at: Some((reset / 1000.0) as i64),
+                });
+            }
+        }
+        Ok(Some(ChatProviderUsageDto { engine_id: "opencode".to_string(), name: "OpenCode".to_string(), available: !data.is_null(), windows }))
     }
 
     /// 用户进入 OpenCode 线程时，读取模型上下文上限和最新可靠 assistant token 快照。
@@ -1556,7 +1715,7 @@ impl CliTool for OpenCodeCli {
         Self::validate_thread(context, thread)?;
         // 将当前线程转换出的 OpenCode 原生规则传入 session 建立流程。
         let permission_rules = permissions
-            .get("permission")
+            .get("permissions")
             .cloned()
             .context("OpenCode 原生权限规则缺失")?;
         anyhow::ensure!(permission_rules.is_array(), "OpenCode 原生权限规则必须是数组");
@@ -1814,15 +1973,33 @@ impl CliTool for OpenCodeCli {
         Ok(Some(snapshot))
     }
 
+    /// 将会话标题同步到所属本机或 SSH OpenCode V2 服务。
     async fn set_thread_name(
         &self,
         context: &CliExecutionContext,
         thread: &ThreadDto,
-        _engine_thread_id: &str,
-        _name: &str,
+        engine_thread_id: &str,
+        name: &str,
     ) -> Result<()> {
+        /* 旧实现仅校验后返回成功，没有更新 OpenCode 会话：
         self.load_workspace(context).await?;
         Self::validate_thread(context, thread)?;
+        Ok(())
+        */
+        // 校验会话归属，并从对应生命周期取得协议客户端。
+        let workspace = self.load_workspace(context).await?;
+        Self::validate_thread(context, thread)?;
+        let cwd = self.thread_cwd(&workspace, thread).await?;
+        let engine = if context.location_kind == CliLocationKind::Ssh {
+            remote_project_opencode_runtime_service::runtime(&workspace).await?
+        } else {
+            self.local_engine(&cwd).await?
+        };
+        // 只有 V2 会话更新成功才返回成功，保留服务的原始错误。
+        let session_id = percent_encoding::utf8_percent_encode(engine_thread_id, percent_encoding::NON_ALPHANUMERIC);
+        engine.send_v2_request(&cwd, reqwest::Method::PATCH, &format!("/api/session/{session_id}"), Some(json!({ "title": name })))
+            .await
+            .inspect_err(|error| log::error!("更新 OpenCode V2 会话标题失败: session_id={engine_thread_id}, error={error:#}"))?;
         Ok(())
     }
 
@@ -1873,6 +2050,7 @@ impl CliTool for OpenCodeCli {
         cwd: Option<&str>,
         requested_kinds: &[String],
     ) -> Result<Vec<ExtensionCatalogKindRefreshDto>> {
+        /*
         if context.location_kind == CliLocationKind::Local && context.workspace_id.is_empty() {
             let mut results = Vec::new();
             for kind in requested_kinds {
@@ -1929,6 +2107,40 @@ impl CliTool for OpenCodeCli {
                 )
             })
             .collect())
+        */
+        // 根据上下文只取得对应机器的协议客户端和目录。
+        let (engine, directory) = if context.location_kind == CliLocationKind::Ssh {
+            let workspace = self.load_workspace(context).await?;
+            let directory = self.resolve_workspace_cwd(&workspace, cwd).await?;
+            (remote_project_opencode_runtime_service::runtime(&workspace).await?, directory)
+        } else if context.workspace_id.is_empty() {
+            (self.local_engine("").await?, String::new())
+        } else {
+            let workspace = self.load_workspace(context).await?;
+            let directory = self.resolve_workspace_cwd(&workspace, cwd).await?;
+            (self.local_engine(&directory).await?, directory)
+        };
+        let mut results = Vec::new();
+        for kind in requested_kinds {
+            let path = match kind.as_str() {
+                "skill" => "/api/skill",
+                "plugin" => "/api/plugin",
+                "mcp" => "/api/mcp",
+                _ => { results.push(ExtensionCatalogKindRefreshDto::failure(kind)); continue; }
+            };
+            let result = match engine.get_v2_data(&directory, path).await {
+                Ok(data) => extensions::opencode::parse_v2_catalog(kind, &data, Some(&directory)),
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(items) => results.push(ExtensionCatalogKindRefreshDto::success(kind, items)),
+                Err(error) => {
+                    log::error!("读取 OpenCode V2 扩展目录失败: kind={kind}, cwd={directory}, error={error:#}");
+                    results.push(ExtensionCatalogKindRefreshDto::failure(kind));
+                }
+            }
+        }
+        Ok(results)
     }
 
     /// 为当前 OpenCode 工作区创建一次性扩展目录排期。
@@ -2052,26 +2264,22 @@ impl CliTool for OpenCodeCli {
         context: &CliExecutionContext,
         cwd: Option<&str>,
     ) -> Result<CachedExtensionCatalogDto> {
-        if context.location_kind == CliLocationKind::Local {
-            let cwd = if context.workspace_id.is_empty() {
-                cwd.map(str::to_string)
+        // 本机沿用扩展快照，SSH 目录直接从远端协议客户端读取。
+        let mut cached = None;
+        let (engine, cwd) = if context.location_kind == CliLocationKind::Local && context.workspace_id.is_empty() {
+            cached = Some(self.load_cached_extension_catalog(None).await?);
+            (self.local_engine("").await?, String::new())
+        } else {
+            let workspace = self.load_workspace(context).await?;
+            let cwd = self.resolve_workspace_cwd(&workspace, cwd).await?;
+            if context.location_kind == CliLocationKind::Local {
+                cached = Some(self.load_cached_extension_catalog(Some(&cwd)).await?);
+                (self.local_engine(&cwd).await?, cwd)
             } else {
-                let workspace = self.load_workspace(context).await?;
-                Some(
-                    self.resolve_workspace_cwd(&workspace, cwd)
-                        .await?
-                        .to_string(),
-                )
-            };
-            return self.load_cached_extension_catalog(cwd.as_deref()).await;
-        }
-
-        let workspace = self.load_workspace(context).await?;
-        let cwd = self.resolve_workspace_cwd(&workspace, cwd).await?;
-
-        let runtime = self
-            .get_opencode_runtime_catalog(context, cwd.as_str())
-            .await?;
+                (remote_project_opencode_runtime_service::runtime(&workspace).await?, cwd)
+            }
+        };
+        let runtime = engine.runtime_catalog(&cwd).await?;
         let mut items = runtime
             .agents
             .into_iter()
@@ -2137,6 +2345,7 @@ impl CliTool for OpenCodeCli {
                     ..Default::default()
                 }),
         );
+        /*
         items.extend(
             runtime
                 .mcp_servers
@@ -2188,8 +2397,21 @@ impl CliTool for OpenCodeCli {
                     }
                 }),
         );
+        */
+        // 本机保留快照并补充实时 agent、command；SSH 直接读取 V2 扩展目录。
+        if let Some(mut catalog) = cached {
+            catalog.items.extend(items);
+            return Ok(catalog);
+        }
+        for kind in ["skill", "plugin", "mcp"] {
+            let path = match kind { "skill" => "/api/skill", "plugin" => "/api/plugin", _ => "/api/mcp" };
+            let data = engine.get_v2_data(&cwd, path).await.inspect_err(|error| {
+                log::error!("读取 SSH OpenCode V2 扩展目录失败: kind={kind}, cwd={cwd}, error={error:#}");
+            })?;
+            items.extend(extensions::opencode::parse_v2_catalog(kind, &data, Some(&cwd))?);
+        }
         let fetched_at = runtime_env::system_time_rfc3339();
-        let kind_fetched_at = ["agent", "command", "mcp"]
+        let kind_fetched_at = ["agent", "command", "skill", "plugin", "mcp"]
             .into_iter()
             .map(|kind| (kind.to_string(), Some(fetched_at.clone())))
             .collect();
@@ -2256,13 +2478,13 @@ impl CliTool for OpenCodeCli {
         action: &str,
         _scope: Option<&str>,
     ) -> Result<ExtensionActionResultDto> {
+        // 在 workspace 归属的运行位置执行 MCP 动作。
         let workspace = self.load_workspace(context).await?;
-        anyhow::ensure!(
-            context.location_kind == CliLocationKind::Local,
-            "SSH 远端 OpenCode 当前不执行扩展变更，也不会调用本机 OpenCode"
-        );
         let cwd = self.resolve_workspace_cwd(&workspace, None).await?;
-        extensions::opencode::perform_action(&item, action, Some(cwd.as_str())).await
+        let engine = if context.location_kind == CliLocationKind::Ssh {
+            remote_project_opencode_runtime_service::runtime(&workspace).await?
+        } else { self.local_engine(&cwd).await? };
+        self.perform_v2_extension_action(&engine, &cwd, &item, action).await
     }
 
     /// 用户未选择 workspace 时，使用本机用户级 OpenCode 配置执行全局扩展动作。
@@ -2272,7 +2494,9 @@ impl CliTool for OpenCodeCli {
         action: &str,
         _scope: Option<&str>,
     ) -> Result<ExtensionActionResultDto> {
-        extensions::opencode::perform_action(&item, action, None).await
+        // 用户级动作使用本机用户级服务。
+        let engine = self.local_engine("").await?;
+        self.perform_v2_extension_action(&engine, "", &item, action).await
     }
 
     /// 报告 OpenCode 当前不支持的会话分支业务。

@@ -241,7 +241,7 @@ pub async fn get(executable: &Path) -> HashMap<OsString, OsString> {
 
 /// 获取 OpenCode 子进程的完整运行环境。
 ///
-/// 先调用 [`get`] 获取默认环境，再覆盖 OpenCode 服务密码和隔离配置目录。
+/// 先调用 [`get`] 获取用户环境，再设置服务密码和 Gateway 叠加配置。
 pub async fn get_opencode_env(
     executable: &Path,
     password: &str,
@@ -249,9 +249,10 @@ pub async fn get_opencode_env(
 ) -> HashMap<OsString, OsString> {
     let mut values = get(executable).await;
     values.insert(
-        OsString::from("OPENCODE_SERVER_PASSWORD"),
+        OsString::from("OPENCODE_PASSWORD"),
         OsString::from(password),
     );
+    /* 旧实现覆盖用户配置目录，会屏蔽用户 provider 和模型配置，不能恢复：
     values.insert(
         OsString::from("OPENCODE_CONFIG_DIR"),
         run_dir.join(".opencode").into_os_string(),
@@ -259,6 +260,12 @@ pub async fn get_opencode_env(
     values.insert(
         OsString::from("XDG_CONFIG_HOME"),
         run_dir.as_os_str().to_os_string(),
+    );
+    */
+    // 叠加 AuraCoder 自有配置，同时保留用户 provider、模型及凭证目录。
+    values.insert(
+        OsString::from("OPENCODE_CONFIG"),
+        run_dir.join(".opencode").join("opencode.json").into_os_string(),
     );
     values
 }
@@ -334,13 +341,15 @@ pub fn opencode_mcp_gateway_authenticated_config(
 ) -> serde_json::Value {
     serde_json::json!({
         "mcp": {
-            "auracoder": {
+            "servers": {
+              "auracoder": {
                 "type": "remote",
                 "url": endpoint,
-                "enabled": true,
+                "disabled": false,
                 "headers": {
                     "Authorization": authorization_header,
                 },
+              }
             }
         }
     })
@@ -348,7 +357,7 @@ pub fn opencode_mcp_gateway_authenticated_config(
 
 /// 生成远端 OpenCode 服务密码环境变量的导出片段。
 pub fn get_remote_opencode_env(password: &str) -> String {
-    format!("export OPENCODE_SERVER_PASSWORD={};", quote_posix(password))
+    format!("export OPENCODE_PASSWORD={};", quote_posix(password))
 }
 
 /// 生成远端 Claude Code 可执行文件环境变量的导出片段。

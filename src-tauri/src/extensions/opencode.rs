@@ -15,6 +15,7 @@ use super::cli;
 
 const PROVIDER_ID: &str = "opencode";
 
+/*
 pub async fn refresh_kind(
     _manager: &EngineManager,
     cwd: Option<&str>,
@@ -97,6 +98,95 @@ pub async fn perform_action(
         action: action.to_string(),
         requires_new_session: item.requires_new_session,
     })
+}
+
+*/
+
+/// 将 OpenCode V2 扩展目录转换为统一扩展项，不读取技能正文或凭证。
+pub fn parse_v2_catalog(kind: &str, data: &Value, cwd: Option<&str>) -> Result<Vec<ExtensionItemDto>> {
+    // 服务目录必须是数组，每一项按其原生类型解析。
+    let entries = data.as_array().ok_or_else(|| anyhow::anyhow!("OpenCode V2 {kind} 目录不是数组"))?;
+    let mut items = Vec::new();
+    for entry in entries {
+        let mut item = ExtensionItemDto::default();
+        item.provider_id = PROVIDER_ID.to_string();
+        item.kind = kind.to_string();
+        item.installed = Some(true);
+        item.health = "healthy".to_string();
+        match kind {
+            "skill" => {
+                let id = entry.get("id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("OpenCode skill 缺少 id"))?;
+                let name = entry.get("name").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("OpenCode skill 缺少 name"))?;
+                let path = entry.get("path").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("OpenCode skill 缺少 path"))?;
+                item.id = id.to_string();
+                item.name = name.to_string();
+                item.description = string_field(entry, "description");
+                item.path = Some(path.to_string());
+                // 按目录边界判断作用域，兼容 SSH 路径和 Windows 分隔符。
+                item.scope = if cwd.is_some_and(|root| {
+                    let root = root.trim_end_matches(['/', '\\']);
+                    if root.is_empty() { path.starts_with('/') && cwd == Some("/") }
+                    else { crate::path_utils::is_path_within_root(path, root) }
+                }) { "project" } else { "user" }.to_string();
+                item.enabled = Some(true);
+                item.read_only_reason = Some("opencode_skill".to_string());
+            }
+            "plugin" => {
+                let source = entry.get("source").ok_or_else(|| anyhow::anyhow!("OpenCode plugin 缺少 source"))?;
+                let source_type = source.get("type").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("OpenCode plugin 缺少 source.type"))?;
+                let source_key = match source_type {
+                    "package" => source.get("target").and_then(Value::as_str),
+                    "local" => source.get("path").and_then(Value::as_str),
+                    "builtin" | "sdk" => Some(source_type),
+                    _ => anyhow::bail!("OpenCode plugin 来源不支持: {source_type}"),
+                }.ok_or_else(|| anyhow::anyhow!("OpenCode plugin 来源缺少标识"))?;
+                // 目录显示不暴露 URL 中的账户、查询参数或令牌。
+                let safe_key = if source_key.contains("://") { plugin_display_name(source_key) } else { source_key.to_string() };
+                item.id = entry.get("id").and_then(Value::as_str).unwrap_or(&safe_key).to_string();
+                item.name = plugin_display_name(&safe_key);
+                item.source = Some(source_type.to_string());
+                item.version = string_field(source, "version");
+                item.path = if source_type == "local" { Some(safe_key) } else { None };
+                item.scope = "project".to_string();
+                item.configured = Some(true);
+                item.requires_new_session = true;
+                item.read_only_reason = Some("opencode_plugin_jsonc".to_string());
+                match entry.pointer("/state/status").and_then(Value::as_str) {
+                    Some("active") => item.enabled = Some(true),
+                    Some("failed") => {
+                        item.enabled = Some(false);
+                        item.health = "error".to_string();
+                        item.warning = entry.pointer("/state/error").and_then(Value::as_str).map(str::to_string);
+                    }
+                    _ => anyhow::bail!("OpenCode plugin 状态无效"),
+                }
+            }
+            "mcp" => {
+                let name = entry.get("name").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("OpenCode MCP 缺少 name"))?;
+                if name == "auracoder-computer-control" { continue; }
+                item.id = name.to_string();
+                item.name = entry.get("title").and_then(Value::as_str).unwrap_or(name).to_string();
+                item.scope = "project".to_string();
+                item.configured = Some(true);
+                let status = entry.pointer("/status/status").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("OpenCode MCP 缺少状态"))?;
+                match status {
+                    "connected" => { item.enabled = Some(true); item.auth_state = Some("authenticated".to_string()); }
+                    "pending" => { item.enabled = Some(true); item.health = "disconnected".to_string(); }
+                    "disabled" => { item.enabled = Some(false); item.health = "disconnected".to_string(); }
+                    "failed" => { item.enabled = Some(true); item.health = "error".to_string(); }
+                    "needs_auth" => { item.enabled = Some(true); item.health = "auth_required".to_string(); item.auth_state = Some("required".to_string()); }
+                    _ => anyhow::bail!("OpenCode MCP 状态无效: {status}"),
+                }
+                item.warning = entry.pointer("/status/error").and_then(Value::as_str).map(str::to_string);
+                if entry.get("integrationID").and_then(Value::as_str).is_some() {
+                    item.available_actions = vec!["authenticate".to_string(), "logout".to_string()];
+                }
+            }
+            _ => anyhow::bail!("OpenCode 扩展目录类型不支持: {kind}"),
+        }
+        items.push(item);
+    }
+    Ok(items)
 }
 
 fn parse_skills(value: &Value, cwd: Option<&str>) -> Vec<ExtensionItemDto> {

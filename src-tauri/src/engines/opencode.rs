@@ -187,6 +187,7 @@ impl Drop for OpenCodeConnection {
     }
 }
 
+/*
 #[derive(Clone)]
 enum PendingOpenCodeRequest {
     Permission {
@@ -196,6 +197,30 @@ enum PendingOpenCodeRequest {
     Question {
         request_id: String,
         questions: Vec<OpenCodeQuestionInfo>,
+        connection: Arc<OpenCodeConnection>,
+    },
+}
+
+*/
+/// 待回复的 V2 权限或表单请求及其恢复路由。
+#[derive(Clone)]
+enum PendingOpenCodeRequest {
+    Permission {
+        /// 权限请求所属会话。
+        session_id: String,
+        /// 权限请求标识。
+        request_id: String,
+        /// 请求所在的协议连接。
+        connection: Arc<OpenCodeConnection>,
+    },
+    Form {
+        /// 表单所属会话。
+        session_id: String,
+        /// 表单标识。
+        request_id: String,
+        /// 原始字段定义，用于恢复和校验回答。
+        fields: Vec<Value>,
+        /// 请求所在的协议连接。
         connection: Arc<OpenCodeConnection>,
     },
 }
@@ -261,9 +286,18 @@ struct OpenCodeSessionInfo {
 struct OpenCodeSessionRecord {
     id: String,
     title: Option<String>,
+    #[serde(rename = "location", deserialize_with = "deserialize_session_directory")]
     directory: String,
+    #[serde(rename = "permissions")]
     permission: Option<Value>,
     time: OpenCodeSessionTime,
+}
+
+/// 从 V2 会话位置读取所属项目目录。
+fn deserialize_session_directory<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<String, D::Error> {
+    let location = Value::deserialize(deserializer)?;
+    location.get("directory").and_then(Value::as_str).map(str::to_string)
+        .ok_or_else(|| serde::de::Error::custom("OpenCode 会话缺少 location.directory"))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -372,7 +406,7 @@ struct OpenCodeModelInputCapabilities {
 struct OpenCodeBusEvent {
     #[serde(rename = "type")]
     event_type: String,
-    #[serde(default)]
+    #[serde(default, rename = "data")]
     properties: Value,
 }
 
@@ -493,6 +527,15 @@ struct OpenCodeMessageWithParts {
 struct OpenCodeMessageInfo {
     id: String,
     role: String,
+    /// V2 空闲记录的执行结果，用于断线后的可靠补偿。
+    #[serde(default)]
+    outcome: Option<String>,
+    /// assistant 的原生错误，用于恢复失败历史。
+    #[serde(default)]
+    error: Option<Value>,
+    /// assistant 的完成原因，用于识别无错误对象的失败。
+    #[serde(default)]
+    finish: Option<String>,
     #[serde(rename = "parentID")]
     parent_id: Option<String>,
     #[serde(rename = "sessionID", default)]
@@ -870,6 +913,7 @@ impl Engine for OpenCodeEngine {
             .await;
         let agent = normalize_opencode_agent(sandbox.opencode_agent.as_deref());
 
+        /*
         if let Some(existing_id) = resume_engine_thread_id {
             let existing = {
                 let state = self.state.lock().await;
@@ -899,7 +943,9 @@ impl Engine for OpenCodeEngine {
             }
         }
 
+        */
         let connection = self.connection_for_cwd(&cwd).await?;
+        /*
         let engine_thread_id = match resume_engine_thread_id {
             Some(existing_id) => match self.get_session(connection.as_ref(), existing_id).await {
                 Ok(session)
@@ -945,6 +991,25 @@ impl Engine for OpenCodeEngine {
             }
         };
 
+        */
+        // 恢复会话必须验证实际目录，不允许创建替代会话。
+        let engine_thread_id = match resume_engine_thread_id {
+            Some(existing_id) => {
+                let session = self.get_session(connection.as_ref(), existing_id).await?;
+                anyhow::ensure!(session.directory == cwd, "OpenCode 会话目录不匹配: session={} expected={} actual={}", existing_id, cwd, session.directory);
+                self.set_session_permission_rules(&cwd, existing_id, &requested_rules).await?;
+                existing_id.to_string()
+            }
+            None => self.create_session(connection.as_ref(), &requested_rules, &parsed_model, reasoning_effort.as_deref(), agent.as_deref()).await?,
+        };
+        // 将模型、变体和 agent 同步到服务端会话，供后续 prompt 使用。
+        let mut selected_model = json!({"providerID": parsed_model.provider_id, "id": parsed_model.model_id});
+        if let Some(variant) = &reasoning_effort { selected_model["variant"] = json!(variant); }
+        self.send_v2_request(&cwd, reqwest::Method::POST, &format!("/api/session/{engine_thread_id}/model"), Some(json!({"model": selected_model}))).await?;
+        if let Some(agent_id) = &agent {
+            self.send_v2_request(&cwd, reqwest::Method::POST, &format!("/api/session/{engine_thread_id}/agent"), Some(json!({"agent": agent_id}))).await?;
+        }
+
         {
             let mut state = self.state.lock().await;
             let _ = state.sessions.insert(
@@ -970,6 +1035,7 @@ impl Engine for OpenCodeEngine {
         })
     }
 
+    /*
     /// 使用本次请求携带的 OpenCode 原生规则更新 session 后提交 prompt。
     async fn send_message(
         &self,
@@ -995,9 +1061,9 @@ impl Engine for OpenCodeEngine {
             .take()
             .context("OpenCode 当前请求缺少本次权限规则")?;
         let rules = permissions
-            .get("permission")
+            .get("permissions")
             .cloned()
-            .context("OpenCode 当前请求缺少原生 permission 数组")?;
+            .context("OpenCode 当前请求缺少原生 permissions 数组")?;
         self.set_session_permission_rules(&session.cwd, engine_thread_id, &rules)
             .await?;
 
@@ -1224,6 +1290,261 @@ impl Engine for OpenCodeEngine {
         }
     }
 
+    */
+    /// 订阅 V2 事件后提交本轮输入，只有本轮执行成功事件才能结束回合。
+    async fn send_message(&self, engine_thread_id: &str, mut input: TurnInput, event_tx: mpsc::Sender<EngineEvent>, cancellation: CancellationToken) -> Result<()> {
+        let session = self.state.lock().await.sessions.get(engine_thread_id).cloned().context("OpenCode 会话不存在")?;
+        let rules = input.permissions.take().context("OpenCode 当前请求缺少权限")?.get("permissions").cloned().context("OpenCode 当前请求缺少 permissions")?;
+        // 权限更新和订阅就绪都必须先于 prompt 入队。
+        tokio::select! {
+            _ = cancellation.cancelled() => return Ok(()),
+            result = self.set_session_permission_rules(&session.cwd, engine_thread_id, &rules) => result?,
+        }
+        // 仅当输入首词命中 V2 命令目录时执行命令回调。
+        let mut command: Option<(String, String)> = None;
+        if let Some(command_line) = input.message.trim_start().strip_prefix('/') {
+            let end = command_line.find(char::is_whitespace).unwrap_or(command_line.len());
+            let name = &command_line[..end];
+            if !name.is_empty() {
+                let data = tokio::select! { _ = cancellation.cancelled() => return Ok(()), result = self.get_v2_data(&session.cwd, "/api/command") => result? };
+                let commands = data.as_array().context("OpenCode 命令目录不是数组")?;
+                if commands.iter().any(|item| item.get("name").and_then(Value::as_str) == Some(name)) {
+                    command = Some((name.to_string(), command_line[end..].trim_start().to_string()));
+                }
+            }
+        }
+        let (bus, _) = broadcast::channel(OPENCODE_EVENT_BUFFER_CAPACITY);
+        let mut incoming = spawn_opencode_incoming_pump(bus.clone());
+        let pump_cancel = cancellation.child_token();
+        let _pump_guard = pump_cancel.clone().drop_guard();
+        tokio::spawn(run_event_pump(session.connection.base_url.clone(), session.connection.password.clone(), None, self.http.clone(), bus, pump_cancel));
+        let readiness = async {
+            loop {
+                match incoming.recv().await {
+                    Some(OpenCodeIncomingEvent::Message(event)) if event.event_type == "server.connected" => return Ok(()),
+                    Some(OpenCodeIncomingEvent::Failure(message)) => log::warn!("OpenCode 事件订阅未就绪: {message}"),
+                    Some(OpenCodeIncomingEvent::Lagged(count)) => log::warn!("OpenCode 事件订阅丢失 {count} 条事件"),
+                    None | Some(OpenCodeIncomingEvent::Closed) => anyhow::bail!("OpenCode 事件订阅已关闭"),
+                    _ => {},
+                }
+            }
+        };
+        tokio::select! {
+            _ = cancellation.cancelled() => return Ok(()),
+            ready = timeout(Duration::from_secs(8), readiness) => ready.context("等待 OpenCode 事件订阅就绪超时")??,
+        }
+        // 按目录返回的真实技能 ID 解析输入路径，避免把本地路径当作协议 ID。
+        if input.input_items.iter().any(|item| matches!(item, super::TurnInputItem::Skill { .. })) {
+            let data = tokio::select! {
+                _ = cancellation.cancelled() => return Ok(()),
+                result = self.get_v2_data(&session.cwd, "/api/skill") => result?,
+            };
+            let skills = data.as_array().context("OpenCode 技能目录不是数组")?;
+            for item in &mut input.input_items {
+                if let super::TurnInputItem::Skill { path, .. } = item {
+                    let skill = skills.iter().find(|skill| skill.get("path").and_then(Value::as_str) == Some(path.as_str())).context("OpenCode 技能路径未在目录中找到")?;
+                    *path = skill.get("id").and_then(Value::as_str).context("OpenCode 技能缺少 id")?.to_string();
+                }
+            }
+        }
+        let prompt = build_prompt_body(&session.model_id, session.reasoning_effort.as_deref(), session.agent.as_deref(), input)?;
+        let inbox_path = format!("/api/session/{engine_thread_id}/inbox");
+        let mut baseline_ids = HashSet::<String>::new();
+        let mut command_candidates = HashSet::<String>::new();
+        let mut command_delivered = HashSet::<String>::new();
+        let command_action_id = command.as_ref().map(|_| format!("opencode-command-{}", Uuid::new_v4()));
+        if let Some((name, _)) = &command {
+            // 命令无客户端输入 ID，先确认会话空闲并记录已有消息，避免归属到旧执行。
+            let active = tokio::select! { _ = cancellation.cancelled() => return Ok(()), result = self.get_v2_data(&session.cwd, "/api/session/active") => result? };
+            let active = active.as_object().context("OpenCode 活动会话不是对象")?;
+            anyhow::ensure!(!active.contains_key(engine_thread_id), "OpenCode 会话忙，请稍后重试命令");
+            let inbox = tokio::select! { _ = cancellation.cancelled() => return Ok(()), result = self.get_v2_data(&session.cwd, &inbox_path) => result? };
+            let inbox = inbox.as_array().context("OpenCode 会话 inbox 不是数组")?;
+            anyhow::ensure!(inbox.is_empty(), "OpenCode 会话存在待执行输入，请稍后重试命令");
+            let page = tokio::select! { _ = cancellation.cancelled() => return Ok(()), result = self.fetch_session_message_page(session.connection.as_ref(), engine_thread_id, OPENCODE_RECONCILE_MESSAGE_LIMIT, Some("desc"), None) => result? };
+            baseline_ids.extend(page.messages.into_iter().map(|message| message.info.id));
+            let _ = event_tx.send(EngineEvent::ActionStarted { action_id: command_action_id.clone().unwrap_or_default(), engine_action_id: None, action_type: ActionType::Other, summary: format!("执行 OpenCode 命令 /{name}"), details: json!({"command": name}) }).await;
+        }
+        let mut mapper = OpenCodeTurnMapper::new(if command.is_some() { String::new() } else { prompt.message_id });
+        let prompt_request = async {
+            if let Some((name, text)) = &command {
+                let body = json!({"name": name, "text": text, "files": prompt.body.get("files"), "skills": prompt.body.get("skills"), "delivery": "queue"});
+                self.send_v2_request(&session.cwd, reqwest::Method::POST, &format!("/api/session/{engine_thread_id}/command"), Some(body)).await?;
+                Ok(())
+            } else {
+                self.prompt_message(engine_thread_id, session.connection.as_ref(), prompt.body).await
+            }
+        };
+        tokio::pin!(prompt_request);
+        let mut accepted = false;
+        let mut pending_success = false;
+        let mut reconnecting = false;
+        let mut last_relevant_event_at = Instant::now();
+        loop {
+            tokio::select! {
+                _ = sleep(SSE_IDLE_TIMEOUT.saturating_sub(last_relevant_event_at.elapsed())) => {
+                    let message = "等待 OpenCode 当前会话事件超时".to_string();
+                    log::error!("{message}: session={engine_thread_id}");
+                    let _ = event_tx.send(EngineEvent::Error { message: message.clone(), recoverable: false }).await;
+                    anyhow::bail!(message);
+                }
+                _ = cancellation.cancelled() => {
+                    self.interrupt(engine_thread_id).await?;
+                    return Ok(());
+                }
+                result = &mut prompt_request, if !accepted => {
+                    if let Err(error) = result {
+                        if let Some(action_id) = &command_action_id {
+                            let _ = event_tx.send(EngineEvent::ActionCompleted { action_id: action_id.clone(), result: ActionResult { success: false, output: None, error: Some(format!("{error:#}")), diff: None, duration_ms: 0 } }).await;
+                        }
+                        return Err(error);
+                    }
+                    accepted = true;
+                    if command.is_some() {
+                        // 回调结束后补查持久 inbox 与最新投影，覆盖响应前已投递的输入。
+                        let inbox = tokio::select! { _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); }, result = self.get_v2_data(&session.cwd, &inbox_path) => result? };
+                        for item in inbox.as_array().context("OpenCode 会话 inbox 不是数组")? {
+                            let id = item.get("id").and_then(Value::as_str).context("OpenCode inbox 缺少 id")?;
+                            if !baseline_ids.contains(id) { command_candidates.insert(id.to_string()); }
+                        }
+                        let page = tokio::select! { _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); }, result = self.fetch_session_message_page(session.connection.as_ref(), engine_thread_id, OPENCODE_RECONCILE_MESSAGE_LIMIT, Some("desc"), None) => result? };
+                        for message in page.messages {
+                            if matches!(message.info.role.as_str(), "user" | "synthetic" | "compaction") && !baseline_ids.contains(&message.info.id) {
+                                command_delivered.insert(message.info.id.clone());
+                                command_candidates.insert(message.info.id);
+                            }
+                        }
+                        anyhow::ensure!(command_candidates.len() <= 1, "OpenCode 命令产生多个候选输入，无法确认归属，请重试");
+                        if let Some(id) = command_candidates.iter().next() {
+                            mapper.prompt_message_id = id.clone();
+                            if command_delivered.contains(id) { mapper.busy_seen = true; }
+                        } else {
+                            let active = tokio::select! { _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); }, result = self.get_v2_data(&session.cwd, "/api/session/active") => result? };
+                            anyhow::ensure!(!active.as_object().context("OpenCode 活动会话不是对象")?.contains_key(engine_thread_id), "OpenCode 命令后会话仍活动，无法确定输入归属，请重试");
+                        }
+                        let _ = event_tx.send(EngineEvent::ActionCompleted { action_id: command_action_id.clone().unwrap_or_default(), result: ActionResult { success: true, output: None, error: None, diff: None, duration_ms: 0 } }).await;
+                        if command_candidates.is_empty() {
+                            let _ = event_tx.send(EngineEvent::Notice { kind: "command".to_string(), level: "info".to_string(), title: "命令已执行".to_string(), message: "OpenCode 命令已执行".to_string(), metadata: None }).await;
+                            emit_turn_completed(&mut mapper, &event_tx, TurnCompletionStatus::Completed).await;
+                            return Ok(());
+                        }
+                        let result = tokio::select! { _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); }, result = self.reconcile_session_messages(engine_thread_id, &mut mapper, &event_tx, session.connection.as_ref(), true) => result };
+                        if let Err(error) = result { log::error!("OpenCode 命令消息补偿失败: {error:#}"); }
+                        if mapper.completed { return Ok(()); }
+                        if mapper.failed { anyhow::bail!("OpenCode 命令触发的执行失败"); }
+                    }
+                    if pending_success {
+                        let result = tokio::select! {
+                            _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); },
+                            result = self.reconcile_session_messages(engine_thread_id, &mut mapper, &event_tx, session.connection.as_ref(), false) => result,
+                        };
+                        if let Err(error) = result { log::error!("OpenCode 完成前读取历史失败: {error:#}"); }
+                        tokio::select! {
+                            _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); },
+                            _ = self.emit_context_usage_update(&session.cwd, engine_thread_id, &event_tx) => {},
+                        }
+                        let diff = tokio::select! {
+                            _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); },
+                            result = self.emit_v2_turn_diff(session.connection.as_ref(), engine_thread_id, &mapper.prompt_message_id, &event_tx) => result,
+                        };
+                        if let Err(error) = diff {
+                            log::error!("读取 OpenCode 本轮差异失败: {error:#}");
+                            let _ = event_tx.send(EngineEvent::Error { message: format!("读取 OpenCode 本轮差异失败: {error:#}"), recoverable: true }).await;
+                        }
+                        emit_turn_completed(&mut mapper, &event_tx, TurnCompletionStatus::Completed).await;
+                    }
+                    if mapper.completed { return Ok(()); }
+                    if mapper.failed { anyhow::bail!("OpenCode 当前执行失败"); }
+                }
+                incoming_event = incoming.recv() => {
+                    match incoming_event {
+                        Some(OpenCodeIncomingEvent::Message(event)) => {
+                            if event.event_type == "server.connected" && reconnecting && accepted {
+                                let result = tokio::select! {
+                                    _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); },
+                                    result = self.reconcile_session_messages(engine_thread_id, &mut mapper, &event_tx, session.connection.as_ref(), true) => result,
+                                };
+                                if let Err(error) = result {
+                                    log::error!("OpenCode 断线补偿失败: {error:#}");
+                                    let _ = event_tx.send(EngineEvent::Error { message: format!("OpenCode 断线补偿失败: {error:#}"), recoverable: true }).await;
+                                }
+                                reconnecting = false;
+                                if mapper.completed { return Ok(()); }
+                                if mapper.failed { anyhow::bail!("OpenCode 当前执行失败"); }
+                            }
+                            if event_matches_session(event.as_ref(), engine_thread_id) {
+                                last_relevant_event_at = Instant::now();
+                                if command.is_some() && matches!(event.event_type.as_str(), "session.inbox.enqueued" | "session.inbox.delivered") {
+                                    if let Some(id) = event.properties.get("inboxID").and_then(Value::as_str) {
+                                        if !baseline_ids.contains(id) {
+                                            command_candidates.insert(id.to_string());
+                                            anyhow::ensure!(command_candidates.len() == 1, "OpenCode 命令输入归属不明确，请重试");
+                                            mapper.prompt_message_id = id.to_string();
+                                            if event.event_type == "session.inbox.delivered" { command_delivered.insert(id.to_string()); }
+                                        }
+                                    }
+                                }
+                                if event.event_type == "session.execution.succeeded" && mapper.busy_seen && !accepted {
+                                    pending_success = true;
+                                    continue;
+                                }
+                                if event.event_type == "session.execution.succeeded" && mapper.busy_seen {
+                                    let result = tokio::select! {
+                                        _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); },
+                                        result = self.reconcile_session_messages(engine_thread_id, &mut mapper, &event_tx, session.connection.as_ref(), false) => result,
+                                    };
+                                    if let Err(error) = result { log::error!("OpenCode 完成前读取历史失败: {error:#}"); }
+                                    tokio::select! {
+                                        _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); },
+                                        _ = self.emit_context_usage_update(&session.cwd, engine_thread_id, &event_tx) => {},
+                                    }
+                                    let diff = tokio::select! {
+                                        _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); },
+                                        result = self.emit_v2_turn_diff(session.connection.as_ref(), engine_thread_id, &mapper.prompt_message_id, &event_tx) => result,
+                                    };
+                                    if let Err(error) = diff {
+                                        log::error!("读取 OpenCode 本轮差异失败: {error:#}");
+                                        let _ = event_tx.send(EngineEvent::Error { message: format!("读取 OpenCode 本轮差异失败: {error:#}"), recoverable: true }).await;
+                                    }
+                                }
+                                tokio::select! {
+                                    _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); },
+                                    _ = self.handle_event(engine_thread_id, event.as_ref(), &mut mapper, &event_tx, session.connection.clone(), true) => {},
+                                }
+                                if accepted && mapper.completed { return Ok(()); }
+                                if accepted && mapper.failed { anyhow::bail!("OpenCode 当前执行失败"); }
+                            }
+                        }
+                        Some(OpenCodeIncomingEvent::Failure(message)) => {
+                            reconnecting = true;
+                            log::error!("OpenCode 事件流异常: {message}");
+                            let _ = event_tx.send(EngineEvent::Error { message, recoverable: true }).await;
+                            if accepted {
+                                let result = tokio::select! { _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); }, result = self.reconcile_session_messages(engine_thread_id, &mut mapper, &event_tx, session.connection.as_ref(), true) => result };
+                                if let Err(error) = result { log::error!("OpenCode 消息补偿失败: {error:#}"); }
+                                if mapper.completed { return Ok(()); }
+                                if mapper.failed { anyhow::bail!("OpenCode 当前执行失败"); }
+                            }
+                        }
+                        Some(OpenCodeIncomingEvent::Lagged(count)) => {
+                            reconnecting = true;
+                            let message = format!("OpenCode 事件流丢失 {count} 条事件，等待恢复");
+                            log::error!("{message}");
+                            let _ = event_tx.send(EngineEvent::Error { message, recoverable: true }).await;
+                            if accepted {
+                                let result = tokio::select! { _ = cancellation.cancelled() => { self.interrupt(engine_thread_id).await?; return Ok(()); }, result = self.reconcile_session_messages(engine_thread_id, &mut mapper, &event_tx, session.connection.as_ref(), true) => result };
+                                if let Err(error) = result { log::error!("OpenCode 消息补偿失败: {error:#}"); }
+                                if mapper.completed { return Ok(()); }
+                                if mapper.failed { anyhow::bail!("OpenCode 当前执行失败"); }
+                            }
+                        }
+                        None | Some(OpenCodeIncomingEvent::Closed) => anyhow::bail!("OpenCode 事件流已关闭"),
+                    }
+                }
+            }
+        }
+    }
+
     async fn steer_message(
         &self,
         _engine_thread_id: &str,
@@ -1234,6 +1555,7 @@ impl Engine for OpenCodeEngine {
         anyhow::bail!("Mid-turn steering is not supported for OpenCode")
     }
 
+    /*
     async fn respond_to_approval(
         &self,
         approval_id: &str,
@@ -1339,6 +1661,95 @@ impl Engine for OpenCodeEngine {
         Ok(())
     }
 
+    */
+    /// 根据持久路由回复 V2 权限或表单，成功后清理待处理记录。
+    async fn respond_to_approval(&self, approval_id: &str, response: Value, route: Option<ApprovalRequestRoute>) -> Result<()> {
+        let normalized = normalize_approval_response_for_engine("opencode", response).map_err(anyhow::Error::msg)?;
+        let pending = self.state.lock().await.pending_requests.get(approval_id).cloned();
+        let pending = match pending { Some(value) => value, None => self.pending_request_from_route(route).await? };
+        match pending {
+            PendingOpenCodeRequest::Permission { session_id, request_id, connection } => {
+                let decision = match normalized.get("decision").and_then(Value::as_str) {
+                    Some("accept") => "once", Some("accept_for_session") => "always", Some("decline" | "cancel") => "reject",
+                    _ => anyhow::bail!("OpenCode 权限答复缺少 decision"),
+                };
+                self.send_v2_request(&connection.cwd, reqwest::Method::POST, &format!("/api/session/{session_id}/permission/{request_id}/reply"), Some(json!({"decision": decision}))).await?;
+            }
+            PendingOpenCodeRequest::Form { session_id, request_id, fields, connection } => {
+                if should_reject_question_response(&normalized) {
+                    self.send_v2_request(&connection.cwd, reqwest::Method::DELETE, &format!("/api/session/{session_id}/form/{request_id}"), None).await?;
+                } else {
+                    let supplied = normalized.get("answers").and_then(Value::as_object).context("OpenCode 表单缺少 answers")?;
+                    let mut answers = serde_json::Map::new();
+                    // 按字段顺序计算条件、转换选项真实值并验证必填字段。
+                    for field in fields {
+                        let key = field.get("key").and_then(Value::as_str).context("OpenCode 表单字段缺少 key")?;
+                        let kind = field.get("type").and_then(Value::as_str).context("OpenCode 表单字段缺少 type")?;
+                        let active = field.get("when").and_then(Value::as_array).map(|conditions| conditions.iter().all(|condition| {
+                            let current = condition.get("key").and_then(Value::as_str).and_then(|key| answers.get(key));
+                            let expected = condition.get("value");
+                            match (current, expected, condition.get("op").and_then(Value::as_str)) {
+                                (Some(current), Some(expected), Some(op)) => { let equal = current == expected || current.as_array().is_some_and(|items| items.contains(expected)); if op == "eq" { equal } else { !equal } },
+                                _ => false,
+                            }
+                        })).unwrap_or(true);
+                        if !active { continue; }
+                        if kind == "external" { anyhow::bail!("OpenCode 表单需要在外部地址完成操作: {}", field.get("url").and_then(Value::as_str).unwrap_or("")); }
+                        let raw = supplied.get(key).or_else(|| if field.get("hidden").and_then(Value::as_bool) == Some(true) { field.get("default") } else { None });
+                        let Some(raw) = raw else { anyhow::ensure!(field.get("required").and_then(Value::as_bool) != Some(true), "OpenCode 表单必填字段未回答: {key}"); continue; };
+                        let values = answer_to_vec(raw);
+                        let convert_option = |value: &str| -> Result<String> {
+                            if let Some(options) = field.get("options").and_then(Value::as_array) {
+                                if let Some(option) = options.iter().find(|option| option.get("label").and_then(Value::as_str) == Some(value) || option.get("value").and_then(Value::as_str) == Some(value)) {
+                                    return Ok(option.get("value").and_then(Value::as_str).context("表单选项缺少 value")?.to_string());
+                                }
+                                anyhow::ensure!(field.get("custom").and_then(Value::as_bool) == Some(true), "表单选项无效: {key}");
+                            }
+                            Ok(value.to_string())
+                        };
+                        let value = match kind {
+                            "string" => json!(convert_option(values.first().context("表单文本为空")?)?),
+                            "multiselect" => json!(values.iter().map(|value| convert_option(value)).collect::<Result<Vec<_>>>()?),
+                            "number" => { let value = raw.as_f64().or_else(|| values.first().and_then(|value| value.parse::<f64>().ok())).context("表单数字无效")?; json!(value) },
+                            "integer" => { let value = raw.as_i64().or_else(|| values.first().and_then(|value| value.parse::<i64>().ok())).context("表单整数无效")?; json!(value) },
+                            "boolean" => { let value = raw.as_bool().or_else(|| values.first().and_then(|value| value.parse::<bool>().ok())).context("表单布尔值无效")?; json!(value) },
+                            _ => anyhow::bail!("不支持的 OpenCode 表单字段类型: {kind}"),
+                        };
+                        // 检查服务端声明的基础长度、数量和数值边界。
+                        if let Some(text) = value.as_str() {
+                            let len = text.chars().count() as u64;
+                            anyhow::ensure!(field.get("required").and_then(Value::as_bool) != Some(true) || !text.is_empty(), "表单必填字段为空: {key}");
+                            if let Some(min) = field.get("minLength").and_then(Value::as_u64) { anyhow::ensure!(len >= min, "表单字段长度不足: {key}"); }
+                            if let Some(max) = field.get("maxLength").and_then(Value::as_u64) { anyhow::ensure!(len <= max, "表单字段长度超限: {key}"); }
+                        }
+                        if let Some(items) = value.as_array() {
+                            let count = items.len() as u64;
+                            anyhow::ensure!(field.get("required").and_then(Value::as_bool) != Some(true) || count > 0, "表单必填字段为空: {key}");
+                            if let Some(min) = field.get("minItems").and_then(Value::as_u64) { anyhow::ensure!(count >= min, "表单选择数量不足: {key}"); }
+                            if let Some(max) = field.get("maxItems").and_then(Value::as_u64) { anyhow::ensure!(count <= max, "表单选择数量超限: {key}"); }
+                        }
+                        if let Some(number) = value.as_f64() {
+                            if let Some(min) = field.get("minimum").and_then(Value::as_f64) { anyhow::ensure!(number >= min, "表单数值低于下限: {key}"); }
+                            if let Some(max) = field.get("maximum").and_then(Value::as_f64) { anyhow::ensure!(number <= max, "表单数值超过上限: {key}"); }
+                        }
+                        answers.insert(key.to_string(), value);
+                    }
+                    self.send_v2_request(&connection.cwd, reqwest::Method::POST, &format!("/api/session/{session_id}/form/{request_id}/reply"), Some(json!({"answer": answers}))).await?;
+                }
+            }
+        }
+        self.state.lock().await.pending_requests.remove(approval_id);
+        Ok(())
+    }
+
+    /// 中断当前 V2 会话执行。
+    async fn interrupt(&self, engine_thread_id: &str) -> Result<()> {
+        let session = self.state.lock().await.sessions.get(engine_thread_id).cloned();
+        if let Some(session) = session { self.abort_session(&session.cwd, engine_thread_id).await?; }
+        Ok(())
+    }
+
+    /*
     async fn archive_thread(&self, engine_thread_id: &str) -> Result<()> {
         let removed = self.state.lock().await.sessions.remove(engine_thread_id);
         if let Some(session) = removed {
@@ -1356,6 +1767,19 @@ impl Engine for OpenCodeEngine {
     async fn unarchive_thread(&self, _engine_thread_id: &str) -> Result<()> {
         Ok(())
     }
+    */
+    /// 归档已绑定的 V2 会话。
+    async fn archive_thread(&self, engine_thread_id: &str) -> Result<()> {
+        let session = self.state.lock().await.sessions.get(engine_thread_id).cloned().context("OpenCode 会话不存在")?;
+        self.patch_session_archive(session.connection.as_ref(), engine_thread_id, Some(current_unix_time_millis())).await
+    }
+
+    /// 恢复已绑定的 V2 会话。
+    async fn unarchive_thread(&self, engine_thread_id: &str) -> Result<()> {
+        let session = self.state.lock().await.sessions.get(engine_thread_id).cloned().context("OpenCode 会话不存在")?;
+        self.patch_session_archive(session.connection.as_ref(), engine_thread_id, None).await
+    }
+
 }
 
 impl OpenCodeEngine {
@@ -1437,6 +1861,7 @@ impl OpenCodeEngine {
                 );
                 let (event_bus, _) =
                     broadcast::channel::<OpenCodeBusItem>(OPENCODE_EVENT_BUFFER_CAPACITY);
+                /*
                 let pump_cancel = CancellationToken::new();
                 tokio::spawn(run_event_pump(
                     endpoint.base_url.clone(),
@@ -1446,17 +1871,19 @@ impl OpenCodeEngine {
                     event_bus.clone(),
                     pump_cancel.clone(),
                 ));
+                */
                 OpenCodeConnection {
                     cwd: cwd.to_string(),
                     base_url: endpoint.base_url.clone(),
                     password: endpoint.password.clone(),
                     event_bus,
-                    pump_cancel: Some(pump_cancel),
+                    pump_cancel: None,
                     callback_cancel: None,
                     include_directory_header: false,
                 }
             }
             OpenCodeTransportTarget::Remote(endpoint) => {
+                /*
                 let include_directory_header = !cwd.is_empty();
                 #[cfg(test)]
                 let workspace_event_pump_enabled = endpoint.workspace_event_pump_enabled;
@@ -1479,14 +1906,15 @@ impl OpenCodeEngine {
                     } else {
                         (endpoint.event_bus.clone(), None)
                     };
+                */
                 OpenCodeConnection {
                     cwd: cwd.to_string(),
                     base_url: endpoint.base_url.clone(),
                     password: endpoint.password.clone(),
-                    event_bus,
-                    pump_cancel,
+                    event_bus: endpoint.event_bus.clone(),
+                    pump_cancel: None,
                     callback_cancel: None,
-                    include_directory_header,
+                    include_directory_header: false,
                 }
             }
         });
@@ -1508,6 +1936,7 @@ impl OpenCodeEngine {
         }
     }
 
+    /*
     async fn pending_request_from_route(
         &self,
         route: Option<ApprovalRequestRoute>,
@@ -1551,12 +1980,29 @@ impl OpenCodeEngine {
         }
     }
 
+    */
+    /// 根据持久化路由恢复 V2 权限或表单请求。
+    async fn pending_request_from_route(&self, route: Option<ApprovalRequestRoute>) -> Result<PendingOpenCodeRequest> {
+        let route = route.context("OpenCode 审批路由不存在")?;
+        let data = &route.raw_request_id;
+        let request_id = data.get("requestID").and_then(Value::as_str).context("审批路由缺少 requestID")?.to_string();
+        let session_id = data.get("sessionID").and_then(Value::as_str).context("审批路由缺少 sessionID")?.to_string();
+        let cwd = data.get("cwd").and_then(Value::as_str).context("审批路由缺少 cwd")?;
+        let connection = self.connection_for_cwd(cwd).await?;
+        match route.server_method.as_str() {
+            "opencode/permission" => Ok(PendingOpenCodeRequest::Permission { session_id, request_id, connection }),
+            "opencode/form" => Ok(PendingOpenCodeRequest::Form { session_id, request_id, fields: data.get("fields").and_then(Value::as_array).context("表单路由缺少 fields")?.clone(), connection }),
+            method => anyhow::bail!("不支持的 OpenCode 审批路由: {method}"),
+        }
+    }
+
     /// 检查 OpenCode 新旧版本 HTTP 服务，并返回实际成功的接口和版本。
     pub(crate) async fn check_http_service(
         client: &reqwest::Client,
         base_url: &str,
         password: &str,
     ) -> Result<OpenCodeHttpServiceCheck> {
+        /*
         // 优先请求新版接口，新版地址返回 404 或 HTML 时尝试旧地址。
         let base_url = base_url.trim_end_matches('/');
         let response = client
@@ -1602,6 +2048,26 @@ impl OpenCodeEngine {
             path: "/api/info",
             version: Some(info.version),
         })
+    }
+
+        */
+        // 仅接受 V2 服务，并保留 HTTP 错误的状态和原始响应。
+        let base_url = base_url.trim_end_matches('/');
+        let response = client.get(format!("{base_url}/api/info"))
+            .headers(auth_headers(password)).timeout(Duration::from_millis(500)).send().await
+            .context("请求 OpenCode /api/info 失败")?;
+        let status = response.status();
+        let body = response.text().await.context("读取 OpenCode /api/info 响应失败")?;
+        anyhow::ensure!(status.is_success(), "OpenCode /api/info HTTP {status}: {body}");
+        let info: OpenCodeInfoResponse = serde_json::from_str(&body)
+            .context("解析 OpenCode /api/info 响应失败")?;
+        let version = info.version.trim().trim_start_matches('v');
+        let components = version.split('.').collect::<Vec<_>>();
+        anyhow::ensure!(components.len() == 3 && components[0] == "2"
+            && components[1].parse::<u64>().is_ok() && components[2].parse::<u64>().is_ok(),
+            "OpenCode 服务版本不受支持: {}，需要 V2", info.version);
+        let _ = info.pid;
+        Ok(OpenCodeHttpServiceCheck { path: "/api/info", version: Some(info.version) })
     }
 
     /// 通过已绑定的 HTTP endpoint 检查 OpenCode 服务，不启动或探测本机进程。
@@ -1828,6 +2294,7 @@ impl OpenCodeEngine {
         Ok(models)
     }
 
+    /*
     pub async fn list_models_runtime_for_cwd(&self, cwd: &str) -> Vec<ModelInfo> {
         {
             let state = self.state.lock().await;
@@ -1871,6 +2338,52 @@ impl OpenCodeEngine {
             .runtime_model_cache
             .clone()
             .unwrap_or_else(|| self.models())
+    }
+
+    */
+    /// 读取指定位置的 V2 模型目录并保留真实默认模型与能力。
+    pub async fn model_infos(&self, cwd: &str) -> Result<Vec<ModelInfo>> {
+        // 同时读取可用模型和服务指定的默认模型。
+        let data = self.get_v2_data(cwd, "/api/model").await?;
+        let default = self.get_v2_data(cwd, "/api/model/default").await?;
+        let models = data.as_array().context("OpenCode V2 模型目录不是数组")?;
+        let default_provider = default.get("providerID").and_then(Value::as_str);
+        let default_id = default.get("id").and_then(Value::as_str);
+        let mut result = Vec::new();
+        for model in models {
+            if model.get("enabled").and_then(Value::as_bool) != Some(true)
+                || model.get("status").and_then(Value::as_str) == Some("deprecated") { continue; }
+            let provider = model.get("providerID").and_then(Value::as_str).context("OpenCode 模型缺少 providerID")?;
+            let id = model.get("id").and_then(Value::as_str).context("OpenCode 模型缺少 id")?;
+            let name = model.get("name").and_then(Value::as_str).context("OpenCode 模型缺少 name")?;
+            let inputs = model.pointer("/capabilities/input").and_then(Value::as_array).context("OpenCode 模型缺少输入能力")?
+                .iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>();
+            let variants = model.get("variants").and_then(Value::as_array).context("OpenCode 模型缺少 variants")?
+                .iter().filter_map(|item| item.get("id").and_then(Value::as_str))
+                .map(|id| ReasoningEffortOption { reasoning_effort: id.to_string(), description: format!("OpenCode {id} variant") }).collect();
+            let limit: OpenCodeModelLimit = serde_json::from_value(model.get("limit").cloned().context("OpenCode 模型缺少 limit")?)?;
+            let attachment_inputs = inputs.iter().filter(|value| *value != "text").cloned().collect();
+            result.push(model_info_with_metadata(&format!("{provider}/{id}"), name, "OpenCode model",
+                default_provider == Some(provider) && default_id == Some(id), variants, inputs, attachment_inputs, model_limits(Some(&limit))));
+        }
+        self.state.lock().await.runtime_model_cache = Some(result.clone());
+        Ok(result)
+    }
+
+    /// 读取运行时模型目录；失败时只使用已经取得的目录缓存。
+    pub async fn list_models_runtime_for_cwd(&self, cwd: &str) -> Vec<ModelInfo> {
+        match self.model_infos(cwd).await {
+            Ok(models) => models,
+            Err(error) => {
+                log::error!("读取 OpenCode V2 模型目录失败: {error:#}");
+                self.state.lock().await.runtime_model_cache.clone().unwrap_or_default()
+            }
+        }
+    }
+
+    /// 返回已经成功读取的运行时模型缓存。
+    pub async fn runtime_model_fallback(&self) -> Vec<ModelInfo> {
+        self.state.lock().await.runtime_model_cache.clone().unwrap_or_default()
     }
 
     /// 读取 OpenCode 最新 assistant 消息的可靠输入 token，并结合模型 context limit 形成快照。
@@ -1917,19 +2430,8 @@ impl OpenCodeEngine {
         let Some(tokens) = message.info.tokens.as_ref() else {
             return Ok(None);
         };
-        let Some(total) = tokens.total else {
-            log::warn!(
-                "OpenCode context usage unavailable: assistant info.tokens.total is missing; session={engine_thread_id}"
-            );
-            return Ok(None);
-        };
-        if tokens.input == 0 || total < tokens.input {
-            log::warn!(
-                "OpenCode context usage unavailable: assistant token semantics are invalid; session={engine_thread_id} input={} total={total}",
-                tokens.input,
-            );
-            return Ok(None);
-        }
+        // V2 输入上下文包含普通输入和缓存读写，不包含输出 token。
+        let current_tokens = tokens.input.saturating_add(tokens.cache.read).saturating_add(tokens.cache.write);
         let state_model_id = self
             .state
             .lock()
@@ -1973,7 +2475,7 @@ impl OpenCodeEngine {
             );
             return Ok(None);
         };
-        Ok(Some((tokens.input, max_context_tokens)))
+        Ok(Some((current_tokens, max_context_tokens)))
     }
 
     /// 在 OpenCode 本轮消息校正完成后，向聊天事件流推送可靠的线程上下文快照。
@@ -2025,6 +2527,7 @@ impl OpenCodeEngine {
         }
     }
 
+    /*
     pub async fn runtime_catalog(&self, cwd: &str) -> Result<OpenCodeRuntimeCatalogDto> {
         let connection = self.connection_for_cwd(cwd).await?;
         let result = async {
@@ -2069,6 +2572,50 @@ impl OpenCodeEngine {
         result
     }
 
+    */
+    /// 读取 V2 agent、命令和 MCP 目录并转换为统一业务对象。
+    pub async fn runtime_catalog(&self, cwd: &str) -> Result<OpenCodeRuntimeCatalogDto> {
+        // V2 目录均通过 data 数组返回，保留实际选择标识与服务状态。
+        let agents_data = self.get_v2_data(cwd, "/api/agent").await?;
+        let commands_data = self.get_v2_data(cwd, "/api/command").await?;
+        let mcp_data = self.get_v2_data(cwd, "/api/mcp").await?;
+        let mut agents = Vec::new();
+        for agent in agents_data.as_array().context("OpenCode agent 目录不是数组")? {
+            agents.push(OpenCodeAgentDto {
+                name: agent.get("id").and_then(Value::as_str).context("OpenCode agent 缺少 id")?.to_string(),
+                description: agent.get("description").and_then(Value::as_str).map(str::to_string),
+                mode: agent.get("mode").and_then(Value::as_str).context("OpenCode agent 缺少 mode")?.to_string(),
+                native: false,
+                hidden: agent.get("hidden").and_then(Value::as_bool).unwrap_or(false),
+                model_provider_id: agent.pointer("/model/providerID").and_then(Value::as_str).map(str::to_string),
+                model_id: agent.pointer("/model/id").and_then(Value::as_str).map(str::to_string),
+                variant: agent.pointer("/model/variant").and_then(Value::as_str).map(str::to_string),
+                steps: agent.get("steps").and_then(Value::as_u64),
+            });
+        }
+        let mut commands = Vec::new();
+        for command in commands_data.as_array().context("OpenCode 命令目录不是数组")? {
+            commands.push(OpenCodeCommandDto {
+                name: command.get("name").and_then(Value::as_str).context("OpenCode 命令缺少名称")?.to_string(),
+                description: command.get("description").and_then(Value::as_str).map(str::to_string),
+                agent: None, model: None, source: None, subtask: false, hints: Vec::new(),
+            });
+        }
+        let mut mcp_servers = Vec::new();
+        for server in mcp_data.as_array().context("OpenCode MCP 目录不是数组")? {
+            let status = server.pointer("/status/status").and_then(Value::as_str).context("OpenCode MCP 缺少状态")?;
+            anyhow::ensure!(matches!(status, "connected" | "pending" | "disabled" | "failed" | "needs_auth"), "未知 OpenCode MCP 状态: {status}");
+            mcp_servers.push(OpenCodeMcpServerDto {
+                name: server.get("name").and_then(Value::as_str).context("OpenCode MCP 缺少名称")?.to_string(),
+                status: status.to_string(),
+                detail: server.pointer("/status/error").and_then(Value::as_str).map(str::to_string),
+                raw: server.clone(),
+            });
+        }
+        Ok(OpenCodeRuntimeCatalogDto { agents, commands, mcp_servers })
+    }
+
+    /*
     pub async fn list_sessions(
         &self,
         cwd: &str,
@@ -2177,6 +2724,50 @@ impl OpenCodeEngine {
         result
     }
 
+    */
+    /// 按目录、归档状态和游标读取 V2 根会话列表。
+    pub async fn list_sessions(&self, cwd: &str, search_term: Option<&str>, archived: Option<bool>) -> Result<Vec<OpenCodeRemoteSessionSummary>> {
+        // 首页面使用排序，后续页面只按服务端游标继续。
+        let connection = self.connection_for_cwd(cwd).await?;
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        let mut sessions = Vec::new();
+        loop {
+            let mut query = vec![("directory", cwd.to_string()), ("parentID", "null".to_string()), ("limit", "200".to_string())];
+            if let Some(search) = search_term.filter(|s| !s.trim().is_empty()) { query.push(("search", search.to_string())); }
+            if let Some(value) = archived { query.push(("archived", value.to_string())); }
+            if let Some(value) = &cursor { query.push(("cursor", value.clone())); } else { query.push(("order", "desc".to_string())); }
+            let response = self.http.get(format!("{}/api/session", connection.base_url.trim_end_matches('/')))
+                .headers(auth_headers(&connection.password)).query(&query).timeout(Duration::from_secs(30)).send().await?;
+            let status = response.status();
+            let body = response.text().await?;
+            anyhow::ensure!(status.is_success(), "OpenCode 会话列表 HTTP {status}: {body}");
+            let page: Value = serde_json::from_str(&body)?;
+            let records: Vec<OpenCodeSessionRecord> = serde_json::from_value(page.get("data").cloned().context("OpenCode 会话列表缺少 data")?)?;
+            sessions.extend(records.into_iter().map(map_session_record));
+            match page.pointer("/cursor/next").and_then(Value::as_str) {
+                Some(next) if !next.is_empty() && seen.insert(next.to_string()) => cursor = Some(next.to_string()),
+                Some(_) => anyhow::bail!("OpenCode 会话列表游标未推进"),
+                None => break,
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// 按会话标识读取 V2 会话摘要。
+    pub async fn read_session(&self, cwd: &str, session_id: &str) -> Result<OpenCodeRemoteSessionSummary> {
+        let data = self.get_v2_data(cwd, &format!("/api/session/{session_id}")).await?;
+        let session: OpenCodeSessionRecord = serde_json::from_value(data)?;
+        anyhow::ensure!(session.directory == cwd, "OpenCode 会话目录不匹配");
+        Ok(map_session_record(session))
+    }
+
+    /// 请求中断指定 V2 会话的当前执行。
+    pub async fn abort_session(&self, cwd: &str, session_id: &str) -> Result<()> {
+        self.send_v2_request(cwd, reqwest::Method::POST, &format!("/api/session/{session_id}/interrupt"), None).await?;
+        Ok(())
+    }
+
     pub async fn set_session_archived(
         &self,
         cwd: &str,
@@ -2196,10 +2787,7 @@ impl OpenCodeEngine {
             )
             .await;
 
-        if result.is_ok() {
-            let _ = self.state.lock().await.sessions.remove(session_id);
-        }
-        // OpenCode 服务由 CLI 生命周期持有，协议查询完成后不在客户端中停止。
+        // 保留已绑定会话，以便同一运行线程继续执行取消归档。
         result
     }
 
@@ -2231,6 +2819,7 @@ impl OpenCodeEngine {
     }
     */
 
+    /*
     #[allow(dead_code)]
     async fn load_models_from_provider_endpoint(
         &self,
@@ -2276,6 +2865,9 @@ impl OpenCodeEngine {
         Ok(models)
     }
 
+    */
+
+    /*
     /// 使用调用方本次解析得到的原生规则创建 OpenCode session。
     async fn create_session(
         &self,
@@ -2342,6 +2934,30 @@ impl OpenCodeEngine {
         Ok(())
     }
 
+    */
+    /// 按项目目录与权限规则创建 V2 会话。
+    async fn create_session(&self, connection: &OpenCodeConnection, rules: &Value, model: &ParsedModelSlug, variant: Option<&str>, agent: Option<&str>) -> Result<String> {
+        // 创建时明确提交目录、权限和模型，避免服务端使用其他默认配置。
+        let mut selected_model = json!({"providerID": model.provider_id, "id": model.model_id});
+        if let Some(variant) = variant { selected_model["variant"] = json!(variant); }
+        let mut body = json!({"location": {"directory": connection.cwd}, "permissions": rules, "model": selected_model});
+        if let Some(agent) = agent { body["agent"] = json!(agent); }
+        let data = self.send_v2_request(&connection.cwd, reqwest::Method::POST, "/api/session", Some(body)).await?;
+        Ok(data.pointer("/data/id").and_then(Value::as_str).context("OpenCode 创建会话缺少 id")?.to_string())
+    }
+
+    /// 读取 V2 会话及其所属目录和权限。
+    async fn get_session(&self, connection: &OpenCodeConnection, session_id: &str) -> Result<OpenCodeSessionRecord> {
+        let data = self.get_v2_data(&connection.cwd, &format!("/api/session/{session_id}")).await?;
+        Ok(serde_json::from_value(data)?)
+    }
+
+    /// 更新 V2 会话的归档状态。
+    async fn patch_session_archive(&self, connection: &OpenCodeConnection, session_id: &str, archived: Option<i64>) -> Result<()> {
+        self.send_v2_request(&connection.cwd, reqwest::Method::PATCH, &format!("/api/session/{session_id}"), Some(json!({"archived": archived.unwrap_or(0) > 0}))).await?;
+        Ok(())
+    }
+
     /// 将权限模式同步到当前已经存在的 OpenCode session。
     ///
     /// 该方法只 PATCH 指定 session，不创建替代 session，也不会修改其模型、思考
@@ -2358,6 +2974,7 @@ impl OpenCodeEngine {
     }
 
     /// 将完整 OpenCode 权限规则原样同步到已有 session。
+    /*
     pub async fn set_session_permission_rules(
         &self,
         cwd: &str,
@@ -2408,6 +3025,19 @@ impl OpenCodeEngine {
         Ok(())
     }
 
+    */
+    /// 将 V2 原生权限规则同步到已绑定的会话。
+    pub async fn set_session_permission_rules(&self, cwd: &str, session_id: &str, rules: &Value) -> Result<()> {
+        // 原样提交完整原生规则，权限效果由 V2 服务按规则决定。
+        anyhow::ensure!(rules.is_array(), "OpenCode 权限规则必须是数组");
+        self.send_v2_request(cwd, reqwest::Method::PATCH, &format!("/api/session/{session_id}"), Some(json!({"permissions": rules}))).await?;
+        if let Some(session) = self.state.lock().await.sessions.get_mut(session_id) {
+            session.permission_mode = permission_mode_from_policy(Some(rules));
+        }
+        Ok(())
+    }
+
+    /*
     async fn prompt_message(
         &self,
         engine_thread_id: &str,
@@ -2436,6 +3066,47 @@ impl OpenCodeEngine {
         Ok(())
     }
 
+    */
+    /// 将用户输入加入 V2 会话队列并校验服务器确认的输入标识。
+    async fn prompt_message(&self, engine_thread_id: &str, connection: &OpenCodeConnection, body: Value) -> Result<()> {
+        let prompt_id = body.get("id").and_then(Value::as_str).context("OpenCode prompt 缺少 id")?.to_string();
+        let data = self.send_v2_request(&connection.cwd, reqwest::Method::POST, &format!("/api/session/{engine_thread_id}/prompt"), Some(body)).await?;
+        anyhow::ensure!(data.pointer("/data/id").and_then(Value::as_str) == Some(prompt_id.as_str())
+            && data.pointer("/data/sessionID").and_then(Value::as_str) == Some(engine_thread_id), "OpenCode prompt 确认标识不匹配: {data}");
+        Ok(())
+    }
+
+    /// 从 V2 响应信封读取 data，供 OpenCode 目录业务使用。
+    pub async fn get_v2_data(&self, cwd: &str, path: &str) -> Result<Value> {
+        let response = self.send_v2_request(cwd, reqwest::Method::GET, path, None).await?;
+        response.get("data").cloned().context("OpenCode V2 响应缺少 data")
+    }
+
+    /// 向已绑定的 OpenCode 服务发送 V2 HTTP 请求，不管理服务进程。
+    pub async fn send_v2_request(&self, cwd: &str, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value> {
+        anyhow::ensure!(path.starts_with("/api/"), "OpenCode V2 请求路径必须以 /api/ 开头");
+        let connection = self.connection_for_cwd(cwd).await?;
+        let url = format!("{}{}", connection.base_url.trim_end_matches('/'), path);
+        let location_query = (method == reqwest::Method::GET && matches!(path,
+            "/api/location" | "/api/agent" | "/api/plugin" | "/api/plugin/gui" | "/api/model" | "/api/model/default" | "/api/provider" | "/api/integration" | "/api/mcp" | "/api/mcp/resource" | "/api/command" | "/api/skill" | "/api/config" | "/api/experimental/usage/limits"))
+            || (method == reqwest::Method::GET && (path.starts_with("/api/agent/") || path.starts_with("/api/provider/") || path.starts_with("/api/integration/")))
+            || ((method == reqwest::Method::POST || method == reqwest::Method::PUT || method == reqwest::Method::DELETE)
+                && (path.starts_with("/api/experimental/mcp/") || (path.starts_with("/api/integration/") && path.contains("/connect/")) || matches!(path, "/api/plugin/check" | "/api/plugin/update")));
+        let mut request = self.http.request(method, url).headers(auth_headers(&connection.password)).timeout(Duration::from_secs(30));
+        // 仅向 OpenAPI 声明了 location 查询参数的接口附加项目目录。
+        if !cwd.is_empty() && location_query {
+            request = request.query(&[("location[directory]", cwd)]);
+        }
+        if let Some(body) = body { request = request.json(&body); }
+        let response = request.send().await.context("发送 OpenCode V2 请求失败")?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NO_CONTENT { return Ok(Value::Null); }
+        let text = response.text().await.context("读取 OpenCode V2 响应失败")?;
+        anyhow::ensure!(status.is_success(), "OpenCode V2 HTTP {status}: {text}");
+        serde_json::from_str(&text).context("解析 OpenCode V2 响应失败")
+    }
+
+    /*
     fn request(
         &self,
         connection: &OpenCodeConnection,
@@ -2454,6 +3125,9 @@ impl OpenCodeEngine {
         }
     }
 
+    */
+
+    /*
     async fn handle_event(
         &self,
         engine_thread_id: &str,
@@ -2630,6 +3304,87 @@ impl OpenCodeEngine {
         }
     }
 
+    */
+    /// 将当前 V2 会话事件转换成统一回合事件。
+    async fn handle_event(&self, engine_thread_id: &str, event: &OpenCodeBusEvent, mapper: &mut OpenCodeTurnMapper, event_tx: &mpsc::Sender<EngineEvent>, connection: Arc<OpenCodeConnection>, _matched: bool) {
+        let data = &event.properties;
+        if event.event_type == "session.inbox.delivered" && data.get("inboxID").and_then(Value::as_str) == Some(mapper.prompt_message_id.as_str()) {
+            mapper.busy_seen = true;
+            return;
+        }
+        // 只接纳自己输入投递后的执行事件，避免旧轮次终态结束当前回合。
+        if !mapper.busy_seen { return; }
+        match event.event_type.as_str() {
+            "session.execution.succeeded" => emit_turn_completed(mapper, event_tx, TurnCompletionStatus::Completed).await,
+            "session.execution.interrupted" if data.get("reason").and_then(Value::as_str) == Some("user") && MANUAL_STOP.load(Ordering::SeqCst) == 1 => {
+                MANUAL_STOP.store(0, Ordering::SeqCst);
+                emit_turn_completed(mapper, event_tx, TurnCompletionStatus::Interrupted).await;
+            }
+            "session.execution.failed" | "session.execution.interrupted" => {
+                let message = format!("OpenCode 执行异常: {}", data);
+                log::error!("{message}");
+                let _ = event_tx.send(EngineEvent::Error { message, recoverable: false }).await;
+                mapper.failed = true;
+            }
+            "session.text.delta" | "session.reasoning.delta" | "session.text.ended" | "session.reasoning.ended" => {
+                let Some(message_id) = data.get("assistantMessageID").and_then(Value::as_str) else { return; };
+                let Some(ordinal) = data.get("ordinal").and_then(Value::as_u64) else { return; };
+                let part_type = if event.event_type.contains("reasoning") { "reasoning" } else { "text" };
+                let key = format!("{message_id}:{part_type}:{ordinal}");
+                if event.event_type.ends_with(".delta") {
+                    if let Some(delta) = data.get("delta").and_then(Value::as_str) { emit_opencode_part_delta(mapper, event_tx, &key, part_type, delta).await; }
+                } else if let Some(text) = data.get("text").and_then(Value::as_str) {
+                    emit_opencode_part_snapshot(mapper, event_tx, &key, part_type, text).await;
+                }
+            }
+            "session.step.ended" => {
+                if let Some(tokens) = data.get("tokens") {
+                    let usage = mapper.latest_token_usage.get_or_insert(TokenUsage { input: 0, output: 0, reasoning: Some(0), cache_read: Some(0), cache_write: Some(0), cost_usd: Some(0.0) });
+                    usage.input += tokens.get("input").and_then(Value::as_u64).unwrap_or(0);
+                    usage.output += tokens.get("output").and_then(Value::as_u64).unwrap_or(0);
+                    *usage.reasoning.get_or_insert(0) += tokens.get("reasoning").and_then(Value::as_u64).unwrap_or(0);
+                    *usage.cache_read.get_or_insert(0) += tokens.pointer("/cache/read").and_then(Value::as_u64).unwrap_or(0);
+                    *usage.cache_write.get_or_insert(0) += tokens.pointer("/cache/write").and_then(Value::as_u64).unwrap_or(0);
+                    *usage.cost_usd.get_or_insert(0.0) += data.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
+                }
+            }
+            "session.tool.input.started" | "session.tool.called" => {
+                let Some(id) = data.get("id").and_then(Value::as_str) else { return; };
+                if mapper.started_actions.insert(id.to_string()) {
+                    let name = data.get("name").and_then(Value::as_str).unwrap_or("tool");
+                    let _ = event_tx.send(EngineEvent::ActionStarted { action_id: id.to_string(), engine_action_id: Some(id.to_string()), action_type: action_type_for_tool(name), summary: name.to_string(), details: data.clone() }).await;
+                } else if event.event_type == "session.tool.called" {
+                    let _ = event_tx.send(EngineEvent::ActionProgressUpdated { action_id: id.to_string(), message: data.to_string() }).await;
+                }
+            }
+            "session.tool.input.delta" | "session.tool.input.ended" => {
+                if let Some(id) = data.get("id").and_then(Value::as_str) {
+                    let message = data.get("delta").or_else(|| data.get("text")).and_then(Value::as_str).unwrap_or("").to_string();
+                    let _ = event_tx.send(EngineEvent::ActionProgressUpdated { action_id: id.to_string(), message }).await;
+                }
+            }
+            "session.tool.progress" => {
+                if let Some(id) = data.get("id").and_then(Value::as_str) {
+                    let _ = event_tx.send(EngineEvent::ActionProgressUpdated { action_id: id.to_string(), message: data.get("metadata").map(Value::to_string).unwrap_or_default() }).await;
+                }
+            }
+            "session.tool.success" | "session.tool.failed" => {
+                let Some(id) = data.get("id").and_then(Value::as_str) else { return; };
+                if !mapper.completed_actions.insert(id.to_string()) { return; }
+                let output = data.get("content").and_then(opencode_v2_tool_content);
+                if let Some(metadata) = data.get("metadata") {
+                    let _ = event_tx.send(EngineEvent::ActionProgressUpdated { action_id: id.to_string(), message: metadata.to_string() }).await;
+                }
+                if let Some(content) = &output { let _ = event_tx.send(EngineEvent::ActionOutputDelta { action_id: id.to_string(), stream: OutputStream::Stdout, content: content.clone() }).await; }
+                let success = event.event_type == "session.tool.success";
+                let _ = event_tx.send(EngineEvent::ActionCompleted { action_id: id.to_string(), result: ActionResult { success, output, error: data.get("error").map(Value::to_string), diff: None, duration_ms: 0 } }).await;
+            }
+            "permission.asked" => self.handle_permission_asked(data, event_tx, connection).await,
+            "form.created" => if let Some(form) = data.get("form") { self.handle_question_asked(form, event_tx, connection).await; },
+            _ => { let _ = engine_thread_id; }
+        }
+    }
+
     async fn complete_after_idle(
         &self,
         mapper: &mut OpenCodeTurnMapper,
@@ -2712,6 +3467,7 @@ impl OpenCodeEngine {
         }
     }
 
+    /*
     /// 读取 OpenCode 单页消息；该请求同时兼容当前数组响应和带 cursor 的 data 响应。
     async fn fetch_session_message_page(
         &self,
@@ -2761,6 +3517,90 @@ impl OpenCodeEngine {
         })
     }
 
+    */
+    /// 读取本轮 V2 文件差异并更新现有工作区变更面板。
+    async fn emit_v2_turn_diff(&self, connection: &OpenCodeConnection, session_id: &str, prompt_id: &str, event_tx: &mpsc::Sender<EngineEvent>) -> Result<()> {
+        // 使用消息标识作为 from 游标，并由 HTTP 客户端编码查询参数。
+        let response = self.http.get(format!("{}/api/session/{session_id}/diff", connection.base_url.trim_end_matches('/')))
+            .headers(auth_headers(&connection.password)).query(&[("from", prompt_id)]).timeout(Duration::from_secs(30)).send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        anyhow::ensure!(status.is_success(), "OpenCode 文件差异 HTTP {status}: {body}");
+        let page: Value = serde_json::from_str(&body)?;
+        let files = page.get("data").and_then(Value::as_array).context("OpenCode 文件差异缺少 data 数组")?;
+        let mut patches = Vec::new();
+        for file in files {
+            let patch = file.get("patch").and_then(Value::as_str).context("OpenCode 文件差异缺少 patch")?;
+            if !patch.is_empty() { patches.push(patch.to_string()); }
+        }
+        if !patches.is_empty() {
+            let _ = event_tx.send(EngineEvent::DiffUpdated { diff: patches.join("\n"), scope: DiffScope::Workspace }).await;
+        }
+        Ok(())
+    }
+
+    /// 读取 V2 消息页并投影到现有统一历史转换结构。
+    async fn fetch_session_message_page(&self, connection: &OpenCodeConnection, engine_thread_id: &str, limit: usize, order: Option<&str>, cursor: Option<&str>) -> Result<OpenCodeMessagePage> {
+        let mut query = vec![("limit", limit.to_string())];
+        if let Some(order) = order { query.push(("order", order.to_string())); }
+        if let Some(cursor) = cursor { query.push(("cursor", cursor.to_string())); }
+        let response = self.http.get(format!("{}/api/session/{engine_thread_id}/message", connection.base_url.trim_end_matches('/')))
+            .headers(auth_headers(&connection.password)).query(&query).timeout(Duration::from_secs(30)).send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        anyhow::ensure!(status.is_success(), "OpenCode 消息列表 HTTP {status}: {body}");
+        let page: Value = serde_json::from_str(&body)?;
+        let records = page.get("data").and_then(Value::as_array).context("OpenCode 消息列表缺少 data 数组")?;
+        let mut messages = Vec::new();
+        // 保留控制记录的类型和 idle 结果；仅正文、思考、工具和附件映射为展示块。
+        for record in records {
+            let id = record.get("id").and_then(Value::as_str).context("OpenCode 消息缺少 id")?;
+            let role = record.get("type").and_then(Value::as_str).context("OpenCode 消息缺少 type")?;
+            anyhow::ensure!(matches!(role, "user" | "assistant" | "idle" | "compaction" | "agent-switched" | "model-switched" | "location-switched" | "system" | "synthetic" | "skill" | "shell"), "未知 OpenCode 消息类型: {role}");
+            let info = json!({"id": id, "role": role, "outcome": record.get("outcome"), "sessionID": engine_thread_id,
+                "modelID": record.pointer("/model/id"), "providerID": record.pointer("/model/providerID"),
+                "variant": record.pointer("/model/variant"), "time": record.get("time"), "cost": record.get("cost"), "tokens": record.get("tokens"), "error": record.get("error"), "finish": record.get("finish")});
+            let mut parts = Vec::<Value>::new();
+            if role == "user" {
+                parts.push(json!({"id": format!("{id}:text:0"), "messageID": id, "type": "text", "text": record.get("text")}));
+                if let Some(files) = record.get("files").and_then(Value::as_array) {
+                    for (index, file) in files.iter().enumerate() {
+                        let uri = file.pointer("/source/uri").or_else(|| file.get("uri")).cloned().or_else(|| {
+                            let mime = file.get("mime").and_then(Value::as_str)?;
+                            let data = file.get("data").and_then(Value::as_str)?;
+                            Some(json!(format!("data:{mime};base64,{data}")))
+                        }).unwrap_or(Value::Null);
+                        parts.push(json!({"id": format!("{id}:file:{index}"), "messageID": id, "type": "file", "url": uri, "filename": file.get("name"), "mime": file.get("mime"), "source": file.get("source")}));
+                    }
+                }
+            }
+            if role == "assistant" {
+                // V2 正文和思考分别按各自的出现顺序编号，工具不占用序号。
+                let mut text_ordinal = 0_usize;
+                let mut reasoning_ordinal = 0_usize;
+                for part in record.get("content").and_then(Value::as_array).context("OpenCode assistant 缺少 content")? {
+                    let kind = part.get("type").and_then(Value::as_str).context("OpenCode 内容缺少 type")?;
+                    match kind {
+                        "text" | "reasoning" => {
+                            let ordinal = if kind == "text" { let value = text_ordinal; text_ordinal += 1; value } else { let value = reasoning_ordinal; reasoning_ordinal += 1; value };
+                            parts.push(json!({"id": format!("{id}:{kind}:{ordinal}"), "messageID": id, "type": kind, "text": part.get("text")}));
+                        }
+                        "tool" => {
+                            let state = part.get("state").context("OpenCode 工具缺少 state")?;
+                            let output = state.get("content").and_then(opencode_v2_tool_content);
+                            let error = state.get("error").map(Value::to_string);
+                            parts.push(json!({"id": part.get("id"), "messageID": id, "type": "tool", "tool": part.get("name"), "callID": part.get("id"), "state": {"status": if state.get("status").and_then(Value::as_str) == Some("streaming") { "pending" } else { state.get("status").and_then(Value::as_str).unwrap_or("") }, "input": state.get("input"), "output": output, "error": error, "metadata": {"native": state.get("metadata"), "content": state.get("content")}}}));
+                        }
+                        _ => anyhow::bail!("未知 OpenCode assistant 内容类型: {kind}"),
+                    }
+                }
+            }
+            messages.push(serde_json::from_value(json!({"info": info, "parts": parts}))?);
+        }
+        let continuation = match page.pointer("/cursor/next") { Some(Value::String(value)) => Some(value.clone()), None | Some(Value::Null) => None, _ => anyhow::bail!("OpenCode 消息游标无效") };
+        Ok(OpenCodeMessagePage { messages, continuation, uses_cursor: true })
+    }
+
     /// 读取 OpenCode 会话的完整历史，并将远端消息转换成 AuraCoder 快照。
     pub async fn read_thread_sync_snapshot(
         &self,
@@ -2799,11 +3639,7 @@ impl OpenCodeEngine {
                             session_id
                         );
                     }
-                    anyhow::ensure!(
-                        matches!(message.info.role.as_str(), "user" | "assistant"),
-                        "OpenCode 历史消息角色无法识别: {}",
-                        message.info.role
-                    );
+                    if !matches!(message.info.role.as_str(), "user" | "assistant") { continue; }
                     all_messages
                         .entry(message_id.to_string())
                         .or_insert_with(|| message.clone());
@@ -2861,11 +3697,17 @@ impl OpenCodeEngine {
                         .and_then(|time| time.created.or(time.completed))
                         .and_then(|value| {
                             chrono::DateTime::<chrono::Utc>::from_timestamp_millis(value)
-                                .map(|timestamp| timestamp.to_rfc3339())
+                                .map(|timestamp| timestamp.with_timezone(&chrono::Local).to_rfc3339())
                         });
                     let mut blocks = Vec::new();
                     let mut content_parts = Vec::new();
-                    let mut has_error = false;
+                    let mut has_error = message.info.error.is_some() || message.info.finish.as_deref() == Some("error");
+                    // 保留 provider 原始错误，并在历史消息中显示可读的失败原因。
+                    if let Some(error) = &message.info.error {
+                        log::error!("OpenCode 历史 assistant 失败: session={} message={} error={}", engine_thread_id, message.info.id, error);
+                        let description = error.get("message").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| error.to_string());
+                        blocks.push(json!({"type": "notice", "kind": "opencode_error", "level": "error", "title": "OpenCode 执行失败", "message": description}));
+                    }
                     let mut has_running_action = false;
                     let mut part_token_input = 0_u64;
                     let mut part_token_output = 0_u64;
@@ -2904,7 +3746,7 @@ impl OpenCodeEngine {
                                     .context("OpenCode tool part 缺少执行状态")?;
                                 let raw_status = state.status.trim().to_ascii_lowercase();
                                 let (status, success) = match raw_status.as_str() {
-                                    "pending" => ("pending", None),
+                                    "pending" | "streaming" => { has_running_action = true; ("pending", None) },
                                     "running" => {
                                         has_running_action = true;
                                         ("running", None)
@@ -3147,6 +3989,7 @@ impl OpenCodeEngine {
         result
     }
 
+    /*
     /// 活动回合结束后读取固定上限的消息，保持既有补偿筛选和事件行为不变。
     async fn reconcile_session_messages(
         &self,
@@ -3192,6 +4035,51 @@ impl OpenCodeEngine {
             }
             for part in message.parts {
                 self.handle_part_updated(&part, mapper, event_tx).await;
+            }
+        }
+    }
+
+    */
+    /// 断线后按输入消息位置补读当前回合，只有明确的 idle 成功才补偿完成。
+    async fn reconcile_session_messages(&self, engine_thread_id: &str, mapper: &mut OpenCodeTurnMapper, event_tx: &mpsc::Sender<EngineEvent>, connection: &OpenCodeConnection, allow_complete: bool) -> Result<()> {
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        let mut current = false;
+        loop {
+            let page = self.fetch_session_message_page(connection, engine_thread_id, OPENCODE_RECONCILE_MESSAGE_LIMIT, cursor.is_none().then_some("asc"), cursor.as_deref()).await?;
+            for message in page.messages {
+                if message.info.id == mapper.prompt_message_id && matches!(message.info.role.as_str(), "user" | "synthetic" | "compaction") { current = true; mapper.busy_seen = true; continue; }
+                if !current { continue; }
+                if message.info.role == "user" { return Ok(()); }
+                if message.info.role == "idle" {
+                    if message.info.outcome.as_deref() == Some("succeeded") && allow_complete {
+                        self.emit_context_usage_update(&connection.cwd, engine_thread_id, event_tx).await;
+                        if let Err(error) = self.emit_v2_turn_diff(connection, engine_thread_id, &mapper.prompt_message_id, event_tx).await {
+                            log::error!("读取 OpenCode 本轮差异失败: {error:#}");
+                            let _ = event_tx.send(EngineEvent::Error { message: format!("读取 OpenCode 本轮差异失败: {error:#}"), recoverable: true }).await;
+                        }
+                        emit_turn_completed(mapper, event_tx, TurnCompletionStatus::Completed).await;
+                    }
+                    else if matches!(message.info.outcome.as_deref(), Some("failed" | "interrupted")) {
+                        mapper.failed = true;
+                        let _ = event_tx.send(EngineEvent::Error { message: format!("OpenCode 执行结果: {}", message.info.outcome.unwrap_or_default()), recoverable: false }).await;
+                    }
+                    return Ok(());
+                }
+                if message.info.role == "assistant" {
+                    for part in message.parts {
+                        match part.part_type.as_str() {
+                            "text" | "reasoning" => if let Some(text) = &part.text { emit_opencode_part_snapshot(mapper, event_tx, &part.id, &part.part_type, text).await; },
+                            "tool" => self.handle_tool_part(&part, mapper, event_tx).await,
+                            _ => {},
+                        }
+                    }
+                }
+            }
+            match page.continuation {
+                Some(next) if !next.is_empty() && seen.insert(next.clone()) => cursor = Some(next),
+                Some(_) => anyhow::bail!("OpenCode 消息游标未推进"),
+                None => return Ok(()),
             }
         }
     }
@@ -3327,6 +4215,7 @@ impl OpenCodeEngine {
         }
     }
 
+    /*
     async fn handle_permission_asked(
         &self,
         properties: &Value,
@@ -3526,7 +4415,45 @@ impl OpenCodeEngine {
             })
             .await
             .ok();
+    }    */
+    /// 将 V2 权限请求转换为现有审批卡，保留会话及资源信息。
+    async fn handle_permission_asked(&self, properties: &Value, event_tx: &mpsc::Sender<EngineEvent>, connection: Arc<OpenCodeConnection>) {
+        let Some(request_id) = properties.get("id").and_then(Value::as_str) else { log::error!("OpenCode 权限事件缺少 id: {properties}"); return; };
+        let Some(session_id) = properties.get("sessionID").and_then(Value::as_str) else { log::error!("OpenCode 权限事件缺少 sessionID: {properties}"); return; };
+        let action = properties.get("action").and_then(Value::as_str).unwrap_or("tool");
+        let mode = self.state.lock().await.sessions.get(session_id).map(|session| session.permission_mode).unwrap_or(OpenCodePermissionMode::Ask);
+        if let Some(decision) = match mode { OpenCodePermissionMode::Allow => Some("always"), OpenCodePermissionMode::Deny => Some("reject"), OpenCodePermissionMode::Ask => None } {
+            if let Err(error) = self.send_v2_request(&connection.cwd, reqwest::Method::POST, &format!("/api/session/{session_id}/permission/{request_id}/reply"), Some(json!({"decision": decision}))).await {
+                log::error!("OpenCode 自动权限答复失败: {error:#}");
+                let _ = event_tx.send(EngineEvent::Error { message: format!("OpenCode 自动权限答复失败: {error:#}"), recoverable: false }).await;
+            }
+            return;
+        }
+        let approval_id = format!("opencode-permission-{request_id}");
+        self.state.lock().await.pending_requests.insert(approval_id.clone(), PendingOpenCodeRequest::Permission { session_id: session_id.to_string(), request_id: request_id.to_string(), connection: connection.clone() });
+        let _ = event_tx.send(EngineEvent::ApprovalRequested { approval_id, action_type: action_type_for_permission(action), summary: format!("OpenCode 请求 {action} 权限"), details: json!({
+            "_serverMethod": "item/permissions/requestApproval", "permission": action, "patterns": properties.get("resources"), "metadata": properties.get("metadata"),
+            "_opencodeRequestKind": "permission", "_opencodeRequestID": request_id, "_opencodeSessionID": session_id, "_opencodeCwd": connection.cwd,
+        }) }).await;
     }
+
+    /// 将 V2 表单字段映射到输入卡，并保存完整字段用于恢复答复。
+    async fn handle_question_asked(&self, properties: &Value, event_tx: &mpsc::Sender<EngineEvent>, connection: Arc<OpenCodeConnection>) {
+        let Some(request_id) = properties.get("id").and_then(Value::as_str) else { log::error!("OpenCode 表单缺少 id: {properties}"); return; };
+        let Some(session_id) = properties.get("sessionID").and_then(Value::as_str) else { log::error!("OpenCode 表单缺少 sessionID: {properties}"); return; };
+        let Some(fields) = properties.get("fields").and_then(Value::as_array) else { log::error!("OpenCode 表单缺少 fields: {properties}"); return; };
+        let questions = fields.iter().filter(|field| field.get("hidden").and_then(Value::as_bool) != Some(true)).map(|field| {
+            let external = field.get("type").and_then(Value::as_str) == Some("external");
+            json!({"id": field.get("key"), "header": field.get("title"), "question": if external { format!("请在外部地址完成操作: {}", field.get("url").and_then(Value::as_str).unwrap_or("")) } else { field.get("description").and_then(Value::as_str).unwrap_or("").to_string() }, "multiple": field.get("type").and_then(Value::as_str) == Some("multiselect"), "custom": field.get("custom").and_then(Value::as_bool).unwrap_or(false), "options": field.get("options").cloned().unwrap_or(json!([]))})
+        }).collect::<Vec<_>>();
+        let approval_id = format!("opencode-form-{request_id}");
+        self.state.lock().await.pending_requests.insert(approval_id.clone(), PendingOpenCodeRequest::Form { session_id: session_id.to_string(), request_id: request_id.to_string(), fields: fields.clone(), connection: connection.clone() });
+        let _ = event_tx.send(EngineEvent::ApprovalRequested { approval_id, action_type: ActionType::Other, summary: properties.get("title").and_then(Value::as_str).unwrap_or("OpenCode 需要输入").to_string(), details: json!({
+            "_serverMethod": "item/tool/requestUserInput", "questions": questions, "_opencodeFields": fields,
+            "_opencodeRequestKind": "form", "_opencodeRequestID": request_id, "_opencodeSessionID": session_id, "_opencodeCwd": connection.cwd,
+        }) }).await;
+    }
+
 }
 
 impl OpenCodeConnection {
@@ -3587,9 +4514,12 @@ fn should_cache_runtime_model_catalog(models: &[ModelInfo]) -> bool {
     })
 }
 
+/*
 fn opencode_prompt_message_path(engine_thread_id: &str) -> String {
     format!("/session/{engine_thread_id}/message")
 }
+
+*/
 
 /// 为 OpenCode 历史消息提供时间优先、消息 ID 兜底的稳定排序键。
 fn opencode_message_sort_key(message: &OpenCodeMessageWithParts) -> (i64, String) {
@@ -3604,6 +4534,7 @@ fn opencode_message_sort_key(message: &OpenCodeMessageWithParts) -> (i64, String
     )
 }
 
+/*
 fn build_prompt_body(
     model_id: &str,
     reasoning_effort: Option<&str>,
@@ -3649,10 +4580,31 @@ fn build_prompt_body(
     Ok(OpenCodePromptBody { message_id, body })
 }
 
+*/
+/// 将本轮输入转换为 V2 prompt 的文本、文件与技能附件。
+fn build_prompt_body(_model_id: &str, _reasoning_effort: Option<&str>, _agent: Option<&str>, input: TurnInput) -> Result<OpenCodePromptBody> {
+    // 文件和 @提及使用 V2 URI，技能使用服务端技能 ID。
+    let message_id = new_message_id();
+    let mut files = Vec::new();
+    for attachment in input.attachments {
+        files.push(json!({"uri": file_url(&attachment.file_path), "name": attachment.file_name}));
+    }
+    let mut skills = Vec::new();
+    for item in input.input_items {
+        match item {
+            super::TurnInputItem::Skill { path, .. } => skills.push(json!({"id": path})),
+            super::TurnInputItem::Mention { name, path } => files.push(json!({"uri": file_url(&path), "name": name})),
+            super::TurnInputItem::Text { .. } => {},
+        }
+    }
+    let body = json!({"id": message_id, "text": input.message, "files": files, "skills": skills, "delivery": "queue"});
+    Ok(OpenCodePromptBody { message_id, body })
+}
+
 fn normalize_opencode_agent(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != "build")
+        .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
 }
 
@@ -3931,6 +4883,7 @@ fn scope_cwd(scope: &ThreadScope) -> String {
 }
 
 /// 从本次原生规则或兼容的单值策略中提取活动权限事件使用的响应模式。
+/*
 fn permission_mode_from_policy(policy: Option<&Value>) -> OpenCodePermissionMode {
     let Some(raw) = policy.and_then(|value| {
         value
@@ -3946,18 +4899,33 @@ fn permission_mode_from_policy(policy: Option<&Value>) -> OpenCodePermissionMode
     }
 }
 
+*/
+fn permission_mode_from_policy(policy: Option<&Value>) -> OpenCodePermissionMode {
+    // 只有唯一的全局规则可以确定自动模式，细粒度规则交由服务端决定。
+    let raw = policy.and_then(|value| value.as_str().or_else(|| {
+        let rules = value.as_array()?;
+        if rules.len() != 1 { return None; }
+        let rule = &rules[0];
+        if rule.get("action").and_then(Value::as_str) == Some("*") && rule.get("resource").and_then(Value::as_str) == Some("*") { rule.get("effect").and_then(Value::as_str) } else { None }
+    }));
+    match raw.unwrap_or("ask").trim().to_lowercase().as_str() {
+        "allow" | "trusted" | "never" => OpenCodePermissionMode::Allow,
+        "deny" | "restricted" | "untrusted" => OpenCodePermissionMode::Deny,
+        _ => OpenCodePermissionMode::Ask,
+    }
+}
+
 /// 为引擎内部缺少完整规则数组的调用生成对应的 OpenCode 原生权限数组。
 fn permission_rules(mode: OpenCodePermissionMode) -> Value {
     match mode {
         OpenCodePermissionMode::Allow => {
-            json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
+            json!([{ "action": "*", "resource": "*", "effect": "allow" }])
         }
         OpenCodePermissionMode::Deny => {
-            json!([{ "permission": "*", "pattern": "*", "action": "deny" }])
+            json!([{ "action": "*", "resource": "*", "effect": "deny" }])
         }
         OpenCodePermissionMode::Ask => json!([
-            { "permission": "*", "pattern": "*", "action": "ask" },
-            { "permission": "question", "pattern": "*", "action": "allow" }
+            { "action": "*", "resource": "*", "effect": "ask" }
         ]),
     }
 }
@@ -3972,10 +4940,10 @@ fn session_wildcard_permission_action(permission: Option<&Value>) -> Option<&str
     let rules = permission?.as_array()?;
     // OpenCode 使用 findLast 评估权限，后出现的全局规则覆盖前面的规则。
     rules.iter().rev().find_map(|rule| {
-        let permission = rule.get("permission").and_then(Value::as_str)?;
-        let pattern = rule.get("pattern").and_then(Value::as_str)?;
+        let permission = rule.get("action").and_then(Value::as_str)?;
+        let pattern = rule.get("resource").and_then(Value::as_str)?;
         if permission == "*" && pattern == "*" {
-            return rule.get("action").and_then(Value::as_str);
+            return rule.get("effect").and_then(Value::as_str);
         }
         None
     })
@@ -4914,6 +5882,7 @@ async fn start_server(
     Ok(connection)
 }
 */
+/*
 async fn run_event_pump(
     base_url: String,
     password: String,
@@ -5045,6 +6014,67 @@ async fn run_event_pump(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+*/
+/// 订阅 V2 事件流，按完整 SSE 帧解码并在断线后重新连接。
+async fn run_event_pump(base_url: String, password: String, _directory: Option<String>, http: reqwest::Client, event_bus: broadcast::Sender<OpenCodeBusItem>, cancel: CancellationToken) {
+    let url = format!("{}/api/event", base_url.trim_end_matches('/'));
+    loop {
+        // 建立事件流时保留原始网络和 HTTP 错误，连接中断不代表执行完成。
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return,
+            result = http.get(&url).headers(auth_headers(&password)).send() => result,
+        };
+        let response = match response {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let _ = event_bus.send(OpenCodeBusItem::Failure(format!("SSE HTTP {status}: {body}")));
+                tokio::select! { _ = cancel.cancelled() => return, _ = sleep(Duration::from_millis(500)) => {} }
+                continue;
+            }
+            Err(error) => {
+                let _ = event_bus.send(OpenCodeBusItem::Failure(format!("SSE 连接失败: {error}")));
+                tokio::select! { _ = cancel.cancelled() => return, _ = sleep(Duration::from_millis(500)) => {} }
+                continue;
+            }
+        };
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::<u8>::new();
+        let mut data_lines = Vec::<String>::new();
+        loop {
+            let chunk = tokio::select! { _ = cancel.cancelled() => return, chunk = stream.next() => chunk };
+            let Some(chunk) = chunk else { let _ = event_bus.send(OpenCodeBusItem::Failure("SSE 连接结束，正在重连".to_string())); break; };
+            match chunk {
+                Ok(bytes) => buffer.extend_from_slice(&bytes),
+                Err(error) => { let _ = event_bus.send(OpenCodeBusItem::Failure(format!("SSE 读取失败: {error}"))); break; }
+            }
+            // 先拼接字节再解码完整行，避免多字节字符跨 chunk 时损坏。
+            while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+                let mut line = buffer.drain(..=end).collect::<Vec<_>>();
+                line.pop();
+                if line.last() == Some(&b'\r') { line.pop(); }
+                let line = match String::from_utf8(line) {
+                    Ok(line) => line,
+                    Err(error) => { let _ = event_bus.send(OpenCodeBusItem::Failure(format!("SSE UTF-8 解码失败: {error}"))); continue; }
+                };
+                if line.is_empty() {
+                    if !data_lines.is_empty() {
+                        let raw = data_lines.join("\n");
+                        data_lines.clear();
+                        match serde_json::from_str::<OpenCodeBusEvent>(&raw) {
+                            Ok(event) => { let _ = event_bus.send(OpenCodeBusItem::Event(Arc::new(event))); }
+                            Err(error) => { let _ = event_bus.send(OpenCodeBusItem::Failure(format!("SSE 事件解析失败: {error}"))); }
+                        }
+                    }
+                } else if let Some(data) = line.strip_prefix("data:") {
+                    data_lines.push(data.strip_prefix(' ').unwrap_or(data).to_string());
                 }
             }
         }
@@ -5211,12 +6241,27 @@ fn executable_augmented_path(executable: &Path) -> Option<OsString> {
 }
 */
 
+/// 将 V2 工具内容转换为可读正文，同时保留文件地址供用户打开。
+fn opencode_v2_tool_content(content: &Value) -> Option<String> {
+    let items = content.as_array()?;
+    let mut output = Vec::new();
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => if let Some(text) = item.get("text").and_then(Value::as_str) { output.push(text.to_string()); },
+            Some("file") => if let Some(uri) = item.get("uri").and_then(Value::as_str) { output.push(uri.to_string()); },
+            _ => log::warn!("未知 OpenCode 工具内容: {item}"),
+        }
+    }
+    Some(output.join("\n"))
+}
+
 /// 从 OpenCode SSE 事件的允许字段中提取安全会话标识，供链路日志和会话匹配共用。
 fn event_session_id(event: &OpenCodeBusEvent) -> Option<&str> {
     event
         .properties
         .get("sessionID")
         .and_then(Value::as_str)
+        .or_else(|| event.properties.pointer("/form/sessionID").and_then(Value::as_str))
         .or_else(|| {
             event
                 .properties
@@ -5251,7 +6296,7 @@ pub fn extract_persisted_approval_route(details: &Value) -> Option<ApprovalReque
 
     let server_method = match kind {
         "permission" => "opencode/permission",
-        "question" => "opencode/question",
+        "form" => "opencode/form",
         _ => return None,
     };
 
@@ -5261,10 +6306,8 @@ pub fn extract_persisted_approval_route(details: &Value) -> Option<ApprovalReque
         "sessionID": session_id,
         "cwd": cwd,
     });
-    if kind == "question" {
-        if let Some(questions) = details.get("questions") {
-            raw_request_id["questions"] = questions.clone();
-        }
+    if kind == "form" {
+        raw_request_id["fields"] = details.get("_opencodeFields")?.clone();
     }
 
     Some(ApprovalRequestRoute {
@@ -5313,7 +6356,7 @@ fn format_session_diff(properties: &Value) -> Option<String> {
 
 fn action_type_for_permission(permission: &str) -> ActionType {
     match permission {
-        "bash" => ActionType::Command,
+        "bash" | "shell" => ActionType::Command,
         "edit" => ActionType::FileEdit,
         "read" => ActionType::FileRead,
         "webfetch" | "websearch" | "codesearch" => ActionType::Search,
@@ -5323,7 +6366,7 @@ fn action_type_for_permission(permission: &str) -> ActionType {
 
 fn action_type_for_tool(tool: &str) -> ActionType {
     let normalized = tool.to_lowercase();
-    if normalized.contains("bash") || normalized.contains("command") {
+    if normalized.contains("bash") || normalized.contains("shell") || normalized.contains("command") {
         ActionType::Command
     } else if normalized.contains("edit") || normalized.contains("write") {
         ActionType::FileEdit
@@ -5455,6 +6498,7 @@ fn token_usage_from_step_finish(part: &OpenCodePart) -> Option<TokenUsage> {
     })
 }
 
+/*
 fn file_url(path: &str) -> String {
     let mut encoded = String::from("file://");
     for byte in path.as_bytes() {
@@ -5462,6 +6506,22 @@ fn file_url(path: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
                 encoded.push(*byte as char)
             }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
+*/
+/// 将本机或远端绝对文件路径转换成 V2 接受的文件 URI。
+fn file_url(path: &str) -> String {
+    if path.starts_with("file://") || path.starts_with("https://") || path.starts_with("http://") { return path.to_string(); }
+    let path = path.replace('\\', "/");
+    let mut encoded = String::from("file://");
+    if !path.starts_with('/') { encoded.push('/'); }
+    for byte in path.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => encoded.push(*byte as char),
             other => encoded.push_str(&format!("%{other:02X}")),
         }
     }
