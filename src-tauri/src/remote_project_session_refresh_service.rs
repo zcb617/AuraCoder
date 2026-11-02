@@ -352,8 +352,8 @@ pub async fn refresh_all_project_sessions(
     let max_concurrent_projects = match std::thread::available_parallelism() {
         Ok(threads) => (threads.get() / 2).max(1),
         Err(error) => {
-            log::warn!("读取 CPU 逻辑线程数失败，项目同步并发数使用 1: error={error:#}");
-            1
+            log::warn!("读取 CPU 逻辑线程数失败，项目同步并发数使用 6: error={error:#}");
+            6
         }
     };
     log::info!("全量项目会话同步开始: max_concurrent_projects={max_concurrent_projects}");
