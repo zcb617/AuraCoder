@@ -225,6 +225,7 @@ impl OpenCodeCli {
         };
         let endpoint_generation = endpoint.generation;
         let endpoint_version = endpoint.version.clone();
+        let endpoint_lifetime = endpoint.lifetime.clone();
         let mut engines = self.local_engines.lock().await;
         if let Some((generation, engine)) = engines.get(cwd) {
             if *generation == endpoint_generation {
@@ -242,6 +243,8 @@ impl OpenCodeCli {
         engine.prewarm().await.inspect_err(|error| {
             log::error!("本机 OpenCode V2 服务检查失败: cwd={cwd}, error={error:#}");
         })?;
+        // 服务级事件连接先于模型目录读取建立，避免漏掉启动变化。
+        engine.bind_event_stream(endpoint_lifetime, None).await?;
         engine.set_computer_control_service(self.state.computer_control_service.clone());
         // engine.set_auracoder_thread_mcp_service(self.state.auracoder_thread_mcp_service.clone());
         engines.insert(cwd.to_string(), (endpoint_generation, engine.clone()));
@@ -1491,9 +1494,39 @@ impl CliTool for OpenCodeCli {
         })
     }
 
-    /// OpenCode 当前没有独立的桌面运行时事件流，完成统一监听入口。
-    async fn run_runtime_event_bridge(&self, _app: tauri::AppHandle) -> Result<()> {
-        Ok(())
+    /// 将 OpenCode 目录变化转换为前端统一目录刷新通知。
+    async fn run_runtime_event_bridge(&self, app: tauri::AppHandle) -> Result<()> {
+        let mut changes = crate::engines::opencode::subscribe_catalog_changes();
+        // 历史收到过通知的目标不完整；改由当前存活服务登记表提供目标。
+        // let mut known_targets: HashSet<Option<String>> = HashSet::new();
+        loop {
+            // 事件丢失时刷新已知运行目标，恢复目录快照。
+            let targets = match changes.recv().await {
+                Ok(change) => {
+                    log::debug!("OpenCode 模型目录发生变化: connection_id={:?} directory={:?} reason={}", change.connection_id, change.directory, change.reason);
+                    // known_targets.insert(change.connection_id.clone());
+                    vec![change.connection_id]
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                    log::warn!("OpenCode 目录变化通知丢失 {count} 条，重新同步已知目标");
+                    // 原方案只恢复历史收到通知的目标，会遗漏首次通知已丢失的服务。
+                    // known_targets.iter().cloned().collect()
+                    crate::engines::opencode::active_catalog_targets()?
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => anyhow::bail!("OpenCode 目录变化通知已关闭"),
+            };
+            for connection_id in targets {
+                let scope = if connection_id.is_some() { "ssh" } else { "local" };
+                let event = crate::message_notify_helper::EngineCatalogUpdatedEvent {
+                    engine_id: "opencode".to_string(),
+                    scope: scope.to_string(),
+                    connection_id,
+                };
+                if let Err(error) = crate::message_notify_helper::notify_engine_catalog_updated(&app, event) {
+                    log::error!("发送 OpenCode 模型目录更新通知失败: {error:#}");
+                }
+            }
+        }
     }
 
     async fn prewarm_engine(&self, context: &CliExecutionContext) -> Result<()> {

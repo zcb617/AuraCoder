@@ -12,6 +12,27 @@ pub const APP_STARTUP_PROGRESS_EVENT: &str = "app-startup-progress";
 /// 前端用于刷新 CLI 目录缓存的事件名称。
 pub const CLI_SERVICES_UPDATED_EVENT: &str = "cli-services-updated";
 
+/// 前端用于刷新指定运行目标 CLI 模型目录的事件名称。
+pub const ENGINE_CATALOG_UPDATED_EVENT: &str = "engine-catalog-updated";
+
+/// 指定运行目标的 CLI 模型目录发生变化。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineCatalogUpdatedEvent {
+    /// 目录所属的 CLI 标识。
+    pub engine_id: String,
+    /// 目录所在运行位置。
+    pub scope: String,
+    /// SSH 目录所属连接标识，本机为空。
+    pub connection_id: Option<String>,
+}
+
+/// 通知前端重新读取指定 CLI 的模型目录。
+pub fn notify_engine_catalog_updated(app: &AppHandle, event: EngineCatalogUpdatedEvent) -> anyhow::Result<()> {
+    app.emit(ENGINE_CATALOG_UPDATED_EVENT, event)
+        .context("failed to emit engine catalog updated event")
+}
+
 /// 后端初始化阶段发生变化时发送给前端的事件载荷。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -5,7 +5,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, LazyLock, Weak,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener as AsyncTcpListener,
-    sync::{broadcast, mpsc, Mutex},
+    sync::{broadcast, mpsc, watch, Mutex},
     time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
@@ -75,6 +75,54 @@ pub struct OpenCodeEngine {
     */
     /// 当前协议客户端绑定的传输 endpoint。
     target: OpenCodeTransportTarget,
+}
+
+/// 一个 OpenCode HTTP 服务共享的事件连接及连接状态。
+struct OpenCodeEventStream {
+    /// 将服务事件分发给当前回合。
+    bus: broadcast::Sender<OpenCodeBusItem>,
+    /// 指示服务是否已确认事件订阅。
+    ready: watch::Sender<bool>,
+    /// 所属服务停止时终止事件连接。
+    lifetime: CancellationToken,
+    /// 此服务所属 SSH 连接，本机服务为空。
+    connection_id: Option<String>,
+}
+
+/// OpenCode 服务上需要重新读取模型目录的通知。
+#[derive(Clone, Debug)]
+pub(crate) struct OpenCodeCatalogChange {
+    /// 远端服务对应的 SSH 连接，本机为空。
+    pub(crate) connection_id: Option<String>,
+    /// 官方事件所属目录；连接事件没有目录。
+    pub(crate) directory: Option<String>,
+    /// 触发目录同步的官方事件类型。
+    pub(crate) reason: String,
+}
+
+/// 按服务地址和认证信息共享事件连接，弱引用不延长服务生命周期。
+static OPENCODE_EVENT_STREAMS: LazyLock<std::sync::Mutex<HashMap<(String, String), Weak<OpenCodeEventStream>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// 将 OpenCode 目录变化交给实现层的统一通知桥接。
+static OPENCODE_CATALOG_CHANGES: LazyLock<broadcast::Sender<OpenCodeCatalogChange>> =
+    LazyLock::new(|| broadcast::channel(OPENCODE_EVENT_BUFFER_CAPACITY).0);
+
+/// 订阅 OpenCode 实例产生的模型目录变化。
+pub(crate) fn subscribe_catalog_changes() -> broadcast::Receiver<OpenCodeCatalogChange> {
+    OPENCODE_CATALOG_CHANGES.subscribe()
+}
+
+/// 列出当前事件服务对应的运行目标，用于事件丢失后的目录同步。
+pub(crate) fn active_catalog_targets() -> Result<Vec<Option<String>>> {
+    let streams = OPENCODE_EVENT_STREAMS.lock().map_err(|error| anyhow::anyhow!("OpenCode 事件连接注册表不可用: {error}"))?;
+    // 只使用仍存活的服务，多个本机项目共享一个目录目标。
+    let targets: HashSet<Option<String>> = streams.values()
+        .filter_map(Weak::upgrade)
+        .filter(|stream| !stream.lifetime.is_cancelled())
+        .map(|stream| stream.connection_id.clone())
+        .collect();
+    Ok(targets.into_iter().collect())
 }
 
 #[derive(Clone)]
@@ -408,6 +456,17 @@ struct OpenCodeBusEvent {
     event_type: String,
     #[serde(default, rename = "data")]
     properties: Value,
+}
+
+/// OpenCode SSE 事件以及其所属的服务位置。
+#[derive(Debug, Deserialize)]
+struct OpenCodeEventEnvelope {
+    /// 回合消息和目录通知共用的官方事件主体。
+    #[serde(flatten)]
+    event: OpenCodeBusEvent,
+    /// 官方事件所属位置，可为空。
+    #[serde(default)]
+    location: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -1313,19 +1372,30 @@ impl Engine for OpenCodeEngine {
                 }
             }
         }
+        // 旧实现每轮创建并在回合结束时关闭独立 SSE 连接。
+        /*
         let (bus, _) = broadcast::channel(OPENCODE_EVENT_BUFFER_CAPACITY);
         let mut incoming = spawn_opencode_incoming_pump(bus.clone());
         let pump_cancel = cancellation.child_token();
         let _pump_guard = pump_cancel.clone().drop_guard();
         tokio::spawn(run_event_pump(session.connection.base_url.clone(), session.connection.password.clone(), None, self.http.clone(), bus, pump_cancel));
+        */
+        // 回合只订阅服务共享总线，结束回合不会关闭服务事件流。
+        let stream = {
+            let streams = OPENCODE_EVENT_STREAMS.lock().map_err(|error| anyhow::anyhow!("OpenCode 事件连接注册表不可用: {error}"))?;
+            streams.get(&(session.connection.base_url.clone(), session.connection.password.clone()))
+                .and_then(Weak::upgrade)
+                .context("OpenCode 服务事件连接尚未绑定")?
+        };
+        let mut incoming = spawn_opencode_incoming_pump(stream.bus.clone());
+        let mut stream_ready = stream.ready.subscribe();
         let readiness = async {
             loop {
-                match incoming.recv().await {
-                    Some(OpenCodeIncomingEvent::Message(event)) if event.event_type == "server.connected" => return Ok(()),
-                    Some(OpenCodeIncomingEvent::Failure(message)) => log::warn!("OpenCode 事件订阅未就绪: {message}"),
-                    Some(OpenCodeIncomingEvent::Lagged(count)) => log::warn!("OpenCode 事件订阅丢失 {count} 条事件"),
-                    None | Some(OpenCodeIncomingEvent::Closed) => anyhow::bail!("OpenCode 事件订阅已关闭"),
-                    _ => {},
+                anyhow::ensure!(!stream.lifetime.is_cancelled(), "OpenCode 服务已终止");
+                if *stream_ready.borrow_and_update() { return Ok(()); }
+                tokio::select! {
+                    _ = stream.lifetime.cancelled() => anyhow::bail!("OpenCode 服务已终止"),
+                    result = stream_ready.changed() => result.context("OpenCode 事件连接状态已关闭")?,
                 }
             }
         };
@@ -1783,6 +1853,53 @@ impl Engine for OpenCodeEngine {
 }
 
 impl OpenCodeEngine {
+    /// 为当前服务绑定共享事件连接，并等待服务确认订阅。
+    pub(crate) async fn bind_event_stream(&self, lifetime: CancellationToken, connection_id: Option<String>) -> Result<()> {
+        let (base_url, password) = match &self.target {
+            OpenCodeTransportTarget::LocalHttp(endpoint) => (endpoint.base_url.clone(), endpoint.password.clone()),
+            OpenCodeTransportTarget::Remote(endpoint) => (endpoint.base_url.clone(), endpoint.password.clone()),
+            OpenCodeTransportTarget::Local => anyhow::bail!("OpenCode 服务 endpoint 尚未绑定"),
+        };
+        // 相同服务只创建一次连接，临时协议客户端共享事件总线。
+        let stream = {
+            let mut streams = OPENCODE_EVENT_STREAMS.lock().map_err(|error| anyhow::anyhow!("OpenCode 事件连接注册表不可用: {error}"))?;
+            streams.retain(|_, value| value.strong_count() > 0);
+            let key = (base_url.clone(), password.clone());
+            match streams.get(&key).and_then(Weak::upgrade).filter(|stream| !stream.lifetime.is_cancelled()) {
+                Some(stream) => stream,
+                None => {
+                    let stream = Arc::new(OpenCodeEventStream {
+                        bus: broadcast::channel(OPENCODE_EVENT_BUFFER_CAPACITY).0,
+                        ready: watch::channel(false).0,
+                        lifetime,
+                        connection_id: connection_id.clone(),
+                    });
+                    streams.insert(key, Arc::downgrade(&stream));
+                    let running_stream = stream.clone();
+                    let http = self.http.clone();
+                    // 事件任务退出时同步清理连接状态，包含服务终止路径。
+                    tokio::spawn(async move {
+                        run_event_pump(base_url, password, http, running_stream.clone(), connection_id).await;
+                        running_stream.ready.send_replace(false);
+                    });
+                    stream
+                }
+            }
+        };
+        let mut ready = stream.ready.subscribe();
+        // 先绑定监听再检查当前状态，避免漏掉刚建立的连接。
+        timeout(Duration::from_secs(8), async {
+            loop {
+                anyhow::ensure!(!stream.lifetime.is_cancelled(), "OpenCode 服务已终止");
+                if *ready.borrow_and_update() { return Ok(()); }
+                tokio::select! {
+                    _ = stream.lifetime.cancelled() => anyhow::bail!("OpenCode 服务已终止"),
+                    result = ready.changed() => result.context("OpenCode 事件连接状态已关闭")?,
+                }
+            }
+        }).await.context("等待 OpenCode 事件订阅就绪超时")?
+    }
+
     /// 创建绑定本机 CLI 生命周期 endpoint 的纯 OpenCode 协议客户端。
     pub fn new_local_http(
         base_url: String,
@@ -6022,9 +6139,13 @@ async fn run_event_pump(
 
 */
 /// 订阅 V2 事件流，按完整 SSE 帧解码并在断线后重新连接。
-async fn run_event_pump(base_url: String, password: String, _directory: Option<String>, http: reqwest::Client, event_bus: broadcast::Sender<OpenCodeBusItem>, cancel: CancellationToken) {
+async fn run_event_pump(base_url: String, password: String, http: reqwest::Client, shared: Arc<OpenCodeEventStream>, connection_id: Option<String>) {
     let url = format!("{}/api/event", base_url.trim_end_matches('/'));
+    let cancel = &shared.lifetime;
+    let event_bus = &shared.bus;
     loop {
+        // 断开期间不能把旧连接状态当成已就绪。
+        shared.ready.send_replace(false);
         // 建立事件流时保留原始网络和 HTTP 错误，连接中断不代表执行完成。
         let response = tokio::select! {
             _ = cancel.cancelled() => return,
@@ -6035,11 +6156,13 @@ async fn run_event_pump(base_url: String, password: String, _directory: Option<S
             Ok(response) => {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
+                log::warn!("OpenCode SSE 请求失败: status={status} body={body}");
                 let _ = event_bus.send(OpenCodeBusItem::Failure(format!("SSE HTTP {status}: {body}")));
                 tokio::select! { _ = cancel.cancelled() => return, _ = sleep(Duration::from_millis(500)) => {} }
                 continue;
             }
             Err(error) => {
+                log::warn!("OpenCode SSE 连接失败: {error}");
                 let _ = event_bus.send(OpenCodeBusItem::Failure(format!("SSE 连接失败: {error}")));
                 tokio::select! { _ = cancel.cancelled() => return, _ = sleep(Duration::from_millis(500)) => {} }
                 continue;
@@ -6050,10 +6173,10 @@ async fn run_event_pump(base_url: String, password: String, _directory: Option<S
         let mut data_lines = Vec::<String>::new();
         loop {
             let chunk = tokio::select! { _ = cancel.cancelled() => return, chunk = stream.next() => chunk };
-            let Some(chunk) = chunk else { let _ = event_bus.send(OpenCodeBusItem::Failure("SSE 连接结束，正在重连".to_string())); break; };
+            let Some(chunk) = chunk else { shared.ready.send_replace(false); log::warn!("OpenCode SSE 连接结束，正在重连"); let _ = event_bus.send(OpenCodeBusItem::Failure("SSE 连接结束，正在重连".to_string())); break; };
             match chunk {
                 Ok(bytes) => buffer.extend_from_slice(&bytes),
-                Err(error) => { let _ = event_bus.send(OpenCodeBusItem::Failure(format!("SSE 读取失败: {error}"))); break; }
+                Err(error) => { shared.ready.send_replace(false); log::warn!("OpenCode SSE 读取失败: {error}"); let _ = event_bus.send(OpenCodeBusItem::Failure(format!("SSE 读取失败: {error}"))); break; }
             }
             // 先拼接字节再解码完整行，避免多字节字符跨 chunk 时损坏。
             while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
@@ -6062,15 +6185,28 @@ async fn run_event_pump(base_url: String, password: String, _directory: Option<S
                 if line.last() == Some(&b'\r') { line.pop(); }
                 let line = match String::from_utf8(line) {
                     Ok(line) => line,
-                    Err(error) => { let _ = event_bus.send(OpenCodeBusItem::Failure(format!("SSE UTF-8 解码失败: {error}"))); continue; }
+                    Err(error) => { log::warn!("OpenCode SSE UTF-8 解码失败: {error}"); let _ = event_bus.send(OpenCodeBusItem::Failure(format!("SSE UTF-8 解码失败: {error}"))); continue; }
                 };
                 if line.is_empty() {
                     if !data_lines.is_empty() {
                         let raw = data_lines.join("\n");
                         data_lines.clear();
-                        match serde_json::from_str::<OpenCodeBusEvent>(&raw) {
-                            Ok(event) => { let _ = event_bus.send(OpenCodeBusItem::Event(Arc::new(event))); }
-                            Err(error) => { let _ = event_bus.send(OpenCodeBusItem::Failure(format!("SSE 事件解析失败: {error}"))); }
+                        match serde_json::from_str::<OpenCodeEventEnvelope>(&raw) {
+                            Ok(envelope) => {
+                                // 首先向回合投递连接事件，再更新就绪状态，保证断线补偿顺序。
+                                let event = envelope.event;
+                                let connected = event.event_type == "server.connected";
+                                let catalog_changed = matches!(event.event_type.as_str(), "server.connected" | "model.updated" | "provider.updated" | "config.updated" | "location.shutdown");
+                                let reason = event.event_type.clone();
+                                let _ = event_bus.send(OpenCodeBusItem::Event(Arc::new(event)));
+                                if connected { shared.ready.send_replace(true); }
+                                if catalog_changed && !cancel.is_cancelled() {
+                                    let directory = envelope.location.as_ref()
+                                        .and_then(|value| value.get("directory")).and_then(Value::as_str).map(str::to_string);
+                                    let _ = OPENCODE_CATALOG_CHANGES.send(OpenCodeCatalogChange { connection_id: connection_id.clone(), directory, reason });
+                                }
+                            }
+                            Err(error) => { log::warn!("OpenCode SSE 事件解析失败: {error}"); let _ = event_bus.send(OpenCodeBusItem::Failure(format!("SSE 事件解析失败: {error}"))); }
                         }
                     }
                 } else if let Some(data) = line.strip_prefix("data:") {
@@ -6078,6 +6214,8 @@ async fn run_event_pump(base_url: String, password: String, _directory: Option<S
                 }
             }
         }
+        // 连接结束后按既有网络重连间隔重新订阅。
+        tokio::select! { _ = cancel.cancelled() => return, _ = sleep(Duration::from_millis(500)) => {} }
     }
 }
 

@@ -356,6 +356,8 @@ async fn runtime_for_service(service: &SshCliService) -> anyhow::Result<Arc<Open
         base_url,
         password.to_string(),
     ));
+    // 在读取远端模型目录前绑定与服务同生命周期的事件连接。
+    engine.bind_event_stream(service.lifetime(), Some(connection_id.to_string())).await?;
     let mut runtimes = REMOTE_OPENCODE_RUNTIMES.write().await;
     if let Some(entry) = runtimes.get(connection_id) {
         if entry.service_generation == service_generation

@@ -1156,6 +1156,22 @@ export async function listenSshRemoteProjectSessionsRefreshed(
 
 export const CLI_SERVICES_UPDATED_EVENT = "cli-services-updated";
 
+/** CLI 业务目录发生变化；与服务进程的增删通知分开。 */
+export interface EngineCatalogUpdatedEvent {
+  engineId: string;
+  scope: "local" | "ssh";
+  connectionId: string | null;
+}
+
+export async function listenEngineCatalogUpdated(
+  onEvent: (event: EngineCatalogUpdatedEvent) => void,
+): Promise<UnlistenFn> {
+  return listen<EngineCatalogUpdatedEvent>(
+    "engine-catalog-updated",
+    ({ payload }) => onEvent(payload),
+  );
+}
+
 export interface CliHealthReconcileResult {
   /** 本次检查是否已经成功改变 CLI 生命周期登记。 */
   changed: boolean;

@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::Context;
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     cli_tools::{factory::CliToolFactory, CliLocationKind, CliMcpRuntime, CliTool},
@@ -34,6 +35,8 @@ pub(crate) struct SshCliService {
     connection_id: String,
     cli_id: String,
     generation: u64,
+    /// 远端服务终止时通知其客户端连接退出。
+    lifetime: CancellationToken,
     tunnel: Arc<SshCliTunnel>,
     /// 当前生命周期服务登记到 Gateway 的 CLI MCP 实现。
     cli: Arc<dyn CliTool>,
@@ -43,6 +46,10 @@ pub(crate) struct SshCliService {
 }
 
 impl SshCliService {
+    /// 提供不暴露隧道的远端服务生命周期信号。
+    pub(crate) fn lifetime(&self) -> CancellationToken {
+        self.lifetime.child_token()
+    }
     pub(crate) fn connection_id(&self) -> &str {
         &self.connection_id
     }
@@ -151,6 +158,13 @@ impl SshCliService {
         })
     }
     */
+}
+
+impl Drop for SshCliService {
+    /// 服务登记释放时取消仍在使用该实例的连接。
+    fn drop(&mut self) {
+        self.lifetime.cancel();
+    }
 }
 
 #[derive(Default)]
@@ -530,6 +544,7 @@ impl SshCliServiceLifecycleRegistry {
             connection_id: connection_id.to_string(),
             cli_id: cli_id.to_string(),
             generation: NEXT_SERVICE_GENERATION.fetch_add(1, Ordering::Relaxed),
+            lifetime: CancellationToken::new(),
             tunnel,
             cli,
             mcp_token,
@@ -575,6 +590,7 @@ impl SshCliServiceLifecycleRegistry {
 
         // 先将已登记服务标记为终止，避免注销期间继续作为 Ready 服务使用。
         if let Some(service) = &service {
+            service.lifetime.cancel();
             *service.state.lock().await = SshCliServiceEntryState::Terminating;
         }
 
@@ -645,6 +661,8 @@ impl SshCliServiceLifecycleRegistry {
                 .map(|_| true);
         match result {
             Ok(stopped) => {
+                // 远端停止成功后取消连接；失败时保留原服务和事件流。
+                service.lifetime.cancel();
                 let mut services = self.services.write().await;
                 let (remove_service, remove_connection) =
                     if let Some(host_services) = services.get_mut(connection_id) {

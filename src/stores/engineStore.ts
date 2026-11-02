@@ -7,7 +7,7 @@ import type {
   ExecutionTarget,
 } from "../types";
 import { ipc } from "../lib/ipc";
-import type { CliServicesUpdatedEvent } from "../lib/ipc";
+import type { CliServicesUpdatedEvent, EngineCatalogUpdatedEvent } from "../lib/ipc";
 
 /*
 旧实现按执行目标缓存 CLI、模型、健康状态和用量，并在命中缓存后跳过后端接口。
@@ -647,6 +647,7 @@ interface EngineState {
   error?: string;
   load: (workspaceId?: string | null) => Promise<void>;
   preloadCatalogs: () => Promise<void>;
+  applyEngineCatalogUpdated: (event: EngineCatalogUpdatedEvent) => Promise<void>;
   applyCliServicesUpdated: (
     event: Pick<CliServicesUpdatedEvent, "scope" | "connectionId" | "revision">,
   ) => Promise<void>;
@@ -692,7 +693,7 @@ function isCurrentTarget(
  * 启动预热和后端健康检查事件刷新共用本条取数路径（与启动时首次取数是同一个
  * listActivedClis 接口）。
  */
-async function fetchAndCacheCatalog(
+async function fetchCatalogSnapshot(
   targetKey: string,
   connectionId: string | null,
 ): Promise<void> {
@@ -703,9 +704,16 @@ async function fetchAndCacheCatalog(
     }
     useEngineStore.setState((state) => {
       const enginesByTarget = { ...state.enginesByTarget, [targetKey]: engines };
-      return state.target?.targetKey === targetKey
-        ? { enginesByTarget, engines, error: undefined }
-        : { enginesByTarget };
+      if (state.target?.targetKey !== targetKey) return { enginesByTarget };
+      const health = { ...state.health };
+      for (const engine of engines) {
+        const current = health[engine.id];
+        // 只有本次成功取得可用模型，才能清除之前目录读取失败的状态。
+        if (engine.models.length > 0 && current?.available === false) {
+          health[engine.id] = { ...current, available: true, details: undefined };
+        }
+      }
+      return { enginesByTarget, engines, health, error: undefined };
     });
   };
 
@@ -723,6 +731,30 @@ async function fetchAndCacheCatalog(
     }
     console.warn(`Failed to refresh engine catalog for ${targetKey}:`, error);
   }
+}
+
+const catalogRefreshes = new Map<string, { pending: boolean; promise: Promise<void> }>();
+
+/** 同一目标串行取快照；读取中收到的新通知在本次结束后再处理。 */
+function fetchAndCacheCatalog(targetKey: string, connectionId: string | null): Promise<void> {
+  const existing = catalogRefreshes.get(targetKey);
+  if (existing) {
+    existing.pending = true;
+    return existing.promise;
+  }
+  const refresh = { pending: false, promise: Promise.resolve() };
+  catalogRefreshes.set(targetKey, refresh);
+  refresh.promise = (async () => {
+    try {
+      do {
+        refresh.pending = false;
+        await fetchCatalogSnapshot(targetKey, connectionId);
+      } while (refresh.pending);
+    } finally {
+      catalogRefreshes.delete(targetKey);
+    }
+  })();
+  return refresh.promise;
 }
 
 export const useEngineStore = create<EngineState>((set, get) => ({
@@ -777,6 +809,8 @@ export const useEngineStore = create<EngineState>((set, get) => ({
 
       const targetRequestGeneration = requestGenerations[target.targetKey] ?? 0;
 
+      /*
+      旧首次加载单独请求并回写目录，可能覆盖读取期间事件刷新得到的新快照。
       let engines: EngineInfo[];
       if (target.kind === "ssh") {
         if (!target.connectionId) {
@@ -786,6 +820,14 @@ export const useEngineStore = create<EngineState>((set, get) => ({
       } else {
         engines = await ipc.listActivedClis();
       }
+      */
+      if (target.kind === "ssh" && !target.connectionId) {
+        throw new Error("远端项目未绑定 SSH 连接");
+      }
+      await fetchAndCacheCatalog(
+        target.targetKey,
+        target.kind === "ssh" ? target.connectionId ?? null : null,
+      );
       if (
         sequence !== engineLoadSequence ||
         !isCurrentTarget(
@@ -797,13 +839,10 @@ export const useEngineStore = create<EngineState>((set, get) => ({
       ) {
         return;
       }
-      set((state) => ({
-        engines,
-        enginesByTarget: { ...state.enginesByTarget, [target.targetKey]: engines },
+      set({
         loading: false,
         loadedOnce: true,
-        error: undefined,
-      }));
+      });
     } catch (error) {
       if (
         sequence !== engineLoadSequence ||
@@ -845,6 +884,16 @@ export const useEngineStore = create<EngineState>((set, get) => ({
       targetKey,
       event.scope === "ssh" ? event.connectionId : null,
     );
+  },
+
+  applyEngineCatalogUpdated: async (event) => {
+    if (event.scope === "ssh" && !event.connectionId) {
+      console.warn("Ignoring engine catalog update without an SSH connection:", event);
+      return;
+    }
+    const connectionId = event.scope === "ssh" ? event.connectionId : null;
+    const targetKey = connectionId ? `ssh:${connectionId}` : "local";
+    await fetchAndCacheCatalog(targetKey, connectionId);
   },
 
   refreshEngineCatalog: async (engineId) => {

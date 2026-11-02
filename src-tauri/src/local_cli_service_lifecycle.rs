@@ -20,6 +20,7 @@ use tokio::{
     time::timeout,
 };
 use uuid::Uuid;
+use tokio_util::sync::CancellationToken;
 
 use crate::engines::{claude_sidecar::ClaudeSidecarEngine, codex::CodexEngine};
 // 旧 Controller 探测导入已停用，探测职责迁至 runtime_env：
@@ -44,6 +45,8 @@ pub(crate) struct LocalOpenCodeEndpoint {
     pub(crate) version: Option<String>,
     /// 本机 OpenCode 服务实例的生命周期代数。
     pub(crate) generation: u64,
+    /// 本机服务终止时取消协议连接的通用生命周期信号。
+    pub(crate) lifetime: CancellationToken,
 }
 
 /// 一个按项目目录登记的本机 OpenCode 服务进程。
@@ -60,6 +63,8 @@ struct LocalOpenCodeService {
     version: Option<String>,
     /// 服务生命周期代数，用于识别重启后的新实例。
     generation: u64,
+    /// 本机服务自身的生命周期信号。
+    lifetime: CancellationToken,
     /// 服务子进程句柄。
     child: Mutex<Option<Child>>,
     /// 服务隔离配置和运行文件所在目录。
@@ -74,11 +79,14 @@ impl LocalOpenCodeService {
             password: self.password.clone(),
             version: self.version.clone(),
             generation: self.generation,
+            lifetime: self.lifetime.child_token(),
         }
     }
 
     /// 终止本机 OpenCode 服务并清理其任务与隔离运行目录。
     async fn terminate(&self) -> Result<()> {
+        // 服务终止前通知使用该服务的协议连接退出。
+        self.lifetime.cancel();
         let mut child = self.child.lock().await;
         if let Some(mut process) = child.take() {
             if let Err(error) = process.kill().await {
@@ -98,6 +106,13 @@ impl LocalOpenCodeService {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for LocalOpenCodeService {
+    /// 服务对象被释放时关闭仍在使用该实例的连接。
+    fn drop(&mut self) {
+        self.lifetime.cancel();
     }
 }
 
@@ -401,6 +416,7 @@ async fn start_local_opencode_service(
         password,
         version,
         generation: NEXT_OPENCODE_SERVICE_GENERATION.fetch_add(1, Ordering::Relaxed),
+        lifetime: CancellationToken::new(),
         child: Mutex::new(Some(child)),
         run_dir,
     };

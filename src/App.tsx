@@ -18,6 +18,7 @@ import {
   listenComputerControlApprovalRequested,
   listenChatTurnFinished,
   listenCliServicesUpdated,
+  listenEngineCatalogUpdated,
   listenCodexRemoteThreadRemoved,
   listenEngineRuntimeUpdated,
   listenMenuAction,
@@ -149,6 +150,7 @@ export function App() {
   const loadEngines = useEngineStore((s) => s.load);
   const preloadEngineCatalogs = useEngineStore((s) => s.preloadCatalogs);
   const applyCliServicesUpdated = useEngineStore((s) => s.applyCliServicesUpdated);
+  const applyEngineCatalogUpdated = useEngineStore((s) => s.applyEngineCatalogUpdated);
   // 旧实现读取 engines 并作为会话加载 effect 依赖；effect 正文不使用该目录，保留注释避免引擎加载导致重复同步。
   // const engines = useEngineStore((s) => s.engines);
   const applyEngineRuntimeUpdate = useEngineStore((s) => s.applyRuntimeUpdate);
@@ -442,6 +444,24 @@ export function App() {
       }
     };
   }, [applyCliServicesUpdated]);
+
+  // 业务目录通知独立于聊天回合和 CLI 服务的生命周期变化。
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listenEngineCatalogUpdated((event) => {
+      void applyEngineCatalogUpdated(event);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    }).catch((error) => {
+      console.error("Failed to listen for engine catalog updates:", error);
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [applyEngineCatalogUpdated]);
 
   useEffect(() => {
     if (
