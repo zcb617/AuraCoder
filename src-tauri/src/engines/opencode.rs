@@ -3438,8 +3438,23 @@ impl OpenCodeEngine {
                 emit_turn_completed(mapper, event_tx, TurnCompletionStatus::Interrupted).await;
             }
             "session.execution.failed" | "session.execution.interrupted" => {
-                let message = format!("OpenCode 执行异常: {}", data);
-                log::error!("{message}");
+                // 旧实现将完整事件 JSON 直接用作展示正文。
+                // let message = format!("OpenCode 执行异常: {}", data);
+                // log::error!("{message}");
+                // 记录服务端完整原始异常，供诊断保留上下文。
+                log::error!("OpenCode 执行异常: {}", data);
+                // 提取面向用户的错误原因，免费额度错误提供明确处理方向。
+                let message = if data.pointer("/error/type").and_then(Value::as_str) == Some("provider.free-limit") {
+                    "当前模型的免费使用额度已达上限，请更换模型或使用自己的模型服务。".to_string()
+                } else {
+                    data.pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .or_else(|| data.get("message").and_then(Value::as_str).filter(|value| !value.trim().is_empty()))
+                        .or_else(|| data.get("reason").and_then(Value::as_str).filter(|value| !value.trim().is_empty()))
+                        .unwrap_or("OpenCode 本轮执行发生异常，服务端未提供具体原因，请查看日志。")
+                        .to_string()
+                };
                 let _ = event_tx.send(EngineEvent::Error { message, recoverable: false }).await;
                 mapper.failed = true;
             }

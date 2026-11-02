@@ -1693,6 +1693,36 @@ pub(crate) fn chat_engine_event_kind(event: &EngineEvent) -> &'static str {
     }
 }
 
+/// 生成保留具体原因的回合异常提示，后续通道状态不能覆盖已有业务错误。
+fn turn_exception_notice(blocks: &[ContentBlock], reason: &str, preserve_existing: bool) -> EngineEvent {
+    // 后续任务退出或通道关闭只补充缺失提示，不覆盖已显示的异常原因。
+    if preserve_existing {
+        for block in blocks {
+            if let ContentBlock::Notice { kind, level, title, message, .. } = block {
+                if kind == "turn_exception_observed" {
+                    return EngineEvent::Notice {
+                        kind: kind.clone(),
+                        level: level.clone(),
+                        title: title.clone(),
+                        message: message.clone(),
+                        metadata: None,
+                    };
+                }
+            }
+        }
+    }
+    // 将当前异常原因转换为用户可理解的提示，不改变回合状态。
+    let reason = reason.trim();
+    let reason = if reason.is_empty() { "未收到具体错误原因。" } else { reason };
+    EngineEvent::Notice {
+        kind: "turn_exception_observed".to_string(),
+        level: "warning".to_string(),
+        title: "本轮执行遇到问题".to_string(),
+        message: format!("{reason}\n\n本轮尚未结束，可点击停止后调整配置并重试。"),
+        metadata: None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_stream_event(
     app: &tauri::AppHandle,
@@ -4029,9 +4059,9 @@ pub(crate) async fn run_turn(
         TimedOut,
     }
 
-    // 将执行异常转换为固定安全提示，避免原始异常进入前端消息和错误状态。
+    // 将执行异常转换为保留具体原因的提示，不改变回合状态。
     macro_rules! emit_safe_turn_notice {
-        () => {{
+        ($reason:expr) => {{
             if cancellation.is_cancelled() {
                 log::info!(
                     "用户手动终止，抑制执行异常提示: thread_id={}, engine_id={}",
@@ -4039,6 +4069,7 @@ pub(crate) async fn run_turn(
                     thread.engine_id
                 );
             } else {
+                /* 旧提示隐藏了实际异常原因。
                 let notice = EngineEvent::Notice {
                     kind: "turn_exception_observed".to_string(),
                     level: "info".to_string(),
@@ -4047,6 +4078,8 @@ pub(crate) async fn run_turn(
                     // 异常安全提示不附带原始异常或结构化后台任务元数据。
                     metadata: None,
                 };
+                */
+                let notice = turn_exception_notice(&blocks, $reason, true);
                 let progress = process_stream_event(
                     &app,
                     &state,
@@ -4163,7 +4196,7 @@ pub(crate) async fn run_turn(
                     "recoverable": false,
                     "raw_error": raw_error,
                 }));
-                emit_safe_turn_notice!();
+                emit_safe_turn_notice!(&raw_error);
                 continue;
             }
             TurnObservationWait::Engine(Err(error)) => {
@@ -4187,7 +4220,7 @@ pub(crate) async fn run_turn(
                     "recoverable": false,
                     "raw_error": raw_error,
                 }));
-                emit_safe_turn_notice!();
+                emit_safe_turn_notice!(&raw_error);
                 continue;
             }
             TurnObservationWait::Event(Some(event)) => event,
@@ -4207,7 +4240,7 @@ pub(crate) async fn run_turn(
                 if matches!(message_status, MessageStatusDto::Streaming) {
                     remote_attachment_cleanup_required = true;
                 }
-                emit_safe_turn_notice!();
+                emit_safe_turn_notice!(&raw_error);
                 continue;
             }
             TurnObservationWait::FlushPending => {
@@ -4282,7 +4315,7 @@ pub(crate) async fn run_turn(
                     "raw_error": raw_error,
                 }));
                 remote_attachment_cleanup_required = true;
-                emit_safe_turn_notice!();
+                emit_safe_turn_notice!(&raw_error);
                 continue;
             }
         };
@@ -4314,6 +4347,7 @@ pub(crate) async fn run_turn(
                     "recoverable": *recoverable,
                     "raw_error": raw_error,
                 }));
+                /* 旧提示隐藏了引擎返回的具体错误。
                 EngineEvent::Notice {
                     kind: "turn_exception_observed".to_string(),
                     level: "info".to_string(),
@@ -4322,6 +4356,8 @@ pub(crate) async fn run_turn(
                     // 异常安全提示不附带原始异常或结构化后台任务元数据。
                     metadata: None,
                 }
+                */
+                turn_exception_notice(&blocks, message, false)
             }
             EngineEvent::TurnCompleted {
                 status: TurnCompletionStatus::Failed,
@@ -4357,6 +4393,7 @@ pub(crate) async fn run_turn(
                     "engine_thread_id": engine_thread_id.clone(),
                     "status": status,
                 }));
+                /* 旧提示会覆盖此前已经展示的具体错误。
                 EngineEvent::Notice {
                     kind: "turn_exception_observed".to_string(),
                     level: "info".to_string(),
@@ -4365,6 +4402,8 @@ pub(crate) async fn run_turn(
                     // CLI 未完成报告不附带原始异常或结构化后台任务元数据。
                     metadata: None,
                 }
+                */
+                turn_exception_notice(&blocks, "CLI 报告本轮未完成，执行状态需要确认。", true)
             }
             _ => incoming_event.clone(),
         };
@@ -5097,7 +5136,7 @@ pub(crate) async fn run_turn(
                     "recoverable": false,
                     "raw_error": raw_error,
                 }));
-                emit_safe_turn_notice!();
+                emit_safe_turn_notice!(&raw_error);
             }
             Ok(Err(error)) => {
                 remote_attachment_cleanup_required = true;
@@ -5119,7 +5158,7 @@ pub(crate) async fn run_turn(
                     "recoverable": false,
                     "raw_error": raw_error,
                 }));
-                emit_safe_turn_notice!();
+                emit_safe_turn_notice!(&raw_error);
             }
             Err(_) => {
                 let raw_error = "用户停止后后台任务未在清理窗口内结束";
@@ -5140,7 +5179,7 @@ pub(crate) async fn run_turn(
                     "recoverable": false,
                     "raw_error": raw_error,
                 }));
-                emit_safe_turn_notice!();
+                emit_safe_turn_notice!(&raw_error);
                 engine_task.abort();
                 let _ = (&mut engine_task).await;
             }
@@ -5173,7 +5212,7 @@ pub(crate) async fn run_turn(
                         "recoverable": false,
                         "raw_error": raw_error,
                     }));
-                    emit_safe_turn_notice!();
+                    emit_safe_turn_notice!(&raw_error);
                     engine_task.abort();
                     let _ = (&mut engine_task).await;
                     None
@@ -5212,7 +5251,7 @@ pub(crate) async fn run_turn(
                     "recoverable": false,
                     "raw_error": raw_error,
                 }));
-                emit_safe_turn_notice!();
+                emit_safe_turn_notice!(&raw_error);
             }
             Err(error) => {
                 remote_attachment_cleanup_required = true;
@@ -5234,7 +5273,7 @@ pub(crate) async fn run_turn(
                     "recoverable": false,
                     "raw_error": raw_error,
                 }));
-                emit_safe_turn_notice!();
+                emit_safe_turn_notice!(&raw_error);
             }
         }
         }
@@ -5313,7 +5352,7 @@ pub(crate) async fn run_turn(
             "recoverable": false,
             "raw_error": raw_error.clone(),
         }));
-        emit_safe_turn_notice!();
+        emit_safe_turn_notice!(&raw_error);
         if let Some((_, context)) = cli_turn.as_ref() {
             if context.location_kind == CliLocationKind::Ssh {
                 if let Some(connection_id) = context.ssh_connection_id.as_ref() {
