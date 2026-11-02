@@ -6,7 +6,8 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, LazyLock,
     },
-    time::{Duration, Instant},
+    // time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -15,7 +16,8 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
     sync::{Mutex, RwLock},
-    time::{sleep, timeout},
+    // time::{sleep, timeout},
+    time::timeout,
 };
 use uuid::Uuid;
 
@@ -118,8 +120,8 @@ static NEXT_OPENCODE_SERVICE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// OpenCode 服务启动和就绪检查使用的最长等待时间。
 const OPENCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
-/// OpenCode 服务健康检查使用的最长等待时间。
-const OPENCODE_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+// OpenCode 服务健康检查使用的最长等待时间。
+// const OPENCODE_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 /// OpenCode stdout 宣布 HTTP 服务已监听时使用的关键字。
 // const SERVER_READY_PREFIX: &str = "opencode server listening";
 const SERVER_READY_MARKER: &str = "server listening";
@@ -390,10 +392,13 @@ async fn start_local_opencode_service(
         child: Mutex::new(Some(child)),
         run_dir,
     };
+    // 收到监听日志即完成启动，保留原 HTTP 健康检查供追溯。
+    /*
     if let Err(error) = wait_for_local_opencode_health(&service).await {
         service.terminate().await.ok();
         return Err(error);
     }
+    */
     Ok(service)
 }
 
@@ -403,6 +408,7 @@ fn allocate_loopback_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/*
 /// 轮询本机 OpenCode HTTP 健康接口，确认服务已经能够接收协议请求。
 async fn wait_for_local_opencode_health(service: &LocalOpenCodeService) -> Result<()> {
     let client = reqwest::Client::new();
@@ -443,6 +449,8 @@ fn local_opencode_auth_headers(password: &str) -> reqwest::header::HeaderMap {
     }
     headers
 }
+
+*/
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalCliServiceEntryState {

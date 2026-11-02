@@ -292,11 +292,17 @@ async fn runtime_for_service(service: &SshCliService) -> anyhow::Result<Arc<Open
     }
 
     let base_url = format!("http://127.0.0.1:{local_port}");
-    let readiness_client = reqwest::Client::new();
+    // 为每次远端协议请求设置 500 毫秒超时。
+    // let readiness_client = reqwest::Client::new();
+    let readiness_client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .context("创建 SSH 远端 OpenCode 服务检查客户端失败")?;
     let readiness_started = Instant::now();
     let mut readiness_confirmed = false;
     let mut last_readiness_error = "尚未收到健康检查响应".to_string();
     while readiness_started.elapsed() < Duration::from_secs(20) {
+        /*
         match readiness_client
             .get(format!("{base_url}/global/health"))
             .basic_auth("opencode", Some(password))
@@ -326,6 +332,17 @@ async fn runtime_for_service(service: &SshCliService) -> anyhow::Result<Arc<Open
             },
             Err(error) => {
                 last_readiness_error = format!("健康检查请求失败: {error}");
+            }
+        }
+        */
+        // 复用统一的新旧版服务检查并保留最后一次完整错误。
+        match OpenCodeEngine::check_http_service(&readiness_client, &base_url, password).await {
+            Ok(_) => {
+                readiness_confirmed = true;
+                break;
+            }
+            Err(error) => {
+                last_readiness_error = format!("{error:#}");
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

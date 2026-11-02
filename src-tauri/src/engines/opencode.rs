@@ -223,10 +223,32 @@ pub struct OpenCodeHealthReport {
     pub(crate) actions: Vec<super::EngineCheckAction>,
 }
 
+/// OpenCode 旧版健康接口返回的服务状态。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OpenCodeHealthResponse {
+    /// 旧版服务是否健康。
     healthy: bool,
+    /// 旧版服务报告的版本。
+    #[serde(default)]
+    version: Option<String>,
+}
+
+/// OpenCode 新版信息接口返回的服务身份。
+#[derive(Debug, Deserialize)]
+struct OpenCodeInfoResponse {
+    /// 新版服务报告的版本。
+    version: String,
+    /// 新版服务进程标识。
+    pid: u64,
+}
+
+/// OpenCode HTTP 服务检查成功时使用的接口和版本。
+pub(crate) struct OpenCodeHttpServiceCheck {
+    /// 成功响应检查请求的接口路径。
+    pub(crate) path: &'static str,
+    /// 服务接口报告的版本。
+    pub(crate) version: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1529,6 +1551,59 @@ impl OpenCodeEngine {
         }
     }
 
+    /// 检查 OpenCode 新旧版本 HTTP 服务，并返回实际成功的接口和版本。
+    pub(crate) async fn check_http_service(
+        client: &reqwest::Client,
+        base_url: &str,
+        password: &str,
+    ) -> Result<OpenCodeHttpServiceCheck> {
+        // 优先请求新版接口，新版地址返回 404 或 HTML 时尝试旧地址。
+        let base_url = base_url.trim_end_matches('/');
+        let response = client
+            .get(format!("{base_url}/api/info"))
+            .headers(auth_headers(password))
+            .send()
+            .await
+            .context("请求 OpenCode /api/info 失败")?;
+        let status = response.status();
+        let old_service = status == reqwest::StatusCode::NOT_FOUND
+            || (status.is_success()
+                && response.headers().get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/html")));
+        if old_service {
+            // 旧版接口必须返回健康状态，且保留 HTTP 和解析错误。
+            let response = client
+                .get(format!("{base_url}/global/health"))
+                .headers(auth_headers(password))
+                .send()
+                .await
+                .context("请求 OpenCode /global/health 失败")?
+                .error_for_status()
+                .context("OpenCode /global/health 返回 HTTP 错误")?;
+            anyhow::ensure!(response.status().is_success(), "OpenCode /global/health 返回非成功状态: {}", response.status());
+            let health = response.json::<OpenCodeHealthResponse>().await
+                .context("解析 OpenCode /global/health 响应失败")?;
+            anyhow::ensure!(health.healthy, "OpenCode HTTP 服务返回 unhealthy");
+            return Ok(OpenCodeHttpServiceCheck {
+                path: "/global/health",
+                version: health.version,
+            });
+        }
+
+        // 新版接口必须提供非空版本和有效的进程标识。
+        let response = response.error_for_status().context("OpenCode /api/info 返回 HTTP 错误")?;
+        anyhow::ensure!(response.status().is_success(), "OpenCode /api/info 返回非成功状态: {}", response.status());
+        let info = response.json::<OpenCodeInfoResponse>().await
+            .context("解析 OpenCode /api/info 响应失败")?;
+        anyhow::ensure!(!info.version.trim().is_empty(), "OpenCode /api/info 返回空版本");
+        let _ = info.pid;
+        Ok(OpenCodeHttpServiceCheck {
+            path: "/api/info",
+            version: Some(info.version),
+        })
+    }
+
     /// 通过已绑定的 HTTP endpoint 检查 OpenCode 服务，不启动或探测本机进程。
     pub async fn prewarm(&self) -> Result<()> {
         let (base_url, password, label) = match &self.target {
@@ -1544,6 +1619,7 @@ impl OpenCodeEngine {
                 "SSH 远端",
             ),
         };
+        /*
         let response = self
             .http
             .get(format!("{}/global/health", base_url.trim_end_matches('/')))
@@ -1554,6 +1630,11 @@ impl OpenCodeEngine {
             .json::<OpenCodeHealthResponse>()
             .await?;
         anyhow::ensure!(response.healthy, "{label} OpenCode 服务健康检查失败");
+        */
+        // 使用统一协议检查并保留本机或远端上下文。
+        Self::check_http_service(&self.http, &base_url, &password)
+            .await
+            .with_context(|| format!("{label} OpenCode 服务健康检查失败"))?;
         Ok(())
     }
 
@@ -1594,6 +1675,7 @@ impl OpenCodeEngine {
                 "SSH 远端 OpenCode HTTP endpoint".to_string(),
             ),
         };
+        /*
         let response = self
             .http
             .get(format!("{}/global/health", base_url.trim_end_matches('/')))
@@ -1658,6 +1740,33 @@ impl OpenCodeEngine {
                 fixes: vec![],
                 actions: vec![super::EngineCheckAction::NativeHealth(
                     "GET /global/health".to_string(),
+                )],
+            },
+        }
+        */
+        // 根据统一服务检查结果展示实际使用的接口或完整错误。
+        match Self::check_http_service(&self.http, &base_url, &password).await {
+            Ok(check) => {
+                let check_name = format!("GET {}", check.path);
+                OpenCodeHealthReport {
+                    available: true,
+                    version: version.or(check.version),
+                    details: Some(details),
+                    warnings: vec![],
+                    checks: vec![check_name.clone()],
+                    fixes: vec![],
+                    actions: vec![super::EngineCheckAction::NativeHealth(check_name)],
+                }
+            }
+            Err(error) => OpenCodeHealthReport {
+                available: false,
+                version,
+                details: Some(format!("OpenCode 服务检查失败: {error:#}")),
+                warnings: vec![],
+                checks: vec!["检查 OpenCode 服务".to_string()],
+                fixes: vec![],
+                actions: vec![super::EngineCheckAction::NativeHealth(
+                    "检查 OpenCode 服务".to_string(),
                 )],
             },
         }
