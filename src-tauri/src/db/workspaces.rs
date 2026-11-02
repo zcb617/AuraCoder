@@ -184,8 +184,26 @@ pub fn list_archived_workspaces(db: &Database) -> anyhow::Result<Vec<WorkspaceDt
 }
 
 pub fn delete_workspace(db: &Database, workspace_id: &str) -> anyhow::Result<()> {
-    let conn = db.connect()?;
-    let affected = conn
+    // let conn = db.connect()?;
+    let mut conn = db.connect()?;
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .context("failed to start workspace deletion transaction")?;
+    let workspace = get_workspace_by_id_optional(&transaction, workspace_id)?
+        .ok_or_else(|| anyhow::anyhow!("workspace not found: {workspace_id}"))?;
+
+    if workspace.location_kind == "local" && !workspace.root_path.trim().is_empty() {
+        let context_key = crate::extensions::refresh::context_key(Some(&workspace.root_path));
+        transaction
+            .execute(
+                "DELETE FROM extension_catalog_snapshots WHERE context_key = ?1",
+                params![context_key],
+            )
+            .context("failed to delete workspace extension catalog snapshots")?;
+    }
+
+    // let affected = conn
+    let affected = transaction
         .execute(
             "DELETE FROM workspaces WHERE id = ?1",
             params![workspace_id],
@@ -196,6 +214,9 @@ pub fn delete_workspace(db: &Database, workspace_id: &str) -> anyhow::Result<()>
         anyhow::bail!("workspace not found: {workspace_id}");
     }
 
+    transaction
+        .commit()
+        .context("failed to commit workspace deletion")?;
     Ok(())
 }
 

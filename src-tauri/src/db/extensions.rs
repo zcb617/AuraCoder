@@ -44,9 +44,33 @@ pub fn ensure_context(
 ) -> Result<()> {
     let observed_at = normalize_extension_time(observed_at)?;
     let mut conn = db.connect()?;
+    // let transaction = conn.transaction().context("failed to start extension context transaction")?;
     let transaction = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .context("failed to start extension context transaction")?;
+    if context_key.starts_with("cwd:") {
+        let workspace_exists = {
+            let mut statement = transaction
+                .prepare("SELECT root_path FROM workspaces WHERE location_kind = 'local'")
+                .context("failed to prepare workspace paths for extension context")?;
+            let paths = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .context("failed to query workspace paths for extension context")?;
+            let mut found = false;
+            for path in paths {
+                let path = path.context("failed to read workspace path for extension context")?;
+                let path = crate::path_utils::normalize_windows_path_string(&path);
+                if crate::extensions::refresh::context_key(Some(&path)) == context_key {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !workspace_exists {
+            return Ok(());
+        }
+    }
     for kind in EXTENSION_KINDS {
         transaction
             .execute(
@@ -251,17 +275,19 @@ pub fn record_success(
         .context("failed to serialize sanitized extension catalog snapshot")?;
     let conn = db.connect()?;
     conn.execute(
-        "INSERT INTO extension_catalog_snapshots (
-            provider_id, context_key, kind, items_json, fetched_at, last_attempt_at,
-            next_refresh_at, last_error, failure_count
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, NULL, 0)
-         ON CONFLICT(provider_id, context_key, kind) DO UPDATE SET
-            items_json = excluded.items_json,
-            fetched_at = excluded.fetched_at,
-            last_attempt_at = excluded.last_attempt_at,
-            next_refresh_at = excluded.next_refresh_at,
-            last_error = NULL,
-            failure_count = 0",
+        // 原 INSERT 会在删除项目后重新创建扩展记录。
+        // "INSERT INTO extension_catalog_snapshots (
+        //     provider_id, context_key, kind, items_json, fetched_at, last_attempt_at,
+        //     next_refresh_at, last_error, failure_count
+        //  ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, NULL, 0)
+        //  ON CONFLICT(provider_id, context_key, kind) DO UPDATE SET
+        //     items_json = excluded.items_json, fetched_at = excluded.fetched_at,
+        //     last_attempt_at = excluded.last_attempt_at, next_refresh_at = excluded.next_refresh_at,
+        //     last_error = NULL, failure_count = 0",
+        "UPDATE extension_catalog_snapshots
+         SET items_json = ?4, fetched_at = ?5, last_attempt_at = ?5,
+             next_refresh_at = ?6, last_error = NULL, failure_count = 0
+         WHERE provider_id = ?1 AND context_key = ?2 AND kind = ?3",
         params![
             provider_id,
             context_key,
@@ -285,26 +311,30 @@ pub fn record_failure(
 ) -> Result<u32> {
     let attempted_at = normalize_extension_time(attempted_at)?;
     let mut conn = db.connect()?;
+    // let transaction = conn.transaction().context("failed to start extension catalog failure transaction")?;
     let transaction = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .context("failed to start extension catalog failure transaction")?;
-    transaction
-        .execute(
-            "INSERT INTO extension_catalog_snapshots (
-                provider_id, context_key, kind, items_json, next_refresh_at, failure_count
-             ) VALUES (?1, ?2, ?3, '[]', ?4, 0)
-             ON CONFLICT(provider_id, context_key, kind) DO NOTHING",
-            params![provider_id, context_key, kind, attempted_at],
-        )
-        .context("failed to register failed extension catalog refresh")?;
-    let previous_failure_count: i64 = transaction
+    // 原 INSERT 会在删除项目后重新创建扩展记录。
+    // transaction.execute(
+    //     "INSERT INTO extension_catalog_snapshots (
+    //         provider_id, context_key, kind, items_json, next_refresh_at, failure_count
+    //      ) VALUES (?1, ?2, ?3, '[]', ?4, 0)
+    //      ON CONFLICT(provider_id, context_key, kind) DO NOTHING",
+    //     params![provider_id, context_key, kind, attempted_at],
+    // ).context("failed to register failed extension catalog refresh")?;
+    let previous_failure_count: Option<i64> = transaction
         .query_row(
             "SELECT failure_count FROM extension_catalog_snapshots
              WHERE provider_id = ?1 AND context_key = ?2 AND kind = ?3",
             params![provider_id, context_key, kind],
             |row| row.get(0),
         )
+        .optional()
         .context("failed to read extension catalog failure count")?;
+    let Some(previous_failure_count) = previous_failure_count else {
+        return Ok(0);
+    };
     let failure_count = previous_failure_count.max(0) as u32 + 1;
     let next_refresh_at = runtime_env::format_system_time(Local::now() + retry_delay(failure_count));
     transaction
