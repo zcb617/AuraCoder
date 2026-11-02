@@ -586,6 +586,7 @@ impl OpenCodeCli {
         let permissions = thread.permission_mode.clone().unwrap_or_default();
         permissions.validate()?;
 
+        /* 旧实现拒绝沙箱和网络覆盖，保留以便追溯。
         // OpenCode 无法表达统一权限中的 sandbox 和 network 覆盖，发送前明确拒绝此类配置。
         anyhow::ensure!(
             permissions
@@ -601,6 +602,11 @@ impl OpenCodeCli {
                 .map_or(true, |value| value == "automatic"),
             "OpenCode 不支持 network 覆盖"
         );
+        */
+
+        // 读取本次沙箱和网络细分项，空值使用自动策略。
+        let sandbox = permissions.sandbox.first().map(String::as_str).unwrap_or("automatic");
+        let network = permissions.network.first().map(String::as_str).unwrap_or("automatic");
 
         // 先设置基线，再按 V2 最后匹配规则追加受控动作与外部目录例外。
         let trust = match permissions.trust.first().map(String::as_str) {
@@ -627,8 +633,31 @@ impl OpenCodeCli {
                 rules.push(json!({ "action": action, "resource": "*", "effect": "allow" }));
             }
         }
+        /* 旧实现仅依据审批模式限制外部目录，现改为依据沙箱细分项处理。
         if mode == "workspace" {
             rules.push(json!({ "action": "external_directory", "resource": "*", "effect": "ask" }));
+        }
+        */
+        // 只读沙箱禁止编辑，并限制能够间接写文件或联网的入口。
+        if sandbox == "read-only" {
+            rules.push(json!({ "action": "edit", "resource": "*", "effect": "deny" }));
+        }
+        if sandbox == "read-only" || network == "restricted" {
+            // MCP 动作采用 server_tool 命名且非法字符替换为下划线；*_* 覆盖动态工具，最后须用精确的 external_directory 规则恢复目录策略。
+            for action in ["shell", "execute", "subagent", "*_*"] {
+                rules.push(json!({ "action": action, "resource": "*", "effect": "deny" }));
+            }
+        }
+        // 网络受限时禁止原生网络和图像生成入口。
+        if network == "restricted" {
+            for action in ["webfetch", "websearch", "experimental_image_generate"] {
+                rules.push(json!({ "action": action, "resource": "*", "effect": "deny" }));
+            }
+        }
+        // 工作区写入要求外部目录审批，并确保通配限制不会覆盖原有目录基线。
+        if sandbox == "workspace-write" || sandbox == "read-only" || network == "restricted" {
+            let effect = if sandbox == "workspace-write" && baseline != "deny" { "ask" } else { baseline };
+            rules.push(json!({ "action": "external_directory", "resource": "*", "effect": effect }));
         }
         Ok(json!({ "permissions": rules }))
     }

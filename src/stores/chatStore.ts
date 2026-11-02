@@ -30,6 +30,19 @@ import type {
   ThreadStatus
 } from "../types";
 
+/** 提取聊天发送异常中的业务提示，供消息发送和追加失败时展示。 */
+function chatErrorMessage(error: unknown): string {
+  // 优先展示异常对象中的业务消息，兼容直接返回的字符串错误。
+  if (typeof error === "object" && error !== null && "message" in error &&
+      typeof error.message === "string" && error.message.trim().length > 0) {
+    return error.message;
+  }
+  if (typeof error === "string" && error.trim().length > 0) {
+    return error;
+  }
+  return "消息发送失败，请查看日志了解具体原因";
+}
+
 interface ChatState {
   threadId: string | null;
   /** 记录各线程是否已经完成 CLI 会话准备，仅存在于当前前端内存。 */
@@ -3050,6 +3063,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // 旧的独立运行选择和权限保存入口已停用，保留参数变化时的保存入口供 ChatPanel 使用。
       return true;
     } catch (error) {
+      // 保留原始异常供排查，并将业务错误转换为可展示的提示。
+      console.error("发送消息失败:", error);
+      const errorMessage = chatErrorMessage(error);
       pendingTurnMetaByThread.delete(threadId);
       set((current) => {
         if (current.threadId !== threadId) {
@@ -3065,7 +3081,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
           preparingEngineId: null,
           preparingAttachments: false,
           turnStartedAt: null,
-          error: String(error),
+          // 旧逻辑：error: String(error)，对象异常会显示为 [object Object]。
+          error: errorMessage,
         };
       });
       return false;
@@ -3137,13 +3154,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }));
       return true;
     } catch (error) {
+      // 保留原始异常供排查，并统一追加消息的失败提示。
+      console.error("追加消息失败:", error);
+      const errorMessage = chatErrorMessage(error);
       set((current) => ({
         messages: applyHydrationWindow(
           updateSteerBlockDelivery(current.messages, steerBlock.steerId, "failed", {
-            failureReason: String(error),
+            // 旧逻辑：failureReason: String(error)。
+            failureReason: errorMessage,
           }),
         ),
-        error: String(error),
+        // 旧逻辑：error: String(error)。
+        error: errorMessage,
       }));
       return false;
     }
