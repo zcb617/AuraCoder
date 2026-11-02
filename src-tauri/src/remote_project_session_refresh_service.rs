@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use futures::{stream, StreamExt};
 use tauri::{AppHandle, Manager};
 
 use crate::db::Database;
@@ -348,6 +349,17 @@ pub async fn refresh_all_project_sessions(
         }
     };
 
+    let max_concurrent_projects = match std::thread::available_parallelism() {
+        Ok(threads) => (threads.get() / 2).max(1),
+        Err(error) => {
+            log::warn!("读取 CPU 逻辑线程数失败，项目同步并发数使用 1: error={error:#}");
+            1
+        }
+    };
+    log::info!("全量项目会话同步开始: max_concurrent_projects={max_concurrent_projects}");
+
+    // 原逐项目串行同步保留注释，改由下方按并发上限调度。
+    /*
     let mut reports = Vec::new();
     for workspace in workspaces {
         if !is_local_workspace(&workspace) && !is_enabled_ssh_workspace(&workspace) {
@@ -360,6 +372,29 @@ pub async fn refresh_all_project_sessions(
                     "同步项目会话失败: workspace_id={} error={error:#}",
                     workspace.id,
                 );
+            }
+        }
+    }
+    reports
+    */
+    let mut pending = stream::iter(workspaces.into_iter().filter(|workspace| {
+        is_local_workspace(workspace) || is_enabled_ssh_workspace(workspace)
+    }))
+    .map(|workspace| {
+        let db = db.clone();
+        async move {
+            let result = sync_project_sessions(app, db, &workspace.id).await;
+            (workspace.id, result)
+        }
+    })
+    .buffer_unordered(max_concurrent_projects);
+
+    let mut reports = Vec::new();
+    while let Some((workspace_id, result)) = pending.next().await {
+        match result {
+            Ok(report) => reports.push(report),
+            Err(error) => {
+                log::warn!("同步项目会话失败: workspace_id={} error={error:#}", workspace_id);
             }
         }
     }
