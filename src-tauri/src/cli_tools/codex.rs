@@ -347,91 +347,50 @@ impl CodexCli {
         let permissions = thread.permission_mode.clone().unwrap_or_default();
         permissions.validate()?;
 
-        // 将 workspace 信任状态归一化，供 automatic 权限选择和原生 reviewer 决策复用。
+        // 将 workspace 信任状态归一化，供 automatic 网络权限继承。
         let workspace_trust = workspace.trust_level.as_str();
         let requested_trust = permissions.trust.first().map(String::as_str);
         let effective_trust = match requested_trust {
             Some(value) if value != "automatic" => value,
             _ => workspace_trust,
         };
-        let preset = permissions.autonomy_preset.first().map(String::as_str);
         let approval = permissions.approval.first().map(String::as_str).unwrap_or("automatic");
         let sandbox = permissions.sandbox.first().map(String::as_str).unwrap_or("automatic");
         let network = permissions.network.first().map(String::as_str).unwrap_or("automatic");
 
-        // 将预设或自定义统一权限字段映射为 Codex 原生审批、沙箱和网络字段。
-        let (approval_policy, approval_is_automatic, mut sandbox_mode, mut allow_network, auto_mcp) =
-            match preset {
-                Some("read-only") => ("untrusted", false, Some("read-only"), false, false),
-                Some("ask") => ("on-request", false, Some("workspace-write"), false, false),
-                Some("auto") => ("on-request", true, Some("workspace-write"), true, true),
-                Some("full") => ("never", false, Some("danger-full-access"), true, true),
-                Some("automatic") | None => {
-                    let (approval_policy, allow_network) = if effective_trust == "restricted" {
-                        ("untrusted", false)
-                    } else {
-                        ("on-request", effective_trust == "trusted")
-                    };
-                    let sandbox_mode = if preset.is_some() {
-                        Some("workspace-write")
-                    } else {
-                        match sandbox {
-                            "read-only" => Some("read-only"),
-                            "workspace-write" => Some("workspace-write"),
-                            "full-access" => Some("danger-full-access"),
-                            "automatic" => Some("workspace-write"),
-                            _ => anyhow::bail!("Codex sandbox 权限值不支持: {sandbox}"),
-                        }
-                    };
-                    let approval_policy = if preset.is_some() {
-                        approval_policy
-                    } else {
-                        match approval {
-                            "restricted" => "untrusted",
-                            "ask" => "on-request",
-                            "autonomous" => "never",
-                            "automatic" => approval_policy,
-                            _ => anyhow::bail!("Codex approval 权限值不支持: {approval}"),
-                        }
-                    };
-                    let approval_is_automatic =
-                        preset.is_some() || approval == "automatic";
-                    let allow_network = if preset.is_some() {
-                        allow_network
-                    } else {
-                        match network {
-                            "enabled" => true,
-                            "restricted" => false,
-                            "automatic" => allow_network,
-                            _ => anyhow::bail!("Codex network 权限值不支持: {network}"),
-                        }
-                    };
-                    (approval_policy, approval_is_automatic, sandbox_mode, allow_network, false)
-                }
-                _ => anyhow::bail!("Codex autonomy preset 不支持: {}", preset.unwrap_or_default()),
-            };
+        // 将审批细分项独立转换为原生审批策略和审核人。
+        let (approval_policy, approvals_reviewer, auto_mcp) = match approval {
+            "restricted" => ("untrusted", "user", false),
+            "ask" => ("on-request", "user", false),
+            "autonomous" => ("never", "user", true),
+            "automatic" | "" => ("on-request", "auto_review", true),
+            _ => anyhow::bail!("Codex approval 权限值不支持: {approval}"),
+        };
+        // 将沙箱和网络细分项分别转换为原生权限。
+        let mut sandbox_mode = match sandbox {
+            "read-only" => Some("read-only"),
+            "workspace-write" | "automatic" | "" => Some("workspace-write"),
+            "full-access" => Some("danger-full-access"),
+            _ => anyhow::bail!("Codex sandbox 权限值不支持: {sandbox}"),
+        };
+        let mut allow_network = match network {
+            "enabled" => true,
+            "restricted" => false,
+            "automatic" | "" => effective_trust == "trusted",
+            _ => anyhow::bail!("Codex network 权限值不支持: {network}"),
+        };
 
         // full-access 原生沙箱必须同时允许网络，避免生成互相矛盾的原生策略。
         if sandbox_mode == Some("danger-full-access") {
             allow_network = true;
         }
-        let approvals_reviewer = if effective_trust == "trusted" && approval_is_automatic {
-            "auto_review"
-        } else {
-            "user"
-        };
-
-        // 本地 external sandbox 继续使用其既有策略；自定义沙箱遇到不支持组合时明确失败。
+        // 本地 external sandbox 按沙箱细分项处理，不支持的显式沙箱直接报错。
         if context.location_kind == CliLocationKind::Local
             && self.local_engine().await?.uses_external_sandbox().await
         {
-            if preset.is_some() && preset != Some("full") {
+            if matches!(sandbox, "automatic" | "") {
                 sandbox_mode = None;
-            } else if preset.is_none() && sandbox == "automatic" {
-                sandbox_mode = None;
-            } else if preset.is_none()
-                && matches!(sandbox_mode, Some("read-only" | "workspace-write"))
-            {
+            } else if matches!(sandbox, "read-only" | "workspace-write") {
                 anyhow::bail!(
                     "Codex 自定义 read-only/workspace-write 沙箱在本地 external sandbox 模式下不可用"
                 );

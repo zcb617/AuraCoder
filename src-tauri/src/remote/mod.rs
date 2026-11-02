@@ -1584,25 +1584,18 @@ impl RemoteTunnelManager {
                                                 .filter(|value| !value.is_empty())
                                                 .map(str::to_string)
                                                 .ok_or_else(|| "thread_id is required".to_string());
-                                            let preset = request.payload.get("preset")
-                                                .and_then(Value::as_str)
-                                                .map(str::trim)
-                                                .filter(|value| matches!(*value, "inherit" | "read-only" | "ask" | "auto" | "full"))
-                                                .map(str::to_string)
-                                                .ok_or_else(|| "preset is invalid".to_string());
-                                            match (thread_id, preset) {
-                                                (Ok(thread_id), Ok(preset)) => {
+                                            // 接收前端展开的完整统一权限，直接交给会话服务校验保存。
+                                            let permissions = request.payload.get("permission_values")
+                                                .ok_or_else(|| "permission_values is required".to_string())
+                                                .and_then(|value| serde_json::from_value::<crate::models::PermissionComponentJson>(value.clone())
+                                                    .map_err(|error| {
+                                                        log::error!("无效的 permission_values: {}", error);
+                                                        format!("permission_values is invalid: {error}")
+                                                    }));
+                                            match (thread_id, permissions) {
+                                                (Ok(thread_id), Ok(permissions)) => {
                                                     async {
                                                     let thread_service = ThreadService::new(state.clone());
-                                                    let mut permissions = thread_service
-                                                        .get_permissions(&thread_id)
-                                                        .await
-                                                        .map_err(|error| error.to_string())?;
-                                                    permissions.autonomy_preset = if preset == "inherit" {
-                                                        Vec::new()
-                                                    } else {
-                                                        vec![preset]
-                                                    };
                                                     let saved_thread = thread_service
                                                         .save_permissions(&thread_id, permissions)
                                                         .await

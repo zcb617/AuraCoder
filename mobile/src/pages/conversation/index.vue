@@ -311,10 +311,10 @@ function formatReasoningEffort(value: string) {
 // 重构初版直接显示协议值（low、high 等），保留原写法以便追溯。
 // const runtimeLabel = computed(() => [selectedModel.value?.displayName || selectedModelId.value, selectedReasoningEffort.value].filter(Boolean).join(" · ") || "模型与思考强度");
 const runtimeLabel = computed(() => [selectedModel.value?.displayName, selectedReasoningEffort.value && formatReasoningEffort(selectedReasoningEffort.value)].filter(Boolean).join(" · ") || "模型与思考强度");
-const accessLabel = computed(() => selectedAutonomyPreset.value === "full" ? "完全访问" : selectedAutonomyPreset.value === "auto" ? "自动权限" : selectedAutonomyPreset.value === "read-only" ? "只读" : selectedAutonomyPreset.value === "ask" ? "标准权限" : "跟随权限");
+const accessLabel = computed(() => selectedAutonomyPreset.value === "full" ? "完全访问" : selectedAutonomyPreset.value === "auto" ? "自动权限" : selectedAutonomyPreset.value === "read-only" ? "只读" : selectedAutonomyPreset.value === "ask" ? "标准权限" : "自动");
 const composerPlaceholder = computed(() => !auracoderConnectionManager.getState(auracoderId.value).peerOnline ? "桌面离线，不能发送消息" : activeTurn.value ? "当前回复尚未完成" : workspace.value ? `在 ${workspace.value.name} 上工作` : "给 AuraCoder 发消息…");
 const autonomyOptions: Array<{ id: AutonomyPreset; label: string; description: string }> = [
-  { id: "inherit", label: "跟随桌面默认设置", description: "使用桌面 AuraCoder 的默认权限" },
+  { id: "inherit", label: "自动", description: "使用各项自动权限设置" },
   { id: "read-only", label: "只读", description: "仅允许读取工作区内容" },
   { id: "ask", label: "标准权限", description: "写入或联网前请求确认" },
   { id: "auto", label: "自动权限", description: "允许工作区写入与联网" },
@@ -338,6 +338,7 @@ function applyThreadDefaults(value: Thread | null) {
         : sandboxMode === "workspace-write" || approvalPolicy === "on-request" ? "ask" : "inherit";
 }
 */
+/** 根据会话记录恢复模型、思考强度和权限套餐。 */
 function applyThreadDefaults(value: Thread | null) {
   if (!value) return;
   const metadata = value.engineMetadata || {};
@@ -353,13 +354,9 @@ function applyThreadDefaults(value: Thread | null) {
     : model?.supportedReasoningEfforts.find((item) => item.reasoningEffort === model.defaultReasoningEffort)?.reasoningEffort
       ?? model?.supportedReasoningEfforts[0]?.reasoningEffort
       ?? "";
-  const sandboxMode = typeof metadata.sandboxMode === "string" ? metadata.sandboxMode : "";
-  const approvalPolicy = typeof metadata.sandboxApprovalPolicy === "string" ? metadata.sandboxApprovalPolicy
-    : typeof metadata.approvalPolicy === "string" ? metadata.approvalPolicy : "";
-  selectedAutonomyPreset.value = sandboxMode === "danger-full-access" && approvalPolicy === "never" ? "full"
-    : sandboxMode === "read-only" || approvalPolicy === "untrusted" ? "read-only"
-      : sandboxMode === "workspace-write" && metadata.sandboxAllowNetwork === true ? "auto"
-        : sandboxMode === "workspace-write" || approvalPolicy === "on-request" ? "ask" : "inherit";
+  // 直接使用统一权限记录回显套餐，自动或未设置时显示自动。
+  const preset = value.permissionMode?.autonomyPreset?.[0];
+  selectedAutonomyPreset.value = preset === "read-only" || preset === "ask" || preset === "auto" || preset === "full" ? preset : "inherit";
 }
 
 async function initializeConversation() {
@@ -479,10 +476,29 @@ function chooseReasoningEffort(reasoningEffort: string) {
   selectedReasoningEffort.value = reasoningEffort;
 }
 
+/** 根据手机端选择的套餐提交完整统一权限。 */
 function chooseAutonomy(preset?: AutonomyPreset) {
   if (preset) {
+    // 套餐在前端展开，保留默认设置。
+    const packages: Record<AutonomyPreset, [string, string, string, string, string]> = {
+      inherit: ["automatic", "automatic", "automatic", "automatic", "automatic"],
+      "read-only": ["read-only", "restricted", "restricted", "read-only", "restricted"],
+      ask: ["ask", "standard", "ask", "workspace-write", "restricted"],
+      auto: ["auto", "trusted", "automatic", "workspace-write", "enabled"],
+      full: ["full", "trusted", "autonomous", "full-access", "enabled"],
+    };
+    const values = packages[preset];
+    const permissionValues = {
+      autonomyPreset: [values[0]],
+      trust: [values[1]],
+      approval: [values[2]],
+      sandbox: [values[3]],
+      network: [values[4]],
+      defaultForNewThreads: [...(thread.value?.permissionMode?.defaultForNewThreads ?? [])],
+    };
     permissionSaving.value = true;
-    void auracoderConnectionManager.request<Thread>(auracoderId.value, "thread.set_autonomy_preset", { thread_id: threadId.value, preset }).then((updated) => {
+    // 保存完成后刷新会话和权限选择状态。
+    void auracoderConnectionManager.request<Thread>(auracoderId.value, "thread.set_autonomy_preset", { thread_id: threadId.value, permission_values: permissionValues }).then((updated) => {
       projectStore.upsert(auracoderId.value, updated);
       selectedAutonomyPreset.value = preset;
       permissionPickerOpen.value = false;
@@ -491,24 +507,7 @@ function chooseAutonomy(preset?: AutonomyPreset) {
     }).finally(() => {
       permissionSaving.value = false;
     });
-    return;
   }
-  /* 重构初版使用系统 ActionSheet，保留其实现以便追溯。
-  const options: Array<{ id: AutonomyPreset; label: string }> = [
-    { id: "inherit", label: "跟随默认权限" }, { id: "read-only", label: "只读权限" }, { id: "ask", label: "标准访问权限" }, { id: "auto", label: "工作区自动权限" }, { id: "full", label: "完全访问权限" },
-  ];
-  uni.showActionSheet({ itemList: options.map((item) => item.label), success: async (result) => {
-    const option = options[result.tapIndex];
-    if (!option) return;
-    try {
-      const updated = await auracoderConnectionManager.request<Thread>(auracoderId.value, "thread.set_autonomy_preset", { thread_id: threadId.value, preset: option.id });
-      projectStore.upsert(auracoderId.value, updated);
-      selectedAutonomyPreset.value = option.id;
-    } catch (error) {
-      uni.showToast({ title: error instanceof Error ? error.message : "无法更新权限", icon: "none" });
-    }
-  } });
-  */
 }
 
 function attachmentCounts() {
@@ -740,7 +739,7 @@ onUnload(() => {
   <!-- @vue-ignore -->
   <view v-if="false && conversation" aria-hidden="true">
   <view class="conversation-page">
-    <view class="conversation-meta"><button class="meta-chip" @tap="chooseModel">{{ selectedModel?.displayName || selectedModelId || '模型' }}</button><button class="meta-chip" @tap="chooseReasoningEffort">{{ selectedReasoningEffort || '思考强度' }}</button><button class="meta-chip" @tap="chooseAutonomy">{{ selectedAutonomyPreset === 'full' ? '完全访问' : selectedAutonomyPreset === 'auto' ? '自动权限' : selectedAutonomyPreset === 'read-only' ? '只读' : selectedAutonomyPreset === 'ask' ? '标准权限' : '跟随权限' }}</button></view>
+    <view class="conversation-meta"><button class="meta-chip" @tap="chooseModel">{{ selectedModel?.displayName || selectedModelId || '模型' }}</button><button class="meta-chip" @tap="chooseReasoningEffort">{{ selectedReasoningEffort || '思考强度' }}</button><button class="meta-chip" @tap="chooseAutonomy">{{ selectedAutonomyPreset === 'full' ? '完全访问' : selectedAutonomyPreset === 'auto' ? '自动权限' : selectedAutonomyPreset === 'read-only' ? '只读' : selectedAutonomyPreset === 'ask' ? '标准权限' : '自动' }}</button></view>
     <view v-if="!auracoderConnectionManager.getState(auracoderId).peerOnline" class="offline-banner">桌面 AuraCoder 当前离线，消息与草稿已保留。</view>
     <view v-if="!conversation && !auracoderConnectionManager.getState(auracoderId).peerOnline" class="empty-state conversation-waiting"><view class="loader"></view><text>正在等待桌面 AuraCoder 连接…</text></view>
     <!-- 未经用户确认的滚动加载改动，保留记录但不启用。 -->

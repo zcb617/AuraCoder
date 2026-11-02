@@ -602,50 +602,6 @@ impl OpenCodeCli {
             "OpenCode 不支持 network 覆盖"
         );
 
-        /*
-        // 按当前统一权限配置和 workspace 信任级别生成完整 OpenCode 原生权限数组。
-        let trust = match permissions.trust.first().map(String::as_str) {
-            Some("automatic") | None => workspace.trust_level.as_str(),
-            Some(value) => value,
-        };
-        let trust_rules = match trust {
-            "restricted" => json!([{ "permission": "*", "pattern": "*", "action": "deny" }]),
-            "trusted" | "standard" => json!([
-                { "permission": "*", "pattern": "*", "action": "ask" },
-                { "permission": "question", "pattern": "*", "action": "allow" }
-            ]),
-            _ => anyhow::bail!("workspace 信任级别不支持 OpenCode 权限映射: {trust}"),
-        };
-        let rules = match permissions.autonomy_preset.first().map(String::as_str) {
-            Some("read-only") => {
-                json!([{ "permission": "*", "pattern": "*", "action": "deny" }])
-            }
-            Some("ask") => json!([
-                { "permission": "*", "pattern": "*", "action": "ask" },
-                { "permission": "question", "pattern": "*", "action": "allow" }
-            ]),
-            Some("auto") | Some("full") => {
-                json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
-            }
-            Some("automatic") => trust_rules,
-            None => match permissions.approval.first().map(String::as_str) {
-                Some("restricted") => {
-                    json!([{ "permission": "*", "pattern": "*", "action": "deny" }])
-                }
-                Some("ask") => json!([
-                    { "permission": "*", "pattern": "*", "action": "ask" },
-                    { "permission": "question", "pattern": "*", "action": "allow" }
-                ]),
-                Some("autonomous") => {
-                    json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
-                }
-                Some("automatic") | None => trust_rules,
-                Some(value) => anyhow::bail!("OpenCode approval 配置不支持: {value}"),
-            },
-            Some(value) => anyhow::bail!("OpenCode autonomy preset 不支持: {value}"),
-        };
-        Ok(json!({ "permission": rules }))
-        */
         // 先设置基线，再按 V2 最后匹配规则追加受控动作与外部目录例外。
         let trust = match permissions.trust.first().map(String::as_str) {
             Some("automatic") | None => workspace.trust_level.as_str(),
@@ -653,20 +609,15 @@ impl OpenCodeCli {
         };
         anyhow::ensure!(matches!(trust, "restricted" | "trusted" | "standard"),
             "workspace 信任级别不支持 OpenCode 权限映射: {trust}");
-        let mode = match permissions.autonomy_preset.first().map(String::as_str) {
-            Some("read-only") => "restricted",
+        // 按审批细分项和工作区信任状态确定原生权限基线。
+        let mode = match permissions.approval.first().map(String::as_str) {
+            Some("restricted") => "restricted",
             Some("ask") => "ask",
-            Some("auto") => "workspace",
-            Some("full") => "full",
-            Some("automatic") | None => match permissions.approval.first().map(String::as_str) {
-                Some("restricted") => "restricted",
-                Some("ask") => "ask",
-                Some("autonomous") => "full",
-                Some("automatic") | None if trust == "restricted" => "restricted",
-                Some("automatic") | None => "ask",
-                Some(value) => anyhow::bail!("OpenCode approval 配置不支持: {value}"),
-            },
-            Some(value) => anyhow::bail!("OpenCode autonomy preset 不支持: {value}"),
+            Some("autonomous") => "full",
+            Some("automatic") | Some("") | None if trust == "restricted" => "restricted",
+            Some("automatic") | Some("") | None if trust == "trusted" => "workspace",
+            Some("automatic") | Some("") | None => "ask",
+            Some(value) => anyhow::bail!("OpenCode approval 配置不支持: {value}"),
         };
         let baseline = match mode { "restricted" => "deny", "ask" => "ask", _ => "allow" };
         let mut rules = vec![json!({ "action": "*", "resource": "*", "effect": baseline })];

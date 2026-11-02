@@ -279,7 +279,7 @@ export type ChatEngineId = "codex" | "claude" | "opencode";
 export type PermissionComponentValue = string[];
 /** 前端与后端共享的 CLI 无关六键权限对象。 */
 export interface PermissionComponentJson {
-  /** 当前统一权限预设；空数组表示自定义配置。 */
+  /** 前端权限套餐展示记录；空数组表示自定义，后端不据此解析权限。 */
   autonomyPreset: string[];
   /** 当前项目或工作区信任级别。 */
   trust: string[];
@@ -289,7 +289,7 @@ export interface PermissionComponentJson {
   sandbox: string[];
   /** 统一权限对象中的网络策略选项。 */
   network: string[];
-  /** 是否将当前预设作为新会话默认值。 */
+  /** 前端新会话默认套餐名。 */
   defaultForNewThreads: string[];
 }
 

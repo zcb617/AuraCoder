@@ -41,7 +41,28 @@ describe("PermissionPicker 统一 JSON 契约", () => {
     expect(updatePermissionComponentValue(values, "approval", "ask").autonomyPreset).toEqual([]);
     expect(updatePermissionComponentValue(values, "sandbox", "workspace-write").autonomyPreset).toEqual([]);
     expect(updatePermissionComponentValue(values, "network", "enabled").autonomyPreset).toEqual([]);
-    expect(updatePermissionComponentValue(values, "trust", "trusted").autonomyPreset).toEqual(["full"]);
+    expect(updatePermissionComponentValue(values, "trust", "trusted").autonomyPreset).toEqual([]);
+  });
+
+  it("各套餐填写完整权限，修改细分项保留其他权限和默认套餐", () => {
+    const values = normalizePermissionComponent({ defaultForNewThreads: ["ask"] });
+    const expected: Record<string, string[]> = {
+      automatic: ["automatic", "automatic", "automatic", "automatic"],
+      "read-only": ["restricted", "restricted", "read-only", "restricted"],
+      ask: ["standard", "ask", "workspace-write", "restricted"],
+      auto: ["trusted", "automatic", "workspace-write", "enabled"],
+      full: ["trusted", "autonomous", "full-access", "enabled"],
+    };
+    for (const [preset, fields] of Object.entries(expected)) {
+      const result = updatePermissionComponentValue(values, "autonomyPreset", preset);
+      expect([result.trust[0], result.approval[0], result.sandbox[0], result.network[0]]).toEqual(fields);
+      expect(result.defaultForNewThreads).toEqual(["ask"]);
+    }
+    const full = updatePermissionComponentValue(values, "autonomyPreset", "full");
+    expect(updatePermissionComponentValue(full, "approval", "ask")).toEqual({
+      autonomyPreset: [], trust: ["trusted"], approval: ["ask"],
+      sandbox: ["full-access"], network: ["enabled"], defaultForNewThreads: ["ask"],
+    });
   });
 
   it("默认预设必须与当前预设相同才显示选中", () => {

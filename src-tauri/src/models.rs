@@ -186,7 +186,7 @@ fn scheduled_task_default_device_id() -> String {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PermissionComponentJson {
-    /// 线程统一自主级别预设；空数组表示使用高级权限字段。
+    /// 前端套餐展示记录；空数组表示自定义，CLI 权限仅按细分项解析。。
     pub autonomy_preset: Vec<String>,
     /// 线程执行时采用的统一信任等级选择。
     pub trust: Vec<String>,

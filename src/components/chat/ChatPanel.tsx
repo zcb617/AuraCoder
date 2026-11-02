@@ -57,6 +57,7 @@ import { useGitStore } from "../../stores/gitStore";
 import { useTerminalStore, type LayoutMode } from "../../stores/terminalStore";
 import { toast } from "../../stores/toastStore";
 import { ipc, listenExtensionCatalogUpdated } from "../../lib/ipc";
+import { applyPermissionPackage, loadDefaultPermissionPackage } from "../../lib/permissionPackages";
 import {
   clampChatInputHeight,
   normalizeChatInputHeight,
@@ -2832,6 +2833,20 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     // UNKNOWN_ENGINE_ID），比较处按 string 宽化。
     const settings = sessionSettingsRef.current;
     const savedThread = activeThreadInCurrentWorkspace ? activeThread : null;
+    // 新会话读取默认套餐，异步返回时保留用户已经修改的权限。
+    if (composerSessionKey?.startsWith("new:") && !savedThread && settings.permissionMode == null) {
+      const sessionKey = composerSessionKey;
+      const scopeKey = composerSettingsScopeKey;
+      void loadDefaultPermissionPackage().then((permissions) => {
+        if (lastSyncedThreadIdRef.current === scopeKey &&
+            useChatComposerStore.getState().settingsBySession[sessionKey]?.permissionMode == null) {
+          setSessionSettings(sessionKey, { permissionMode: permissions });
+        }
+      }).catch((error) => {
+        console.error("读取新会话默认权限套餐失败", error);
+        toast.error("读取新会话默认权限套餐失败");
+      });
+    }
     const savedThreadHasKnownEngine =
       Boolean(savedThread) && (savedThread!.engineId as string) !== "unknown";
     const defaultEngineId =
@@ -4088,13 +4103,22 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
       ? useChatComposerStore.getState().settingsBySession[submissionSourceSessionKey] ??
         EMPTY_CHAT_SESSION_SETTINGS
       : EMPTY_CHAT_SESSION_SETTINGS;
-    const inheritNewDraftPermissions =
-      Boolean(composerSessionKey?.startsWith("new:")) &&
-      !activeThreadInCurrentWorkspace &&
-      sourceSettings.permissionMode === undefined;
-    const submittedPermissionValues = inheritNewDraftPermissions
-      ? undefined
-      : permissionComponent;
+    // 发送时始终使用来源会话的完整权限，缺失时读取默认套餐。
+    let submittedPermissionValues = sourceSettings.permissionMode ??
+      (submissionSourceSessionKey === composerSessionKey && activeThreadInCurrentWorkspace
+        ? activeThread?.permissionMode : null);
+    if (!submittedPermissionValues) {
+      try {
+        const defaultPermissions = await loadDefaultPermissionPackage();
+        submittedPermissionValues = (submissionSourceSessionKey
+          ? useChatComposerStore.getState().settingsBySession[submissionSourceSessionKey]?.permissionMode
+          : null) ?? defaultPermissions;
+      } catch (error) {
+        console.error("读取发送消息的默认权限套餐失败", error);
+        toast.error("读取默认权限套餐失败，无法发送消息");
+        return false;
+      }
+    }
     const submittedSendMethod = sessionMessageSendMode;
     const submittedSettings: ChatSessionSettings = {
       engineId: selectedEngineId,
@@ -4832,10 +4856,8 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     batchApprovalInFlightRef.current = true;
     try {
       if (stopAsking) {
-        const next = {
-          ...permissionComponent,
-          autonomyPreset: ["full"],
-        } satisfies PermissionComponentJson;
+        // 不再询问时保存完全自主套餐的全部权限细分项。
+        const next = applyPermissionPackage(permissionComponent, "full");
         const permissionsSaved = await saveThreadRuntimeSelectionPatch(targetThreadId, {
           permissionMode: next,
         });

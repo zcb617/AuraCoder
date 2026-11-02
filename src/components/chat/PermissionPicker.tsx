@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { PermissionComponentJson } from "../../types";
+import { applyPermissionPackage } from "../../lib/permissionPackages";
 
 type UnifiedPermissionOption = {
   /** 统一权限参数的稳定值。 */
@@ -76,9 +77,11 @@ export function updatePermissionComponentValue(
   key: PermissionComponentKey,
   next: string,
 ): PermissionComponentJson {
-  // 更新被选中的统一权限属性，并在高级选项变化时将预设标为自定义。
+  // 选择套餐时一次填写全部权限细分项。
+  if (key === "autonomyPreset") return applyPermissionPackage(values, next);
+  // 修改细分项后标记为自定义，默认套餐设置保持独立。
   const updated = { ...values, [key]: [next] };
-  if (key !== "trust" && key !== "autonomyPreset") {
+  if (key !== "defaultForNewThreads") {
     updated.autonomyPreset = [];
   }
   return updated;

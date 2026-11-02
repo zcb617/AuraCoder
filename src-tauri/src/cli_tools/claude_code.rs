@@ -828,53 +828,29 @@ impl ClaudeCodeCli {
             Some("automatic") | None => workspace.trust_level.as_str(),
             Some(value) => value,
         };
-        let preset = permissions.autonomy_preset.first().map(String::as_str);
-
-        // 统一 preset 转为 Claude 支持的原生 permissionMode、sandboxMode 与 allowNetwork。
-        let (permission_mode, sandbox_mode, allow_network) = match preset {
-            Some("read-only") => ("dontAsk", "read-only", false),
-            Some("ask") => ("default", "workspace-write", false),
-            Some("auto") => (
-                "acceptEdits",
-                "workspace-write",
-                trust == "trusted",
-            ),
-            Some("full") => ("bypassPermissions", "danger-full-access", true),
-            Some("automatic") => (
-                match trust {
-                    "restricted" => "dontAsk",
-                    "trusted" => "acceptEdits",
-                    _ => "default",
-                },
-                "workspace-write",
-                trust == "trusted",
-            ),
-            None | Some(_) => {
-                let permission_mode = match permissions.approval.first().map(String::as_str) {
-                    Some("restricted") => "dontAsk",
-                    Some("ask") => "default",
-                    Some("autonomous") => "bypassPermissions",
-                    _ => match trust {
-                        "restricted" => "dontAsk",
-                        "trusted" => "acceptEdits",
-                        _ => "default",
-                    },
-                };
-                let sandbox_mode = match permissions.sandbox.first().map(String::as_str) {
-                    Some("read-only") => "read-only",
-                    Some("full-access") => "danger-full-access",
-                    _ => "workspace-write",
-                };
-                let allow_network = if sandbox_mode == "danger-full-access" {
-                    true
-                } else {
-                    match permissions.network.first().map(String::as_str) {
-                        Some("enabled") => true,
-                        Some("restricted") => false,
-                        _ => trust == "trusted",
-                    }
-                };
-                (permission_mode, sandbox_mode, allow_network)
+        // 按审批、沙箱和网络细分项分别生成 Claude 原生权限。
+        let permission_mode = match permissions.approval.first().map(String::as_str) {
+            Some("restricted") => "dontAsk",
+            Some("ask") => "default",
+            Some("autonomous") => "bypassPermissions",
+            _ => match trust {
+                "restricted" => "dontAsk",
+                "trusted" => "acceptEdits",
+                _ => "default",
+            },
+        };
+        let sandbox_mode = match permissions.sandbox.first().map(String::as_str) {
+            Some("read-only") => "read-only",
+            Some("full-access") => "danger-full-access",
+            _ => "workspace-write",
+        };
+        let allow_network = if sandbox_mode == "danger-full-access" {
+            true
+        } else {
+            match permissions.network.first().map(String::as_str) {
+                Some("enabled") => true,
+                Some("restricted") => false,
+                _ => trust == "trusted",
             }
         };
 

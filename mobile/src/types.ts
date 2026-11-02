@@ -70,6 +70,22 @@ export interface Workspace {
   lastOpenedAt: string;
 }
 
+/** 手机端提交和回显的统一线程权限。 */
+export interface PermissionComponentJson {
+  /** 当前权限套餐的展示标识。 */
+  autonomyPreset: string[];
+  /** 工作区信任权限。 */
+  trust: string[];
+  /** 操作审批权限。 */
+  approval: string[];
+  /** 文件系统沙箱权限。 */
+  sandbox: string[];
+  /** 网络访问权限。 */
+  network: string[];
+  /** 新会话默认权限套餐。 */
+  defaultForNewThreads: string[];
+}
+
 export interface Thread {
   id: string;
   workspaceId: string;
@@ -78,6 +94,8 @@ export interface Thread {
   engineThreadId?: string | null;
   modelId: string;
   engineMetadata?: Record<string, unknown> | null;
+  /** 当前会话保存的统一权限。 */
+  permissionMode?: PermissionComponentJson | null;
   title: string;
   status: "idle" | "streaming" | "awaiting_approval" | "error" | "completed";
   messageCount: number;
