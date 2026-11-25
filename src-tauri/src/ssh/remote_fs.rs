@@ -73,6 +73,24 @@ pub async fn read_file(
     })
 }
 
+/// 读取远端工作区内的原始图片字节。
+pub async fn read_binary_file(
+    record: &SshConnectionRecord,
+    root: &str,
+    file_path: &str,
+) -> anyhow::Result<Vec<u8>> {
+    // 校验工作区范围并限制远端文件大小。
+    validate_root(root)?;
+    validate_remote_relative_path(file_path, false)?;
+    let command = scope_command(root, file_path, &format!(
+        "[ -f \"$target\" ] && [ -r \"$target\" ] || exit 24; size=$(wc -c < \"$target\") || exit 25; [ \"$size\" -le {READ_FILE_MAX_SIZE} ] || exit 26; head -c {} -- \"$target\"",
+        READ_FILE_MAX_SIZE + 1
+    ));
+    let bytes = gateway::run_command_with_input(record, &command, &[]).await.context("读取远端图片失败")?;
+    anyhow::ensure!(bytes.len() <= READ_FILE_MAX_SIZE as usize, "图片超过 10 MiB 大小限制");
+    Ok(bytes)
+}
+
 pub async fn file_version(
     record: &SshConnectionRecord,
     root: &str,

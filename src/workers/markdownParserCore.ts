@@ -102,6 +102,11 @@ function sanitizeUrl(url: string, attrName: string): string {
     return trimmed;
   }
 
+  // 图片允许普通相对路径，协议和控制字符仍由安全过滤拦截。
+  if (attrName.toLowerCase() === "src" && !/^[a-z][a-z0-9+.-]*:/i.test(trimmed) && !trimmed.startsWith("//") && !/[\x00-\x1f\x7f]/.test(trimmed)) {
+    return trimmed;
+  }
+
   return "#";
 }
 

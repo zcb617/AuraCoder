@@ -884,6 +884,18 @@ export const ipc = {
       rootPath,
       filePath,
     }),
+  /** 读取 Markdown 文件引用的工作区图片。 */
+  readMarkdownImage: (
+    rootPath: string,
+    filePath: string,
+    imageSource: string,
+    workspaceId?: string | null,
+  ) => invoke<string>("read_markdown_image", {
+    rootPath,
+    filePath,
+    imageSource,
+    workspaceId: workspaceId ?? null,
+  }),
   getFileVersion: (
     rootPath: string,
     filePath: string,

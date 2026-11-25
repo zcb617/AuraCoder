@@ -11,6 +11,7 @@ use std::{
 use std::collections::BTreeSet;
 
 use anyhow::Context;
+use base64::Engine;
 
 use crate::services::{app_config_service::AppConfigService, workspace_service::WorkspaceService};
 use crate::{
@@ -88,6 +89,40 @@ impl FileService {
         .await
         .map_err(|error| error.to_string())?
 
+        }
+        /// 读取 Markdown 文件引用的工作区原始图片并转换为数据 URL。
+        pub async fn read_markdown_image(
+            &self,
+            root_path: String,
+            file_path: String,
+            image_source: String,
+            workspace_id: Option<String>,
+        ) -> Result<String, String> {
+            // 按工作区类型分别读取图片，远程读取失败时不回退到本机。
+            let result: anyhow::Result<String> = async {
+                let relative_path = resolve_markdown_image_path(&file_path, &image_source)?;
+                let mut remote_bytes = None;
+                if let Some(workspace_id) = workspace_id.as_deref() {
+                    let target = load_workspace_target(&self.state, workspace_id).await.map_err(anyhow::Error::msg)?;
+                    if target.is_remote() {
+                        let connection = target.remote_connection().map_err(|error| anyhow::anyhow!("{error}"))?;
+                        let root = remote_access_root(&target, &root_path).await.map_err(anyhow::Error::msg)?;
+                        remote_bytes = Some(remote_fs::read_binary_file(connection, &root, &relative_path).await?);
+                    }
+                }
+                let bytes = if let Some(bytes) = remote_bytes {
+                    bytes
+                } else {
+                    let root = root_path.clone();
+                    let path = relative_path.clone();
+                    tokio::task::spawn_blocking(move || read_local_markdown_image(&root, &path)).await??
+                };
+                encode_markdown_image(&relative_path, &bytes)
+            }.await;
+            result.map_err(|error| {
+                log::error!("读取 Markdown 图片失败 root={} file={} imageSource={}: {error:#}", root_path, file_path, image_source);
+                format!("图片加载失败：{error:#}")
+            })
         }
         /// 获取文件版本以校验并发写入。
         pub async fn get_file_version(
@@ -1645,6 +1680,88 @@ fn parse_line_column(value: &str, separator: char) -> Option<(Option<u32>, Optio
     let column = column.and_then(|value| value.parse::<u32>().ok().filter(|column| *column > 0));
     Some((Some(line), column))
 
+}
+
+/// 将 Markdown 图片地址解析为工作区内的相对路径。
+fn resolve_markdown_image_path(file_path: &str, image_source: &str) -> anyhow::Result<String> {
+    // 解码后校验路径，防止编码字符绕过目录边界。
+    let source = image_source.split(['?', '#']).next().unwrap_or("");
+    let source = percent_encoding::percent_decode_str(source)
+        .decode_utf8()
+        .context("图片路径不是有效的 UTF-8")?
+        .replace('\\', "/");
+    let file_path = file_path.replace('\\', "/");
+    anyhow::ensure!(
+        !source.is_empty() && !source.starts_with('/') && !source.contains(':')
+            && !source.chars().any(char::is_control),
+        "图片路径无效"
+    );
+    anyhow::ensure!(
+        !file_path.is_empty() && !file_path.starts_with('/') && !file_path.contains(':')
+            && !file_path.chars().any(char::is_control),
+        "Markdown 文件路径无效"
+    );
+    let directory = file_path.rsplit_once('/').map_or("", |(directory, _)| directory);
+    let combined = format!("{directory}/{source}");
+    let mut segments = Vec::new();
+    for segment in combined.split('/') {
+        match segment {
+            "" | "." => {},
+            ".." => { anyhow::ensure!(segments.pop().is_some(), "图片路径超出文件根目录"); },
+            _ => segments.push(segment),
+        }
+    }
+    anyhow::ensure!(!segments.is_empty(), "图片路径无效");
+    Ok(segments.join("/"))
+}
+
+/// 从本机工作区读取完整图片，并校验符号链接和大小。
+fn read_local_markdown_image(root_path: &str, relative_path: &str) -> anyhow::Result<Vec<u8>> {
+    // 解析实际路径，禁止符号链接指向工作区外。
+    let root = fs::canonicalize(root_path).context("无法解析工作区根目录")?;
+    let image = fs::canonicalize(root.join(relative_path)).context("图片文件不存在或无法访问")?;
+    anyhow::ensure!(image.starts_with(&root), "图片路径超出文件根目录");
+    let metadata = fs::metadata(&image).context("无法读取图片信息")?;
+    anyhow::ensure!(metadata.is_file(), "图片路径不是普通文件");
+    const MAX_SIZE: u64 = 10 * 1024 * 1024;
+    anyhow::ensure!(metadata.len() <= MAX_SIZE, "图片超过 10 MiB 大小限制");
+    let mut bytes = Vec::new();
+    fs::File::open(image)
+        .context("无法打开图片")?
+        .take(MAX_SIZE + 1)
+        .read_to_end(&mut bytes)
+        .context("无法读取图片")?;
+    anyhow::ensure!(bytes.len() <= MAX_SIZE as usize, "图片超过 10 MiB 大小限制");
+    Ok(bytes)
+}
+
+/// 根据图片真实格式生成保留原始字节的数据 URL。
+fn encode_markdown_image(relative_path: &str, bytes: &[u8]) -> anyhow::Result<String> {
+    // 按文件内容确定受支持的图片类型，SVG 额外校验文本和扩展名。
+    anyhow::ensure!(!bytes.is_empty() && bytes.len() <= 10 * 1024 * 1024, "图片为空或超过 10 MiB 大小限制");
+    let mime = match image::guess_format(bytes) {
+        Ok(image::ImageFormat::Png) => "image/png",
+        Ok(image::ImageFormat::Jpeg) => "image/jpeg",
+        Ok(image::ImageFormat::Gif) => "image/gif",
+        Ok(image::ImageFormat::WebP) => "image/webp",
+        Ok(image::ImageFormat::Bmp) => "image/bmp",
+        Ok(image::ImageFormat::Ico) => "image/x-icon",
+        _ => {
+            let svg_extension = Path::new(relative_path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("svg"));
+            let text = std::str::from_utf8(bytes).unwrap_or("").trim_start();
+            anyhow::ensure!(
+                svg_extension && (text.starts_with("<svg") || text.starts_with("<?xml"))
+                    && text.contains("<svg"),
+                "不支持的图片类型"
+            );
+            "image/svg+xml"
+        }
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
 }
 
 /// 经 WorkspaceService 解析工作区目标。

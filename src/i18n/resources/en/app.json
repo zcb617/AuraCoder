@@ -475,6 +475,7 @@
     }
   },
   "editor": {
+    "markdownImageLoadFailed": "Failed to load image",
     "closeTab": "Close file",
     "loadingFile": "Loading file...",
     "binaryFile": "Binary file - cannot display",

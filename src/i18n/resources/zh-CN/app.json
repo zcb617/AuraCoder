@@ -474,6 +474,7 @@
     }
   },
   "editor": {
+    "markdownImageLoadFailed": "图片加载失败",
     "closeTab": "关闭文件",
     "loadingFile": "正在加载文件…",
     "binaryFile": "二进制文件，无法显示",

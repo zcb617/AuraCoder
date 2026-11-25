@@ -260,7 +260,13 @@ export function FileEditorPanel({ embedded = false }: FileEditorPanelProps = {})
               onChange={(content) => setTabContent(activeTab.id, content)}
             />
           ) : activeTab.renderMode === "markdown-preview" ? (
-            <MarkdownPreviewPanel content={activeTab.content} />
+            /* <MarkdownPreviewPanel content={activeTab.content} /> */
+            <MarkdownPreviewPanel
+              content={activeTab.content}
+              rootPath={activeTab.rootPath}
+              filePath={activeTab.filePath}
+              workspaceId={activeTab.workspaceId ?? null}
+            />
           ) : activeTab.isBinary ? (
             <div
               style={{

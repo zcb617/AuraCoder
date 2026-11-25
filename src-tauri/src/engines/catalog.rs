@@ -85,11 +85,12 @@ pub async fn get_chat_provider_usage(
                 .execution_context(workspace_id.as_deref())
                 .await
                 .with_context(|| format!("读取所选 CLI 执行目标失败: cli_id={engine_id}"))?;
-            if let Some(item) = cli
+            if let Some(mut item) = cli
                 .get_chat_provider_usage(&context, CliUsageQueryScope::Explicit)
                 .await
                 .with_context(|| format!("读取所选 CLI 额度失败: cli_id={engine_id}"))?
             {
+                item.limits = item.frontend_limits(Some(&context.workspace_id));
                 usage.push(item);
             }
             return Ok(usage);
@@ -104,11 +105,12 @@ pub async fn get_chat_provider_usage(
                 .execution_context(workspace_id.as_deref())
                 .await
                 .with_context(|| format!("读取 CLI 汇总执行目标失败: cli_id={cli_id}"))?;
-            if let Some(item) = cli
+            if let Some(mut item) = cli
                 .get_chat_provider_usage(&context, CliUsageQueryScope::Summary)
                 .await
                 .with_context(|| format!("读取 CLI 额度汇总失败: cli_id={cli_id}"))?
             {
+                item.limits = item.frontend_limits(Some(&context.workspace_id));
                 usage.push(item);
             }
         }

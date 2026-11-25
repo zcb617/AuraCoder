@@ -740,6 +740,103 @@ pub struct ChatProviderUsageDto {
     pub name: String,
     pub available: bool,
     pub windows: Vec<ChatProviderUsageWindowDto>,
+    /// 后端统一转换后的账号额度。
+    #[serde(default)]
+    pub limits: Option<ChatProviderUsageLimitsDto>,
+}
+
+/// 独立会话生命周期的统一账号额度及其来源。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatProviderUsageLimitsDto {
+    /// 额度所属的 CLI 标识。
+    pub engine_id: String,
+    /// 额度所属的工作区标识。
+    pub workspace_id: Option<String>,
+    /// 五小时额度剩余百分比。
+    pub window_five_hour_percent: Option<u8>,
+    /// 周额度剩余百分比。
+    pub window_weekly_percent: Option<u8>,
+    /// Fable 周额度剩余百分比。
+    pub window_fable_weekly_percent: Option<u8>,
+    /// Opus 周额度剩余百分比。
+    pub window_opus_weekly_percent: Option<u8>,
+    /// Sonnet 周额度剩余百分比。
+    pub window_sonnet_weekly_percent: Option<u8>,
+    /// 五小时额度重置时间。
+    pub window_five_hour_resets_at: Option<String>,
+    /// 周额度重置时间。
+    pub window_weekly_resets_at: Option<String>,
+    /// Fable 周额度重置时间。
+    pub window_fable_weekly_resets_at: Option<String>,
+    /// Opus 周额度重置时间。
+    pub window_opus_weekly_resets_at: Option<String>,
+    /// Sonnet 周额度重置时间。
+    pub window_sonnet_weekly_resets_at: Option<String>,
+}
+
+impl ChatProviderUsageDto {
+    /// 将统一窗口转换为前端展示的账号额度。
+    pub fn frontend_limits(&self, workspace_id: Option<&str>) -> Option<ChatProviderUsageLimitsDto> {
+        if !self.available {
+            return None;
+        }
+        // 将支持的窗口转换为剩余额度及本地重置时间。
+        let mut limits = ChatProviderUsageLimitsDto {
+            engine_id: self.engine_id.clone(),
+            workspace_id: workspace_id.map(str::to_string),
+            ..Default::default()
+        };
+        let mut found = false;
+        for window in &self.windows {
+            let remaining = Some(100 - window.used_percent.min(100));
+            let reset = window.resets_at.and_then(usage_reset_time);
+            match window.kind.as_str() {
+                "five_hour" => {
+                    limits.window_five_hour_percent = remaining;
+                    limits.window_five_hour_resets_at = reset;
+                    found = true;
+                }
+                "weekly" => {
+                    limits.window_weekly_percent = remaining;
+                    limits.window_weekly_resets_at = reset;
+                    found = true;
+                }
+                "fable_weekly" => {
+                    limits.window_fable_weekly_percent = remaining;
+                    limits.window_fable_weekly_resets_at = reset;
+                    found = true;
+                }
+                "opus_weekly" => {
+                    limits.window_opus_weekly_percent = remaining;
+                    limits.window_opus_weekly_resets_at = reset;
+                    found = true;
+                }
+                "sonnet_weekly" => {
+                    limits.window_sonnet_weekly_percent = remaining;
+                    limits.window_sonnet_weekly_resets_at = reset;
+                    found = true;
+                }
+                _ => {}
+            }
+        }
+        if found {
+            Some(limits)
+        } else {
+            None
+        }
+    }
+}
+
+/// 将账号额度重置时间转换为本地时间。
+fn usage_reset_time(value: i64) -> Option<String> {
+    let millis = if value < 10_000_000_000 {
+        value.checked_mul(1000)?
+    } else {
+        value
+    };
+    chrono::DateTime::from_timestamp_millis(millis)
+        .map(|time| time.with_timezone(&chrono::Local).to_rfc3339_opts(chrono::SecondsFormat::Millis, false))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

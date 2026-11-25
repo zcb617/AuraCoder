@@ -1779,13 +1779,49 @@ pub(crate) async fn process_stream_event(
         _ => {}
     }
 
+    // 实时账号额度与主动查询使用相同的后端转换结果。
+    let usage_payload = if let EngineEvent::UsageLimitsUpdated { usage } = &normalized_event {
+        let provider = crate::engines::map_provider_usage(
+            &thread.engine_id,
+            &thread.engine_id,
+            Ok(usage.clone()),
+        );
+        let limits = provider.frontend_limits(Some(&thread.workspace_id));
+        match (
+            serde_json::to_value(&normalized_event),
+            serde_json::to_value(limits),
+        ) {
+            (Ok(mut event_value), Ok(limits_value)) => {
+                if let Some(object) = event_value.as_object_mut() {
+                    object.insert("usageLimits".to_string(), limits_value);
+                }
+                Some(event_value)
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                log::error!(
+                    "序列化账号额度事件失败: thread_id={}, engine_id={}, error={error:#}",
+                    thread.id,
+                    thread.engine_id,
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 审批事件延后到审批记录和展示块保存成功后发送，其他事件仍按原位置转发。
     let is_approval_request = matches!(
         &normalized_event,
         EngineEvent::ApprovalRequested { .. }
     );
     let emit_stream_event = || {
-        if let Err(error) = app.emit(stream_event_topic, &normalized_event) {
+        let result = if let Some(payload) = &usage_payload {
+            app.emit(stream_event_topic, payload)
+        } else {
+            app.emit(stream_event_topic, &normalized_event)
+        };
+        if let Err(error) = result {
             log::error!(
                 "聊天流式事件发送失败: thread_id={}, engine_id={}, assistant_message_id={}, topic={}, event_kind={}, error={error:#}",
                 thread.id,

@@ -33,6 +33,19 @@ pub async fn read_file(
     FileService::new(state.inner().clone()).read_file(root_path, file_path, workspace_id).await
 }
 
+/// 读取 Markdown 文件引用的工作区图片。
+#[tauri::command]
+pub async fn read_markdown_image(
+    state: State<'_, AppState>,
+    root_path: String,
+    file_path: String,
+    image_source: String,
+    workspace_id: Option<String>,
+) -> Result<String, String> {
+    // 以下代码将图片读取参数交给文件业务 Service。
+    FileService::new(state.inner().clone()).read_markdown_image(root_path, file_path, image_source, workspace_id).await
+}
+
 /// 获取文件版本以校验并发写入。
 #[tauri::command]
 pub async fn get_file_version(

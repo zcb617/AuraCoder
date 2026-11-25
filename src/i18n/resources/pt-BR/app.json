@@ -475,6 +475,7 @@
     }
   },
   "editor": {
+    "markdownImageLoadFailed": "Falha ao carregar imagem",
     "closeTab": "Fechar arquivo",
     "loadingFile": "Carregando arquivo...",
     "binaryFile": "Arquivo binário - não é possível exibir",

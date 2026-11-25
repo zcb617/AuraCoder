@@ -901,6 +901,7 @@ impl Engine for CodexEngine {
             .await;
         validate_turn_attachments(&input.attachments).await?;
 
+        /* 已停用每轮开始时主动查询账号额度，保留 CLI 主动额度通知。
         let transport_for_rate_limits = transport.clone();
         let rate_limits_task = tokio::spawn(async move {
             request_with_fallback(
@@ -911,6 +912,7 @@ impl Engine for CodexEngine {
             )
             .await
         });
+        */
 
         let transport_for_turn = transport.clone();
         let thread_id_for_turn = thread_id.clone();
@@ -929,8 +931,8 @@ impl Engine for CodexEngine {
         });
 
         let mut turn_task = turn_task;
-        let mut rate_limits_task = rate_limits_task;
-        let mut rate_limits_done = false;
+        // let mut rate_limits_task = rate_limits_task;
+        // let mut rate_limits_done = false;
         let mut turn_request_done = false;
         let mut completion_seen = false;
         let mut expected_turn_id: Option<String> = None;
@@ -940,6 +942,7 @@ impl Engine for CodexEngine {
 
         while !completion_seen || !turn_request_done {
             tokio::select! {
+              /* 已停用每轮额度查询结果的转发。
               response = &mut rate_limits_task, if !rate_limits_done => {
                 rate_limits_done = true;
                 match response {
@@ -961,6 +964,7 @@ impl Engine for CodexEngine {
                   }
                 }
               }
+              */
               _ = cancellation.cancelled() => {
                 turn_task.abort();
                 self
@@ -1637,9 +1641,11 @@ impl Engine for CodexEngine {
             }
         }
 
+        /* 对应的每轮额度查询任务已停用。
         if !rate_limits_done {
             rate_limits_task.abort();
         }
+        */
 
         if !completion_seen {
             if !self
@@ -2327,6 +2333,7 @@ impl CodexEngine {
         let auto_approve_mcp_elicitations = false;
         let requested_delivery = delivery.map(str::to_string);
 
+        /* 已停用每轮开始时主动查询账号额度，保留 CLI 主动额度通知。
         let transport_for_rate_limits = transport.clone();
         let rate_limits_task = tokio::spawn(async move {
             request_with_fallback(
@@ -2337,6 +2344,7 @@ impl CodexEngine {
             )
             .await
         });
+        */
 
         let transport_for_review = transport.clone();
         let source_thread_id_for_review = source_thread_id.clone();
@@ -2356,8 +2364,8 @@ impl CodexEngine {
         });
 
         let mut review_task = review_task;
-        let mut rate_limits_task = rate_limits_task;
-        let mut rate_limits_done = false;
+        // let mut rate_limits_task = rate_limits_task;
+        // let mut rate_limits_done = false;
         let mut turn_request_done = false;
         let mut completion_seen = false;
         let mut expected_turn_id: Option<String> = None;
@@ -2367,6 +2375,7 @@ impl CodexEngine {
 
         while !completion_seen || !turn_request_done {
             tokio::select! {
+              /* 已停用每轮额度查询结果的转发。
               response = &mut rate_limits_task, if !rate_limits_done => {
                 rate_limits_done = true;
                 match response {
@@ -2388,6 +2397,7 @@ impl CodexEngine {
                   }
                 }
               }
+              */
               _ = cancellation.cancelled() => {
                 review_task.abort();
                 drop(started_tx.take());
@@ -2858,9 +2868,11 @@ impl CodexEngine {
             }
         }
 
+        /* 对应的每轮额度查询任务已停用。
         if !rate_limits_done {
             rate_limits_task.abort();
         }
+        */
 
         if !completion_seen {
             if !self

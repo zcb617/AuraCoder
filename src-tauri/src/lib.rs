@@ -607,6 +607,7 @@ pub fn run() {
             commands::update::prepare_local_update_for_development,
             commands::files::list_dir,
             commands::files::read_file,
+            commands::files::read_markdown_image,
             commands::files::get_file_version,
             commands::files::get_directory_fingerprint,
             commands::files::resolve_editor_file_reference,

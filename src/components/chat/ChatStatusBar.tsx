@@ -49,7 +49,7 @@ export function ChatStatusBar({
   usageLimitsLoading,
   selectedClaudeWeeklyUsage,
   hasUserMessage,
-  streaming,
+  // streaming,
   gitStatus,
   error,
   onOpenUsageLimits,
@@ -153,7 +153,8 @@ export function ChatStatusBar({
             <div className="chat-context-section">
               <Clock size={10} />
               <span>
-                {t(resolveUsageStatusKey(hasUserMessage, streaming || usageLimitsLoading))}
+                {/* {t(resolveUsageStatusKey(hasUserMessage, streaming || usageLimitsLoading))} */}
+                {t(resolveUsageStatusKey(hasUserMessage, usageLimitsLoading))}
               </span>
             </div>
           )

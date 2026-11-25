@@ -3198,11 +3198,13 @@ async function handleQuery(req, persistentSession = null) {
       */
     };
 
+    /* 已停用每轮开始时主动查询账号额度，保留 SDK 的 rate_limit_event 通知。
     void fetchClaudeUsageSnapshot().then((usage) => {
       if (usage && activeQueries.has(id)) {
         emit({ id, type: "usage_limits_updated", usage });
       }
     });
+    */
 
     for await (const message of query) {
       traceClaudeSdk(`sdk_message_${id}`, { requestId: id, message });

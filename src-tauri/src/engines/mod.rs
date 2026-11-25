@@ -1106,12 +1106,16 @@ pub(crate) fn map_provider_usage(
     name: &str,
     result: anyhow::Result<UsageLimitsSnapshot>,
 ) -> crate::models::ChatProviderUsageDto {
+    if let Err(error) = &result {
+        log::error!("读取账号额度失败: engine_id={}, name={}, error={error:#}", engine_id, name);
+    }
     let Ok(usage) = result else {
         return crate::models::ChatProviderUsageDto {
             engine_id: engine_id.to_string(),
             name: name.to_string(),
             available: false,
             windows: Vec::new(),
+            limits: None,
         };
     };
 
@@ -1152,6 +1156,7 @@ pub(crate) fn map_provider_usage(
         name: name.to_string(),
         available: !windows.is_empty(),
         windows,
+        limits: None,
     }
 }
 

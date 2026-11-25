@@ -990,7 +990,11 @@ export function ChatPanel({ embedded = false }: ChatPanelProps = {}) {
     [availableModels, selectedModelId],
   );
   const selectedClaudeWeeklyUsage = useMemo(() => {
-    if (selectedEngineId !== "claude" || !usageLimits) {
+    if (
+      selectedEngineId !== "claude" ||
+      !usageLimits ||
+      (usageLimits.engineId && usageLimits.engineId !== "claude")
+    ) {
       return null;
     }
 

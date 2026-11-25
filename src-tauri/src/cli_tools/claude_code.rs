@@ -1891,6 +1891,7 @@ impl CliTool for ClaudeCodeCli {
                 name: "Claude".to_string(),
                 available: false,
                 windows: Vec::new(),
+                limits: None,
             }));
         }
         let engine = self.local_engine().await?;

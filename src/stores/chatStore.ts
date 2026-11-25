@@ -63,10 +63,12 @@ interface ChatState {
   contextUsageLoading: boolean;
   /** 完成上下文压缩后从当前 CLI 读取并同步真实上下文用量。 */
   refreshContextUsage: (threadId: string) => Promise<void>;
-  /** 当前 CLI 账号额度窗口快照，不承载线程上下文。 */
+  /** 独立会话生命周期的统一账号额度，不承载线程上下文。 */
   usageLimits: ChatProviderUsageLimits | null;
-  /** 当前 CLI 账号额度恢复请求是否仍在执行。 */
+  /** 独立会话生命周期的统一账号额度请求是否仍在执行。 */
   usageLimitsLoading: boolean;
+  /** 从指定 CLI 刷新独立会话生命周期的统一账号额度。 */
+  refreshUsageLimits: (workspaceId: string | null, engineId: string) => Promise<void>;
   error?: string;
   unlisten?: () => void;
   setActiveThread: (threadId: string | null) => Promise<void>;
@@ -115,6 +117,7 @@ interface ChatState {
 }
 
 let activeThreadBindSeq = 0;
+let activeUsageLimitsRequestSeq = 0;
 const STREAM_EVENT_BATCH_WINDOW_MS = 16;
 const STREAM_EVENT_QUEUE_FLUSH_THRESHOLD = 500;
 
@@ -1416,6 +1419,7 @@ function normalizeMessages(
     : collapseTrailingSteerMessages(nextMessages);
 }
 
+/*
 function toIsoTimestamp(value: number | null | undefined): string | null {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return null;
@@ -1428,6 +1432,8 @@ function toIsoTimestamp(value: number | null | undefined): string | null {
   }
   return date.toISOString();
 }
+
+*/
 
 /*
  * 旧上下文百分比算法曾扣除固定 12K 基线，导致 current/max 的原始比例被改变；
@@ -1515,6 +1521,7 @@ function mapUsageLimitsFromEvent(
       ? { currentTokens, maxContextTokens, contextPercent }
       : null;
 
+  /* 旧账号额度转换保留作迁移记录，统一由后端转换。
   const toRemainingPercent = (
     usedPercent: number | null | undefined,
   ): number | null => {
@@ -1544,6 +1551,9 @@ function mapUsageLimitsFromEvent(
         }
       : null;
 
+  */
+  const usageLimits = event.usageLimits ?? null;
+
   return { contextUsage, usageLimits };
 }
 
@@ -1551,6 +1561,7 @@ function mapUsageLimitsFromEvent(
 function mapProviderUsage(
   provider: ChatProviderUsage | undefined,
 ): ChatProviderUsageLimits | null {
+  /* 旧窗口转换保留作迁移记录，统一由后端转换。
   if (!provider?.available || provider.windows.length === 0) {
     return null;
   }
@@ -1596,6 +1607,8 @@ function mapProviderUsage(
   }
 
   return usage;
+  */
+  return provider?.available ? provider.limits ?? null : null;
 }
 
 /** 合并同一线程的上下文快照，避免部分事件清空已有可靠 token。 */
@@ -1616,7 +1629,7 @@ function mergeContextUsage(
   };
 }
 
-/** 合并同一线程的账号额度窗口，避免单窗口事件清空其他窗口。 */
+/* 旧实现按来源及字段合并账号额度，保留作迁移记录，不再执行。
 function mergeUsageLimits(
   previous: ChatProviderUsageLimits | null,
   update: ChatProviderUsageLimits | null,
@@ -1628,7 +1641,14 @@ function mergeUsageLimits(
     return update;
   }
 
+  // 来源变化时整体替换，避免混合不同 CLI 或工作区的额度。
+  if ((previous.engineId && update.engineId && previous.engineId !== update.engineId) ||
+      (previous.workspaceId !== undefined && update.workspaceId !== undefined && previous.workspaceId !== update.workspaceId)) {
+    return update;
+  }
   return {
+    engineId: update.engineId ?? previous.engineId,
+    workspaceId: update.workspaceId ?? previous.workspaceId,
     windowFiveHourPercent:
       update.windowFiveHourPercent ?? previous.windowFiveHourPercent,
     windowWeeklyPercent: update.windowWeeklyPercent ?? previous.windowWeeklyPercent,
@@ -1649,6 +1669,15 @@ function mergeUsageLimits(
     windowSonnetWeeklyResetsAt:
       update.windowSonnetWeeklyResetsAt ?? previous.windowSonnetWeeklyResetsAt,
   };
+}
+*/
+
+/** 有效的统一账号额度整份替换，未获取到有效对象时保留原值。 */
+function replaceUsageLimits(
+  previous: ChatProviderUsageLimits | null,
+  update: ChatProviderUsageLimits | null,
+): ChatProviderUsageLimits | null {
+  return update ?? previous;
 }
 
 function resolveAssistantTargetFromEvent(
@@ -2196,6 +2225,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
   contextUsageLoading: false,
   usageLimits: null,
   usageLimitsLoading: false,
+  refreshUsageLimits: async (workspaceId, engineId) => {
+    const requestSeq = ++activeUsageLimitsRequestSeq;
+    // 请求期间保留已有账号额度，最新请求决定加载状态。
+    set({ usageLimitsLoading: true });
+    try {
+      const providers = await ipc.getChatProviderUsage(workspaceId, engineId);
+      if (requestSeq !== activeUsageLimitsRequestSeq) {
+        return;
+      }
+      const update = mapProviderUsage(providers.find((provider) => provider.engineId === engineId));
+      set((state) => ({
+        usageLimits: replaceUsageLimits(state.usageLimits, update),
+        usageLimitsLoading: false,
+      }));
+    } catch (error) {
+      console.warn(`Failed to refresh provider usage for engine ${engineId}:`, error);
+      if (requestSeq === activeUsageLimitsRequestSeq) {
+        set({ usageLimitsLoading: false });
+      }
+    }
+  },
   refreshContextUsage: async (threadId) => {
     const bindSeq = activeThreadBindSeq;
     const startingState = get();
@@ -2309,8 +2359,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         status: "idle",
         contextUsage: null,
         contextUsageLoading: false,
-        usageLimits: null,
-        usageLimitsLoading: false,
+        // usageLimits: null,
+        // usageLimitsLoading: false,
         error: undefined,
         unlisten: undefined,
       });
@@ -2362,8 +2412,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         status: "idle",
         contextUsage: null,
         contextUsageLoading: false,
-        usageLimits: null,
-        usageLimitsLoading: false,
+        // usageLimits: null,
+        // usageLimitsLoading: false,
         error: undefined,
       });
 
@@ -2499,11 +2549,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 if (usageUpdate.contextUsage !== null) {
                   nextContextUsageLoading = false;
                 }
-                nextUsageLimits = mergeUsageLimits(
+                nextUsageLimits = replaceUsageLimits(
                   nextUsageLimits,
                   usageUpdate.usageLimits,
                 );
-                nextUsageLimitsLoading = false;
+                if (usageUpdate.usageLimits !== null) {
+                  nextUsageLimitsLoading = false;
+                }
                 continue;
               }
               const previousLength = nextMessages.length;
@@ -2725,8 +2777,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         status: threadStatus,
         contextUsage: null,
         contextUsageLoading: shouldRefreshContextUsage,
-        usageLimits: null,
-        usageLimitsLoading: shouldRefreshUsageLimits,
+        // usageLimits: null,
+        // usageLimitsLoading: shouldRefreshUsageLimits,
       });
       console.info("[context-usage] thread bind complete", {
         phase: "bind-complete",
@@ -2823,6 +2875,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
 
       if (shouldRefreshUsageLimits) {
+        /* 旧账号额度请求绑定线程生命周期，保留作迁移记录。
         const refreshRestoredUsageLimits = async () => {
           try {
             const providers = await ipc.getChatProviderUsage(
@@ -2847,6 +2900,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
           }
         };
         void refreshRestoredUsageLimits();
+        */
+        void get().refreshUsageLimits(activeThread?.workspaceId ?? null, restoredEngineId!);
       }
     } catch (error) {
       console.error("[context-usage] thread bind failed", {
@@ -2878,8 +2933,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         olderLoadBlockedUntil: 0,
         contextUsage: null,
         contextUsageLoading: false,
-        usageLimits: null,
-        usageLimitsLoading: false,
+        // usageLimits: null,
+        // usageLimitsLoading: false,
         turnStartedAt: null,
         error: String(error),
       });

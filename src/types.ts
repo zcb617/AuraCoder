@@ -868,6 +868,8 @@ export interface ChatProviderUsage {
   name: string;
   available: boolean;
   windows: ChatProviderUsageWindow[];
+  /** 后端统一转换的账号额度。 */
+  limits?: ChatProviderUsageLimits | null;
 }
 
 export interface ChatProviderUsageWindow {
@@ -1753,6 +1755,9 @@ export interface ErrorEvent {
 
 export interface UsageLimitsUpdatedEvent {
   type: "UsageLimitsUpdated";
+  /** 后端统一转换的账号额度。 */
+  usageLimits?: ChatProviderUsageLimits | null;
+  /** 账号原始字段仅用于协议兼容，上下文字段仍供线程使用。 */
   usage: {
     current_tokens?: number | null;
     max_context_tokens?: number | null;
@@ -1928,6 +1933,10 @@ export interface CliContextUsage {
 
 /** 当前 CLI 账号额度窗口快照，不承载线程上下文 token。 */
 export interface ChatProviderUsageLimits {
+  /** 额度所属的 CLI。 */
+  engineId?: string;
+  /** 额度所属的工作区。 */
+  workspaceId?: string | null;
   /** 五小时账号额度剩余百分比。 */
   windowFiveHourPercent: number | null;
   /** 周账号额度剩余百分比。 */

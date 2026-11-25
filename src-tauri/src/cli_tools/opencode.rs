@@ -86,6 +86,7 @@ impl OpenCodeCli {
                 name: "OpenCode".to_string(),
                 available: false,
                 windows: Vec::new(),
+                limits: None,
             }),
         }
     }
@@ -1259,7 +1260,7 @@ impl CliTool for OpenCodeCli {
                 });
             }
         }
-        Ok(Some(ChatProviderUsageDto { engine_id: "opencode".to_string(), name: "OpenCode".to_string(), available: !data.is_null(), windows }))
+        Ok(Some(ChatProviderUsageDto { engine_id: "opencode".to_string(), name: "OpenCode".to_string(), available: !data.is_null(), windows, limits: None }))
     }
 
     /// 用户进入 OpenCode 线程时，读取模型上下文上限和最新可靠 assistant token 快照。
