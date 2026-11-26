@@ -3,6 +3,15 @@ use serde_json::Value;
 
 pub mod chat;
 
+/// 服务前置检查的可读提示与原始异常分别保存，向上返回时不丢失错误链。
+#[derive(Debug, thiserror::Error)]
+#[error("{user_message}")]
+pub struct CliServicePrerequisiteError {
+    pub user_message: &'static str,
+    #[source]
+    pub source: anyhow::Error,
+}
+
 /// SSH 数据库连接记录及其未向前端暴露的主机密钥信息。
 #[derive(Debug, Clone)]
 pub struct SshConnectionRecord {

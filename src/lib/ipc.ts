@@ -1155,6 +1155,8 @@ export interface SshRemoteProjectSessionsRefreshedEvent {
   succeededCliIds: string[];
   /** 同步失败的远端 CLI 标识。 */
   failedCliIds: string[];
+  /** 含连接、项目和具体原因的可读提示；不包含原始异常。 */
+  failureMessages: string[];
 }
 
 export async function listenSshRemoteProjectSessionsRefreshed(

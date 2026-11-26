@@ -351,12 +351,22 @@ pub async fn run_command_with_input(
         .await
         .context("SSH 远端命令执行超时")??;
     if !output.status.success() {
+        /* 旧实现只返回裁剪后的 stderr，丢失退出码和 stdout 中的认证检查结果。
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         anyhow::bail!(if stderr.is_empty() {
             "SSH 远端命令执行失败".to_string()
         } else {
             stderr
         });
+        */
+        let error = super::errors::SshError::RemoteCommandFailed {
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        };
+        // 输出正文原样记录；不裁剪、不替换，也不以用户提示覆盖原始错误。
+        log::error!("SSH connection_id={}\n{}", record.dto.id, error);
+        return Err(error.into());
     }
     Ok(output.stdout)
 }

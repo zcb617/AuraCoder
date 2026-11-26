@@ -894,6 +894,7 @@ pub(crate) async fn start_remote_cli_service_for_tunnel(
         "启动 SSH 远端 CLI 服务必须提供有效 MCP 租约 Token"
     );
     if tunnel.cli_id() == "claude" {
+        /* 旧检查混淆 Node.js 与 CLI 缺失，并丢弃认证结果。
         let prerequisite_command = wrap_remote_login_shell_command(
             "node -e 'const [major, minor] = process.versions.node.split(\".\").map(Number); const compatible = (major > 20 || (major === 20 && minor >= 5)) && typeof Symbol.dispose === \"symbol\" && typeof Symbol.asyncDispose === \"symbol\"; process.exit(compatible ? 0 : 45)' && claude_path=$(type -P claude) || exit 44; \"$claude_path\" auth status >/dev/null || exit 46",
         );
@@ -902,6 +903,35 @@ pub(crate) async fn start_remote_cli_service_for_tunnel(
             .context(
                 "SSH 远端 Claude 前置检查失败：需要 Node.js 20.5+、Claude Code 可执行文件和有效登录状态",
             )?;
+        */
+        // 各前置条件使用独立退出码；保留 auth status 的原始输出供日志记录。
+        let prerequisite_command = wrap_remote_login_shell_command(
+            "node_path=$(type -P node) || exit 45; \"$node_path\" -e 'const [major, minor] = process.versions.node.split(\".\").map(Number); const compatible = (major > 20 || (major === 20 && minor >= 5)) && typeof Symbol.dispose === \"symbol\" && typeof Symbol.asyncDispose === \"symbol\"; process.exit(compatible ? 0 : 45)' || exit 45; claude_path=$(type -P claude) || exit 44; \"$claude_path\" auth status || exit 46",
+        );
+        if let Err(error) = gateway::run_command(tunnel.connection(), &prerequisite_command).await {
+            let user_message = match error.downcast_ref::<super::errors::SshError>() {
+                Some(super::errors::SshError::RemoteCommandFailed { exit_code: Some(44), .. }) =>
+                    "未找到 Claude Code，请在远端安装并确认当前 SSH 账号可以运行 claude 命令。",
+                Some(super::errors::SshError::RemoteCommandFailed { exit_code: Some(45), .. }) =>
+                    "远端 Node.js 未安装或版本不兼容，Claude Code 需要 Node.js 20.5 及以上版本。",
+                Some(super::errors::SshError::RemoteCommandFailed { exit_code: Some(46), stdout, .. }) => {
+                    let logged_out = serde_json::from_str::<serde_json::Value>(stdout)
+                        .ok()
+                        .and_then(|status| status.get("loggedIn").and_then(|value| value.as_bool()))
+                        == Some(false);
+                    if logged_out {
+                        "Claude Code 尚未登录或登录已失效，请使用当前 SSH 账号在远端登录后重试。"
+                    } else {
+                        "Claude Code 登录状态检查失败，请使用当前 SSH 账号在远端执行 claude auth status 检查认证配置。"
+                    }
+                }
+                _ => "无法检查远端 Claude Code 的运行条件，请确认 SSH 连接正常后重试。",
+            };
+            return Err(crate::models::CliServicePrerequisiteError {
+                user_message,
+                source: error,
+            }.into());
+        }
         ensure_claude_runtime_installed(tunnel.connection())
             .await
             .with_context(|| {

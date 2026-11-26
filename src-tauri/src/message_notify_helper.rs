@@ -51,6 +51,8 @@ pub struct SshRemoteProjectSessionsRefreshedEvent {
     pub succeeded_cli_ids: Vec<String>,
     /// 刷新失败的远端 CLI 标识列表。
     pub failed_cli_ids: Vec<String>,
+    /// 面向用户的失败说明；原始错误仅写日志，不放入通知。
+    pub failure_messages: Vec<String>,
 }
 
 /// 一次 CLI 健康检查对生命周期 MAP 的处理结果。
@@ -134,6 +136,7 @@ mod tests {
             workspace_id: "workspace-1".to_owned(),
             succeeded_cli_ids: vec!["codex".to_owned()],
             failed_cli_ids: vec!["claude".to_owned()],
+            failure_messages: Vec::new(),
         })
         .expect("event DTO should serialize");
 

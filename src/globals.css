@@ -425,6 +425,9 @@
 
 /* ── Design Tokens ── */
 :root {
+  /* 原生滚动条与表单控件跟随当前主题配色。 */
+  color-scheme: dark;
+
   /* AuraCoder brand palette */
   --brand-neutral-0: #ffffff;
   --brand-neutral-50: #fafafb;
@@ -655,6 +658,8 @@
    Preferences menu (dark / light / system); "system" resolves to one of
    these two at runtime and stamps data-theme accordingly. */
 :root[data-theme="light"] {
+  color-scheme: light;
+
   --bg-0: var(--brand-neutral-0);
   --bg-1: var(--brand-neutral-0);
   --bg-2: var(--brand-neutral-50);

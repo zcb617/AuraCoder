@@ -13,4 +13,11 @@ pub enum SshError {
     InvalidHostKey,
     #[error("SSH 连接检测失败: {0}")]
     Connection(String),
+    /// 保留远端命令的退出码与原始输出，供日志记录和调用方识别失败阶段。
+    #[error("SSH command failed: exit_code={exit_code:?}\nstdout:\n{stdout}\nstderr:\n{stderr}")]
+    RemoteCommandFailed {
+        exit_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    },
 }

@@ -350,10 +350,15 @@ export function App() {
         completeSshSessionSync(event.workspaceId);
       }
 
+      /* 旧提示只统计失败数量，无法判断哪个项目、CLI 或运行条件失败。
       if (event.failedCliIds.length > 0) {
         toast.warning(
           `SSH 远端项目会话同步失败：${event.failedCliIds.length} 个 CLI 未能同步。`,
         );
+      }
+      */
+      if (event.failureMessages.length > 0) {
+        toast.warning(event.failureMessages.join(" "), { duration: 12000 });
       }
     }).then((fn) => {
       if (disposed) {

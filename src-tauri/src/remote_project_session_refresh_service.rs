@@ -89,6 +89,7 @@ async fn sync_project_sessions(
         failed_cli_ids: Vec::new(),
     };
     let mut prepared_clis: Vec<(&str, Arc<dyn CliTool>)> = Vec::new();
+    let mut failure_messages = Vec::new();
 
     if !is_ssh {
         log::info!(
@@ -108,6 +109,9 @@ async fn sync_project_sessions(
                     cli_id
                 );
                 report.failed_cli_ids.push(cli_id.to_string());
+                failure_messages.push(session_sync_failure_message(
+                    &workspace, cli_id, &error, "初始化失败",
+                ));
                 continue;
             }
         };
@@ -120,6 +124,9 @@ async fn sync_project_sessions(
                     cli_id
                 );
                 report.failed_cli_ids.push(cli_id.to_string());
+                failure_messages.push(session_sync_failure_message(
+                    &workspace, cli.name(), &error, "服务启动失败",
+                ));
                 continue;
             }
         }
@@ -136,6 +143,7 @@ async fn sync_project_sessions(
                 log::warn!("发送启动进度失败: {error:#}");
             }
         }
+        let cli_name = cli.name().to_string();
         match sync_cli(&factory, &workspace, cli_id, Some(cli)).await {
             Ok(()) => report.succeeded_cli_ids.push(cli_id.to_string()),
             Err(error) => {
@@ -145,6 +153,9 @@ async fn sync_project_sessions(
                     cli_id
                 );
                 report.failed_cli_ids.push(cli_id.to_string());
+                failure_messages.push(session_sync_failure_message(
+                    &workspace, &cli_name, &error, "历史会话读取或保存失败",
+                ));
             }
         }
     }
@@ -166,6 +177,7 @@ async fn sync_project_sessions(
                 workspace_id: report.workspace_id.clone(),
                 succeeded_cli_ids: report.succeeded_cli_ids.clone(),
                 failed_cli_ids: report.failed_cli_ids.clone(),
+                failure_messages,
             },
         ) {
             log::warn!("发送 SSH 会话刷新通知失败: {error:#}");
@@ -173,6 +185,25 @@ async fn sync_project_sessions(
     }
 
     Ok(report)
+}
+
+/// 转换明确的失败原因供界面显示；不解析或修改原始异常文本。
+fn session_sync_failure_message(
+    workspace: &WorkspaceDto,
+    cli_name: &str,
+    error: &anyhow::Error,
+    stage: &str,
+) -> String {
+    let reason = match error.downcast_ref::<crate::models::CliServicePrerequisiteError>() {
+        Some(prerequisite) => prerequisite.user_message.to_string(),
+        None => format!("{cli_name} {stage}，详细原因请查看日志。"),
+    };
+    let location = if workspace.location_kind == "ssh" {
+        workspace.connection_display_name.as_deref().unwrap_or("SSH 服务器")
+    } else {
+        "本机"
+    };
+    format!("「{location}」项目「{}」历史会话同步失败：{reason}", workspace.name)
 }
 
 static REFRESHING_WORKSPACES: LazyLock<Mutex<HashSet<String>>> =
